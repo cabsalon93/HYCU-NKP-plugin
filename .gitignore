@@ -1,0 +1,20 @@
+# Artefacts Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# Fichiers générés à l'exécution par l'outil (ne jamais committer)
+# sauvegardes PV/PVC + journal d'audit
+hycu-backups/
+# configuration locale par déploiement
+hycu_config.json
+# coffre d'identifiants chiffré (secrets)
+hycu_secrets.enc
+hycu_replica_state.json
+hycu_txn_*.json
+
+# Divers
+.DS_Store
+.venv/
+venv/

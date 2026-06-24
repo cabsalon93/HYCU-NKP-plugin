@@ -1,0 +1,31 @@
+{
+  "_aide": "Copiez ce fichier en 'hycu_config.json' (à côté du programme) puis adaptez les valeurs. Les clés inconnues comme celle-ci sont ignorées. Détail de chaque clé : voir README.md.",
+
+  "kubectl_path": "kubectl",
+  "allowed_contexts": [],
+  "namespace_filter": [],
+  "wait_timeout": 120,
+  "subprocess_margin": 30,
+  "clone_name_suffix": "0000",
+  "volume_handle_prefix": "",
+  "strip_claimref": false,
+  "clone_strip_runtime_attrs": true,
+  "clone_fix_disk_uuids": true,
+  "clone_require_disk_uuids": true,
+  "retain_source_pv": true,
+  "backup_before_restore": true,
+  "inplace_refresh_pv_disk": true,
+  "require_context_confirm": true,
+  "open_browser": true,
+
+  "hycu_url": "",
+  "hycu_api_base": "/rest/v1.0",
+  "hycu_test_path": "/vms",
+  "hycu_verify_tls": false,
+  "nutanix_url": "",
+  "nutanix_api_base": "/PrismGateway/services/rest/v2.0",
+  "nutanix_verify_tls": false,
+  "prismcentral_url": "",
+  "prismcentral_api_base": "/api/nutanix/v3",
+  "prismcentral_verify_tls": false
+}
