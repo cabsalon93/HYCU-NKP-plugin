@@ -3566,8 +3566,8 @@ HTML = r"""<!DOCTYPE html>
   <section id="tab-connect" style="display:none">
     <div class="card">
       <h3><span class="step-no">H</span>HYCU — connexion</h3>
-      <p class="sub">Pour lister les points de restauration et déclencher un clone/restore.
-        Les identifiants restent <b>en mémoire</b> le temps de la session — jamais écrits sur disque.</p>
+      <p class="sub">Pour lister les points de restauration et orchestrer le clone/restore d'un Volume Group
+        depuis l'onglet <b>Restaurer</b>. Les identifiants restent <b>en mémoire</b> le temps de la session — jamais écrits sur disque.</p>
       <label class="fld">URL HYCU (port 8443)</label>
       <input type="text" id="hyUrl" placeholder="https://hycu.exemple.com:8443">
       <label class="fld">Authentification</label>
@@ -3590,39 +3590,6 @@ HTML = r"""<!DOCTYPE html>
         <span class="hint" id="hyStatus" style="margin:0"><span class="conn-dot"></span>non connecté</span>
       </div>
       <div id="hyErr"></div>
-    </div>
-
-    <div class="card" id="hyRestoreCard" style="display:none">
-      <h3><span class="step-no">H</span>HYCU — déclencher un clone / restore</h3>
-      <p class="sub">Mode simulation par défaut : l'appel exact (méthode + URL + corps) est affiché
-        <b>avant</b> tout envoi réel, pour validation contre votre version HYCU.</p>
-      <label class="fld">Volume Group protégé</label>
-      <div class="row">
-        <div><input type="text" id="hyVgSearch" placeholder="rechercher un Volume Group par nom…"></div>
-        <div style="flex:none;align-self:flex-end"><button class="btn ghost" id="hyLoadSources">Charger</button></div>
-      </div>
-      <div id="hyVgList" class="pvc-list" style="max-height:240px;overflow:auto;margin-top:8px"></div>
-      <div class="hint" id="hyVgCount" style="margin-top:4px"></div>
-      <label class="fld">Point de restauration</label>
-      <select id="hyRp"></select>
-      <label class="fld">Type d'opération</label>
-      <div class="seg" id="hyMode">
-        <button class="on" data-mode="clone">Clone (nouveau VG)</button>
-        <button data-mode="inplace">Restauration sur place</button>
-      </div>
-      <div id="hyNameWrap">
-        <label class="fld">Nom du VG cloné</label>
-        <input type="text" id="hyVgName" placeholder="ex. mon-vg-restore-0000">
-      </div>
-      <div class="dry" id="hyDryBar" style="margin-top:14px">
-        <label class="switch"><input type="checkbox" id="hyDry" checked><span class="slider"></span></label>
-        <div><b id="hyDryLabel">Mode simulation activé</b> — l'appel HYCU n'est pas envoyé.</div>
-      </div>
-      <div style="margin-top:6px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
-        <button class="btn" id="hyTrigger">Déclencher</button>
-        <span class="hint" id="hyJobStatus" style="margin:0"></span>
-      </div>
-      <div id="hyTriggerOut"></div>
     </div>
 
     <div class="card">
@@ -3789,14 +3756,12 @@ document.querySelector("nav").addEventListener("keydown",e=>{
   if(j>=0){ e.preventDefault(); navBtns[j].focus(); navBtns[j].click(); }
 });
 
-// Bandeau simulation (source de vérité unique : #dry ; #hyDry le suit)
+// Bandeau simulation (source de vérité unique : #dry)
 function refreshDry(){
   const live=!dry();
   $("#dryBar").classList.toggle("live",live);
   document.body.classList.toggle("realmode",live);   // barre rouge fixe + en-tête souligné
   $("#dryLabel").textContent = live? "MODE RÉEL — les commandes seront exécutées" : "Mode simulation activé";
-  const hy=$("#hyDry"); if(hy){ hy.checked=!live; if($("#hyDryBar")) $("#hyDryBar").classList.toggle("live",live);
-    if($("#hyDryLabel")) $("#hyDryLabel").textContent=live?"MODE RÉEL — l'appel HYCU sera envoyé":"Mode simulation activé"; }
 }
 $("#dry").onchange=refreshDry;
 
@@ -4540,7 +4505,6 @@ async function loadConnStatus(){
   if(!$("#ntUrl").value) $("#ntUrl").value = s.nutanix.url||"";
   if(!$("#pcUrl").value) $("#pcUrl").value = s.prismcentral.url||"";
   $("#hyTls").checked=!!s.hycu.verify_tls; $("#ntTls").checked=!!s.nutanix.verify_tls; $("#pcTls").checked=!!s.prismcentral.verify_tls;
-  $("#hyRestoreCard").style.display = s.hycu.connected? "block":"none";
   $("#bkProtectOff").style.display = s.hycu.connected? "none":"block";
   $("#bkProtectOn").style.display = s.hycu.connected? "block":"none";
   loadVaultStatus();
@@ -4663,64 +4627,6 @@ async function ntFindRef(pvc){
   inp.oninput=render; render(); inp.focus();
 }
 
-// HYCU : sources / points de restauration / déclenchement
-$("#hyDry").onchange=()=>{ $("#dry").checked=$("#hyDry").checked; refreshDry(); };  // unifié avec le toggle global
-let hyAllVgs=[], hySelVg=null;
-$("#hyLoadSources").onclick=async()=>{
-  $("#hyErr").innerHTML=""; $("#hyVgCount").textContent="Chargement…";
-  const r=await get("/api/hycu/sources");        // récupère TOUS les VG (pagination serveur)
-  if(!r.ok){ $("#hyErr").innerHTML=errBox(r.error); $("#hyVgCount").textContent=""; return; }
-  hyAllVgs=r.sources||[];
-  renderHyVgs();
-};
-$("#hyVgSearch").oninput=renderHyVgs;
-function renderHyVgs(){
-  const term=($("#hyVgSearch").value||"").toLowerCase();
-  let list=term? hyAllVgs.filter(v=>(v.name||"").toLowerCase().includes(term)) : hyAllVgs;
-  const totalMatch=list.length, capped=list.length>200;
-  list=list.slice(0,200);
-  $("#hyVgList").innerHTML = list.length? list.map(v=>`
-     <li data-uuid="${esc(v.uuid)}" data-name="${esc(v.name)}" style="cursor:pointer">
-       <div style="flex:1"><div class="nm">${esc(v.name||v.uuid)}</div>
-       <div class="meta">${v.has_backups?'sauvegardé':'aucun backup'}</div></div>
-       ${v.has_backups?badge('sauvegardé'):''}</li>`).join("")
-     : '<div class="hint">Aucun Volume Group ne correspond.</div>';
-  $("#hyVgCount").textContent = `${totalMatch} VG${totalMatch>1?'s':''} sur ${hyAllVgs.length}`+(capped?` (200 affichés — affinez la recherche)`:``);
-  document.querySelectorAll("#hyVgList li").forEach(li=>li.onclick=()=>{
-    document.querySelectorAll("#hyVgList li").forEach(x=>x.classList.remove("sel"));
-    li.classList.add("sel"); hySelVg=li.dataset.uuid;
-    $("#hyVgName").value = $("#hyVgName").value || (li.dataset.name+"-0000");
-    loadHyRp();
-  });
-}
-async function loadHyRp(){
-  if(!hySelVg){ return; }
-  $("#hyRp").innerHTML="<option value=''>…</option>";
-  const r=await get("/api/hycu/restorepoints?source="+encodeURIComponent(hySelVg));
-  if(!r.ok){ $("#hyErr").innerHTML=errBox(r.error); return; }
-  $("#hyRp").innerHTML=(r.points||[]).map(p=>`<option value="${esc(p.id)}">${esc(p.time||p.id)}${p.status?' · '+esc(p.status):''}</option>`).join("")||"<option value=''>aucun point</option>";
-}
-let hyMode="clone";
-document.querySelectorAll("#hyMode button").forEach(b=>b.onclick=()=>{
-  document.querySelectorAll("#hyMode button").forEach(x=>x.classList.remove("on"));
-  b.classList.add("on"); hyMode=b.dataset.mode;
-  $("#hyNameWrap").style.display = hyMode==="clone"?"block":"none";
-});
-$("#hyTrigger").onclick=async()=>{
-  const live=!$("#hyDry").checked;
-  if(live && !(await confirmDanger({title:"Opération HYCU RÉELLE", lines:[
-     "Déclencher le <b>"+(hyMode==="clone"?"clone":"restore sur place")+"</b> du Volume Group dans HYCU ?"]}))) return;
-  $("#hyTriggerOut").innerHTML="";
-  if(!hySelVg){ $("#hyTriggerOut").innerHTML='<div class="err">Sélectionnez un Volume Group dans la liste.</div>'; return; }
-  const body={restore_point_id:$("#hyRp").value, source_uuid:hySelVg,
-              mode:hyMode, new_name:$("#hyVgName").value, dry:$("#hyDry").checked};
-  const r=await post("/api/hycu/restore",body);
-  if(!r.ok){ $("#hyTriggerOut").innerHTML=errBox(r.error); return; }
-  if(r.dry){ $("#hyTriggerOut").innerHTML=`<div class="warnbox">Simulation — appel qui serait envoyé :</div>
-     <pre class="box">${esc(JSON.stringify(r.planned,null,2))}</pre>`; return; }
-  $("#hyTriggerOut").innerHTML=`<div class="note">Job HYCU lancé : <code>${esc(r.job_id||'?')}</code></div><div id="hyJobProgress"></div>`;
-  if(r.job_id) pollJobBar(r.job_id,"#hyJobProgress");
-};
 // Suivi générique d'un job HYCU : barre de progression + polling (backup ou restore).
 async function pollJobBar(id, target){
   const el=(typeof target==="string")?$(target):target; if(!el) return false;
