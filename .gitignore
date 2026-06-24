@@ -18,3 +18,7 @@ hycu_txn_*.json
 .DS_Store
 .venv/
 venv/
+
+# Documentation générée localement (livrable hors-repo) + son générateur
+build_doc.py
+*.docx
