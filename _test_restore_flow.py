@@ -28,8 +28,8 @@ PVC = {"apiVersion": "v1", "kind": "PersistentVolumeClaim",
                 "storageClassName": "nutanix-volume"}}
 
 # Neutraliser tout accès cluster.
-H._load_old_pv = lambda ns, pvc, bp: (json.loads(json.dumps(REAL_PV)), PV_NAME)
-H._load_backup_pvc = lambda bp, pvc: json.loads(json.dumps(PVC))
+H._load_old_pv = lambda ns, pvc, bp, root=None: (json.loads(json.dumps(REAL_PV)), PV_NAME)
+H._load_backup_pvc = lambda bp, pvc, root=None: json.loads(json.dumps(PVC))
 H._resolve_workloads = lambda ns: ([], [])
 H._namespace_allowed = lambda ns: True
 H.kubectl_json = lambda args: ({}, None)

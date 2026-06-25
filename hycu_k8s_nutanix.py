@@ -177,7 +177,7 @@ def save_config(updates):
 
 # Version horodatée de la build (format AAAAMMJJ-HHMM). À incrémenter à chaque
 # changement notable du programme ; affichée dans l'en-tête de l'interface.
-VERSION = "20260625-1021"
+VERSION = "20260625-1100"
 
 # Jeton anti-CSRF généré au démarrage, injecté dans la page et exigé sur les POST.
 CSRF_TOKEN = secrets.token_urlsafe(32)
@@ -617,27 +617,56 @@ def build_new_pv(old_pv, new_ref, new_name, mode):
 # ------------------------------------------------------------------------------
 # Stockage des sauvegardes
 # ------------------------------------------------------------------------------
-def backup_dir(ns):
+def backup_dir(ns, root=None):
     ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")  # microsec anti-collision
-    d = os.path.join(CONFIG["backup_root"], ns, ts)
+    d = os.path.join(root or CONFIG["backup_root"], ns, ts)
     os.makedirs(d, exist_ok=True)
     return d
 
 
-def _safe_backup_path(p):
-    """Valide qu'un backup_path fourni par l'UI reste sous backup_root
-    (défense en profondeur contre une lecture de fichier hors zone)."""
+def _resolve_backup_dest(dest):
+    """Résout le dossier de destination choisi par l'utilisateur pour une sauvegarde.
+    Vide -> dossier par défaut (backup_root). Sinon : chemin absolu (expanduser), créé
+    si besoin. Renvoie (root, erreur). Note : c'est un outil localhost mono-opérateur,
+    la destination est volontairement choisie par l'utilisateur sur SA machine."""
+    dest = (dest or "").strip()
+    if not dest:
+        return CONFIG["backup_root"], None
+    root = os.path.abspath(os.path.expanduser(dest))
+    try:
+        os.makedirs(root, exist_ok=True)
+    except OSError as e:
+        return None, "Dossier de destination inutilisable (%s) : %s" % (root, e)
+    if not os.path.isdir(root):
+        return None, "Le chemin de destination n'est pas un dossier : %s" % root
+    return root, None
+
+
+def _safe_backup_path(p, extra_root=None):
+    """Valide qu'un backup_path fourni par l'UI reste sous backup_root — ou sous un
+    dossier personnalisé EXPLICITEMENT choisi par l'utilisateur (extra_root). Défense en
+    profondeur contre une lecture hors zone ; la zone personnalisée n'est ouverte que si
+    l'utilisateur la désigne (outil localhost mono-opérateur)."""
     if not p:
         return None
-    root = os.path.realpath(CONFIG["backup_root"])
     full = os.path.realpath(p)
-    if full == root or full.startswith(root + os.sep):
-        return full
+    roots = [os.path.realpath(CONFIG["backup_root"])]
+    extra = (extra_root or "").strip()
+    if extra:
+        er = os.path.realpath(os.path.expanduser(extra))
+        if os.path.isdir(er):
+            roots.append(er)
+    for root in roots:
+        if full == root or full.startswith(root + os.sep):
+            return full
     return None
 
 
-def list_backups(ns):
-    base = os.path.join(CONFIG["backup_root"], ns)
+def list_backups(ns, root=None):
+    """Liste les sauvegardes d'un namespace sous backup_root, ou sous un dossier
+    personnalisé `root` (chemin contenant <namespace>/<horodatage>/index.json)."""
+    root = os.path.expanduser(root.strip()) if (root and root.strip()) else CONFIG["backup_root"]
+    base = os.path.join(root, ns)
     if not os.path.isdir(base):
         return []
     out = []
@@ -766,10 +795,14 @@ def action_pvcs(ns):
     return {"ok": True, "pvcs": pvcs, "error": None}
 
 
-def action_backup(ns):
-    """Exporte + nettoie tous les PV/PVC du namespace (étapes 1-3 du document)."""
+def action_backup(ns, dest=None):
+    """Exporte + nettoie tous les PV/PVC du namespace (étapes 1-3 du document).
+    `dest` (optionnel) = dossier de destination choisi par l'utilisateur (vide = défaut)."""
     if not _namespace_allowed(ns):
         return {"ok": False, "error": "Namespace '%s' non autorisé par la configuration." % ns}
+    root, derr = _resolve_backup_dest(dest)
+    if derr:
+        return {"ok": False, "error": derr}
     pvc_data, err = kubectl_json(["get", "pvc", "-n", ns])
     if err:
         return {"ok": False, "error": err}
@@ -777,7 +810,7 @@ def action_backup(ns):
     if not items:
         return {"ok": False, "error": "Aucun PVC trouvé dans le namespace '%s'." % ns}
 
-    d = backup_dir(ns)
+    d = backup_dir(ns, root)
     index = {"namespace": ns, "created": datetime.datetime.now().isoformat(),
              "context": action_context().get("context"), "volumes": []}
     files = []
@@ -810,10 +843,11 @@ def action_backup(ns):
             "files": files, "volumes": index["volumes"]}
 
 
-def action_backup_all():
+def action_backup_all(dest=None):
     """Sauvegarde la config (PV/PVC) de TOUS les namespaces autorisés par le filtre
     courant (tous les namespaces du cluster si aucun filtre). Un namespace sans PVC est
-    « ignoré » (pas une erreur). Renvoie un récapitulatif par namespace + des totaux."""
+    « ignoré » (pas une erreur). Renvoie un récapitulatif par namespace + des totaux.
+    `dest` (optionnel) = dossier de destination commun (vide = défaut)."""
     info = action_namespaces()
     if not info.get("ok"):
         return {"ok": False, "error": info.get("error") or "Liste des namespaces indisponible.",
@@ -821,9 +855,12 @@ def action_backup_all():
     namespaces = info.get("namespaces") or []
     if not namespaces:
         return {"ok": False, "error": "Aucun namespace à sauvegarder.", "results": []}
+    root, derr = _resolve_backup_dest(dest)        # valide la destination une seule fois
+    if derr:
+        return {"ok": False, "error": derr, "results": []}
     results, backed_up, vol_total = [], 0, 0
     for ns in namespaces:
-        b = action_backup(ns)
+        b = action_backup(ns, root)
         if b.get("ok"):
             backed_up += 1
             vol_total += b.get("count", 0)
@@ -832,8 +869,8 @@ def action_backup_all():
             err = b.get("error") or ""
             results.append({"ns": ns, "ok": False, "skipped": "Aucun PVC" in err,
                             "count": 0, "error": err})
-    audit("backup_all", namespaces=len(namespaces), backed_up=backed_up, volumes=vol_total)
-    return {"ok": True, "error": None, "results": results,
+    audit("backup_all", namespaces=len(namespaces), backed_up=backed_up, volumes=vol_total, root=root)
+    return {"ok": True, "error": None, "results": results, "root": root,
             "namespaces": len(namespaces), "backed_up": backed_up, "volumes": vol_total,
             "filtered": bool(CONFIG.get("namespace_filter"))}
 
@@ -1073,9 +1110,9 @@ def _wait_pvc_bound(name, ns, log):
 # ------------------------------------------------------------------------------
 # Récupération du PV de référence (sauvegarde ou live)
 # ------------------------------------------------------------------------------
-def _load_old_pv(ns, pvc_name, backup_path):
+def _load_old_pv(ns, pvc_name, backup_path, backup_root=None):
     """Renvoie (old_pv, pv_name) depuis la sauvegarde si fournie, sinon en live."""
-    bp = _safe_backup_path(backup_path)
+    bp = _safe_backup_path(backup_path, backup_root)
     if bp:
         idx_path = os.path.join(bp, "index.json")
         if os.path.isfile(idx_path):
@@ -1099,8 +1136,8 @@ def _load_old_pv(ns, pvc_name, backup_path):
     return None, pv_name
 
 
-def _load_backup_pvc(backup_path, pvc_name):
-    bp = _safe_backup_path(backup_path)
+def _load_backup_pvc(backup_path, pvc_name, backup_root=None):
+    bp = _safe_backup_path(backup_path, backup_root)
     if not bp:
         return None
     idx_path = os.path.join(bp, "index.json")
@@ -1115,11 +1152,11 @@ def _load_backup_pvc(backup_path, pvc_name):
     return None
 
 
-def _load_old_pvc(ns, pvc_name, backup_path):
+def _load_old_pvc(ns, pvc_name, backup_path, backup_root=None):
     """Manifeste du PVC depuis la sauvegarde si fournie, sinon en LIVE (nettoyé).
     Permet de recréer le PVC même sans export préalable (étape 1), tant que le PVC
     existe encore dans le cluster au moment de la préparation."""
-    b = _load_backup_pvc(backup_path, pvc_name)
+    b = _load_backup_pvc(backup_path, pvc_name, backup_root)
     if b is not None:
         return b
     live, _ = kubectl_json(["get", "pvc", pvc_name, "-n", ns])
@@ -1131,7 +1168,7 @@ def _load_old_pvc(ns, pvc_name, backup_path):
 # ------------------------------------------------------------------------------
 # Préparation (aperçu) — multi-PVC
 # ------------------------------------------------------------------------------
-def _prepare_one(ns, item, mode, backup_path):
+def _prepare_one(ns, item, mode, backup_path, backup_root=None):
     """Construit l'aperçu pour UN volume. item = {pvc, new_ref|new_iqn, new_name}.
     `new_ref` = UUID du VG (NKP), volumeHandle, ou IQN (legacy)."""
     pvc_name = item.get("pvc")
@@ -1151,7 +1188,7 @@ def _prepare_one(ns, item, mode, backup_path):
                 "error": "Référence invalide pour « %s » : aucun UUID détecté. Collez l'UUID du VG "
                          "(8-4-4-4-12), un volumeHandle « NutanixVolumes-<uuid> », ou l'IQN complet." % pvc_name}
 
-    old_pv, pv_name = _load_old_pv(ns, pvc_name, backup_path)
+    old_pv, pv_name = _load_old_pv(ns, pvc_name, backup_path, backup_root)
     if old_pv is None:
         return {"ok": False, "pvc": pvc_name,
                 "error": "Manifeste du PV introuvable pour « %s ». Sauvegardez d'abord ce namespace, "
@@ -1175,7 +1212,7 @@ def _prepare_one(ns, item, mode, backup_path):
 
     # Capturer le PVC MAINTENANT (avant toute suppression), sauvegarde ou live, pour
     # pouvoir le recréer même sans export préalable (étape 1). None s'il est introuvable.
-    pvc_manifest = _load_old_pvc(ns, pvc_name, backup_path)
+    pvc_manifest = _load_old_pvc(ns, pvc_name, backup_path, backup_root)
     return {"ok": True, "pvc": pvc_name, "old_pv_name": pv_name,
             "new_pv_name": built["new_name"], "new_volume_handle": built["new_volume_handle"],
             "old_volume_handle": built["old_volume_handle"], "old_iqn": built["old_iqn"],
@@ -1193,13 +1230,14 @@ def action_prepare_restore(payload):
         return {"ok": False, "error": "Namespace '%s' non autorisé par la configuration." % ns}
     mode = payload.get("mode", "clone")
     backup_path = payload.get("backup_path")
+    backup_root = payload.get("backup_root")
     items = payload.get("items")
     if not items:  # compat : ancien format mono-PVC
         items = [{"pvc": payload.get("pvc"),
                   "new_ref": payload.get("new_ref") or payload.get("new_iqn"),
                   "new_name": payload.get("new_name")}]
 
-    results = [_prepare_one(ns, it, mode, backup_path) for it in items]
+    results = [_prepare_one(ns, it, mode, backup_path, backup_root) for it in items]
     ok = all(r["ok"] for r in results)
     plan = _plan_steps(ns, [r for r in results if r.get("ok")], mode)
     return {"ok": ok, "error": None if ok else "Un ou plusieurs volumes n'ont pas pu être préparés.",
@@ -2822,6 +2860,7 @@ def action_clone_app(payload, log=None):
     suffix = (payload.get("suffix") or "").strip()
     same_ns = (target_ns == ns)
     backup_path = payload.get("backup_path")
+    backup_root = payload.get("backup_root")
     items = payload.get("items") or []
     if not _namespace_allowed(ns):
         return {"ok": False, "error": "Namespace '%s' non autorisé." % ns, "log": []}
@@ -2848,7 +2887,7 @@ def action_clone_app(payload, log=None):
         if not new_ref or not UUID_RE.search(new_ref):
             return {"ok": False, "error": "Référence du VG cloné manquante/invalide pour « %s » "
                     "(UUID du VG, volumeHandle, ou IQN)." % pvc_name, "log": []}
-        old_pv, _ = _load_old_pv(ns, pvc_name, backup_path)
+        old_pv, _ = _load_old_pv(ns, pvc_name, backup_path, backup_root)
         if old_pv is None:
             return {"ok": False, "error": "Manifeste du PV introuvable pour « %s »." % pvc_name, "log": []}
         built, err = build_new_pv(old_pv, new_ref, (it.get("new_name") or "").strip(), "clone")
@@ -2864,7 +2903,7 @@ def action_clone_app(payload, log=None):
         if built.get("looks_like_vg_name"):
             return {"ok": False, "error": "« %s » : la référence correspond au NOM du Volume Group "
                     "(« pvc-<uuid-du-PVC> ») et non à son UUID. Collez l'UUID du VG cloné." % pvc_name, "log": []}
-        src_pvc = _load_backup_pvc(backup_path, pvc_name)
+        src_pvc = _load_backup_pvc(backup_path, pvc_name, backup_root)
         if src_pvc is None:
             live, _ = kubectl_json(["get", "pvc", pvc_name, "-n", ns])
             src_pvc = clean_pvc(json.loads(json.dumps(live))) if live else None
@@ -3112,7 +3151,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if path == "/api/pvcs":
                 return self._json(action_pvcs(qs.get("ns", "")))
             if path == "/api/backups":
-                return self._json({"backups": list_backups(qs.get("ns", ""))})
+                return self._json({"backups": list_backups(qs.get("ns", ""), qs.get("root"))})
             if path == "/api/verify":
                 return self._json(action_verify(qs.get("ns", "")))
             if path == "/api/config":
@@ -3154,9 +3193,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path = urllib.parse.urlparse(self.path).path
         try:
             if path == "/api/backup":
-                return self._json(action_backup(payload.get("ns", "")))
+                return self._json(action_backup(payload.get("ns", ""), payload.get("dest")))
             if path == "/api/backup_all":
-                return self._json(action_backup_all())
+                return self._json(action_backup_all(payload.get("dest")))
             if path == "/api/prepare_restore":
                 return self._json(action_prepare_restore(payload))
             if path == "/api/execute_restore":
@@ -3572,6 +3611,9 @@ HTML = r"""<!DOCTYPE html>
         <div style="flex:none"><button class="btn" id="bkRun">Sauvegarder ce namespace</button></div>
         <div style="flex:none"><button class="btn ghost" id="bkRunAll" title="Sauvegarder tous les namespaces autorisés par le filtre (tous si aucun filtre)">Sauvegarder tous (filtrés)</button></div>
       </div>
+      <label class="fld" style="margin-top:10px">Dossier de destination (optionnel)</label>
+      <input type="text" id="bkDest" placeholder="Vide = hycu-backups/ (à côté du programme). Ex. D:\sauvegardes\hycu  ou  /mnt/backups">
+      <div class="hint" style="margin-top:4px">Chemin sur la machine qui exécute l'outil. Le sous-dossier &lt;namespace&gt;/&lt;horodatage&gt; est créé automatiquement.</div>
       <div id="bkOut"></div>
     </div>
 
@@ -3614,6 +3656,16 @@ HTML = r"""<!DOCTYPE html>
       <div class="row">
         <div><select id="rsNs"></select></div>
         <div style="flex:none;align-self:flex-end"><button class="btn ghost nsEdit" title="Filtrer la liste des namespaces">✎ Filtrer</button></div>
+      </div>
+      <label class="fld" style="margin-top:8px"><input type="checkbox" id="rsCustomDir" style="width:auto"> Lire les sauvegardes depuis un dossier personnalisé</label>
+      <div id="rsCustomDirWrap" style="display:none;margin-top:4px">
+        <input type="text" id="rsBackupRoot" placeholder="Ex. D:\sauvegardes\hycu  ou  /mnt/backups  (dossier contenant &lt;namespace&gt;/&lt;horodatage&gt;/)">
+        <div class="hint" style="margin-top:4px">Les sauvegardes lues (et utilisées pour la restauration) seront cherchées ici, au lieu de <code>hycu-backups/</code>.</div>
+      </div>
+      <div id="rsBackupSelWrap" style="display:none;margin-top:8px">
+        <label class="fld">Sauvegarde de configuration à restaurer</label>
+        <select id="rsBackupSel"></select>
+        <div class="hint" style="margin-top:4px">Manifestes PV/PVC utilisés (le « squelette »). Indépendant du point de restauration HYCU des <b>données</b>. Par défaut : la plus récente.</div>
       </div>
       <label class="fld">Type d'opération HYCU (pour tout le lot)</label>
       <div class="seg" id="rsMode">
@@ -3827,7 +3879,7 @@ HTML = r"""<!DOCTYPE html>
 const $ = s => document.querySelector(s);
 const CSRF = document.querySelector('meta[name=csrf-token]').content;
 const dry = () => $("#dry").checked;
-let state = {selected:{}, mode:"clone", cloneSub:"reattach", cloneNsMode:"same", backup_path:null, preview:null, ns:null};
+let state = {selected:{}, mode:"clone", cloneSub:"reattach", cloneNsMode:"same", backup_path:null, backup_root:null, preview:null, ns:null};
 let ctxInfo = {};
 function isCloneApp(){ return state.mode==="clone" && state.cloneSub==="cloneapp"; }
 
@@ -4101,9 +4153,9 @@ $("#wizNext").onclick=async()=>{
 
 // --------- Sauvegarde ---------
 $("#bkRun").onclick=async()=>{
-  const ns=$("#bkNs").value, b=$("#bkRun");
+  const ns=$("#bkNs").value, b=$("#bkRun"), dest=$("#bkDest").value.trim();
   b.disabled=true; b.innerHTML='<span class="spin"></span>Sauvegarde…';
-  const r=await post("/api/backup",{ns});
+  const r=await post("/api/backup",{ns, dest});
   b.disabled=false; b.textContent="Sauvegarder ce namespace";
   if(!r.ok){$("#bkOut").innerHTML=errBox(r.error);return;}
   const rows=r.volumes.map(v=>{
@@ -4118,9 +4170,9 @@ $("#bkRun").onclick=async()=>{
      <div class="warnbox">⚠ Copiez ce dossier <b>hors du cluster</b> (autre stockage) : c'est votre filet de sécurité en cas de sinistre.</div>`;
 };
 $("#bkRunAll").onclick=async()=>{
-  const b=$("#bkRunAll");
+  const b=$("#bkRunAll"), dest=$("#bkDest").value.trim();
   b.disabled=true; b.innerHTML='<span class="spin"></span>Sauvegarde…';
-  const r=await post("/api/backup_all",{});
+  const r=await post("/api/backup_all",{dest});
   b.disabled=false; b.textContent="Sauvegarder tous (filtrés)";
   if(!r.ok){$("#bkOut").innerHTML=errBox(r.error);return;}
   const rows=(r.results||[]).map(x=>{
@@ -4219,20 +4271,46 @@ $("#bkProtect").onclick=async()=>{
 
 // --------- Restauration ---------
 $("#rsNs").onchange=()=>{ state.ns=$("#rsNs").value; applyGlobalNs(); loadPvcs(); };
+$("#rsCustomDir").onchange=()=>{ $("#rsCustomDirWrap").style.display=$("#rsCustomDir").checked?"block":"none"; if($("#rsNs").value) loadPvcs(); };
+$("#rsBackupRoot").addEventListener("change",()=>{ if($("#rsCustomDir").checked && $("#rsNs").value) loadPvcs(); });
+$("#rsBackupSel").onchange=applyBackupSelection;   // changer de sauvegarde de config sans re-fetch
+let rsBackups = [];   // sauvegardes de config du namespace courant (la plus récente en premier)
 async function loadPvcs(){
   const sel=$("#rsNs"); if(!sel.value) return;
-  const ns=sel.value; state.ns=ns; state.pvcNs=ns; state.selected={}; rsHyMatch=null; rsInplaceSel={};
-  const bk=await get("/api/backups?ns="+encodeURIComponent(ns));
-  let pvcs=[], src="cluster";
-  if(bk.backups && bk.backups.length){
-    state.backup_path=bk.backups[0].path;
-    pvcs=bk.backups[0].index.volumes.map(v=>({name:v.pvc,pv:v.pv,phase:"sauvegardé"}));
-    src="dernière sauvegarde";
+  const ns=sel.value; state.ns=ns; state.pvcNs=ns; rsHyMatch=null; rsInplaceSel={};
+  const customRoot = $("#rsCustomDir").checked ? $("#rsBackupRoot").value.trim() : "";
+  state.backup_root = customRoot || null;
+  const bk=await get("/api/backups?ns="+encodeURIComponent(ns)+(customRoot?("&root="+encodeURIComponent(customRoot)):""));
+  rsBackups = bk.backups || [];
+  const wrap=$("#rsBackupSelWrap"), selEl=$("#rsBackupSel");
+  if(rsBackups.length){
+    selEl.innerHTML = rsBackups.map((b,i)=>{
+      const idx=b.index||{}; const n=(idx.volumes||[]).length;
+      const created=((idx.created||b.timestamp||"")+"").replace("T"," ").slice(0,19);
+      const ctx=idx.context?(" · ctx "+idx.context):"";
+      return `<option value="${i}">${esc(created)} — ${n} volume(s)${esc(ctx)}${i===0?" (la plus récente)":""}</option>`;
+    }).join("");
+    selEl.value="0"; wrap.style.display="block";
+  }else{ selEl.innerHTML=""; wrap.style.display="none"; }
+  await applyBackupSelection();
+}
+async function applyBackupSelection(){
+  const ns=state.ns; state.selected={};
+  const customRoot=state.backup_root, i=$("#rsBackupSel").value;
+  let pvcs=[], src=customRoot?"dossier personnalisé":"cluster";
+  if(rsBackups.length && i!=="" && rsBackups[i*1]){
+    const b=rsBackups[i*1];
+    state.backup_path=b.path;
+    pvcs=((b.index||{}).volumes||[]).map(v=>({name:v.pvc,pv:v.pv,phase:"sauvegardé"}));
+    src=customRoot?"sauvegarde (dossier perso)":(i==="0"?"dernière sauvegarde":"sauvegarde choisie");
   }else{
-    state.backup_path=null;
+    state.backup_path=null;   // aucune sauvegarde -> repli live (vide si namespace détruit)
     const live=await get("/api/pvcs?ns="+encodeURIComponent(ns));
     pvcs=live.pvcs||[];
   }
+  renderRsPvcs(pvcs, src);
+}
+function renderRsPvcs(pvcs, src){
   $("#rsPvcs").innerHTML = pvcs.length? pvcs.map(p=>`
      <li><input type="checkbox" style="width:auto" class="rsChk" data-pvc="${esc(p.name)}" data-pv="${esc(p.pv||'')}">
        <div style="flex:1"><div class="nm">${esc(p.name)}</div>
@@ -4437,7 +4515,7 @@ document.querySelectorAll("#rsCloneNsMode button").forEach(b=>b.onclick=()=>{
 });
 function cloneAppBody(){
   const same = state.cloneNsMode==="same";
-  return {namespace:$("#rsNs").value, items:collectItems(), backup_path:state.backup_path,
+  return {namespace:$("#rsNs").value, items:collectItems(), backup_path:state.backup_path, backup_root:state.backup_root,
           target_namespace: same? "" : $("#rsCloneTargetNs").value.trim(),
           suffix: same? ($("#rsCloneSuffix").value.trim()||"-clone") : "",
           clone_refs: same? false : !!($("#rsCloneRefs")&&$("#rsCloneRefs").checked)};
@@ -4481,7 +4559,7 @@ $("#rsPreview").onclick=async()=>{
     renderCloneAppPlan(r);
     return;
   }
-  const body={namespace:$("#rsNs").value,mode:state.mode,items,backup_path:state.backup_path,dry:dry()};
+  const body={namespace:$("#rsNs").value,mode:state.mode,items,backup_path:state.backup_path,backup_root:state.backup_root,dry:dry()};
   const r=await post("/api/prepare_restore",body);
   state.preview=body;
   let html="";

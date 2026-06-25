@@ -54,25 +54,46 @@ Tout reste modifiable ensuite via l'onglet **⚙ Réglages**.
 ## 3. Déroulé d'une restauration (les 3 onglets)
 
 ### Onglet 1 — Sauvegarder
-Choisissez un namespace → **Sauvegarder**. L'outil exporte et nettoie tous les
-PV/PVC (équivaut aux boucles `kubectl get … -o yaml` + nettoyage manuel des
+Choisissez un namespace → **Sauvegarder ce namespace**. L'outil exporte et nettoie
+tous les PV/PVC (équivaut aux boucles `kubectl get … -o yaml` + nettoyage manuel des
 manifestes décrit dans la procédure HYCU).
-**Copiez le dossier `hycu-backups/<ns>/…` hors du cluster** : c'est votre filet de
-sécurité.
+
+- **Sauvegarder tous (filtrés)** : sauvegarde en une fois **tous les namespaces
+  autorisés** par le filtre (`namespace_filter`), ou **tous** les namespaces du cluster
+  si aucun filtre. Un namespace sans PVC est **ignoré** (pas une erreur) ; un récapitulatif
+  par namespace est affiché.
+- **Dossier de destination (optionnel)** : par défaut, les sauvegardes vont dans
+  `hycu-backups/` (à côté du programme). Vous pouvez indiquer un **autre dossier** (sur la
+  machine qui exécute l'outil), p. ex. `D:\sauvegardes\hycu` ou `/mnt/backups` ; le
+  sous-dossier `<namespace>/<horodatage>/` y est créé automatiquement.
+
+**Copiez le dossier de sauvegarde hors du cluster** (autre stockage) : c'est votre filet
+de sécurité.
 
 ### Onglet 2 — Restaurer
 1. Côté **HYCU** : restaurez ou clonez le Volume Group (suffixe « 0000 »).
 2. Dans l'outil : choisissez le namespace, le **type d'opération** (Clone ou
    Restauration sur place), puis **cochez le(s) PVC** à restaurer (plusieurs
    volumes d'une même app = une seule transaction : un arrêt, un redémarrage).
-3. Pour chaque volume coché, indiquez la **référence du VG** correspondant — l'**UUID
+3. **Sauvegarde de configuration à restaurer** : l'outil reconstruit les PV/PVC (le
+   « squelette ») à partir d'une **sauvegarde de config** (onglet 1). S'il en existe
+   plusieurs, un **menu déroulant** permet de **choisir laquelle** (horodatage + nombre
+   de volumes + contexte) ; par défaut la **plus récente**. C'est indépendant du **point
+   de restauration HYCU** (les *données* du Volume Group), qui se choisit séparément.
+   - Cas du **namespace détruit** : il n'y a plus de PVC « live » à lire — la
+     reconstruction s'appuie **entièrement** sur la sauvegarde de config sélectionnée.
+   - **Dossier personnalisé** : cochez « Lire les sauvegardes depuis un dossier
+     personnalisé » et indiquez le chemin si vos sauvegardes ne sont pas dans
+     `hycu-backups/` (p. ex. recopiées sur un partage). La liste et la lecture des
+     manifestes viennent alors de ce dossier.
+4. Pour chaque volume coché, indiquez la **référence du VG** correspondant — l'**UUID
    du VG** (ou un `volumeHandle`, ou un IQN legacy). Le bouton **« Réf. VG auto »** la
    récupère depuis Prism ; l'orchestration HYCU la remplit automatiquement. En clone,
    le nom du nouveau PV est pré-rempli et modifiable.
-4. **Prévisualiser le plan** : vérifiez les remplacements dérivés (`volumeHandle`,
+5. **Prévisualiser le plan** : vérifiez les remplacements dérivés (`volumeHandle`,
    UUID du VG), la **purge des attributs runtime** du VG source, le passage du PV
    source en **Retain**, et la séquence.
-5. En **mode réel** : retapez le nom du contexte pour confirmer, puis **Lancer**.
+6. En **mode réel** : retapez le nom du contexte pour confirmer, puis **Lancer**.
 
 > Si une étape échoue, la séquence **s'arrête** et l'application est **laissée
 > arrêtée** (réplicas à 0) pour ne pas redémarrer sur des volumes incohérents. Le
@@ -91,6 +112,10 @@ Confirme que les PVC sont **Bound** et que les pods tournent. Le bouton
 - **Dry-run par défaut** ; confirmation du contexte avant toute action réelle.
 - **Journal d'audit** append-only : `hycu-backups/audit.log` (horodaté : namespace,
   volumes, mode, dry/réel, résultat).
+- **Lecture des sauvegardes bornée** : par défaut, seuls les chemins **sous
+  `hycu-backups/`** sont lisibles (défense contre une lecture hors zone). Un **dossier
+  personnalisé** n'est ouvert que si **vous le désignez explicitement** dans l'onglet
+  Restaurer ; un chemin hors de cette zone reste refusé.
 
 ## 5. Configuration (`hycu_config.json`) — adaptation par client
 

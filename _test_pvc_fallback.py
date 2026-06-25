@@ -13,13 +13,13 @@ def check(c, m):
 ns, pvc = "wordpress", "mariadb-pvc"
 
 print("\n== 1. Sauvegarde présente -> utilisée ==")
-H._load_backup_pvc = lambda bp, name: {"kind": "PersistentVolumeClaim",
+H._load_backup_pvc = lambda bp, name, root=None: {"kind": "PersistentVolumeClaim",
                                        "metadata": {"name": name}, "_src": "backup"}
 got = H._load_old_pvc(ns, pvc, "/un/backup")
 check(got and got.get("_src") == "backup", "PVC pris dans la sauvegarde")
 
 print("\n== 2. Pas de sauvegarde -> repli LIVE (nettoyé) ==")
-H._load_backup_pvc = lambda bp, name: None
+H._load_backup_pvc = lambda bp, name, root=None: None
 H.kubectl_json = lambda args: ({"kind": "PersistentVolumeClaim",
                                 "metadata": {"name": pvc, "uid": "x", "resourceVersion": "9"},
                                 "status": {"phase": "Bound"},
