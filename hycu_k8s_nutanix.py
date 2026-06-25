@@ -206,7 +206,7 @@ def save_config(updates):
 
 # Version horodatée de la build (format AAAAMMJJ-HHMM). À incrémenter à chaque
 # changement notable du programme ; affichée dans l'en-tête de l'interface.
-VERSION = "20260625-1700"
+VERSION = "20260625-1730"
 
 # Jeton anti-CSRF généré au démarrage, injecté dans la page et exigé sur les POST.
 CSRF_TOKEN = secrets.token_urlsafe(32)
@@ -4415,10 +4415,13 @@ function renderRsPvcs(pvcs, src){
   document.querySelectorAll(".rsChk").forEach(c=>c.onchange=rebuildVolCfgs);
   $("#rsConfig").style.display="none"; $("#rsPlan").style.display="none"; setRsStep(1);
 }
+// Horodatage epoch en secondes (≈ `date -u +%s`) : sert de suffixe UNIQUE à chaque clone,
+// pour ne JAMAIS réutiliser un nom déjà créé (sinon : « le PVC/VG …-0000 existe déjà » au
+// 2ᵉ clone de la même application). L'utilisateur peut éditer le champ ensuite.
+function cloneStamp(){ return Math.floor(Date.now()/1000); }
 function suggestName(pv){
   if(!pv) return "";
-  const s=pv.replace(/[0-9a-fA-F]{4}$/,"0000");
-  return s!==pv ? s : (pv+"-clone");   // ne jamais proposer le nom source à l'identique
+  return pv + "-" + cloneStamp();   // suffixe horodaté -> nom toujours unique et ≠ source
 }
 function rebuildVolCfgs(){
   const chks=[...document.querySelectorAll(".rsChk:checked")];
@@ -4500,7 +4503,7 @@ async function openHyOrch(pvc){
      <div>VG HYCU : <b>${esc(m.hycu_vg_name||m.hycu_vg_uuid)}</b> ${m.match_kind!=='exact'?('<span class="sim">(correspondance '+esc(m.match_kind)+' — à vérifier)</span>'):''}</div>
      <label class="fld">Point de restauration</label>
      <select class="hyRp2" data-pvc="${esc(pvc)}">${opts}</select>
-     ${isClone?`<label class="fld">Nom du VG cloné</label><input type="text" class="hyVgName2" data-pvc="${esc(pvc)}" value="${esc((m.hycu_vg_name||'')+'-0000')}">`:''}
+     ${isClone?`<label class="fld">Nom du VG cloné</label><input type="text" class="hyVgName2" data-pvc="${esc(pvc)}" value="${esc((m.hycu_vg_name||'')+'-'+cloneStamp())}"><div class="hint" style="margin-top:2px">Suffixe horodaté = nom unique à chaque clone (modifiable).</div>`:''}
      <div style="margin-top:10px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
        <button class="btn hyGo2" data-pvc="${esc(pvc)}" data-vg="${esc(m.hycu_vg_uuid)}">${isClone?'Cloner dans HYCU':'Restaurer dans HYCU'} puis récupérer la réf. du VG</button>
      </div>
