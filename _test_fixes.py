@@ -60,8 +60,8 @@ check(r_scheme.get("ok") is False and "Schéma" in (r_scheme.get("error") or "")
 
 print("\n== V7 : clone d'app refuse la réf SOURCE / le nom du VG ==")
 H.CONFIG["namespace_filter"] = []
-H._load_old_pv = lambda ns, pvc, bp: (H.json.loads(H.json.dumps(SRC_PV)), "pvc-" + PVCU)
-H._load_backup_pvc = lambda bp, pvc: H.json.loads(H.json.dumps(SRC_PVC))
+H._load_old_pv = lambda ns, pvc, bp, root=None: (H.json.loads(H.json.dumps(SRC_PV)), "pvc-" + PVCU)
+H._load_backup_pvc = lambda bp, pvc, root=None: H.json.loads(H.json.dumps(SRC_PVC))
 base_clone = {"namespace": "wordpress", "target_namespace": "", "suffix": "-clone", "dry": True}
 # réf = UUID du VG SOURCE -> same_uuid
 res_same = H.action_clone_app({**base_clone, "items": [{"pvc": "mariadb-pvc", "new_ref": VG}]})
@@ -163,6 +163,28 @@ check(_os.path.isfile(_os.path.join(_rb["dir"], "index.json")), "index.json pré
 _ra = H.action_backup_all(_custom)
 check(_ra.get("ok") and _ra.get("root") == _root, "action_backup_all honore la destination commune")
 _sh.rmtree(_tmp, ignore_errors=True)
+
+print("\n== Restauration depuis un dossier personnalisé (lecture) ==")
+H._load_old_pv = _ORIG["_load_old_pv"]          # restaurer les vraies fonctions (stubées plus haut)
+H._load_backup_pvc = _ORIG["_load_backup_pvc"]
+_tmp2 = tempfile.mkdtemp()
+_inside = _os.path.join(_tmp2, "wordpress", "2026-01-01_00-00-00_0")
+_os.makedirs(_inside, exist_ok=True)
+check(H._safe_backup_path(_inside, _tmp2) == _os.path.realpath(_inside),
+      "chemin sous le dossier perso DÉSIGNÉ -> autorisé")
+check(H._safe_backup_path(_inside, None) is None,
+      "même chemin SANS dossier perso -> refusé (sécurité par défaut conservée)")
+check(H._safe_backup_path("/etc", _tmp2) is None, "chemin hors zone -> refusé même avec dossier perso")
+with open(_os.path.join(_inside, "index.json"), "w", encoding="utf-8") as f:
+    f.write('{"namespace":"wordpress","volumes":[{"pvc":"mariadb-pvc","pv":"pvc-x","pv_file":"pv_pvc-x.json"}]}')
+with open(_os.path.join(_inside, "pv_pvc-x.json"), "w", encoding="utf-8") as f:
+    f.write('{"kind":"PersistentVolume","metadata":{"name":"pvc-x"}}')
+_bks = H.list_backups("wordpress", _tmp2)
+check(len(_bks) == 1 and _bks[0]["path"] == _inside, "list_backups(dossier perso) trouve la sauvegarde")
+_pv, _pvn = H._load_old_pv("wordpress", "mariadb-pvc", _inside, _tmp2)
+check(_pv is not None and _pv.get("metadata", {}).get("name") == "pvc-x" and _pvn == "pvc-x",
+      "_load_old_pv charge le PV depuis le dossier perso désigné")
+_sh.rmtree(_tmp2, ignore_errors=True)
 
 # --- Restauration de l'état global --------------------------------------------
 for k, v in _ORIG.items():
