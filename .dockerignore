@@ -1,0 +1,15 @@
+# Contexte de build minimal : seuls le .py et le logo sont COPY-és.
+.git
+.github
+deploy
+docs
+_test_*.py
+build_doc*.py
+*.docx
+hycu-backups/
+hycu_config.json
+hycu_secrets.enc
+hycu_replica_state.json
+hycu_txn_*.json
+__pycache__/
+*.pyc

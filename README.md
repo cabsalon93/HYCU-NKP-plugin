@@ -32,6 +32,7 @@ vérification`.
 
 ## 2. Installation & lancement
 
+**Mode python** (par défaut) :
 ```bash
 python3 hycu_k8s_nutanix.py
 ```
@@ -39,6 +40,13 @@ python3 hycu_k8s_nutanix.py
 Le navigateur s'ouvre sur <http://127.0.0.1:8765> (sinon, ouvrez-le manuellement).
 `Ctrl+C` pour arrêter. Les sauvegardes et le journal d'audit sont écrits dans
 `./hycu-backups/`.
+
+**Mode conteneur** (Docker ou Kubernetes) : la **même image** empaquette ce script et
+embarque `kubectl`, pour les postes sans Python. Le comportement est piloté par
+variables d'environnement (même code, deux emballages). Voir **[docs/docker.md](docs/docker.md)**.
+```bash
+docker compose -f deploy/docker-compose.yml up      # puis http://127.0.0.1:8765
+```
 
 **Premier lancement** : si `hycu_config.json` n'existe pas encore, un **assistant
 de configuration** s'affiche automatiquement (binaire kubectl, contextes/namespaces

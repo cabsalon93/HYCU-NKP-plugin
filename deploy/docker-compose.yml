@@ -1,0 +1,23 @@
+# Mode conteneur — Docker / Docker Desktop.
+# 1) Placez votre kubeconfig (token/certs AUTONOMES, sans exec-plugin) dans ./kubeconfig
+# 2) docker compose up
+# 3) Ouvrez http://127.0.0.1:8765
+services:
+  hycu:
+    image: ghcr.io/cabsalon93/hycu-nkp-plugin:latest
+    # Build local au lieu de l'image publiée (contexte = racine du dépôt) :
+    # build:
+    #   context: ..
+    #   dockerfile: deploy/Dockerfile
+    container_name: hycu-nkp
+    ports:
+      - "127.0.0.1:8765:8765"        # loopback de l'HÔTE UNIQUEMENT (jamais "8765:8765")
+    environment:
+      TZ: Europe/Paris
+      # Proxy d'entreprise (urllib les respecte) :
+      # HTTPS_PROXY: "http://proxy.interne:3128"
+      # NO_PROXY: "10.0.0.0/8,.cluster.local"
+    volumes:
+      - ./hycu-data:/data                          # config + coffre + sauvegardes (persistés)
+      - ./kubeconfig:/home/app/.kube/config:ro     # kubeconfig autonome (lecture seule)
+    restart: unless-stopped

@@ -145,8 +145,34 @@ DEFAULT_CONFIG = {
 CONFIG = dict(DEFAULT_CONFIG)
 
 
+def _apply_env_overrides():
+    """Surcharges par variables d'environnement (mode conteneur / 12-factor).
+    Priorité : env > hycu_config.json > défauts. Permet une IMAGE mode-agnostique
+    sans modifier le code ni le fichier de config (ex. HYCU_HOST=0.0.0.0,
+    HYCU_OPEN_BROWSER=0, HYCU_BACKUP_ROOT=/data/hycu-backups). En mode « python »
+    direct, aucune de ces variables n'est posée -> comportement par défaut inchangé."""
+    def _b(v):
+        return str(v).strip().lower() in ("1", "true", "yes", "on")
+    mapping = {
+        "HYCU_HOST": ("host", str),
+        "HYCU_PORT": ("port", int),
+        "HYCU_OPEN_BROWSER": ("open_browser", _b),
+        "HYCU_BACKUP_ROOT": ("backup_root", str),
+        "HYCU_KUBECTL_PATH": ("kubectl_path", str),
+    }
+    for env, (key, conv) in mapping.items():
+        val = os.environ.get(env)
+        if val is None or val == "":
+            continue
+        try:
+            CONFIG[key] = conv(val)
+        except (ValueError, TypeError):
+            print("Variable d'env %s ignorée (valeur invalide : %r)." % (env, val))
+
+
 def load_config():
-    """Charge hycu_config.json par-dessus les valeurs par défaut (clés inconnues ignorées)."""
+    """Charge hycu_config.json par-dessus les valeurs par défaut (clés inconnues ignorées),
+    puis applique les surcharges d'environnement (mode conteneur)."""
     global CONFIG
     CONFIG = dict(DEFAULT_CONFIG)
     if os.path.isfile(CONFIG_PATH):
@@ -158,6 +184,7 @@ def load_config():
                     CONFIG[k] = v
         except Exception as e:  # config illisible : on garde les défauts
             print("Configuration illisible (%s) : valeurs par défaut utilisées." % e)
+    _apply_env_overrides()
     return CONFIG
 
 
@@ -177,7 +204,7 @@ def save_config(updates):
 
 # Version horodatée de la build (format AAAAMMJJ-HHMM). À incrémenter à chaque
 # changement notable du programme ; affichée dans l'en-tête de l'interface.
-VERSION = "20260625-1202"
+VERSION = "20260625-1501"
 
 # Jeton anti-CSRF généré au démarrage, injecté dans la page et exigé sur les POST.
 CSRF_TOKEN = secrets.token_urlsafe(32)
@@ -226,8 +253,16 @@ def audit(event, **fields):
         rec.update(fields)
         with open(os.path.join(CONFIG["backup_root"], "audit.log"), "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-    except Exception:
-        pass  # l'audit ne doit jamais casser l'action
+    except Exception as e:
+        # L'audit ne doit jamais casser l'action ; mais en conteneur (volume non
+        # inscriptible), un échec silencieux masquerait l'absence de trace -> on
+        # journalise au moins sur stderr (capté par `docker logs` / K8s).
+        try:
+            import sys
+            print("AUDIT non écrit (%s) : %s" % (e, json.dumps(
+                {"event": event, **fields}, ensure_ascii=False)), file=sys.stderr)
+        except Exception:
+            pass
 
 
 # ------------------------------------------------------------------------------
@@ -1868,6 +1903,10 @@ def action_save_credentials(payload):
         blob = encrypt_secret(json.dumps(creds).encode("utf-8"), pw)
         with open(SECRETS_PATH, "w", encoding="utf-8") as f:
             f.write(blob)
+        try:
+            os.chmod(SECRETS_PATH, 0o600)   # coffre lisible/écrit par le seul propriétaire
+        except OSError:
+            pass                            # best-effort (Windows / FS sans POSIX perms)
     except Exception as e:
         return {"ok": False, "error": "Écriture du coffre impossible : %s" % e}
     save_config({"remember_credentials": True})
