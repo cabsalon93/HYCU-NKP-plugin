@@ -177,7 +177,7 @@ def save_config(updates):
 
 # Version horodatée de la build (format AAAAMMJJ-HHMM). À incrémenter à chaque
 # changement notable du programme ; affichée dans l'en-tête de l'interface.
-VERSION = "20260625-1053"
+VERSION = "20260625-1100"
 
 # Jeton anti-CSRF généré au démarrage, injecté dans la page et exigé sur les POST.
 CSRF_TOKEN = secrets.token_urlsafe(32)
@@ -3662,6 +3662,11 @@ HTML = r"""<!DOCTYPE html>
         <input type="text" id="rsBackupRoot" placeholder="Ex. D:\sauvegardes\hycu  ou  /mnt/backups  (dossier contenant &lt;namespace&gt;/&lt;horodatage&gt;/)">
         <div class="hint" style="margin-top:4px">Les sauvegardes lues (et utilisées pour la restauration) seront cherchées ici, au lieu de <code>hycu-backups/</code>.</div>
       </div>
+      <div id="rsBackupSelWrap" style="display:none;margin-top:8px">
+        <label class="fld">Sauvegarde de configuration à restaurer</label>
+        <select id="rsBackupSel"></select>
+        <div class="hint" style="margin-top:4px">Manifestes PV/PVC utilisés (le « squelette »). Indépendant du point de restauration HYCU des <b>données</b>. Par défaut : la plus récente.</div>
+      </div>
       <label class="fld">Type d'opération HYCU (pour tout le lot)</label>
       <div class="seg" id="rsMode">
         <button class="on" data-mode="clone">Clone (nouveau VG)</button>
@@ -4268,22 +4273,44 @@ $("#bkProtect").onclick=async()=>{
 $("#rsNs").onchange=()=>{ state.ns=$("#rsNs").value; applyGlobalNs(); loadPvcs(); };
 $("#rsCustomDir").onchange=()=>{ $("#rsCustomDirWrap").style.display=$("#rsCustomDir").checked?"block":"none"; if($("#rsNs").value) loadPvcs(); };
 $("#rsBackupRoot").addEventListener("change",()=>{ if($("#rsCustomDir").checked && $("#rsNs").value) loadPvcs(); });
+$("#rsBackupSel").onchange=applyBackupSelection;   // changer de sauvegarde de config sans re-fetch
+let rsBackups = [];   // sauvegardes de config du namespace courant (la plus récente en premier)
 async function loadPvcs(){
   const sel=$("#rsNs"); if(!sel.value) return;
-  const ns=sel.value; state.ns=ns; state.pvcNs=ns; state.selected={}; rsHyMatch=null; rsInplaceSel={};
+  const ns=sel.value; state.ns=ns; state.pvcNs=ns; rsHyMatch=null; rsInplaceSel={};
   const customRoot = $("#rsCustomDir").checked ? $("#rsBackupRoot").value.trim() : "";
   state.backup_root = customRoot || null;
   const bk=await get("/api/backups?ns="+encodeURIComponent(ns)+(customRoot?("&root="+encodeURIComponent(customRoot)):""));
+  rsBackups = bk.backups || [];
+  const wrap=$("#rsBackupSelWrap"), selEl=$("#rsBackupSel");
+  if(rsBackups.length){
+    selEl.innerHTML = rsBackups.map((b,i)=>{
+      const idx=b.index||{}; const n=(idx.volumes||[]).length;
+      const created=((idx.created||b.timestamp||"")+"").replace("T"," ").slice(0,19);
+      const ctx=idx.context?(" · ctx "+idx.context):"";
+      return `<option value="${i}">${esc(created)} — ${n} volume(s)${esc(ctx)}${i===0?" (la plus récente)":""}</option>`;
+    }).join("");
+    selEl.value="0"; wrap.style.display="block";
+  }else{ selEl.innerHTML=""; wrap.style.display="none"; }
+  await applyBackupSelection();
+}
+async function applyBackupSelection(){
+  const ns=state.ns; state.selected={};
+  const customRoot=state.backup_root, i=$("#rsBackupSel").value;
   let pvcs=[], src=customRoot?"dossier personnalisé":"cluster";
-  if(bk.backups && bk.backups.length){
-    state.backup_path=bk.backups[0].path;
-    pvcs=bk.backups[0].index.volumes.map(v=>({name:v.pvc,pv:v.pv,phase:"sauvegardé"}));
-    src=customRoot?"sauvegarde (dossier personnalisé)":"dernière sauvegarde";
+  if(rsBackups.length && i!=="" && rsBackups[i*1]){
+    const b=rsBackups[i*1];
+    state.backup_path=b.path;
+    pvcs=((b.index||{}).volumes||[]).map(v=>({name:v.pvc,pv:v.pv,phase:"sauvegardé"}));
+    src=customRoot?"sauvegarde (dossier perso)":(i==="0"?"dernière sauvegarde":"sauvegarde choisie");
   }else{
-    state.backup_path=null;   // aucun backup trouvé (ici/dossier perso) -> repli live ci-dessous
+    state.backup_path=null;   // aucune sauvegarde -> repli live (vide si namespace détruit)
     const live=await get("/api/pvcs?ns="+encodeURIComponent(ns));
     pvcs=live.pvcs||[];
   }
+  renderRsPvcs(pvcs, src);
+}
+function renderRsPvcs(pvcs, src){
   $("#rsPvcs").innerHTML = pvcs.length? pvcs.map(p=>`
      <li><input type="checkbox" style="width:auto" class="rsChk" data-pvc="${esc(p.name)}" data-pv="${esc(p.pv||'')}">
        <div style="flex:1"><div class="nm">${esc(p.name)}</div>
