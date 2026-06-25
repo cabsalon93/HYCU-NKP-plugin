@@ -72,13 +72,22 @@ res_name = H.action_clone_app({**base_clone, "items": [{"pvc": "mariadb-pvc", "n
 check(res_name.get("ok") is False and "NOM" in (res_name.get("error") or ""),
       "réf = nom du VG -> refus (looks_like_vg_name)")
 
-print("\n== V8 : clone d'app applique l'allowlist au namespace CIBLE ==")
+print("\n== Clone d'app : namespace CIBLE hors filtre autorisé ; SOURCE toujours filtrée ==")
 H.CONFIG["namespace_filter"] = ["wordpress"]
-res_ns = H.action_clone_app({"namespace": "wordpress", "target_namespace": "interdit",
-                             "suffix": "", "dry": True, "items": [{"pvc": "mariadb-pvc", "new_ref": VG}]})
-check(res_ns.get("ok") is False and "cible" in (res_ns.get("error") or "").lower()
-      and "autoris" in (res_ns.get("error") or "").lower(),
-      "namespace cible hors filtre -> refus")
+NEW_VG = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+_kj_v8 = H.kubectl_json
+H.kubectl_json = lambda args: ({"items": []}, None)   # pas de workloads/services à cloner
+# cible hors filtre -> ne doit PLUS être refusée pour cause de filtre (création permise)
+res_tgt = H.action_clone_app({"namespace": "wordpress", "target_namespace": "ns-hors-filtre",
+                              "suffix": "", "dry": True, "items": [{"pvc": "mariadb-pvc", "new_ref": NEW_VG}]})
+check("non autoris" not in (res_tgt.get("error") or "").lower(),
+      "namespace cible hors filtre -> plus de refus 'non autorisé'")
+# source hors filtre -> toujours refusée (le filtre borne bien les sources)
+res_src = H.action_clone_app({"namespace": "interdit-src", "target_namespace": "x",
+                              "suffix": "", "dry": True, "items": [{"pvc": "mariadb-pvc", "new_ref": NEW_VG}]})
+check(res_src.get("ok") is False and "autoris" in (res_src.get("error") or "").lower(),
+      "namespace SOURCE hors filtre -> toujours refusé")
+H.kubectl_json = _kj_v8
 
 print("\n== V9 : extId des disques triés (ordre canonique) ==")
 H._rest_raw = lambda system, method, path, body=None, timeout=30: {

@@ -177,7 +177,7 @@ def save_config(updates):
 
 # Version horodatée de la build (format AAAAMMJJ-HHMM). À incrémenter à chaque
 # changement notable du programme ; affichée dans l'en-tête de l'interface.
-VERSION = "20260625-1138"
+VERSION = "20260625-1202"
 
 # Jeton anti-CSRF généré au démarrage, injecté dans la page et exigé sur les POST.
 CSRF_TOKEN = secrets.token_urlsafe(32)
@@ -2864,9 +2864,9 @@ def action_clone_app(payload, log=None):
     items = payload.get("items") or []
     if not _namespace_allowed(ns):
         return {"ok": False, "error": "Namespace '%s' non autorisé." % ns, "log": []}
-    if not _namespace_allowed(target_ns):
-        return {"ok": False, "error": "Namespace cible '%s' non autorisé par la configuration "
-                "(namespace_filter)." % target_ns, "log": []}
+    # NB : le namespace CIBLE d'un clone est une destination de COPIE (créée par l'outil),
+    # pas une source : on ne le restreint donc PAS au namespace_filter (qui borne les
+    # sources). On valide seulement son nom (RFC 1123) ; il est créé s'il n'existe pas.
     if same_ns and not suffix:
         return {"ok": False, "error": "Un suffixe est requis pour cloner dans le même namespace.", "log": []}
     if not K8S_NAME_RE.match(target_ns):
@@ -4379,11 +4379,14 @@ function rebuildVolCfgs(){
     guide = hyOn
       ? "<b>Restauration sur place (recommandé) :</b> sur chaque volume, cliquez « Point de restauration HYCU » et choisissez le point, puis « <b>Lancer la restauration sur place</b> » ci-dessous. <span class='hint'>Aucune référence à saisir.</span>"
       : "<b>Restauration sur place — flux manuel :</b> restaurez le VG dans HYCU, renseignez la référence du VG (UUID) par volume, puis « <b>Prévisualiser le plan</b> ». <span class='hint'>Connectez HYCU pour le flux orchestré.</span>";
-  } else {
-    const sub = isCloneApp()? "Cloner l'application" : "Rattacher à l'app existante";
+  } else if(isCloneApp()){
     guide = hyOn
-      ? ("<b>Clone — "+sub+" (recommandé) :</b> sur chaque volume, cliquez « ⚙ Orchestrer depuis HYCU (clone) » pour créer le clone et <b>récupérer la référence du VG</b>, puis « <b>Prévisualiser le plan</b> » → « Lancer la restauration (réel) ».")
-      : ("<b>Clone — "+sub+" — flux manuel :</b> clonez le VG dans HYCU, renseignez la référence du VG (UUID) par volume, puis « <b>Prévisualiser le plan</b> » → « Lancer la restauration (réel) ». <span class='hint'>Connectez HYCU pour récupérer la référence automatiquement.</span>");
+      ? "<b>Clone d'application — 2 étapes :</b> <b>(A)</b> sur chaque volume, « ⚙ Orchestrer depuis HYCU (clone) » → crée le VG cloné et récupère sa référence. <b>(B)</b> quand tous les volumes ont leur référence, « <b>Prévisualiser le plan</b> » puis « <b>Lancer le clone de l'application</b> » crée la copie (namespace, PV/PVC, workloads, dépendances)."
+      : "<b>Clone d'application — flux manuel :</b> <b>(A)</b> clonez le VG de chaque volume dans HYCU et collez sa référence (UUID). <b>(B)</b> « <b>Prévisualiser le plan</b> » puis « <b>Lancer le clone de l'application</b> ». <span class='hint'>Connectez HYCU pour cloner et récupérer la référence automatiquement.</span>";
+  } else {
+    guide = hyOn
+      ? "<b>Clone (rattacher à l'app existante) :</b> sur chaque volume, « ⚙ Orchestrer depuis HYCU (clone) » → VG cloné + référence, puis « <b>Prévisualiser le plan</b> » → « <b>Lancer le clone</b> »."
+      : "<b>Clone (rattacher) — flux manuel :</b> clonez le VG dans HYCU, collez la référence (UUID) par volume, puis « <b>Prévisualiser le plan</b> » → « <b>Lancer le clone</b> ». <span class='hint'>Connectez HYCU pour automatiser.</span>";
   }
   $("#rsFlowGuide").innerHTML = guide;
 }
@@ -4555,7 +4558,8 @@ function cloneAppBody(){
 function renderCloneAppPlan(r){
   if(!r.ok && !r.preview){ $("#rsErr").innerHTML=errBox(r.error); return; }
   const p=r.preview||{};
-  let html=`<div class="repl"><div class="nm">Clone d'application → namespace <b>${esc(p.target_namespace)}</b> ${p.same_namespace?'(même namespace, suffixe)':'(autre namespace)'}</div>
+  let html=`<div class="note">Aperçu prêt. Vérifiez ci-dessous, puis cliquez « <b>Lancer le clone de l'application (réel)</b> » en bas pour créer la copie. <span class="hint">L'application d'origine n'est pas touchée.</span></div>
+     <div class="repl"><div class="nm">Clone d'application → namespace <b>${esc(p.target_namespace)}</b> ${p.same_namespace?'(même namespace, suffixe)':'(autre namespace)'}</div>
      <div><span class="k">PV créés</span> : ${esc((p.pvs||[]).join(', ')||'—')}</div>
      <div><span class="k">PVC créés</span> : ${esc((p.pvcs||[]).join(', ')||'—')}</div>
      <div><span class="k">Applications clonées</span> : ${esc((p.workloads||[]).join(', ')||'aucune')}</div>
@@ -4621,7 +4625,10 @@ function updateGoButton(ready){
   $("#rsGoHint").textContent = live? "Mode réel : ces opérations seront exécutées sur le cluster."
      : "Mode simulation : rien ne sera modifié.";
   $("#rsGo").className = live? "btn danger" : "btn";
-  const act = state.mode==="clone" ? "le clone" : "la restauration sur place (flux manuel)";
+  let act;
+  if(state.mode!=="clone") act = "la restauration sur place (flux manuel)";
+  else if(isCloneApp()) act = "le clone de l'application";
+  else act = "le clone";
   $("#rsGo").textContent = (live? "Lancer " : "Simuler ") + act + (live? " (réel)" : "");
   $("#rsGo").disabled = !ready;
 }
