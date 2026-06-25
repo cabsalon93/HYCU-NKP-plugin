@@ -177,7 +177,7 @@ def save_config(updates):
 
 # Version horodatée de la build (format AAAAMMJJ-HHMM). À incrémenter à chaque
 # changement notable du programme ; affichée dans l'en-tête de l'interface.
-VERSION = "20260625-1021"
+VERSION = "20260625-1040"
 
 # Jeton anti-CSRF généré au démarrage, injecté dans la page et exigé sur les POST.
 CSRF_TOKEN = secrets.token_urlsafe(32)
@@ -617,11 +617,29 @@ def build_new_pv(old_pv, new_ref, new_name, mode):
 # ------------------------------------------------------------------------------
 # Stockage des sauvegardes
 # ------------------------------------------------------------------------------
-def backup_dir(ns):
+def backup_dir(ns, root=None):
     ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")  # microsec anti-collision
-    d = os.path.join(CONFIG["backup_root"], ns, ts)
+    d = os.path.join(root or CONFIG["backup_root"], ns, ts)
     os.makedirs(d, exist_ok=True)
     return d
+
+
+def _resolve_backup_dest(dest):
+    """Résout le dossier de destination choisi par l'utilisateur pour une sauvegarde.
+    Vide -> dossier par défaut (backup_root). Sinon : chemin absolu (expanduser), créé
+    si besoin. Renvoie (root, erreur). Note : c'est un outil localhost mono-opérateur,
+    la destination est volontairement choisie par l'utilisateur sur SA machine."""
+    dest = (dest or "").strip()
+    if not dest:
+        return CONFIG["backup_root"], None
+    root = os.path.abspath(os.path.expanduser(dest))
+    try:
+        os.makedirs(root, exist_ok=True)
+    except OSError as e:
+        return None, "Dossier de destination inutilisable (%s) : %s" % (root, e)
+    if not os.path.isdir(root):
+        return None, "Le chemin de destination n'est pas un dossier : %s" % root
+    return root, None
 
 
 def _safe_backup_path(p):
@@ -766,10 +784,14 @@ def action_pvcs(ns):
     return {"ok": True, "pvcs": pvcs, "error": None}
 
 
-def action_backup(ns):
-    """Exporte + nettoie tous les PV/PVC du namespace (étapes 1-3 du document)."""
+def action_backup(ns, dest=None):
+    """Exporte + nettoie tous les PV/PVC du namespace (étapes 1-3 du document).
+    `dest` (optionnel) = dossier de destination choisi par l'utilisateur (vide = défaut)."""
     if not _namespace_allowed(ns):
         return {"ok": False, "error": "Namespace '%s' non autorisé par la configuration." % ns}
+    root, derr = _resolve_backup_dest(dest)
+    if derr:
+        return {"ok": False, "error": derr}
     pvc_data, err = kubectl_json(["get", "pvc", "-n", ns])
     if err:
         return {"ok": False, "error": err}
@@ -777,7 +799,7 @@ def action_backup(ns):
     if not items:
         return {"ok": False, "error": "Aucun PVC trouvé dans le namespace '%s'." % ns}
 
-    d = backup_dir(ns)
+    d = backup_dir(ns, root)
     index = {"namespace": ns, "created": datetime.datetime.now().isoformat(),
              "context": action_context().get("context"), "volumes": []}
     files = []
@@ -810,10 +832,11 @@ def action_backup(ns):
             "files": files, "volumes": index["volumes"]}
 
 
-def action_backup_all():
+def action_backup_all(dest=None):
     """Sauvegarde la config (PV/PVC) de TOUS les namespaces autorisés par le filtre
     courant (tous les namespaces du cluster si aucun filtre). Un namespace sans PVC est
-    « ignoré » (pas une erreur). Renvoie un récapitulatif par namespace + des totaux."""
+    « ignoré » (pas une erreur). Renvoie un récapitulatif par namespace + des totaux.
+    `dest` (optionnel) = dossier de destination commun (vide = défaut)."""
     info = action_namespaces()
     if not info.get("ok"):
         return {"ok": False, "error": info.get("error") or "Liste des namespaces indisponible.",
@@ -821,9 +844,12 @@ def action_backup_all():
     namespaces = info.get("namespaces") or []
     if not namespaces:
         return {"ok": False, "error": "Aucun namespace à sauvegarder.", "results": []}
+    root, derr = _resolve_backup_dest(dest)        # valide la destination une seule fois
+    if derr:
+        return {"ok": False, "error": derr, "results": []}
     results, backed_up, vol_total = [], 0, 0
     for ns in namespaces:
-        b = action_backup(ns)
+        b = action_backup(ns, root)
         if b.get("ok"):
             backed_up += 1
             vol_total += b.get("count", 0)
@@ -832,8 +858,8 @@ def action_backup_all():
             err = b.get("error") or ""
             results.append({"ns": ns, "ok": False, "skipped": "Aucun PVC" in err,
                             "count": 0, "error": err})
-    audit("backup_all", namespaces=len(namespaces), backed_up=backed_up, volumes=vol_total)
-    return {"ok": True, "error": None, "results": results,
+    audit("backup_all", namespaces=len(namespaces), backed_up=backed_up, volumes=vol_total, root=root)
+    return {"ok": True, "error": None, "results": results, "root": root,
             "namespaces": len(namespaces), "backed_up": backed_up, "volumes": vol_total,
             "filtered": bool(CONFIG.get("namespace_filter"))}
 
@@ -3154,9 +3180,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path = urllib.parse.urlparse(self.path).path
         try:
             if path == "/api/backup":
-                return self._json(action_backup(payload.get("ns", "")))
+                return self._json(action_backup(payload.get("ns", ""), payload.get("dest")))
             if path == "/api/backup_all":
-                return self._json(action_backup_all())
+                return self._json(action_backup_all(payload.get("dest")))
             if path == "/api/prepare_restore":
                 return self._json(action_prepare_restore(payload))
             if path == "/api/execute_restore":
@@ -3572,6 +3598,9 @@ HTML = r"""<!DOCTYPE html>
         <div style="flex:none"><button class="btn" id="bkRun">Sauvegarder ce namespace</button></div>
         <div style="flex:none"><button class="btn ghost" id="bkRunAll" title="Sauvegarder tous les namespaces autorisés par le filtre (tous si aucun filtre)">Sauvegarder tous (filtrés)</button></div>
       </div>
+      <label class="fld" style="margin-top:10px">Dossier de destination (optionnel)</label>
+      <input type="text" id="bkDest" placeholder="Vide = hycu-backups/ (à côté du programme). Ex. D:\sauvegardes\hycu  ou  /mnt/backups">
+      <div class="hint" style="margin-top:4px">Chemin sur la machine qui exécute l'outil. Le sous-dossier &lt;namespace&gt;/&lt;horodatage&gt; est créé automatiquement.</div>
       <div id="bkOut"></div>
     </div>
 
@@ -4101,9 +4130,9 @@ $("#wizNext").onclick=async()=>{
 
 // --------- Sauvegarde ---------
 $("#bkRun").onclick=async()=>{
-  const ns=$("#bkNs").value, b=$("#bkRun");
+  const ns=$("#bkNs").value, b=$("#bkRun"), dest=$("#bkDest").value.trim();
   b.disabled=true; b.innerHTML='<span class="spin"></span>Sauvegarde…';
-  const r=await post("/api/backup",{ns});
+  const r=await post("/api/backup",{ns, dest});
   b.disabled=false; b.textContent="Sauvegarder ce namespace";
   if(!r.ok){$("#bkOut").innerHTML=errBox(r.error);return;}
   const rows=r.volumes.map(v=>{
@@ -4118,9 +4147,9 @@ $("#bkRun").onclick=async()=>{
      <div class="warnbox">⚠ Copiez ce dossier <b>hors du cluster</b> (autre stockage) : c'est votre filet de sécurité en cas de sinistre.</div>`;
 };
 $("#bkRunAll").onclick=async()=>{
-  const b=$("#bkRunAll");
+  const b=$("#bkRunAll"), dest=$("#bkDest").value.trim();
   b.disabled=true; b.innerHTML='<span class="spin"></span>Sauvegarde…';
-  const r=await post("/api/backup_all",{});
+  const r=await post("/api/backup_all",{dest});
   b.disabled=false; b.textContent="Sauvegarder tous (filtrés)";
   if(!r.ok){$("#bkOut").innerHTML=errBox(r.error);return;}
   const rows=(r.results||[]).map(x=>{

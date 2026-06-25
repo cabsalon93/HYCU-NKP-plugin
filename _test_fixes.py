@@ -100,7 +100,7 @@ check(H._hycu_job_id({}) is None and H._hycu_job_id({"entities": []}) is None, "
 print("\n== Sauvegarde de TOUS les namespaces filtrés (nouvelle fonctionnalité) ==")
 _ns_orig, _bk_orig = H.action_namespaces, H.action_backup
 H.action_namespaces = lambda: {"ok": True, "namespaces": ["wordpress", "vide", "shop"], "error": None}
-def _fake_bk(ns):
+def _fake_bk(ns, dest=None):
     if ns == "vide":
         return {"ok": False, "error": "Aucun PVC trouvé dans le namespace 'vide'."}
     return {"ok": True, "dir": "/b/" + ns, "count": 2 if ns == "wordpress" else 3}
@@ -138,6 +138,31 @@ try:
     check(True, "connexion coupée (end_headers/write) -> _send n'explose pas (plus de traceback)")
 except Exception as e:
     check(False, "_send a propagé %r" % e)
+
+print("\n== Sauvegarde : dossier de destination choisi par l'utilisateur ==")
+import tempfile, os as _os, shutil as _sh
+_root_def, _e0 = H._resolve_backup_dest("")
+check(_e0 is None and _root_def == H.CONFIG["backup_root"], "destination vide -> backup_root par défaut")
+_tmp = tempfile.mkdtemp()
+_custom = _os.path.join(_tmp, "mes-sauvegardes")
+_root, _e1 = H._resolve_backup_dest(_custom)
+check(_e1 is None and _os.path.isdir(_root) and _os.path.abspath(_custom) == _root,
+      "destination valide -> dossier créé + chemin absolu")
+H.CONFIG["namespace_filter"] = []
+H.action_context = lambda: {"context": "c"}
+def _fake_kj(args):
+    if args[:2] == ["get", "ns"]:
+        return ({"items": [{"metadata": {"name": "wordpress"}}]}, None)
+    if args[:2] == ["get", "pvc"]:
+        return ({"items": [{"metadata": {"name": "mariadb-pvc"}, "spec": {}, "status": {"phase": "Bound"}}]}, None)
+    return ({}, None)
+H.kubectl_json = _fake_kj
+_rb = H.action_backup("wordpress", _custom)
+check(_rb.get("ok") and _rb.get("dir", "").startswith(_root), "action_backup écrit SOUS la destination choisie")
+check(_os.path.isfile(_os.path.join(_rb["dir"], "index.json")), "index.json présent dans la destination")
+_ra = H.action_backup_all(_custom)
+check(_ra.get("ok") and _ra.get("root") == _root, "action_backup_all honore la destination commune")
+_sh.rmtree(_tmp, ignore_errors=True)
 
 # --- Restauration de l'état global --------------------------------------------
 for k, v in _ORIG.items():
