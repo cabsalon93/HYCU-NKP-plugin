@@ -1,0 +1,94 @@
+# Déploiement Kubernetes — outil HYCU / Kubernetes / Nutanix.
+#
+# ⚠ 1 réplica OBLIGATOIRE : l'app a un état global (config, coffre, verrou, jeton CSRF,
+#   connexion HYCU partagée) + un PVC ReadWriteOnce. Ne JAMAIS scaler > 1.
+#
+# Prérequis — créer le Secret du kubeconfig (token/certs AUTONOMES, sans exec-plugin) :
+#   kubectl -n hycu create secret generic hycu-kubeconfig --from-file=config=./kubeconfig
+#
+# Appliquer :
+#   kubectl apply -f deploy/k8s/hycu.yaml
+#
+# Accéder (PAS d'Ingress — cf. spec) :
+#   kubectl -n hycu port-forward svc/hycu 8765:8765   ->   http://127.0.0.1:8765
+#
+# Sécurité : la frontière d'accès réelle est le RBAC sur ce namespace —
+#   quiconque peut port-forward/exec ici = opérateur complet (kubectl puissant).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: hycu
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: hycu-data
+  namespace: hycu
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 5Gi
+  # storageClassName: <votre-classe>   # à préciser selon le cluster
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hycu
+  namespace: hycu
+  labels: { app: hycu }
+spec:
+  replicas: 1                       # OBLIGATOIRE — état global, ne pas scaler
+  strategy: { type: Recreate }      # PVC RWO : pas de rolling update
+  selector:
+    matchLabels: { app: hycu }
+  template:
+    metadata:
+      labels: { app: hycu }
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+      containers:
+        - name: hycu
+          image: ghcr.io/cabsalon93/hycu-nkp-plugin:latest
+          ports:
+            - containerPort: 8765
+          env:
+            - { name: TZ, value: "Europe/Paris" }
+          volumeMounts:
+            - { name: data, mountPath: /data }
+            - { name: kubeconfig, mountPath: /home/app/.kube, readOnly: true }
+          resources:
+            requests: { cpu: "50m", memory: "64Mi" }
+            limits:   { cpu: "500m", memory: "256Mi" }
+          readinessProbe:
+            tcpSocket: { port: 8765 }   # TCP : la garde Host de l'app rejette un httpGet sondé par IP
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          livenessProbe:
+            tcpSocket: { port: 8765 }
+            initialDelaySeconds: 10
+            periodSeconds: 30
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: hycu-data
+        - name: kubeconfig
+          secret:
+            secretName: hycu-kubeconfig
+            items:
+              - { key: config, path: config }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hycu
+  namespace: hycu
+spec:
+  type: ClusterIP                   # accès par `kubectl port-forward` ; PAS d'Ingress
+  selector: { app: hycu }
+  ports:
+    - port: 8765
+      targetPort: 8765

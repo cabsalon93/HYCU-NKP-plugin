@@ -195,6 +195,28 @@ check(_pv is not None and _pv.get("metadata", {}).get("name") == "pvc-x" and _pv
       "_load_old_pv charge le PV depuis le dossier perso désigné")
 _sh.rmtree(_tmp2, ignore_errors=True)
 
+print("\n== Conteneur : surcharges par variables d'environnement (mode-agnostique) ==")
+import os as _os2
+_envsave = {k: _os2.environ.get(k) for k in ("HYCU_HOST", "HYCU_PORT", "HYCU_OPEN_BROWSER", "HYCU_BACKUP_ROOT")}
+_cfgsave = dict(H.CONFIG)
+_os2.environ["HYCU_HOST"] = "0.0.0.0"; _os2.environ["HYCU_PORT"] = "9999"
+_os2.environ["HYCU_OPEN_BROWSER"] = "0"; _os2.environ["HYCU_BACKUP_ROOT"] = "/data/hycu-backups"
+H.CONFIG["host"] = "127.0.0.1"; H.CONFIG["open_browser"] = True; H.CONFIG["port"] = 8765
+H._apply_env_overrides()
+check(H.CONFIG["host"] == "0.0.0.0", "HYCU_HOST surcharge host (bind conteneur)")
+check(H.CONFIG["port"] == 9999 and isinstance(H.CONFIG["port"], int), "HYCU_PORT converti en int")
+check(H.CONFIG["open_browser"] is False, "HYCU_OPEN_BROWSER=0 -> False")
+check(H.CONFIG["backup_root"] == "/data/hycu-backups", "HYCU_BACKUP_ROOT surcharge le dossier")
+# rien posé -> aucune surcharge (mode python direct inchangé)
+for k in ("HYCU_HOST", "HYCU_PORT", "HYCU_OPEN_BROWSER", "HYCU_BACKUP_ROOT"):
+    _os2.environ.pop(k, None)
+H.CONFIG["host"] = "127.0.0.1"
+H._apply_env_overrides()
+check(H.CONFIG["host"] == "127.0.0.1", "sans variable d'env -> défaut conservé (mode python)")
+for k, v in _envsave.items():
+    (_os2.environ.__setitem__(k, v) if v is not None else _os2.environ.pop(k, None))
+H.CONFIG.clear(); H.CONFIG.update(_cfgsave)
+
 # --- Restauration de l'état global --------------------------------------------
 for k, v in _ORIG.items():
     setattr(H, k, v)

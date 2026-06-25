@@ -1,0 +1,61 @@
+# Identité « autonome » pour l'outil : un ServiceAccount + ses droits RBAC + un token
+# long-lived (k8s >= 1.24 ne génère plus de token automatiquement). On en fabrique
+# ensuite un kubeconfig SANS exec-plugin (cf. make-kubeconfig.sh).
+#
+# Prérequis : le namespace `hycu` doit exister (kubectl create namespace hycu).
+# Ajustez les verbes selon votre politique de moindre privilège ; pour un essai rapide,
+# vous pouvez à la place lier le SA à `cluster-admin` (déconseillé en prod).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: hycu-operator
+  namespace: hycu
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: hycu-operator
+rules:
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list", "watch", "create", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "create", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list", "create"]            # clone cross-namespace : création du ns cible
+  - apiGroups: [""]
+    resources: ["secrets", "configmaps", "serviceaccounts", "services"]
+    verbs: ["get", "list", "create"]            # clone d'application : lecture + création des dépendances
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+  - apiGroups: ["apps"]
+    resources: ["deployments/scale", "statefulsets/scale"]
+    verbs: ["get", "update", "patch"]           # scale-down/up de l'application
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: hycu-operator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: hycu-operator
+subjects:
+  - kind: ServiceAccount
+    name: hycu-operator
+    namespace: hycu
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: hycu-operator-token
+  namespace: hycu
+  annotations:
+    kubernetes.io/service-account.name: hycu-operator
+type: kubernetes.io/service-account-token

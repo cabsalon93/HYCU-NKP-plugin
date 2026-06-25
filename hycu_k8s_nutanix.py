@@ -66,6 +66,8 @@ import ssl
 import hmac
 import hashlib
 import base64
+import io
+import zipfile
 import secrets
 import datetime
 import threading
@@ -145,8 +147,34 @@ DEFAULT_CONFIG = {
 CONFIG = dict(DEFAULT_CONFIG)
 
 
+def _apply_env_overrides():
+    """Surcharges par variables d'environnement (mode conteneur / 12-factor).
+    Priorité : env > hycu_config.json > défauts. Permet une IMAGE mode-agnostique
+    sans modifier le code ni le fichier de config (ex. HYCU_HOST=0.0.0.0,
+    HYCU_OPEN_BROWSER=0, HYCU_BACKUP_ROOT=/data/hycu-backups). En mode « python »
+    direct, aucune de ces variables n'est posée -> comportement par défaut inchangé."""
+    def _b(v):
+        return str(v).strip().lower() in ("1", "true", "yes", "on")
+    mapping = {
+        "HYCU_HOST": ("host", str),
+        "HYCU_PORT": ("port", int),
+        "HYCU_OPEN_BROWSER": ("open_browser", _b),
+        "HYCU_BACKUP_ROOT": ("backup_root", str),
+        "HYCU_KUBECTL_PATH": ("kubectl_path", str),
+    }
+    for env, (key, conv) in mapping.items():
+        val = os.environ.get(env)
+        if val is None or val == "":
+            continue
+        try:
+            CONFIG[key] = conv(val)
+        except (ValueError, TypeError):
+            print("Variable d'env %s ignorée (valeur invalide : %r)." % (env, val))
+
+
 def load_config():
-    """Charge hycu_config.json par-dessus les valeurs par défaut (clés inconnues ignorées)."""
+    """Charge hycu_config.json par-dessus les valeurs par défaut (clés inconnues ignorées),
+    puis applique les surcharges d'environnement (mode conteneur)."""
     global CONFIG
     CONFIG = dict(DEFAULT_CONFIG)
     if os.path.isfile(CONFIG_PATH):
@@ -158,6 +186,7 @@ def load_config():
                     CONFIG[k] = v
         except Exception as e:  # config illisible : on garde les défauts
             print("Configuration illisible (%s) : valeurs par défaut utilisées." % e)
+    _apply_env_overrides()
     return CONFIG
 
 
@@ -177,7 +206,7 @@ def save_config(updates):
 
 # Version horodatée de la build (format AAAAMMJJ-HHMM). À incrémenter à chaque
 # changement notable du programme ; affichée dans l'en-tête de l'interface.
-VERSION = "20260625-1202"
+VERSION = "20260625-1730"
 
 # Jeton anti-CSRF généré au démarrage, injecté dans la page et exigé sur les POST.
 CSRF_TOKEN = secrets.token_urlsafe(32)
@@ -226,8 +255,16 @@ def audit(event, **fields):
         rec.update(fields)
         with open(os.path.join(CONFIG["backup_root"], "audit.log"), "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-    except Exception:
-        pass  # l'audit ne doit jamais casser l'action
+    except Exception as e:
+        # L'audit ne doit jamais casser l'action ; mais en conteneur (volume non
+        # inscriptible), un échec silencieux masquerait l'absence de trace -> on
+        # journalise au moins sur stderr (capté par `docker logs` / K8s).
+        try:
+            import sys
+            print("AUDIT non écrit (%s) : %s" % (e, json.dumps(
+                {"event": event, **fields}, ensure_ascii=False)), file=sys.stderr)
+        except Exception:
+            pass
 
 
 # ------------------------------------------------------------------------------
@@ -839,7 +876,7 @@ def action_backup(ns, dest=None):
         json.dump(index, f, indent=2)
 
     audit("backup", namespace=ns, dir=d, count=len(items))
-    return {"ok": True, "error": None, "dir": d, "count": len(items),
+    return {"ok": True, "error": None, "dir": d, "root": root, "count": len(items),
             "files": files, "volumes": index["volumes"]}
 
 
@@ -1868,6 +1905,10 @@ def action_save_credentials(payload):
         blob = encrypt_secret(json.dumps(creds).encode("utf-8"), pw)
         with open(SECRETS_PATH, "w", encoding="utf-8") as f:
             f.write(blob)
+        try:
+            os.chmod(SECRETS_PATH, 0o600)   # coffre lisible/écrit par le seul propriétaire
+        except OSError:
+            pass                            # best-effort (Windows / FS sans POSIX perms)
     except Exception as e:
         return {"ok": False, "error": "Écriture du coffre impossible : %s" % e}
     save_config({"remember_credentials": True})
@@ -3086,16 +3127,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a):  # silence
         pass
 
-    def _send(self, code, body, ctype="application/json"):
+    def _send(self, code, body, ctype="application/json", extra_headers=None):
         data = body.encode("utf-8") if isinstance(body, str) else body
+        # charset uniquement pour le texte ; surtout pas pour un binaire (zip…).
+        ct = ctype if (";" in ctype or "zip" in ctype or "octet-stream" in ctype) else ctype + "; charset=utf-8"
         try:
             self.send_response(code)
-            self.send_header("Content-Type", ctype + "; charset=utf-8")
+            self.send_header("Content-Type", ct)
             self.send_header("Content-Length", str(len(data)))
             self.send_header("X-Content-Type-Options", "nosniff")
             # Empêche le navigateur de servir une ancienne version en cache.
             self.send_header("Cache-Control", "no-store, must-revalidate")
             self.send_header("Pragma", "no-cache")
+            for k, v in (extra_headers or {}).items():
+                self.send_header(k, v)
             self.end_headers()           # flush des en-têtes (écrit sur le socket)
             self.wfile.write(data)        # corps de la réponse
         except ConnectionError:
@@ -3108,6 +3153,38 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def _json(self, obj, code=200):
         self._send(code, json.dumps(obj))
+
+    def _download_backup(self, raw_path, root):
+        """Empaquette un dossier de sauvegarde en .zip et le renvoie en téléchargement.
+        Sert à SORTIR une sauvegarde du conteneur/Pod vers le poste de l'opérateur via le
+        navigateur (le serveur ne peut pas écrire sur le disque du client). Le chemin est
+        validé par _safe_backup_path (anti-traversée : reste sous backup_root ou un dossier
+        personnalisé explicitement désigné)."""
+        full = _safe_backup_path(raw_path, root)
+        if not full or not os.path.isdir(full):
+            return self._send(404, "Sauvegarde introuvable.", "text/plain")
+        # Nom lisible : <ns>_<horodatage>.zip pour une sauvegarde, sinon le nom du dossier.
+        top = os.path.basename(full.rstrip("/\\")) or "backups"
+        if os.path.isfile(os.path.join(full, "index.json")):
+            top = "%s_%s" % (os.path.basename(os.path.dirname(full)), top)
+        fname = re.sub(r"[^A-Za-z0-9._-]+", "_", top) + ".zip"
+        buf, total = io.BytesIO(), 0
+        try:
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+                for dirpath, _dirs, fnames in os.walk(full):
+                    for n in sorted(fnames):
+                        fp = os.path.join(dirpath, n)
+                        if not os.path.isfile(fp):
+                            continue
+                        total += os.path.getsize(fp)
+                        if total > 512 * 1024 * 1024:   # garde-fou : 512 Mo décompressés
+                            return self._send(413, "Sauvegarde trop volumineuse pour un téléchargement direct.", "text/plain")
+                        z.write(fp, os.path.join(top, os.path.relpath(fp, full)))
+        except OSError as e:
+            print("Erreur zip sauvegarde %s : %s" % (full, e))
+            return self._send(500, "Erreur lors de la création de l'archive.", "text/plain")
+        return self._send(200, buf.getvalue(), "application/zip",
+                          {"Content-Disposition": 'attachment; filename="%s"' % fname})
 
     def _origin_ok(self, require_origin=False):
         """Anti-DNS-rebinding : l'en-tête Host doit pointer vers la boucle locale ;
@@ -3152,6 +3229,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._json(action_pvcs(qs.get("ns", "")))
             if path == "/api/backups":
                 return self._json({"backups": list_backups(qs.get("ns", ""), qs.get("root"))})
+            if path == "/api/backup/download":
+                return self._download_backup(qs.get("path", ""), qs.get("root"))
             if path == "/api/verify":
                 return self._json(action_verify(qs.get("ns", "")))
             if path == "/api/config":
@@ -3671,7 +3750,7 @@ HTML = r"""<!DOCTYPE html>
       <div id="rsBackupSelWrap" style="display:none;margin-top:8px">
         <label class="fld">Sauvegarde de configuration à restaurer</label>
         <select id="rsBackupSel"></select>
-        <div class="hint" style="margin-top:4px">Manifestes PV/PVC utilisés (le « squelette »). Indépendant du point de restauration HYCU des <b>données</b>. Par défaut : la plus récente.</div>
+        <div class="hint" style="margin-top:4px">Manifestes PV/PVC utilisés (le « squelette »). Indépendant du point de restauration HYCU des <b>données</b>. Par défaut : la plus récente.<a id="rsBackupDl" href="#" download style="display:none;margin-left:6px;text-decoration:none">⬇ Télécharger (.zip)</a></div>
       </div>
       <label class="fld">Type d'opération HYCU (pour tout le lot)</label>
       <div class="seg" id="rsMode">
@@ -4159,6 +4238,14 @@ $("#wizNext").onclick=async()=>{
 };
 
 // --------- Sauvegarde ---------
+// Lien de téléchargement (.zip) d'un dossier de sauvegarde — permet de SORTIR une
+// sauvegarde du conteneur/Pod vers le poste de l'opérateur (indispensable en Docker/K8s,
+// où le serveur ne peut pas écrire sur le disque du client).
+function dlBackupLink(dir, root, label){
+  if(!dir) return "";
+  const u="/api/backup/download?path="+encodeURIComponent(dir)+(root?("&root="+encodeURIComponent(root)):"");
+  return `<a class="btn ghost" href="${u}" download style="padding:2px 8px;font-size:12px;text-decoration:none;margin-left:6px">⬇ ${esc(label||'Télécharger (.zip)')}</a>`;
+}
 $("#bkRun").onclick=async()=>{
   const ns=$("#bkNs").value, b=$("#bkRun"), dest=$("#bkDest").value.trim();
   b.disabled=true; b.innerHTML='<span class="spin"></span>Sauvegarde…';
@@ -4173,8 +4260,8 @@ $("#bkRun").onclick=async()=>{
      <span><b>${esc(v.pvc)}</b> → PV ${esc(v.pv||"—")} ${tag}</span></li>`;
   }).join("");
   $("#bkOut").innerHTML=`<div class="note">${r.count} volume(s) sauvegardé(s) dans
-     <code>${esc(r.dir)}</code></div><ul class="pvc-list" style="margin-top:10px">${rows}</ul>
-     <div class="warnbox">⚠ Copiez ce dossier <b>hors du cluster</b> (autre stockage) : c'est votre filet de sécurité en cas de sinistre.</div>`;
+     <code>${esc(r.dir)}</code>${dlBackupLink(r.dir, r.root)}</div><ul class="pvc-list" style="margin-top:10px">${rows}</ul>
+     <div class="warnbox">⚠ Récupérez cette sauvegarde <b>hors du cluster</b> via ⬇ Télécharger (.zip) — ou copiez le dossier vers un autre stockage : c'est votre filet de sécurité en cas de sinistre.</div>`;
 };
 $("#bkRunAll").onclick=async()=>{
   const b=$("#bkRunAll"), dest=$("#bkDest").value.trim();
@@ -4183,14 +4270,14 @@ $("#bkRunAll").onclick=async()=>{
   b.disabled=false; b.textContent="Sauvegarder tous (filtrés)";
   if(!r.ok){$("#bkOut").innerHTML=errBox(r.error);return;}
   const rows=(r.results||[]).map(x=>{
-    if(x.ok) return `<li class="logline"><span class="ic ok">✓</span><span><b>${esc(x.ns)}</b> — ${x.count} volume(s) → <code>${esc(x.dir)}</code></span></li>`;
+    if(x.ok) return `<li class="logline"><span class="ic ok">✓</span><span><b>${esc(x.ns)}</b> — ${x.count} volume(s) → <code>${esc(x.dir)}</code>${dlBackupLink(x.dir, r.root, 'Télécharger')}</span></li>`;
     if(x.skipped) return `<li class="logline"><span class="ic sim">○</span><span><b>${esc(x.ns)}</b> — aucun PVC (ignoré)</span></li>`;
     return `<li class="logline"><span class="ic ko">✕</span><span><b>${esc(x.ns)}</b> — ${esc(x.error||'échec')}</span></li>`;
   }).join("");
   const scope = r.filtered? "namespaces du filtre" : "tous les namespaces du cluster";
-  $("#bkOut").innerHTML=`<div class="note">${r.backed_up}/${r.namespaces} namespace(s) sauvegardé(s) · ${r.volumes} volume(s) au total <span class="hint">(${scope})</span>.</div>
+  $("#bkOut").innerHTML=`<div class="note">${r.backed_up}/${r.namespaces} namespace(s) sauvegardé(s) · ${r.volumes} volume(s) au total <span class="hint">(${scope})</span>.${dlBackupLink(r.root, r.root, 'Tout télécharger (.zip)')}</div>
      <ul class="pvc-list" style="margin-top:10px">${rows}</ul>
-     <div class="warnbox">⚠ Copiez ces dossiers <b>hors du cluster</b> : c'est votre filet de sécurité en cas de sinistre.</div>`;
+     <div class="warnbox">⚠ Récupérez ces sauvegardes <b>hors du cluster</b> via ⬇ Télécharger — ou copiez les dossiers vers un autre stockage : c'est votre filet de sécurité en cas de sinistre.</div>`;
 };
 
 // --------- Protection HYCU (assigner politique + sauvegarder) ---------
@@ -4310,8 +4397,10 @@ async function applyBackupSelection(){
     state.backup_path=b.path;
     pvcs=((b.index||{}).volumes||[]).map(v=>({name:v.pvc,pv:v.pv,phase:"sauvegardé"}));
     src=customRoot?"sauvegarde (dossier perso)":(i==="0"?"dernière sauvegarde":"sauvegarde choisie");
+    const _dl=$("#rsBackupDl"); if(_dl){ _dl.href="/api/backup/download?path="+encodeURIComponent(b.path)+(customRoot?("&root="+encodeURIComponent(customRoot)):""); _dl.style.display="inline"; }
   }else{
     state.backup_path=null;   // aucune sauvegarde -> repli live (vide si namespace détruit)
+    const _dl=$("#rsBackupDl"); if(_dl) _dl.style.display="none";
     const live=await get("/api/pvcs?ns="+encodeURIComponent(ns));
     pvcs=live.pvcs||[];
   }
@@ -4326,10 +4415,13 @@ function renderRsPvcs(pvcs, src){
   document.querySelectorAll(".rsChk").forEach(c=>c.onchange=rebuildVolCfgs);
   $("#rsConfig").style.display="none"; $("#rsPlan").style.display="none"; setRsStep(1);
 }
+// Horodatage epoch en secondes (≈ `date -u +%s`) : sert de suffixe UNIQUE à chaque clone,
+// pour ne JAMAIS réutiliser un nom déjà créé (sinon : « le PVC/VG …-0000 existe déjà » au
+// 2ᵉ clone de la même application). L'utilisateur peut éditer le champ ensuite.
+function cloneStamp(){ return Math.floor(Date.now()/1000); }
 function suggestName(pv){
   if(!pv) return "";
-  const s=pv.replace(/[0-9a-fA-F]{4}$/,"0000");
-  return s!==pv ? s : (pv+"-clone");   // ne jamais proposer le nom source à l'identique
+  return pv + "-" + cloneStamp();   // suffixe horodaté -> nom toujours unique et ≠ source
 }
 function rebuildVolCfgs(){
   const chks=[...document.querySelectorAll(".rsChk:checked")];
@@ -4411,7 +4503,7 @@ async function openHyOrch(pvc){
      <div>VG HYCU : <b>${esc(m.hycu_vg_name||m.hycu_vg_uuid)}</b> ${m.match_kind!=='exact'?('<span class="sim">(correspondance '+esc(m.match_kind)+' — à vérifier)</span>'):''}</div>
      <label class="fld">Point de restauration</label>
      <select class="hyRp2" data-pvc="${esc(pvc)}">${opts}</select>
-     ${isClone?`<label class="fld">Nom du VG cloné</label><input type="text" class="hyVgName2" data-pvc="${esc(pvc)}" value="${esc((m.hycu_vg_name||'')+'-0000')}">`:''}
+     ${isClone?`<label class="fld">Nom du VG cloné</label><input type="text" class="hyVgName2" data-pvc="${esc(pvc)}" value="${esc((m.hycu_vg_name||'')+'-'+cloneStamp())}"><div class="hint" style="margin-top:2px">Suffixe horodaté = nom unique à chaque clone (modifiable).</div>`:''}
      <div style="margin-top:10px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
        <button class="btn hyGo2" data-pvc="${esc(pvc)}" data-vg="${esc(m.hycu_vg_uuid)}">${isClone?'Cloner dans HYCU':'Restaurer dans HYCU'} puis récupérer la réf. du VG</button>
      </div>
