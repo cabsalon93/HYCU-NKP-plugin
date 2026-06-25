@@ -72,8 +72,11 @@ docker load -i hycu-nkp.tar.gz
 
 3. **« Dossier personnalisé » = chemin DANS le conteneur.** Les champs « dossier de
    destination » (sauvegarde) et « dossier personnalisé » (restauration) désignent un
-   chemin **du conteneur**. Pour viser un dossier de l'hôte (ex. `D:\sauvegardes`),
-   montez-le (`-v D:\sauvegardes:/backups-externe`) et saisissez le chemin **conteneur**
+   chemin **du conteneur**, jamais le disque du client. Pour récupérer une sauvegarde sur
+   votre poste, le plus simple est le bouton **⬇ Télécharger (.zip)** de l'UI (le
+   navigateur la dépose localement ; marche en Docker **et** en K8s, sans montage). En
+   Docker, vous pouvez aussi monter un dossier de l'hôte
+   (`-v D:\sauvegardes:/backups-externe`) et saisir le chemin **conteneur**
    (`/backups-externe`).
 
 4. **Accès = sécurité.** Aucune authentification applicative : quiconque peut

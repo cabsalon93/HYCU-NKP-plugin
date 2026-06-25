@@ -66,6 +66,8 @@ import ssl
 import hmac
 import hashlib
 import base64
+import io
+import zipfile
 import secrets
 import datetime
 import threading
@@ -204,7 +206,7 @@ def save_config(updates):
 
 # Version horodatée de la build (format AAAAMMJJ-HHMM). À incrémenter à chaque
 # changement notable du programme ; affichée dans l'en-tête de l'interface.
-VERSION = "20260625-1501"
+VERSION = "20260625-1700"
 
 # Jeton anti-CSRF généré au démarrage, injecté dans la page et exigé sur les POST.
 CSRF_TOKEN = secrets.token_urlsafe(32)
@@ -874,7 +876,7 @@ def action_backup(ns, dest=None):
         json.dump(index, f, indent=2)
 
     audit("backup", namespace=ns, dir=d, count=len(items))
-    return {"ok": True, "error": None, "dir": d, "count": len(items),
+    return {"ok": True, "error": None, "dir": d, "root": root, "count": len(items),
             "files": files, "volumes": index["volumes"]}
 
 
@@ -3125,16 +3127,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a):  # silence
         pass
 
-    def _send(self, code, body, ctype="application/json"):
+    def _send(self, code, body, ctype="application/json", extra_headers=None):
         data = body.encode("utf-8") if isinstance(body, str) else body
+        # charset uniquement pour le texte ; surtout pas pour un binaire (zip…).
+        ct = ctype if (";" in ctype or "zip" in ctype or "octet-stream" in ctype) else ctype + "; charset=utf-8"
         try:
             self.send_response(code)
-            self.send_header("Content-Type", ctype + "; charset=utf-8")
+            self.send_header("Content-Type", ct)
             self.send_header("Content-Length", str(len(data)))
             self.send_header("X-Content-Type-Options", "nosniff")
             # Empêche le navigateur de servir une ancienne version en cache.
             self.send_header("Cache-Control", "no-store, must-revalidate")
             self.send_header("Pragma", "no-cache")
+            for k, v in (extra_headers or {}).items():
+                self.send_header(k, v)
             self.end_headers()           # flush des en-têtes (écrit sur le socket)
             self.wfile.write(data)        # corps de la réponse
         except ConnectionError:
@@ -3147,6 +3153,38 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def _json(self, obj, code=200):
         self._send(code, json.dumps(obj))
+
+    def _download_backup(self, raw_path, root):
+        """Empaquette un dossier de sauvegarde en .zip et le renvoie en téléchargement.
+        Sert à SORTIR une sauvegarde du conteneur/Pod vers le poste de l'opérateur via le
+        navigateur (le serveur ne peut pas écrire sur le disque du client). Le chemin est
+        validé par _safe_backup_path (anti-traversée : reste sous backup_root ou un dossier
+        personnalisé explicitement désigné)."""
+        full = _safe_backup_path(raw_path, root)
+        if not full or not os.path.isdir(full):
+            return self._send(404, "Sauvegarde introuvable.", "text/plain")
+        # Nom lisible : <ns>_<horodatage>.zip pour une sauvegarde, sinon le nom du dossier.
+        top = os.path.basename(full.rstrip("/\\")) or "backups"
+        if os.path.isfile(os.path.join(full, "index.json")):
+            top = "%s_%s" % (os.path.basename(os.path.dirname(full)), top)
+        fname = re.sub(r"[^A-Za-z0-9._-]+", "_", top) + ".zip"
+        buf, total = io.BytesIO(), 0
+        try:
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+                for dirpath, _dirs, fnames in os.walk(full):
+                    for n in sorted(fnames):
+                        fp = os.path.join(dirpath, n)
+                        if not os.path.isfile(fp):
+                            continue
+                        total += os.path.getsize(fp)
+                        if total > 512 * 1024 * 1024:   # garde-fou : 512 Mo décompressés
+                            return self._send(413, "Sauvegarde trop volumineuse pour un téléchargement direct.", "text/plain")
+                        z.write(fp, os.path.join(top, os.path.relpath(fp, full)))
+        except OSError as e:
+            print("Erreur zip sauvegarde %s : %s" % (full, e))
+            return self._send(500, "Erreur lors de la création de l'archive.", "text/plain")
+        return self._send(200, buf.getvalue(), "application/zip",
+                          {"Content-Disposition": 'attachment; filename="%s"' % fname})
 
     def _origin_ok(self, require_origin=False):
         """Anti-DNS-rebinding : l'en-tête Host doit pointer vers la boucle locale ;
@@ -3191,6 +3229,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._json(action_pvcs(qs.get("ns", "")))
             if path == "/api/backups":
                 return self._json({"backups": list_backups(qs.get("ns", ""), qs.get("root"))})
+            if path == "/api/backup/download":
+                return self._download_backup(qs.get("path", ""), qs.get("root"))
             if path == "/api/verify":
                 return self._json(action_verify(qs.get("ns", "")))
             if path == "/api/config":
@@ -3710,7 +3750,7 @@ HTML = r"""<!DOCTYPE html>
       <div id="rsBackupSelWrap" style="display:none;margin-top:8px">
         <label class="fld">Sauvegarde de configuration à restaurer</label>
         <select id="rsBackupSel"></select>
-        <div class="hint" style="margin-top:4px">Manifestes PV/PVC utilisés (le « squelette »). Indépendant du point de restauration HYCU des <b>données</b>. Par défaut : la plus récente.</div>
+        <div class="hint" style="margin-top:4px">Manifestes PV/PVC utilisés (le « squelette »). Indépendant du point de restauration HYCU des <b>données</b>. Par défaut : la plus récente.<a id="rsBackupDl" href="#" download style="display:none;margin-left:6px;text-decoration:none">⬇ Télécharger (.zip)</a></div>
       </div>
       <label class="fld">Type d'opération HYCU (pour tout le lot)</label>
       <div class="seg" id="rsMode">
@@ -4198,6 +4238,14 @@ $("#wizNext").onclick=async()=>{
 };
 
 // --------- Sauvegarde ---------
+// Lien de téléchargement (.zip) d'un dossier de sauvegarde — permet de SORTIR une
+// sauvegarde du conteneur/Pod vers le poste de l'opérateur (indispensable en Docker/K8s,
+// où le serveur ne peut pas écrire sur le disque du client).
+function dlBackupLink(dir, root, label){
+  if(!dir) return "";
+  const u="/api/backup/download?path="+encodeURIComponent(dir)+(root?("&root="+encodeURIComponent(root)):"");
+  return `<a class="btn ghost" href="${u}" download style="padding:2px 8px;font-size:12px;text-decoration:none;margin-left:6px">⬇ ${esc(label||'Télécharger (.zip)')}</a>`;
+}
 $("#bkRun").onclick=async()=>{
   const ns=$("#bkNs").value, b=$("#bkRun"), dest=$("#bkDest").value.trim();
   b.disabled=true; b.innerHTML='<span class="spin"></span>Sauvegarde…';
@@ -4212,8 +4260,8 @@ $("#bkRun").onclick=async()=>{
      <span><b>${esc(v.pvc)}</b> → PV ${esc(v.pv||"—")} ${tag}</span></li>`;
   }).join("");
   $("#bkOut").innerHTML=`<div class="note">${r.count} volume(s) sauvegardé(s) dans
-     <code>${esc(r.dir)}</code></div><ul class="pvc-list" style="margin-top:10px">${rows}</ul>
-     <div class="warnbox">⚠ Copiez ce dossier <b>hors du cluster</b> (autre stockage) : c'est votre filet de sécurité en cas de sinistre.</div>`;
+     <code>${esc(r.dir)}</code>${dlBackupLink(r.dir, r.root)}</div><ul class="pvc-list" style="margin-top:10px">${rows}</ul>
+     <div class="warnbox">⚠ Récupérez cette sauvegarde <b>hors du cluster</b> via ⬇ Télécharger (.zip) — ou copiez le dossier vers un autre stockage : c'est votre filet de sécurité en cas de sinistre.</div>`;
 };
 $("#bkRunAll").onclick=async()=>{
   const b=$("#bkRunAll"), dest=$("#bkDest").value.trim();
@@ -4222,14 +4270,14 @@ $("#bkRunAll").onclick=async()=>{
   b.disabled=false; b.textContent="Sauvegarder tous (filtrés)";
   if(!r.ok){$("#bkOut").innerHTML=errBox(r.error);return;}
   const rows=(r.results||[]).map(x=>{
-    if(x.ok) return `<li class="logline"><span class="ic ok">✓</span><span><b>${esc(x.ns)}</b> — ${x.count} volume(s) → <code>${esc(x.dir)}</code></span></li>`;
+    if(x.ok) return `<li class="logline"><span class="ic ok">✓</span><span><b>${esc(x.ns)}</b> — ${x.count} volume(s) → <code>${esc(x.dir)}</code>${dlBackupLink(x.dir, r.root, 'Télécharger')}</span></li>`;
     if(x.skipped) return `<li class="logline"><span class="ic sim">○</span><span><b>${esc(x.ns)}</b> — aucun PVC (ignoré)</span></li>`;
     return `<li class="logline"><span class="ic ko">✕</span><span><b>${esc(x.ns)}</b> — ${esc(x.error||'échec')}</span></li>`;
   }).join("");
   const scope = r.filtered? "namespaces du filtre" : "tous les namespaces du cluster";
-  $("#bkOut").innerHTML=`<div class="note">${r.backed_up}/${r.namespaces} namespace(s) sauvegardé(s) · ${r.volumes} volume(s) au total <span class="hint">(${scope})</span>.</div>
+  $("#bkOut").innerHTML=`<div class="note">${r.backed_up}/${r.namespaces} namespace(s) sauvegardé(s) · ${r.volumes} volume(s) au total <span class="hint">(${scope})</span>.${dlBackupLink(r.root, r.root, 'Tout télécharger (.zip)')}</div>
      <ul class="pvc-list" style="margin-top:10px">${rows}</ul>
-     <div class="warnbox">⚠ Copiez ces dossiers <b>hors du cluster</b> : c'est votre filet de sécurité en cas de sinistre.</div>`;
+     <div class="warnbox">⚠ Récupérez ces sauvegardes <b>hors du cluster</b> via ⬇ Télécharger — ou copiez les dossiers vers un autre stockage : c'est votre filet de sécurité en cas de sinistre.</div>`;
 };
 
 // --------- Protection HYCU (assigner politique + sauvegarder) ---------
@@ -4349,8 +4397,10 @@ async function applyBackupSelection(){
     state.backup_path=b.path;
     pvcs=((b.index||{}).volumes||[]).map(v=>({name:v.pvc,pv:v.pv,phase:"sauvegardé"}));
     src=customRoot?"sauvegarde (dossier perso)":(i==="0"?"dernière sauvegarde":"sauvegarde choisie");
+    const _dl=$("#rsBackupDl"); if(_dl){ _dl.href="/api/backup/download?path="+encodeURIComponent(b.path)+(customRoot?("&root="+encodeURIComponent(customRoot)):""); _dl.style.display="inline"; }
   }else{
     state.backup_path=null;   // aucune sauvegarde -> repli live (vide si namespace détruit)
+    const _dl=$("#rsBackupDl"); if(_dl) _dl.style.display="none";
     const live=await get("/api/pvcs?ns="+encodeURIComponent(ns));
     pvcs=live.pvcs||[];
   }

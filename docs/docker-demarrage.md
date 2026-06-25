@@ -135,9 +135,14 @@ Désormais, un **double-clic** sur `lancer-hycu.bat` démarre l'outil. Plus rien
    façon, une protection interne refuse les accès qui ne viennent pas de la machine.)
 
 3. **« Dossier personnalisé » = chemin DANS le conteneur.** Si l'outil te demande un
-   dossier de destination/source, c'est un chemin **du conteneur**, pas de Windows. Pour
-   viser un dossier de ton poste (ex. `D:\sauvegardes`), monte-le en ajoutant
-   `-v D:/sauvegardes:/backups` à la commande, puis saisis `/backups` dans l'outil.
+   dossier de destination/source, c'est un chemin **du conteneur**, pas de Windows : un
+   `D:\sauvegardes` saisi ici n'atteint **pas** ton PC (le serveur écrit sur son propre
+   disque). Deux solutions :
+   - **Le plus simple** — laisse le dossier par défaut et clique sur **⬇ Télécharger
+     (.zip)** à côté de la sauvegarde : ton navigateur la dépose sur **ton PC**
+     (fonctionne en Docker **et** en Kubernetes, sans rien monter).
+   - En Docker uniquement, tu peux aussi monter un dossier de ton poste
+     (`-v D:/sauvegardes:/backups`) puis saisir le chemin **conteneur** `/backups`.
 
 ---
 

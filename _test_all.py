@@ -20,6 +20,7 @@ SUITES = [
     "_test_pvc_fallback",    # repli PVC sauvegarde -> live -> None (restore sans étape 1)
     "_test_inplace_refresh",  # rafraîchissement PV après restore in-place (disque changé)
     "_test_fixes",           # correctifs revue : V2 reprise, V4 redirection/schéma, V7/V8 clone, V9 tri disques
+    "_test_download",        # téléchargement .zip d'une sauvegarde + garde anti-traversée
 ]
 
 
