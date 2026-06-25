@@ -43,7 +43,9 @@ Le navigateur s'ouvre sur <http://127.0.0.1:8765> (sinon, ouvrez-le manuellement
 
 **Mode conteneur** (Docker ou Kubernetes) : la **même image** empaquette ce script et
 embarque `kubectl`, pour les postes sans Python. Le comportement est piloté par
-variables d'environnement (même code, deux emballages). Voir **[docs/docker.md](docs/docker.md)**.
+variables d'environnement (même code, deux emballages). Guides : vue d'ensemble
+**[docs/docker.md](docs/docker.md)** · démarrage **[Docker](docs/docker-demarrage.md)** ·
+démarrage **[Kubernetes](docs/kubernetes-demarrage.md)**.
 ```bash
 docker compose -f deploy/docker-compose.yml up      # puis http://127.0.0.1:8765
 ```

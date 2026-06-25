@@ -39,6 +39,9 @@ docker run --rm -p 127.0.0.1:8765:8765 \
 
 ## 2. Kubernetes
 
+> Guide utilisateur pas-à-pas : **[docs/kubernetes-demarrage.md](kubernetes-demarrage.md)**
+> (prérequis, mise à jour, moindre privilège RBAC, cluster distant, dépannage).
+
 ```bash
 kubectl create namespace hycu
 kubectl -n hycu create secret generic hycu-kubeconfig --from-file=config=./kubeconfig
