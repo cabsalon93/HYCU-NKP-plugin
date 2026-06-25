@@ -38,7 +38,8 @@ la **même image**. Plusieurs opérateurs peuvent l'utiliser (chacun via son `po
 
    - `client-certificate-data` / `client-key-data` ou `token:` → ✅ utilisable tel quel.
    - une section `exec:` / `command:` (kubelogin, oidc-login, aws/gke…) → ⚠️ **non**
-     utilisable dans un Pod. Fabriquez un kubeconfig autonome (cf. §5).
+     utilisable dans un Pod. Fabriquez un kubeconfig autonome (voir `deploy/k8s/rbac.yaml`
+     et `deploy/k8s/make-kubeconfig.sh` dans le dépôt).
 3. Une **StorageClass** capable de provisionner un volume **ReadWriteOnce** (par défaut
    sur le cluster, sinon à préciser — cf. dépannage).
 
@@ -47,7 +48,8 @@ la **même image**. Plusieurs opérateurs peuvent l'utiliser (chacun via son `po
 ## 2. Déploiement — chemin rapide
 
 > Hypothèse simple : l'outil tourne dans le cluster qu'il pilote, avec un kubeconfig
-> existant. (Pour le moindre privilège ou un cluster distant, voir §5.)
+> existant. (Pour une identité à droits limités ou un cluster distant, voir
+> `deploy/k8s/rbac.yaml` et `deploy/k8s/make-kubeconfig.sh` dans le dépôt.)
 
 **1. Créer le namespace dédié :**
 ```bash
@@ -60,12 +62,22 @@ kubectl -n hycu create secret generic hycu-kubeconfig --from-file=config=<chemin
 ```
 *(Windows : `--from-file=config=C:\Users\<toi>\.kube\config`.)*
 
-**3. Déployer l'outil :**
-```bash
-kubectl apply -f deploy/k8s/hycu.yaml
-```
-*(Sans le dépôt sous la main, tu peux appliquer directement depuis l'URL publique du
-fichier — voir la dernière section.)*
+**3. Déployer l'outil.** L'image est tirée **automatiquement depuis ghcr.io**
+(`ghcr.io/cabsalon93/hycu-nkp-plugin:latest`, publique) — rien à construire. Deux façons
+d'appliquer le manifeste, **au choix** :
+
+- **Sans cloner le dépôt** (directement depuis l'URL publique GitHub) :
+  ```bash
+  kubectl apply -f https://raw.githubusercontent.com/cabsalon93/HYCU-NKP-plugin/main/deploy/k8s/hycu.yaml
+  ```
+  *(Remplacez `main` par un tag de version, ex. `v0.1.0`, pour épingler une version.)*
+
+- **Depuis une copie locale** (dépôt cloné) :
+  ```bash
+  git clone https://github.com/cabsalon93/HYCU-NKP-plugin.git
+  cd HYCU-NKP-plugin
+  kubectl apply -f deploy/k8s/hycu.yaml
+  ```
 
 **4. Vérifier que le Pod démarre :**
 ```bash
@@ -120,53 +132,12 @@ ne peut pas écrire sur ton PC. Pour récupérer une sauvegarde **localement** :
 
 ---
 
-## 5. Production — moindre privilège (RBAC) et/ou cluster distant
-
-Pour un déploiement chez un client, évite de monter un kubeconfig **admin**. Donne à
-l'outil une **identité dédiée** à droits limités :
-
-```bash
-# 1) Identité + droits RBAC (ServiceAccount « hycu-operator » + token long-lived)
-kubectl apply -f deploy/k8s/rbac.yaml
-
-# 2) Fabriquer un kubeconfig AUTONOME à partir de ce ServiceAccount
-#    - pour piloter LE cluster où tourne l'outil :
-./deploy/k8s/make-kubeconfig.sh
-#    - pour piloter un cluster DISTANT (joignable depuis les Pods) :
-./deploy/k8s/make-kubeconfig.sh https://api.mon-cluster-prod:6443
-
-# 3) Monter CE kubeconfig (au lieu de l'admin)
-kubectl -n hycu create secret generic hycu-kubeconfig --from-file=config=./kubeconfig
-kubectl -n hycu rollout restart deployment hycu
-```
-
-**Cluster d'administration ≠ cluster de production** : déploie l'outil sur ton cluster
-d'admin, et monte le kubeconfig **du cluster de prod**. Vérifie alors que l'**URL de l'API
-du cluster de prod est joignable depuis les Pods** du cluster d'admin.
-
-Ajuste les droits dans `rbac.yaml` selon ta politique. Les verbes par défaut couvrent les
-PV/PVC, pods, namespaces, et le scale des Deployments/StatefulSets (clone/restauration).
-
----
-
-## 6. Dépannage
+## 5. Dépannage
 
 | Symptôme | Cause probable | Solution |
 |---|---|---|
 | Pod **`Pending`** longtemps | PVC non lié (pas de StorageClass par défaut) | `kubectl get storageclass` ; décommentez `storageClassName:` dans `hycu.yaml` (PVC) avec votre classe RWO |
 | **`ImagePullBackOff`** | Image inaccessible au cluster | Vérifiez l'accès internet des nœuds (ghcr.io), ou utilisez un registre interne / une image chargée hors-ligne |
-| **« Contexte kubectl : indisponible »** | Kubeconfig OIDC, ou API injoignable depuis le Pod | Utilisez un kubeconfig autonome (§5) ; pour le cluster local, pointez le `server:` sur `https://kubernetes.default.svc` |
+| **« Contexte kubectl : indisponible »** | Kubeconfig OIDC, ou API injoignable depuis le Pod | Utilisez un kubeconfig autonome (`deploy/k8s/rbac.yaml` + `make-kubeconfig.sh`) ; pour le cluster local, pointez le `server:` sur `https://kubernetes.default.svc` |
 | `port-forward` coupé | Le Pod a redémarré | Relancez la commande de l'étape 5 |
 | Page inaccessible | Mauvaise URL | Ouvrez bien `http://127.0.0.1:8765` (pas `https`) |
-
----
-
-## Annexe — appliquer le manifeste sans cloner le dépôt
-
-`kubectl` peut appliquer un manifeste directement depuis une URL publique :
-
-```bash
-kubectl apply -f https://raw.githubusercontent.com/cabsalon93/HYCU-NKP-plugin/main/deploy/k8s/hycu.yaml
-```
-
-*(Remplacez `main` par la branche/le tag voulu si nécessaire.)*
