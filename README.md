@@ -61,6 +61,16 @@ cp hycu_config.example.json hycu_config.json   # puis éditer (voir §5)
 
 Tout reste modifiable ensuite via l'onglet **⚙ Réglages**.
 
+### Langue / Language
+
+L'interface est **bilingue français / anglais** : le bouton **EN** / **FR** dans
+l'en-tête bascule la langue (page **et** messages du serveur). Le choix est mémorisé
+par navigateur (cookie `hycu_lang`) ; le français est la langue par défaut.
+
+*The UI is bilingual French / English: the **EN** / **FR** button in the header
+switches the language (page **and** server messages). The choice is remembered per
+browser (`hycu_lang` cookie); French is the default.*
+
 ## 3. Déroulé d'une restauration (les 3 onglets)
 
 ### Onglet 1 — Sauvegarder
