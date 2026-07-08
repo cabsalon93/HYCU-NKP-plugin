@@ -50,6 +50,38 @@ démarrage **[Kubernetes](docs/kubernetes-demarrage.md)**.
 docker compose -f deploy/docker-compose.yml up      # puis http://127.0.0.1:8765
 ```
 
+#### Fournir le kubeconfig en mode Kubernetes
+
+Dans l'image, `kubectl` est embarqué et lit `KUBECONFIG=/home/app/.kube/config` : il
+n'y a donc **aucune option en ligne de commande** à passer. Le kubeconfig se fournit
+via un **Secret** monté à cet emplacement.
+
+Utilisez un kubeconfig **autonome** (token de ServiceAccount + CA, **sans** exec-plugin
+type `aws`/`gcloud`/`oidc`, qui ne fonctionne pas dans le conteneur). Le script
+[deploy/k8s/make-kubeconfig.sh](deploy/k8s/make-kubeconfig.sh) le fabrique depuis le
+ServiceAccount `hycu-operator` créé par [deploy/k8s/rbac.yaml](deploy/k8s/rbac.yaml).
+
+Créez ensuite le Secret (nom et namespace attendus par
+[deploy/k8s/hycu.yaml](deploy/k8s/hycu.yaml)) :
+
+```bash
+kubectl -n hycu create secret generic hycu-kubeconfig --from-file=config=./kubeconfig
+```
+
+- `-n hycu` : namespace où tourne l'outil.
+- `hycu-kubeconfig` : nom du Secret référencé par le déploiement.
+- `--from-file=config=./kubeconfig` : la **clé** doit être `config` (montée en
+  `/home/app/.kube/config`) ; `./kubeconfig` est votre fichier local.
+
+Pour **remplacer** un kubeconfig existant, ajoutez `--dry-run=client -o yaml | kubectl apply -f -` :
+
+```bash
+kubectl -n hycu create secret generic hycu-kubeconfig \
+  --from-file=config=./kubeconfig --dry-run=client -o yaml | kubectl apply -f -
+```
+
+Guide complet : **[docs/kubernetes-demarrage.md](docs/kubernetes-demarrage.md)**.
+
 **Premier lancement** : si `hycu_config.json` n'existe pas encore, un **assistant
 de configuration** s'affiche automatiquement (binaire kubectl, contextes/namespaces
 autorisés, garde-fous) et génère le fichier pour vous. Vous pouvez aussi le créer à
