@@ -125,29 +125,34 @@ manifestes décrit dans la procédure HYCU).
 de sécurité.
 
 ### Onglet 2 — Restaurer
-1. Côté **HYCU** : restaurez ou clonez le Volume Group (suffixe « 0000 »).
-2. Dans l'outil : choisissez le namespace, le **type d'opération** (Clone ou
-   Restauration sur place), puis **cochez le(s) PVC** à restaurer (plusieurs
-   volumes d'une même app = une seule transaction : un arrêt, un redémarrage).
-3. **Sauvegarde de configuration à restaurer** : l'outil reconstruit les PV/PVC (le
+1. Choisissez le namespace, le **type d'opération** (Clone ou Restauration sur
+   place), puis **cochez le(s) volume(s)** à restaurer (plusieurs volumes d'une
+   même app = une seule transaction : un arrêt, un redémarrage).
+2. **Sauvegarde de configuration à restaurer** : l'outil reconstruit les PV/PVC (le
    « squelette ») à partir d'une **sauvegarde de config** (onglet 1). S'il en existe
-   plusieurs, un **menu déroulant** permet de **choisir laquelle** (horodatage + nombre
-   de volumes + contexte) ; par défaut la **plus récente**. C'est indépendant du **point
-   de restauration HYCU** (les *données* du Volume Group), qui se choisit séparément.
+   plusieurs, un **menu déroulant** permet de **choisir laquelle** ; par défaut la
+   **plus récente**. C'est indépendant du **point de restauration HYCU** (les
+   *données* du Volume Group).
    - Cas du **namespace détruit** : il n'y a plus de PVC « live » à lire — la
      reconstruction s'appuie **entièrement** sur la sauvegarde de config sélectionnée.
    - **Dossier personnalisé** : cochez « Lire les sauvegardes depuis un dossier
-     personnalisé » et indiquez le chemin si vos sauvegardes ne sont pas dans
-     `hycu-backups/` (p. ex. recopiées sur un partage). La liste et la lecture des
-     manifestes viennent alors de ce dossier.
-4. Pour chaque volume coché, indiquez la **référence du VG** correspondant — l'**UUID
-   du VG** (ou un `volumeHandle`, ou un IQN legacy). Le bouton **« Réf. VG auto »** la
-   récupère depuis Prism ; l'orchestration HYCU la remplit automatiquement. En clone,
-   le nom du nouveau PV est pré-rempli et modifiable.
-5. **Prévisualiser le plan** : vérifiez les remplacements dérivés (`volumeHandle`,
-   UUID du VG), la **purge des attributs runtime** du VG source, le passage du PV
-   source en **Retain**, et la séquence.
-6. En **mode réel** : retapez le nom du contexte pour confirmer, puis **Lancer**.
+     personnalisé » si vos sauvegardes ne sont pas dans `hycu-backups/`.
+3. **Avec HYCU connecté**, un panneau groupé liste chaque volume coché avec son
+   Volume Group apparié et ses points de restauration (**le plus récent
+   pré-sélectionné**) :
+   - **Clone** : un **seul clic** sur **« Restaurer les VG depuis HYCU »** clone
+     tous les VG au point choisi, remplit les références automatiquement, et le
+     plan s'affiche — prêt à lancer.
+   - **Restauration sur place** : rien d'autre à sélectionner — **« Lancer la
+     restauration sur place »** est prêt d'emblée (arrêt → restore in-place
+     HYCU → redémarrage).
+4. **Sans HYCU** (flux manuel) : restaurez/clonez chaque VG dans HYCU vous-même,
+   collez son **UUID** par volume dans le volet **Avancé** (ou « Rechercher le
+   VG dans Prism »), puis **« Continuer : vérifier et lancer »**.
+5. Vérifiez le plan (`volumeHandle` dérivé, **purge des attributs runtime** du
+   VG source, passage du PV source en **Retain**, séquence). En **mode réel** :
+   retapez le nom du contexte pour confirmer, puis **Lancer**. L'outil ouvre
+   ensuite automatiquement l'onglet **Vérifier**.
 
 > Si une étape échoue, la séquence **s'arrête** et l'application est **laissée
 > arrêtée** (réplicas à 0) pour ne pas redémarrer sur des volumes incohérents. Le
