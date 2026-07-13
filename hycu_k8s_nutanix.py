@@ -116,6 +116,11 @@ DEFAULT_CONFIG = {
     # réelle (le seul filet en cas d'échec d'apply). True = sauvegarder d'abord, abandonner
     # si la sauvegarde échoue.
     "backup_before_restore": True,
+    # Sauvegarde AUTOMATIQUE planifiée : tant que l'outil tourne, sauvegarde la config
+    # PV/PVC de tous les namespaces autorisés par namespace_filter, à intervalle régulier.
+    "auto_backup_enabled": False,
+    "auto_backup_interval_hours": 24,
+    "auto_backup_dest": "",         # vide = backup_root ; sinon dossier commun dédié
     # Restore in-place HYCU : HYCU remplace le DISQUE du VG (nouvel extId) -> le
     # hypervisorAttachedDiskUUIDs du PV devient périmé et le montage échoue
     # ("failed to get symlink for disk ..."). True = après le restore, recréer le PV
@@ -206,7 +211,7 @@ def save_config(updates):
 
 # Version horodatée de la build (format AAAAMMJJ-HHMM). À incrémenter à chaque
 # changement notable du programme ; affichée dans l'en-tête de l'interface.
-VERSION = "20260713-2000"
+VERSION = "20260713-2230"
 
 # Jeton anti-CSRF généré au démarrage, injecté dans la page et exigé sur les POST.
 CSRF_TOKEN = secrets.token_urlsafe(32)
@@ -788,6 +793,22 @@ def _namespace_allowed(ns):
     return (not flt) or (ns in flt)
 
 
+def _allow_namespace(ns, log=None):
+    """Ajoute ns à la liste blanche namespace_filter (si un filtre est actif).
+
+    Un namespace CRÉÉ PAR L'OUTIL (clone d'application vers un nouveau namespace)
+    doit rester utilisable ensuite : sans cet ajout, Vérifier/Restaurer/Sauvegarder
+    refuseraient le namespace fraîchement créé (« Namespace non autorisé »)."""
+    flt = CONFIG.get("namespace_filter") or []
+    if not flt or ns in flt:
+        return
+    save_config({"namespace_filter": flt + [ns]})
+    audit("namespace_filter_auto_add", namespace=ns)
+    if log is not None:
+        log.append(logentry("Namespace « %s » ajouté aux namespaces autorisés" % ns, ok=True,
+                            stdout="Filtre mis à jour (⚙ Réglages) pour que Vérifier/Restaurer acceptent ce namespace."))
+
+
 def action_namespaces():
     data, err = kubectl_json(["get", "ns"])
     if err:
@@ -919,6 +940,100 @@ def action_backup_all(dest=None):
     return {"ok": True, "error": None, "results": results, "root": root,
             "namespaces": len(namespaces), "backed_up": backed_up, "volumes": vol_total,
             "filtered": bool(CONFIG.get("namespace_filter"))}
+
+
+# ------------------------------------------------------------------------------
+# Sauvegarde AUTOMATIQUE planifiée — tant que l'outil tourne, sauvegarde à
+# intervalle régulier la config PV/PVC des namespaces autorisés par le filtre
+# (= action_backup_all, en lecture seule côté cluster). Le dernier passage est
+# persisté sur disque : l'intervalle est respecté même après un redémarrage.
+# ------------------------------------------------------------------------------
+AUTO_BACKUP = {"last_run": 0.0, "last_ok": None, "last_summary": "", "running": False}
+
+
+def _auto_backup_state_path():
+    return os.path.join(CONFIG["backup_root"], ".auto_backup_state.json")
+
+
+def _load_auto_backup_state():
+    try:
+        with open(_auto_backup_state_path(), encoding="utf-8") as f:
+            st = json.load(f)
+        for k in ("last_run", "last_ok", "last_summary"):
+            if k in st:
+                AUTO_BACKUP[k] = st[k]
+    except Exception:
+        pass                        # pas d'état = jamais exécutée
+
+
+def _save_auto_backup_state():
+    try:
+        with open(_auto_backup_state_path(), "w", encoding="utf-8") as f:
+            json.dump({k: AUTO_BACKUP[k] for k in ("last_run", "last_ok", "last_summary")}, f)
+    except OSError:
+        pass                        # best-effort : l'état vit en mémoire de toute façon
+
+
+def _auto_backup_interval_s():
+    try:
+        h = float(CONFIG.get("auto_backup_interval_hours") or 24)
+    except (TypeError, ValueError):
+        h = 24.0
+    return max(0.25, h) * 3600.0    # plancher 15 min (garde-fou anti-boucle)
+
+
+def _auto_backup_due(now):
+    if not CONFIG.get("auto_backup_enabled"):
+        return False
+    last = float(AUTO_BACKUP.get("last_run") or 0)
+    if not last:
+        return True                 # jamais exécutée -> première sauvegarde immédiate
+    return (now - last) >= _auto_backup_interval_s()
+
+
+def _auto_backup_run(now=None, runner=None):
+    """Une exécution de sauvegarde auto (scheduler ou tests). Enregistre le résultat."""
+    now = time.time() if now is None else now
+    runner = runner or action_backup_all
+    AUTO_BACKUP["running"] = True
+    try:
+        r = runner(CONFIG.get("auto_backup_dest") or None)
+        ok = bool(r.get("ok"))
+        summary = ("%d namespace(s) sauvegardé(s), %d volume(s)" % (r.get("backed_up", 0), r.get("volumes", 0))
+                   if ok else (r.get("error") or "échec"))
+        AUTO_BACKUP.update({"last_run": now, "last_ok": ok, "last_summary": summary})
+        _save_auto_backup_state()
+        audit("auto_backup", ok=ok, summary=summary)
+        return ok
+    finally:
+        AUTO_BACKUP["running"] = False
+
+
+def _auto_backup_loop():
+    """Thread démon : vérifie ~toutes les 30 s si une sauvegarde auto est due.
+    Tick sauté si une restauration est en cours (ACTION_LOCK pris) — la sauvegarde
+    repassera au tick suivant."""
+    _load_auto_backup_state()
+    while True:
+        time.sleep(30)
+        try:
+            if _auto_backup_due(time.time()) and not ACTION_LOCK.locked():
+                _auto_backup_run()
+        except Exception as e:
+            print("Sauvegarde auto : erreur inattendue : %s" % e)
+
+
+def action_auto_backup_status():
+    itv = _auto_backup_interval_s()
+    last = float(AUTO_BACKUP.get("last_run") or 0)
+    enabled = bool(CONFIG.get("auto_backup_enabled"))
+    return {"ok": True, "enabled": enabled,
+            "interval_hours": itv / 3600.0,
+            "dest": CONFIG.get("auto_backup_dest") or "",
+            "running": bool(AUTO_BACKUP.get("running")),
+            "last_run": last or None, "last_ok": AUTO_BACKUP.get("last_ok"),
+            "last_summary": AUTO_BACKUP.get("last_summary") or "",
+            "next_due": (last + itv) if (enabled and last) else None}
 
 
 # ------------------------------------------------------------------------------
@@ -1575,6 +1690,7 @@ def action_verify(ns):
     if not _namespace_allowed(ns):
         out["ok"] = False
         out["error"] = "Namespace '%s' non autorisé par la configuration." % ns
+        out["ns_not_allowed"] = True   # l'UI propose « Autoriser ce namespace »
         return out
     pvc_data, err = kubectl_json(["get", "pvc", "-n", ns])
     if err:
@@ -3121,6 +3237,10 @@ def action_clone_app(payload, log=None):
             log.append(_apply_manifest({"apiVersion": "v1", "kind": "Namespace",
                                         "metadata": {"name": target_ns}},
                                        "ns_%s" % target_ns, dry, "Namespace cible « %s »" % target_ns))
+            # Namespace créé par l'outil -> l'ajouter à la liste blanche, sinon les
+            # onglets Vérifier/Restaurer refuseront ce namespace juste après le clone.
+            if not dry and log[-1].get("ok"):
+                _allow_namespace(target_ns, log)
         # Dépendances (Secrets/ConfigMaps/SA/Services) AVANT les workloads. On NE
         # remplace PAS une dépendance déjà présente dans la cible (ne rien écraser).
         for o in dep_manifests:
@@ -3282,6 +3402,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._json(action_get_config())
             if path == "/api/conn_status":
                 return self._json(action_conn_status())
+            if path == "/api/auto_backup":
+                return self._json(action_auto_backup_status())
             if path == "/api/op_status":
                 return self._json(action_op_status(qs.get("id", "")))
             if path == "/api/nutanix/vgs":
@@ -3770,6 +3892,22 @@ HTML = r"""<!DOCTYPE html>
       <div id="bkOut"></div>
     </div>
 
+    <div class="card">
+      <h3><span class="step-no">⏱</span>Sauvegarde automatique (planifiée)</h3>
+      <p class="sub">Sauvegarde régulièrement la config PV/PVC de <b>tous les namespaces autorisés par le filtre</b>
+        (tous si aucun filtre) — tant que l'outil est lancé. Au démarrage, une sauvegarde en retard est rattrapée.</p>
+      <div class="row">
+        <div style="flex:none"><label class="fld">Activer</label>
+          <label class="switch"><input type="checkbox" id="abEnabled"><span class="slider"></span></label></div>
+        <div style="flex:none;width:150px"><label class="fld">Intervalle (heures)</label>
+          <input type="number" id="abInterval" min="1" step="1" value="24"></div>
+        <div><label class="fld">Dossier de destination (optionnel)</label>
+          <input type="text" id="abDest" placeholder="Vide = hycu-backups/"></div>
+        <div style="flex:none;align-self:flex-end"><button class="btn" id="abSave">Enregistrer</button></div>
+      </div>
+      <div class="hint" id="abStatus" style="margin-top:8px"></div>
+    </div>
+
     <div class="card" id="bkProtectCard">
       <h3><span class="step-no">2</span>Protéger les données dans HYCU</h3>
       <p class="sub">L'export ci-dessus ne sauvegarde que les <b>manifestes</b> (la « recette » du restore).
@@ -4229,6 +4367,7 @@ async function initApp(){
   if(n.error){["#bkNs","#rsNs","#vfNs"].forEach(id=>$(id).innerHTML="<option>kubectl ?</option>");}
   applyPrefs();                               // derniers choix de CE navigateur (ns, mode, dossiers)
   loadConfig();
+  loadAutoBackup();
   await loadConnStatus();                     // ATTENDRE que `conn` soit prêt (sinon la popup
   loadPvcs();                                 // de déverrouillage ne s'affichait jamais)
   maybePromptUnlock();                        // coffre présent + rien de connecté -> déverrouillage
@@ -4383,6 +4522,27 @@ function dlBackupLink(dir, root, label){
   const u="/api/backup/download?path="+encodeURIComponent(dir)+(root?("&root="+encodeURIComponent(root)):"");
   return `<a class="btn ghost" href="${u}" download style="padding:2px 8px;font-size:12px;text-decoration:none;margin-left:6px">⬇ ${esc(label||'Télécharger (.zip)')}</a>`;
 }
+// ----- Sauvegarde automatique planifiée (onglet 1) -----
+async function loadAutoBackup(){
+  const s=await get("/api/auto_backup");
+  if(!s || !s.ok) return;
+  $("#abEnabled").checked=!!s.enabled;
+  $("#abInterval").value=Math.round(s.interval_hours||24);
+  if(!$("#abDest").value) $("#abDest").value=s.dest||"";
+  let txt = s.enabled? "Activée — toutes les "+Math.round(s.interval_hours||24)+" h." : "Désactivée.";
+  if(s.running) txt+=" Sauvegarde en cours…";
+  if(s.last_run) txt+=" Dernière : "+new Date(s.last_run*1000).toLocaleString()+" "+(s.last_ok?"✓":"✕")+" "+(s.last_summary||"");
+  if(s.enabled) txt+= s.next_due? (" · Prochaine : "+new Date(s.next_due*1000).toLocaleString()) : " · Première exécution dans moins d'une minute.";
+  $("#abStatus").textContent=txt;
+}
+$("#abSave").onclick=async()=>{
+  const cfg={auto_backup_enabled:$("#abEnabled").checked,
+    auto_backup_interval_hours:Math.max(1,parseInt($("#abInterval").value)||24),
+    auto_backup_dest:$("#abDest").value.trim()};
+  const r=await post("/api/config",{config:cfg});
+  $("#abStatus").textContent = r.ok? "Enregistré." : ("Erreur : "+(r.error||""));
+  setTimeout(loadAutoBackup, 700);
+};
 $("#bkRun").onclick=async()=>{
   const ns=$("#bkNs").value, b=$("#bkRun"), dest=$("#bkDest").value.trim();
   b.disabled=true; b.innerHTML='<span class="spin"></span>Sauvegarde…';
@@ -5028,7 +5188,25 @@ $("#rsGo").onclick=async()=>{
 async function runVerify(){
   const ns=$("#vfNs").value;
   const r=await get("/api/verify?ns="+encodeURIComponent(ns));
-  if(r.error){$("#vfOut").innerHTML=errBox(r.error);return false;}
+  if(r.error){
+    let html=errBox(r.error);
+    // Erreur actionnable : namespace hors liste blanche (ex. namespace créé par un
+    // clone AVANT que l'ajout automatique n'existe) -> proposer l'ajout en un clic.
+    if(r.ns_not_allowed) html+=`<div style="margin-top:8px"><button class="btn" id="vfAllowNs">Autoriser « ${esc(ns)} » et réessayer</button></div>`;
+    $("#vfOut").innerHTML=html;
+    const ab=$("#vfAllowNs");
+    if(ab) ab.onclick=async()=>{
+      const f=await get("/api/ns_filter");
+      const rr=await post("/api/ns_filter",{filter:(f.filter||[]).concat([ns])});
+      if(!rr.ok){ $("#vfOut").innerHTML=errBox(rr.error||"Mise à jour du filtre impossible."); return; }
+      const n=await get("/api/namespaces");            // recharger les listes déroulantes
+      const opts=(n.namespaces||[]).map(x=>`<option>${esc(x)}</option>`).join("");
+      ["#bkNs","#rsNs","#vfNs"].forEach(id=>$(id).innerHTML=opts||"<option>—</option>");
+      $("#vfNs").value=ns; state.ns=ns; applyGlobalNs();
+      runVerify();
+    };
+    return false;
+  }
   const pvcs=r.pvcs.map(p=>`<li class="logline"><span>${badge(p.phase)} <b>${esc(p.name)}</b>
      <span class="hint">→ ${esc(p.pv||'—')}</span></span></li>`).join("")||'<div class="hint">Aucun PVC.</div>';
   let allReady=r.pods.length>0;
@@ -6324,6 +6502,28 @@ I18N_EN += [
      "HYCU job not identified — fetch the reference via the Advanced section once the clone completes."),
     ("✓ VG cloné — référence <code>", "✓ VG cloned — reference <code>"),
     ("</code> remplie.", "</code> filled."),
+    # Namespace créé par un clone : ajout automatique au filtre + bouton de secours.
+    (" » ajouté aux namespaces autorisés", " » added to the allowed namespaces"),
+    ("Filtre mis à jour (⚙ Réglages) pour que Vérifier/Restaurer acceptent ce namespace.",
+     "Filter updated (⚙ Settings) so Verify/Restore accept this namespace."),
+    ("Autoriser « ", "Allow « "),
+    (" » et réessayer", " » and retry"),
+    ("Mise à jour du filtre impossible.", "Could not update the filter."),
+    # Sauvegarde automatique planifiée (onglet 1).
+    ("Sauvegarde automatique (planifiée)", "Automatic backup (scheduled)"),
+    ("Sauvegarde régulièrement la config PV/PVC de <b>tous les namespaces autorisés par le filtre</b>",
+     "Regularly backs up the PV/PVC config of <b>all namespaces allowed by the filter</b>"),
+    ("(tous si aucun filtre) — tant que l'outil est lancé. Au démarrage, une sauvegarde en retard est rattrapée.",
+     "(all if no filter) — while the tool is running. On startup, an overdue backup is caught up."),
+    ("Activer</label>", "Enable</label>"),
+    ("Intervalle (heures)", "Interval (hours)"),
+    ('"Activée — toutes les "', '"Enabled — every "'),
+    ('"Désactivée."', '"Disabled."'),
+    ("Sauvegarde en cours…", "Backup in progress…"),
+    ('" Dernière : "', '" Last: "'),
+    ('" · Prochaine : "', '" · Next: "'),
+    ('" · Première exécution dans moins d\'une minute."', '" · First run in less than a minute."'),
+    (" namespace(s) sauvegardé(s), ", " namespace(s) backed up, "),
 ]
 
 _I18N_SORTED = None          # (fr, en) triés du plus long au plus court
@@ -6357,7 +6557,7 @@ def _html_for_lang(lang):
 # Clés JSON dont la valeur est du texte destiné à l'écran (jamais des données).
 _TR_TEXT_KEYS = frozenset(("error", "warning", "warn", "label", "message", "hint",
                            "detail", "stdout", "stderr", "cmd",
-                           "planned_steps", "warnings"))
+                           "planned_steps", "warnings", "last_summary"))
 
 
 def _tr_json_en(obj, key=None):
@@ -6415,6 +6615,9 @@ def main():
     print("  Configuration : %s" % CONFIG_PATH)
     print("  Astuce : au 1er affichage, faites Ctrl+Shift+R pour vider le cache.")
     print("=" * 64)
+    # Sauvegarde automatique planifiée : le thread tourne en permanence et ne fait
+    # quelque chose que si auto_backup_enabled est vrai (activable sans redémarrer).
+    threading.Thread(target=_auto_backup_loop, daemon=True).start()
     if CONFIG.get("open_browser"):
         try:
             threading.Timer(1.0, lambda: webbrowser.open(url)).start()

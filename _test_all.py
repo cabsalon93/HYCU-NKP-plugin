@@ -22,6 +22,8 @@ SUITES = [
     "_test_fixes",           # correctifs revue : V2 reprise, V4 redirection/schéma, V7/V8 clone, V9 tri disques
     "_test_download",        # téléchargement .zip d'une sauvegarde + garde anti-traversée
     "_test_session_lock",    # identifiants liés à la session navigateur (re-déverrouillage exigé)
+    "_test_ns_autoadd",      # namespace créé par un clone -> ajouté au filtre automatiquement
+    "_test_auto_backup",     # sauvegarde automatique planifiée (échéance, état, statut)
 ]
 
 
