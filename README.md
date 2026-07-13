@@ -34,59 +34,86 @@ an **IQN** (legacy iSCSI clusters); the tool derives the `volumeHandle` from it.
   UUID** (suffix of the `volumeHandle` `NutanixVolumes-<uuid>` and of the
   `ntnx-k8s-<uuid>` target), or the **IQN** on legacy iSCSI clusters.
 
-## 2. Installation & launch
+## 2. Installation & launch — two ways to run the tool
 
-**Python mode** (default):
+|  | **Option A — Python mode** | **Option B — Kubernetes application** |
+|---|---|---|
+| Where it runs | On your workstation | Inside the cluster (Deployment) |
+| Prerequisites | Python 3.7+ and `kubectl` on the workstation | Admin rights on a cluster namespace |
+| Best for | Quick trial, single operator | Team tool, always on (scheduled auto-backup) |
+| Data | `./hycu-backups/` next to the script | `hycu-data` PVC (persistent) |
+
+### Option A — Python mode (on your workstation)
+
+1. Prerequisites: **Python 3.7+** (stdlib only — no library to install) and
+   **`kubectl`** configured on the right context.
+2. Grab the `hycu_k8s_nutanix.py` file, then run:
+   ```bash
+   python3 hycu_k8s_nutanix.py
+   ```
+3. The browser opens at <http://127.0.0.1:8765> (otherwise, open it manually).
+   `Ctrl+C` to stop.
+
+Backups and the audit log are written to `./hycu-backups/`, the configuration to
+`hycu_config.json` (next to the script).
+
+> **Workstation without Python**: the same container image runs with **Docker** —
+> `docker compose -f deploy/docker-compose.yml up` then <http://127.0.0.1:8765>.
+> Guides: [docs/docker.md](docs/docker.md) · [docs/docker-demarrage.md](docs/docker-demarrage.md).
+
+### Option B — Kubernetes application (deployed in the cluster)
+
+The **same image** (`ghcr.io/cabsalon93/hycu-nkp-plugin:latest`, public) packages
+the script **and** `kubectl`: nothing to install on workstations, the tool runs
+continuously inside the cluster. Deployment in **5 steps** — detailed
+step-by-step guide: **[docs/kubernetes-demarrage.md](docs/kubernetes-demarrage.md)**.
+
+**Step 1 — Namespace + RBAC identity.** Creates the `hycu-operator`
+ServiceAccount and its rights ([deploy/k8s/rbac.yaml](deploy/k8s/rbac.yaml)):
 ```bash
-python3 hycu_k8s_nutanix.py
+kubectl create namespace hycu
+kubectl apply -f deploy/k8s/rbac.yaml
 ```
 
-The browser opens at <http://127.0.0.1:8765> (otherwise, open it manually).
-`Ctrl+C` to stop. Backups and the audit log are written to `./hycu-backups/`.
-
-**Container mode** (Docker or Kubernetes): the **same image** packages this
-script and bundles `kubectl`, for workstations without Python. Behaviour is
-driven by environment variables (same code, two packagings). Guides: overview
-**[docs/docker.md](docs/docker.md)** · getting started
-**[Docker](docs/docker-demarrage.md)** · getting started
-**[Kubernetes](docs/kubernetes-demarrage.md)**.
-```bash
-docker compose -f deploy/docker-compose.yml up      # then http://127.0.0.1:8765
-```
-
-#### Providing the kubeconfig in Kubernetes mode
-
-In the image, `kubectl` is bundled and reads `KUBECONFIG=/home/app/.kube/config`:
-there is therefore **no command-line option** to pass. The kubeconfig is provided
-via a **Secret** mounted at that location.
-
-Use a **self-contained** kubeconfig (ServiceAccount token + CA, **without**
-`aws`/`gcloud`/`oidc`-style exec-plugins, which do not work inside the
+**Step 2 — Build a self-contained kubeconfig.** ServiceAccount token + CA,
+**without** `aws`/`gcloud`/`oidc`-style exec-plugins (they do not work inside a
 container). The script
-[deploy/k8s/make-kubeconfig.sh](deploy/k8s/make-kubeconfig.sh) builds one from
-the `hycu-operator` ServiceAccount created by
-[deploy/k8s/rbac.yaml](deploy/k8s/rbac.yaml).
+[deploy/k8s/make-kubeconfig.sh](deploy/k8s/make-kubeconfig.sh) writes `./kubeconfig`:
+```bash
+./deploy/k8s/make-kubeconfig.sh          # local cluster; or pass a remote API URL
+```
 
-Then create the Secret (name and namespace expected by
-[deploy/k8s/hycu.yaml](deploy/k8s/hycu.yaml)):
-
+**Step 3 — Provide that kubeconfig via a Secret.** In the image, `kubectl` reads
+`KUBECONFIG=/home/app/.kube/config`: the Secret is mounted there, the **key**
+must be `config`:
 ```bash
 kubectl -n hycu create secret generic hycu-kubeconfig --from-file=config=./kubeconfig
 ```
-
-- `-n hycu`: namespace where the tool runs.
-- `hycu-kubeconfig`: name of the Secret referenced by the deployment.
-- `--from-file=config=./kubeconfig`: the **key** must be `config` (mounted as
-  `/home/app/.kube/config`); `./kubeconfig` is your local file.
-
-To **replace** an existing kubeconfig, add `--dry-run=client -o yaml | kubectl apply -f -`:
-
+To **replace** an existing kubeconfig:
 ```bash
 kubectl -n hycu create secret generic hycu-kubeconfig \
   --from-file=config=./kubeconfig --dry-run=client -o yaml | kubectl apply -f -
 ```
 
-Full guide: **[docs/kubernetes-demarrage.md](docs/kubernetes-demarrage.md)**.
+**Step 4 — Deploy the tool.** PVC + Deployment + Service
+([deploy/k8s/hycu.yaml](deploy/k8s/hycu.yaml)), image pulled automatically from
+ghcr.io — nothing to build:
+```bash
+kubectl apply -f https://raw.githubusercontent.com/cabsalon93/HYCU-NKP-plugin/main/deploy/k8s/hycu.yaml
+# or, from a local clone of the repo:
+kubectl apply -f deploy/k8s/hycu.yaml
+```
+
+**Step 5 — Access the UI.** No Ingress (by design: the server only accepts the
+local loopback); each operator opens their own tunnel:
+```bash
+kubectl -n hycu port-forward svc/hycu 8765:8765      # then http://127.0.0.1:8765
+```
+
+> ⚠ **1 replica mandatory** (global state + ReadWriteOnce PVC) — never scale.
+> Backups live in the `hycu-data` PVC. The security boundary is the **RBAC of
+> the `hycu` namespace**: anyone who can `port-forward`/`exec` to the Pod is a
+> full operator.
 
 **First launch**: if `hycu_config.json` does not exist yet, a **configuration
 wizard** is shown automatically (kubectl binary, allowed contexts/namespaces,
