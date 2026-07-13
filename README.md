@@ -156,9 +156,15 @@ net.
 > message states the failing step. Fix, then **relaunch**: the original target
 > replicas are remembered (never restarted at 0).
 
+> A floating **“next action” bar** guides you through the flow (fill the VG
+> references → preview → launch) without having to scroll the page, and the
+> step indicator stays visible while scrolling.
+
 ### Tab 3 — Verify
-Confirms the PVCs are **Bound** and the pods are running. The **Auto-track**
-button refreshes up to 10 times.
+Confirms the PVCs are **Bound** and the pods are running. **Auto-track**
+refreshes every ~3 s until the state is stable (all PVCs Bound, pods Running;
+~10 min cap — click again to stop). After a **real** restore or clone, the tool
+switches to this tab automatically and starts tracking.
 
 ## 4. Security
 

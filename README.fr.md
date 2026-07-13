@@ -154,9 +154,16 @@ de sécurité.
 > message indique l'étape en cause. Corrigez puis **relancez** : les réplicas cibles
 > d'origine sont mémorisés (jamais redémarrés à 0).
 
+> Une barre **« action suivante »** flottante guide le parcours (remplir les
+> références VG → prévisualiser → lancer) sans avoir à faire défiler la page,
+> et l'indicateur d'étapes reste visible pendant le défilement.
+
 ### Onglet 3 — Vérifier
-Confirme que les PVC sont **Bound** et que les pods tournent. Le bouton
-**Suivi auto** rafraîchit jusqu'à 10 fois.
+Confirme que les PVC sont **Bound** et que les pods tournent. Le **Suivi auto**
+rafraîchit toutes les ~3 s jusqu'à l'état stable (tous les PVC Bound, pods
+Running ; plafond ~10 min — recliquez pour arrêter). Après une restauration ou
+un clone **réel**, l'outil bascule automatiquement sur cet onglet et démarre le
+suivi.
 
 ## 4. Sécurité
 

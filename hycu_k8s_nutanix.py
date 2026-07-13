@@ -206,7 +206,7 @@ def save_config(updates):
 
 # Version horodatée de la build (format AAAAMMJJ-HHMM). À incrémenter à chaque
 # changement notable du programme ; affichée dans l'en-tête de l'interface.
-VERSION = "20260713-1030"
+VERSION = "20260713-1400"
 
 # Jeton anti-CSRF généré au démarrage, injecté dans la page et exigé sur les POST.
 CSRF_TOKEN = secrets.token_urlsafe(32)
@@ -3484,11 +3484,29 @@ HTML = r"""<!DOCTYPE html>
   /* Focus clavier visible partout (accessibilité). */
   button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible,[tabindex]:focus-visible{
     outline:3px solid var(--accent);outline-offset:2px;border-radius:4px}
-  /* Stepper (fil conducteur du parcours Restaurer). */
-  .stepper{display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap}
-  .stepper .st{font-size:12px;font-weight:600;color:var(--muted);background:#EEF0F6;border-radius:20px;padding:5px 12px}
+  /* Stepper (fil conducteur du parcours Restaurer) : collant sous le bandeau
+     simulation pour rester visible malgré la longueur de la page, et cliquable
+     (chaque pastille fait défiler vers sa carte). */
+  .stepper{display:flex;gap:8px;flex-wrap:wrap;position:sticky;top:54px;z-index:35;
+           background:var(--paper);padding:8px 0 10px;margin:-8px 0 8px}
+  .stepper .st{font-size:12px;font-weight:600;color:var(--muted);background:#EEF0F6;border-radius:20px;
+               padding:5px 12px;cursor:pointer;border:1px solid transparent;user-select:none}
+  .stepper .st:hover{border-color:var(--teal)}
   .stepper .st.on{background:var(--teal);color:#fff}
   .stepper .st.done{background:#E6F0CC;color:var(--good)}
+  /* Barre « action suivante » du parcours Restaurer : flottante en bas de fenêtre,
+     pour que l'étape suivante (prévisualiser / lancer) reste visible sans scroller. */
+  .nextbar{position:fixed;left:50%;transform:translateX(-50%);bottom:16px;z-index:60;display:none;
+           align-items:center;gap:12px;max-width:92vw;background:var(--ink);color:#fff;
+           border-radius:12px;padding:10px 16px;font-size:13px;box-shadow:0 6px 24px rgba(27,12,51,.35)}
+  .nextbar.show{display:flex}
+  .nextbar .btn{margin:0}
+  @keyframes pulseGlow{0%{box-shadow:0 0 0 0 rgba(173,255,0,.7)}100%{box-shadow:0 0 0 14px rgba(173,255,0,0)}}
+  .pulse{animation:pulseGlow 1s ease-out 3}
+  /* Pastilles d'état des connexions dans l'en-tête (cliquables -> onglet Connexions). */
+  .hdrconn{display:inline-flex;gap:10px;margin-right:12px;cursor:pointer;vertical-align:1px}
+  .hdrconn .hc{font-size:10px;font-weight:700;letter-spacing:.5px;color:#B8B4FC}
+  .hdrconn:hover .hc{color:#fff}
   .ctx b{color:#fff}
   .ctx .bad{color:#f3b0a8}
   .wrap{max-width:980px;margin:0 auto;padding:22px}
@@ -3712,7 +3730,7 @@ HTML = r"""<!DOCTYPE html>
     __LOGO__
     <h1><span class="wm">HYCU</span>Protection Kubernetes sur Nutanix<small>Sauvegarde &amp; restauration guidées · Nutanix</small></h1>
   </div>
-  <div class="ctx">Contexte kubectl : <b id="ctx">…</b><span id="ctxWarn"></span> · <span class="ver" title="Version de la build">v:__VERSION__</span><button id="langBtn" class="langbtn" type="button" title="Afficher l'interface en anglais">EN</button></div>
+  <div class="ctx"><span id="hdrConn" class="hdrconn" title="État des connexions — cliquer pour ouvrir l'onglet Connexions"></span>Contexte kubectl : <b id="ctx">…</b><span id="ctxWarn"></span> · <span class="ver" title="Version de la build">v:__VERSION__</span><button id="langBtn" class="langbtn" type="button" title="Afficher l'interface en anglais">EN</button></div>
 </header>
 
 <div class="wrap">
@@ -3865,6 +3883,7 @@ HTML = r"""<!DOCTYPE html>
       </div>
       <div id="rsLog"></div>
     </div>
+    <div class="nextbar" id="rsNextBar"><span id="rsNextTxt"></span><button class="btn" id="rsNextBtn"></button></div>
   </section>
 
   <!-- ===================== VÉRIFICATION ===================== -->
@@ -3877,7 +3896,7 @@ HTML = r"""<!DOCTYPE html>
         <div><select id="vfNs"></select></div>
         <div style="flex:none"><button class="btn ghost nsEdit" title="Filtrer la liste des namespaces">✎ Filtrer</button></div>
         <div style="flex:none"><button class="btn" id="vfRun">Vérifier</button></div>
-        <div style="flex:none"><button class="btn ghost" id="vfAuto" title="Rafraîchit la vérification toutes les ~3 s (jusqu'à 10 fois) et s'arrête dès que tous les PVC sont Bound et les pods Running">Rafraîchir auto (~30 s)</button></div>
+        <div style="flex:none"><button class="btn ghost" id="vfAuto" title="Rafraîchit la vérification toutes les ~3 s et s'arrête dès que tous les PVC sont Bound et les pods Running (10 min max) ; recliquez pour arrêter">Suivi auto (jusqu'à stable)</button></div>
       </div>
       <div id="vfOut"></div>
     </div>
@@ -4049,23 +4068,84 @@ function errBox(raw){
   return `<div class="err">${h?`<b>${esc(h)}</b><div class="hint" style="margin-top:4px">${esc(raw||"")}</div>`:esc(raw||"erreur")}</div>`;
 }
 
+// Préférences mémorisées PAR NAVIGATEUR (localStorage) : namespace, type d'opération,
+// dossiers. Confort uniquement — jamais d'identifiant ni de secret ici.
+const PREFS_KEY="hycu_prefs";
+function prefs(){ try{ return JSON.parse(localStorage.getItem(PREFS_KEY)||"{}"); }catch(e){ return {}; } }
+function savePref(k,v){ try{ const p=prefs(); p[k]=v; localStorage.setItem(PREFS_KEY,JSON.stringify(p)); }catch(e){} }
+function applyPrefs(){
+  const p=prefs();
+  if(p.bkDest) $("#bkDest").value=p.bkDest;
+  if(p.backupRoot) $("#rsBackupRoot").value=p.backupRoot;
+  if(p.customDir){ $("#rsCustomDir").checked=true; $("#rsCustomDirWrap").style.display="block"; }
+  if(p.mode==="inplace"){ state.mode="inplace";
+    document.querySelectorAll("#rsMode button").forEach(x=>x.classList.toggle("on",x.dataset.mode==="inplace"));
+    $("#rsCloneSubWrap").style.display="none"; }
+  if(p.ns && [...$("#bkNs").options].some(o=>o.value===p.ns)){ state.ns=p.ns; applyGlobalNs(); }
+}
+
 // Onglets
 // Namespace GLOBAL synchronisé entre les 3 onglets (fluidité : un seul choix).
 function applyGlobalNs(){ if(!state.ns) return; ["#bkNs","#rsNs","#vfNs"].forEach(id=>{ const e=$(id); if(e && e.value!==state.ns) e.value=state.ns; }); }
 // Stepper du parcours Restaurer : surligne l'étape courante (1 Volumes, 2 Configurer, 3 Lancer).
 function setRsStep(n){ document.querySelectorAll("#rsStepper .st").forEach(e=>{ const k=+e.dataset.st;
   e.classList.toggle("on",k===n); e.classList.toggle("done",k<n); }); }
+// Pastilles cliquables du stepper : faire défiler vers la carte de l'étape (si affichée).
+document.querySelectorAll("#rsStepper .st").forEach(s=>s.onclick=()=>{
+  const n=+s.dataset.st;
+  const el = n===1? document.querySelector("#tab-restore .card") : (n===2? $("#rsConfig") : $("#rsPlan"));
+  if(el && el.style.display!=="none") el.scrollIntoView({behavior:"smooth",block:"start"});
+});
 const navBtns=[...document.querySelectorAll("nav button")];
-navBtns.forEach(b=>b.onclick=()=>{
-  navBtns.forEach(x=>{ x.classList.remove("on"); x.setAttribute("aria-selected","false"); });
-  b.classList.add("on"); b.setAttribute("aria-selected","true");
-  const tab=b.dataset.tab;
+// Changement d'onglet — utilisé par les clics ET par les bascules programmées
+// (ex. ouverture automatique de Vérifier après une restauration réelle).
+function switchTab(tab){
+  navBtns.forEach(x=>{ const on=x.dataset.tab===tab; x.classList.toggle("on",on); x.setAttribute("aria-selected",on?"true":"false"); });
   ["backup","restore","verify","connect","settings"].forEach(t=>$("#tab-"+t).style.display="none");
   $("#tab-"+tab).style.display="block";
   applyGlobalNs();                                   // l'onglet ouvert reflète le namespace courant
   if(tab==="restore" && state.ns && state.pvcNs!==state.ns) loadPvcs();   // recharger si le ns a changé ailleurs
   if(tab==="backup" && bkMatchNs && bkMatchNs!==state.ns) clearBkProtect();
-});
+  updateNextBar();                                   // la barre « action suivante » ne vit que dans Restaurer
+}
+navBtns.forEach(b=>b.onclick=()=>switchTab(b.dataset.tab));
+$("#hdrConn").onclick=()=>switchTab("connect");
+
+// ----- Barre « action suivante » du parcours Restaurer (anti-scroll) -----
+// La page Restaurer est longue : cette barre flottante rend l'étape suivante
+// visible en permanence (références à remplir -> prévisualiser -> lancer),
+// sans que l'opérateur ait à chercher le bouton en bas de page.
+function rsNext(txt, btnLabel, fn){
+  $("#rsNextTxt").innerHTML=txt;
+  const b=$("#rsNextBtn"); b.textContent=btnLabel; b.onclick=fn;
+  $("#rsNextBar").classList.add("show");
+}
+function hideNextBar(){ $("#rsNextBar").classList.remove("show"); }
+function scrollPulse(el){ if(!el) return; el.scrollIntoView({behavior:"smooth",block:"center"});
+  el.classList.remove("pulse"); void el.offsetWidth; el.classList.add("pulse"); }
+function updateNextBar(){
+  if($("#tab-restore").style.display==="none") return hideNextBar();
+  const chks=[...document.querySelectorAll(".rsChk:checked")];
+  if(!chks.length) return hideNextBar();
+  const hyOn = conn.hycu && conn.hycu.connected;
+  // Étape 3 : plan affiché et lancement possible -> guider vers le bouton Lancer.
+  if($("#rsPlan").style.display!=="none" && !$("#rsGo").disabled){
+    return rsNext("Plan prêt — dernière étape :", $("#rsGo").textContent, ()=>scrollPulse($("#rsGo")));
+  }
+  // Restauration sur place orchestrée : compte des points sélectionnés.
+  if(state.mode==="inplace" && hyOn){
+    const ready=chks.map(c=>c.dataset.pvc).filter(p=>rsInplaceSel[p]).length;
+    if(ready===chks.length)
+      return rsNext("Tous les points de restauration sont sélectionnés.","Aller au lancement",()=>scrollPulse($("#rsInplaceRun")));
+    return rsNext(ready+" / "+chks.length+" point(s) de restauration sélectionné(s).","Voir les volumes",()=>scrollPulse($("#rsVolCfgs")));
+  }
+  // Clone / flux manuel : compte des références VG remplies.
+  const items=collectItems();
+  const filled=items.filter(i=>(i.new_ref||"").trim()).length;
+  if(filled===items.length)
+    return rsNext("Toutes les références VG sont remplies.","Prévisualiser le plan",()=>$("#rsPreview").click());
+  return rsNext(filled+" / "+items.length+" référence(s) VG remplie(s).","Voir les volumes",()=>scrollPulse($("#rsVolCfgs")));
+}
 // Navigation clavier des onglets (flèches gauche/droite + Home/Fin).
 document.querySelector("nav").addEventListener("keydown",e=>{
   const i=navBtns.indexOf(document.activeElement); if(i<0) return;
@@ -4147,6 +4227,7 @@ async function initApp(){
   const opts = (n.namespaces||[]).map(x=>`<option>${esc(x)}</option>`).join("");
   ["#bkNs","#rsNs","#vfNs"].forEach(id=>$(id).innerHTML = opts || "<option>—</option>");
   if(n.error){["#bkNs","#rsNs","#vfNs"].forEach(id=>$(id).innerHTML="<option>kubectl ?</option>");}
+  applyPrefs();                               // derniers choix de CE navigateur (ns, mode, dossiers)
   loadConfig();
   await loadConnStatus();                     // ATTENDRE que `conn` soit prêt (sinon la popup
   loadPvcs();                                 // de déverrouillage ne s'affichait jamais)
@@ -4349,8 +4430,9 @@ function goReprotect(ns){
   window.scrollTo({top:0, behavior:"smooth"});
   setTimeout(()=>$("#bkMatch").click(), 50);   // lance l'analyse + affiche le formulaire de protection
 }
-$("#bkNs").onchange=()=>{ state.ns=$("#bkNs").value; applyGlobalNs(); clearBkProtect(); };  // ns global + invalide l'analyse
-$("#vfNs").onchange=()=>{ state.ns=$("#vfNs").value; applyGlobalNs(); };
+$("#bkNs").onchange=()=>{ state.ns=$("#bkNs").value; savePref("ns",state.ns); applyGlobalNs(); clearBkProtect(); };  // ns global + invalide l'analyse
+$("#vfNs").onchange=()=>{ state.ns=$("#vfNs").value; savePref("ns",state.ns); applyGlobalNs(); };
+$("#bkDest").addEventListener("change",()=>savePref("bkDest",$("#bkDest").value.trim()));
 $("#bkMatch").onclick=async()=>{
   const ns=$("#bkNs").value; clearBkProtect();
   $("#bkMatchOut").innerHTML='<div class="hint">Analyse en cours…</div>';
@@ -4420,9 +4502,9 @@ $("#bkProtect").onclick=async()=>{
 };
 
 // --------- Restauration ---------
-$("#rsNs").onchange=()=>{ state.ns=$("#rsNs").value; applyGlobalNs(); loadPvcs(); };
-$("#rsCustomDir").onchange=()=>{ $("#rsCustomDirWrap").style.display=$("#rsCustomDir").checked?"block":"none"; if($("#rsNs").value) loadPvcs(); };
-$("#rsBackupRoot").addEventListener("change",()=>{ if($("#rsCustomDir").checked && $("#rsNs").value) loadPvcs(); });
+$("#rsNs").onchange=()=>{ state.ns=$("#rsNs").value; savePref("ns",state.ns); applyGlobalNs(); loadPvcs(); };
+$("#rsCustomDir").onchange=()=>{ savePref("customDir",$("#rsCustomDir").checked); $("#rsCustomDirWrap").style.display=$("#rsCustomDir").checked?"block":"none"; if($("#rsNs").value) loadPvcs(); };
+$("#rsBackupRoot").addEventListener("change",()=>{ savePref("backupRoot",$("#rsBackupRoot").value.trim()); if($("#rsCustomDir").checked && $("#rsNs").value) loadPvcs(); });
 $("#rsBackupSel").onchange=applyBackupSelection;   // changer de sauvegarde de config sans re-fetch
 let rsBackups = [];   // sauvegardes de config du namespace courant (la plus récente en premier)
 async function loadPvcs(){
@@ -4470,6 +4552,7 @@ function renderRsPvcs(pvcs, src){
      : `<div class="hint">Aucun PVC. Sauvegardez d'abord ce namespace dans l'onglet 1.</div>`;
   document.querySelectorAll(".rsChk").forEach(c=>c.onchange=rebuildVolCfgs);
   $("#rsConfig").style.display="none"; $("#rsPlan").style.display="none"; setRsStep(1);
+  updateNextBar();
 }
 // Horodatage epoch en secondes (≈ `date -u +%s`) : sert de suffixe UNIQUE à chaque clone,
 // pour ne JAMAIS réutiliser un nom déjà créé (sinon : « le PVC/VG …-0000 existe déjà » au
@@ -4537,6 +4620,9 @@ function rebuildVolCfgs(){
       : "<b>Clone (rattacher) — flux manuel :</b> clonez le VG dans HYCU, collez la référence (UUID) par volume, puis « <b>Prévisualiser le plan</b> » → « <b>Lancer le clone</b> ». <span class='hint'>Connectez HYCU pour automatiser.</span>";
   }
   $("#rsFlowGuide").innerHTML = guide;
+  // Barre « action suivante » : suivre la saisie des références en direct.
+  document.querySelectorAll(".rsRef").forEach(t=>t.addEventListener("input",updateNextBar));
+  updateNextBar();
 }
 let rsHyMatch=null;   // cache de la correspondance PVC↔VG HYCU pour le namespace courant
 async function openHyOrch(pvc){
@@ -4605,6 +4691,7 @@ async function hyOrchFillRef(pvc, vgName){
   const ta=document.querySelector(`.rsRef[data-pvc="${CSS.escape(pvc)}"]`);
   if(ta){ ta.value=ref; const d=ta.closest("details.rsAdv"); if(d) d.open=true; }   // déplier pour montrer la réf remplie
   out.innerHTML+=`<div class="note">Référence du VG (UUID <code>${esc(ref)}</code>) remplie automatiquement depuis « ${esc(vg.name||'')} ». Cliquez « Prévisualiser le plan ».</div>`;
+  updateNextBar();   // si toutes les références sont remplies, la barre propose la prévisualisation
 }
 // --------- Orchestration RESTAURATION SUR PLACE (arrêt -> restore in-place -> redémarrage) ---------
 let rsInplaceSel={};   // {pvc: {source_vg_uuid, restore_point_id, vg_name}}
@@ -4646,6 +4733,7 @@ function updateInplaceRunBtn(){
   $("#rsInplaceHint").textContent = ready.length
     ? (ready.length+" / "+chosen.length+" volume(s) prêt(s)"+(dry()?" · simulation":" · MODE RÉEL"))
     : "Sélectionnez un point de restauration par volume.";
+  updateNextBar();
 }
 $("#dry").addEventListener("change",()=>{ if($("#rsInplaceRunWrap").style.display!=="none") updateInplaceRunBtn(); });
 $("#rsInplaceRun").onclick=async()=>{
@@ -4663,6 +4751,7 @@ $("#rsInplaceRun").onclick=async()=>{
     if(!res) return;
     if(typeof res==="string") confirmedCtx=res;
   }
+  hideNextBar();   // pas de « prochaine action » pendant l'exécution
   const b=$("#rsInplaceRun"); b.disabled=true; b.innerHTML='<span class="spin"></span>Orchestration…';
   $("#rsInplaceLog").innerHTML='<div class="hint"><span class="spin"></span> Démarrage…</div>';
   const ipBody={namespace:(rsHyMatch?rsHyMatch.ns:$("#rsNs").value), items, dry:dry()};
@@ -4676,10 +4765,14 @@ $("#rsInplaceRun").onclick=async()=>{
     :(r.aborted?'<div class="err"><b>Séquence interrompue</b> — l\'application est restée arrêtée. Voir le détail.</div>'
       :(r.ok?'<div class="note">Restauration sur place terminée.</div>':'<div class="err">Des étapes ont échoué.</div>'));
   $("#rsInplaceLog").innerHTML=head+lines;
+  if(!r.dry && r.ok && !r.aborted){
+    $("#rsInplaceLog").insertAdjacentHTML("afterbegin",'<div class="note">Ouverture de l\'onglet Vérifier…</div>');
+    setTimeout(()=>gotoVerify(ipBody.namespace,true),1200);
+  }
 };
 document.querySelectorAll("#rsMode button").forEach(b=>b.onclick=()=>{
   document.querySelectorAll("#rsMode button").forEach(x=>x.classList.remove("on"));
-  b.classList.add("on"); state.mode=b.dataset.mode;
+  b.classList.add("on"); state.mode=b.dataset.mode; savePref("mode",state.mode);
   $("#rsCloneSubWrap").style.display = state.mode==="clone"?"block":"none";
   rebuildVolCfgs();
 });
@@ -4718,6 +4811,7 @@ function renderCloneAppPlan(r){
   $("#rsSteps").innerHTML='<li>Créer le namespace cible (si « autre »)</li><li>Créer les PV/PVC clonés (sur le VG cloné)</li><li>Créer les applications clonées (elles démarrent automatiquement)</li><li>L\'application d\'origine n\'est PAS modifiée ni arrêtée</li>';
   $("#rsPlan").style.display="block"; setRsStep(3);
   updateGoButton(r.ok);
+  $("#rsPlan").scrollIntoView({behavior:"smooth",block:"start"});   // amener l'étape 3 sous les yeux
 }
 
 function collectItems(){
@@ -4763,6 +4857,7 @@ $("#rsPreview").onclick=async()=>{
   $("#rsPlan").style.display="block"; setRsStep(3);
   if(!r.ok){$("#rsErr").innerHTML='<div class="err">Corrigez les volumes en erreur avant de lancer.</div>';}
   updateGoButton(r.ok);
+  $("#rsPlan").scrollIntoView({behavior:"smooth",block:"start"});   // amener l'étape 3 sous les yeux
 };
 
 function updateGoButton(ready){
@@ -4779,10 +4874,12 @@ function updateGoButton(ready){
   else act = "le clone";
   $("#rsGo").textContent = (live? "Lancer " : "Simuler ") + act + (live? " (réel)" : "");
   $("#rsGo").disabled = !ready;
+  updateNextBar();
 }
 $("#dry").addEventListener("change",()=>{ if($("#rsPlan").style.display!=="none") updateGoButton(!$("#rsGo").disabled); });
 
 $("#rsGo").onclick=async()=>{
+  hideNextBar();   // pas de « prochaine action » pendant l'exécution
   const live=!dry();
   if(state.preview && state.preview._cloneapp){
     let confirmedCtxCA="";
@@ -4807,6 +4904,16 @@ $("#rsGo").onclick=async()=>{
     const hd=r.dry?'<div class="warnbox">Simulation — ressources qui seraient créées (l\'app d\'origine reste intacte).</div>'
       :(r.ok?'<div class="note">Clone d\'application créé. L\'application d\'origine est intacte.</div>':'<div class="err">Des étapes ont échoué — voir le détail.</div>');
     $("#rsLog").innerHTML=hd+lns+((r.warnings||[]).map(w=>`<div class="warnbox">⚠ ${esc(w)}</div>`).join(""));
+    if(!r.dry && r.ok){
+      const tgt = state.cloneNsMode==="other" ? $("#rsCloneTargetNs").value.trim() : $("#rsNs").value;
+      if((r.warnings||[]).length){   // laisser lire les avertissements ; la vérification est à un clic
+        $("#rsLog").insertAdjacentHTML("beforeend",'<div style="margin-top:8px"><button class="btn" id="rsGoVerify">Vérifier l\'application maintenant →</button></div>');
+        $("#rsGoVerify").onclick=()=>gotoVerify(tgt,true);
+      } else {
+        $("#rsLog").insertAdjacentHTML("afterbegin",'<div class="note">Ouverture de l\'onglet Vérifier…</div>');
+        setTimeout(()=>gotoVerify(tgt,true),1200);
+      }
+    }
     return;
   }
   let confirmedCtx="";
@@ -4843,6 +4950,15 @@ $("#rsGo").onclick=async()=>{
   }
   $("#rsLog").innerHTML = head + lines + reprot;
   const rb=$("#rsReprotectBtn"); if(rb) rb.onclick=()=>goReprotect($("#rsNs").value);
+  if(!r.dry && r.ok && !r.aborted){
+    if(reprot){   // ne pas quitter la page tant que la re-protection HYCU n'est pas traitée
+      $("#rsLog").insertAdjacentHTML("beforeend",'<div style="margin-top:8px"><button class="btn" id="rsGoVerify">Vérifier l\'application maintenant →</button></div>');
+      $("#rsGoVerify").onclick=()=>gotoVerify($("#rsNs").value,true);
+    } else {
+      $("#rsLog").insertAdjacentHTML("afterbegin",'<div class="note">Ouverture de l\'onglet Vérifier…</div>');
+      setTimeout(()=>gotoVerify($("#rsNs").value,true),1200);
+    }
+  }
 };
 
 // --------- Vérification ---------
@@ -4864,11 +4980,32 @@ async function runVerify(){
   return allBound && allReady;
 }
 $("#vfRun").onclick=runVerify;
-$("#vfAuto").onclick=async()=>{
-  const b=$("#vfAuto"); b.disabled=true;
-  for(let i=0;i<10;i++){ const done=await runVerify(); if(done) break; await new Promise(r=>setTimeout(r,3000)); }
-  b.disabled=false;
-};
+// Suivi auto CONTINU : rafraîchit toutes les ~3 s jusqu'à l'état stable (tous les PVC
+// Bound + pods Running), avec plafond de sécurité ~10 min. Re-cliquer arrête le suivi.
+let vfTrack=false;
+function vfSetBtn(){ $("#vfAuto").textContent = vfTrack? "■ Arrêter le suivi" : "Suivi auto (jusqu'à stable)"; }
+async function vfAutoTrack(){
+  if(vfTrack){ vfTrack=false; return; }          // stop demandé : la boucle en cours s'arrête
+  vfTrack=true; vfSetBtn();
+  for(let i=0;i<200 && vfTrack;i++){             // ~10 min à 3 s
+    const done=await runVerify();
+    if(done){ $("#vfOut").insertAdjacentHTML("afterbegin",'<div class="note">État stable : tous les PVC sont Bound et les pods Running.</div>'); break; }
+    await sleep(3000);
+  }
+  vfTrack=false; vfSetBtn();
+}
+$("#vfAuto").onclick=vfAutoTrack;
+// Ouvre l'onglet Vérifier sur un namespace donné (après une restauration réelle) et
+// démarre le suivi. Un namespace fraîchement créé (clone d'app) est ajouté à la liste.
+function gotoVerify(ns, track){
+  if(ns){
+    const sel=$("#vfNs");
+    if(sel && ![...sel.options].some(o=>o.value===ns)) sel.insertAdjacentHTML("beforeend",`<option>${esc(ns)}</option>`);
+    state.ns=ns;
+  }
+  switchTab("verify");
+  if(track && !vfTrack) vfAutoTrack(); else runVerify();
+}
 
 // --------- Réglages ---------
 async function loadConfig(){
@@ -4924,7 +5061,14 @@ async function loadConnStatus(){
   $("#hyTls").checked=!!s.hycu.verify_tls; $("#ntTls").checked=!!s.nutanix.verify_tls; $("#pcTls").checked=!!s.prismcentral.verify_tls;
   $("#bkProtectOff").style.display = s.hycu.connected? "none":"block";
   $("#bkProtectOn").style.display = s.hycu.connected? "block":"none";
+  renderHdrConn();
   loadVaultStatus();
+}
+// Pastilles d'état permanentes dans l'en-tête : HYCU / Prism Element / Prism Central.
+// Un clic ouvre l'onglet Connexions (l'opérateur voit AVANT d'agir s'il est connecté).
+function renderHdrConn(){
+  $("#hdrConn").innerHTML=[["HYCU",conn.hycu],["PE",conn.nutanix],["PC",conn.prismcentral]]
+    .map(([l,x])=>`<span class="hc">${connDot(!!(x&&x.connected))}${l}</span>`).join("");
 }
 function loadVaultStatus(){
   const present = conn && conn.vault && conn.vault.present;
@@ -5513,9 +5657,12 @@ I18N_EN += [
     ("Confirme que les PVC sont liés (Bound) et que les pods tournent.",
      "Confirms that the PVCs are Bound and the pods are running."),
     (">Vérifier<", ">Verify<"),
-    ("Rafraîchit la vérification toutes les ~3 s (jusqu'à 10 fois) et s'arrête dès que tous les PVC sont Bound et les pods Running",
-     "Re-runs the check every ~3 s (up to 10 times) and stops as soon as all PVCs are Bound and pods Running"),
-    ("Rafraîchir auto (~30 s)", "Auto refresh (~30 s)"),
+    ("Rafraîchit la vérification toutes les ~3 s et s'arrête dès que tous les PVC sont Bound et les pods Running (10 min max) ; recliquez pour arrêter",
+     "Re-runs the check every ~3 s and stops as soon as all PVCs are Bound and pods are Running (10 min max); click again to stop"),
+    ("Suivi auto (jusqu'à stable)", "Auto-track (until stable)"),
+    ("■ Arrêter le suivi", "■ Stop tracking"),
+    ("État stable : tous les PVC sont Bound et les pods Running.",
+     "Stable state: all PVCs are Bound and pods are Running."),
     (">Aucun PVC.<", ">No PVC.<"),
     ("· prêts ", "· ready "),
     (">Aucun pod.<", ">No pods.<"),
@@ -6043,6 +6190,21 @@ I18N_EN += [
     ("PV cloné ", "Cloned PV "),
     ("PVC cloné ", "Cloned PVC "),
     ("Application clonée ", "Cloned application "),
+]
+
+# --- Fluidité du parcours : pastilles d'en-tête, barre « action suivante », suivi auto ---
+I18N_EN += [
+    ("État des connexions — cliquer pour ouvrir l'onglet Connexions",
+     "Connection status — click to open the Connections tab"),
+    ("Plan prêt — dernière étape :", "Plan ready — final step:"),
+    ("Tous les points de restauration sont sélectionnés.", "All restore points are selected."),
+    (" point(s) de restauration sélectionné(s).", " restore point(s) selected."),
+    ("Toutes les références VG sont remplies.", "All VG references are filled."),
+    (" référence(s) VG remplie(s).", " VG reference(s) filled."),
+    ("Aller au lancement", "Go to launch"),
+    ("Voir les volumes", "Show the volumes"),
+    (r"Vérifier l\'application maintenant →", r"Verify the application now →"),
+    (r"Ouverture de l\'onglet Vérifier…", r"Opening the Verify tab…"),
 ]
 
 _I18N_SORTED = None          # (fr, en) triés du plus long au plus court
