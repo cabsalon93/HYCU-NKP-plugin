@@ -121,6 +121,12 @@ manifestes décrit dans la procédure HYCU).
   machine qui exécute l'outil), p. ex. `D:\sauvegardes\hycu` ou `/mnt/backups` ; le
   sous-dossier `<namespace>/<horodatage>/` y est créé automatiquement.
 
+- **Sauvegarde automatique (planifiée)** : activez-la pour sauvegarder la config de
+  **tous les namespaces autorisés par le filtre** à intervalle régulier (24 h par
+  défaut), tant que l'outil est lancé. Le dernier passage est persisté : une
+  sauvegarde en retard est rattrapée au démarrage. Clés : `auto_backup_enabled`,
+  `auto_backup_interval_hours`, `auto_backup_dest`.
+
 **Copiez le dossier de sauvegarde hors du cluster** (autre stockage) : c'est votre filet
 de sécurité.
 
@@ -152,7 +158,9 @@ de sécurité.
 5. Vérifiez le plan (`volumeHandle` dérivé, **purge des attributs runtime** du
    VG source, passage du PV source en **Retain**, séquence). En **mode réel** :
    retapez le nom du contexte pour confirmer, puis **Lancer**. L'outil ouvre
-   ensuite automatiquement l'onglet **Vérifier**.
+   ensuite automatiquement l'onglet **Vérifier**. Un namespace cible créé par un
+   clone d'application est **ajouté automatiquement au filtre des namespaces**,
+   pour que Vérifier/Restaurer l'acceptent aussitôt.
 
 > Si une étape échoue, la séquence **s'arrête** et l'application est **laissée
 > arrêtée** (réplicas à 0) pour ne pas redémarrer sur des volumes incohérents. Le
@@ -204,6 +212,9 @@ l'onglet **⚙ Réglages** de l'interface. Toutes les clés sont optionnelles.
 | `clone_name_suffix` | `"0000"` | Convention HYCU pour le nom du PV cloné (suggestion pré-remplie, modifiable). |
 | `volume_handle_prefix` | `""` | **Vide = auto-détecté** depuis le PV existant (suit le driver CSI du client). Ne renseigner que pour forcer un préfixe. |
 | `strip_claimref` | `false` | `true` = retirer entièrement `claimRef` du PV (laisse le PVC recréé rebinder). `false` = conserver `claimRef` (name+namespace) sans uid/resourceVersion. |
+| `auto_backup_enabled` | `false` | Sauvegarde automatique planifiée de tous les namespaces autorisés par le filtre, tant que l'outil tourne. |
+| `auto_backup_interval_hours` | `24` | Intervalle entre deux sauvegardes automatiques (heures, minimum 0,25). |
+| `auto_backup_dest` | `""` | Dossier de destination des sauvegardes automatiques (vide = `hycu-backups/`). |
 | `require_context_confirm` | `true` | Exiger la re-saisie du contexte avant toute action réelle. |
 | `host` / `port` | `127.0.0.1` / `8765` | Adresse d'écoute. **Ne pas exposer** `host` hors de la boucle locale. |
 | `open_browser` | `true` | Ouvrir le navigateur au démarrage. |

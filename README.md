@@ -124,6 +124,12 @@ cleanup described in the HYCU procedure).
   running the tool), e.g. `D:\backups\hycu` or `/mnt/backups`; the
   `<namespace>/<timestamp>/` subfolder is created there automatically.
 
+- **Automatic backup (scheduled)**: enable it to back up the config of **all
+  namespaces allowed by the filter** at a regular interval (default 24 h), for
+  as long as the tool is running. The last run is persisted, so an overdue
+  backup is caught up at startup. Keys: `auto_backup_enabled`,
+  `auto_backup_interval_hours`, `auto_backup_dest`.
+
 **Copy the backup folder off the cluster** (separate storage): it is your safety
 net.
 
@@ -152,7 +158,9 @@ net.
 5. Review the plan (derived `volumeHandle`, purge of the source VG's runtime
    attributes, switch of the source PV to **Retain**, sequence). In **real
    mode**: retype the context name to confirm, then **Launch**. The tool then
-   opens the **Verify** tab automatically.
+   opens the **Verify** tab automatically. A target namespace created by an
+   application clone is **added to the namespace filter automatically**, so
+   Verify/Restore accept it right away.
 
 > If a step fails, the sequence **stops** and the application is **left
 > stopped** (replicas at 0) so it does not restart on inconsistent volumes. The
@@ -203,6 +211,9 @@ Copy `hycu_config.example.json` → `hycu_config.json`. Also editable via the
 | `clone_name_suffix` | `"0000"` | HYCU convention for the cloned PV name (pre-filled suggestion, editable). |
 | `volume_handle_prefix` | `""` | **Empty = auto-detected** from the existing PV (follows the customer's CSI driver). Only set to force a prefix. |
 | `strip_claimref` | `false` | `true` = remove `claimRef` entirely from the PV (lets the recreated PVC rebind). `false` = keep `claimRef` (name+namespace) without uid/resourceVersion. |
+| `auto_backup_enabled` | `false` | Scheduled automatic backup of all namespaces allowed by the filter, while the tool runs. |
+| `auto_backup_interval_hours` | `24` | Interval between automatic backups (hours, minimum 0.25). |
+| `auto_backup_dest` | `""` | Destination folder for automatic backups (empty = `hycu-backups/`). |
 | `require_context_confirm` | `true` | Require retyping the context before any real action. |
 | `host` / `port` | `127.0.0.1` / `8765` | Listen address. **Do not expose** `host` outside the local loopback. |
 | `open_browser` | `true` | Open the browser at startup. |
