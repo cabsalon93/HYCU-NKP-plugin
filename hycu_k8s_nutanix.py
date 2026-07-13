@@ -61,6 +61,7 @@ import json
 import subprocess
 import os
 import re
+import shutil
 import contextlib
 import ssl
 import hmac
@@ -121,6 +122,7 @@ DEFAULT_CONFIG = {
     "auto_backup_enabled": False,
     "auto_backup_interval_hours": 24,
     "auto_backup_dest": "",         # vide = backup_root ; sinon dossier commun dédié
+    "auto_backup_keep": 15,         # rétention : versions conservées par namespace
     # Restore in-place HYCU : HYCU remplace le DISQUE du VG (nouvel extId) -> le
     # hypervisorAttachedDiskUUIDs du PV devient périmé et le montage échoue
     # ("failed to get symlink for disk ..."). True = après le restore, recréer le PV
@@ -211,7 +213,7 @@ def save_config(updates):
 
 # Version horodatée de la build (format AAAAMMJJ-HHMM). À incrémenter à chaque
 # changement notable du programme ; affichée dans l'en-tête de l'interface.
-VERSION = "20260713-2230"
+VERSION = "20260713-2340"
 
 # Jeton anti-CSRF généré au démarrage, injecté dans la page et exigé sur les POST.
 CSRF_TOKEN = secrets.token_urlsafe(32)
@@ -991,8 +993,27 @@ def _auto_backup_due(now):
     return (now - last) >= _auto_backup_interval_s()
 
 
+def _prune_backups(root, ns, keep):
+    """Rétention : ne garde que les `keep` sauvegardes les plus récentes du
+    namespace sous `root`. Ne supprime QUE des dossiers de sauvegarde de l'outil
+    (index.json présent) — jamais autre chose. Renvoie le nombre supprimé."""
+    try:
+        keep = max(1, int(keep))
+    except (TypeError, ValueError):
+        keep = 15
+    removed = 0
+    for b in list_backups(ns, root)[keep:]:      # liste triée : plus récentes d'abord
+        try:
+            shutil.rmtree(b["path"])
+            removed += 1
+        except OSError as e:
+            print("Rétention sauvegarde auto : suppression impossible de %s : %s" % (b["path"], e))
+    return removed
+
+
 def _auto_backup_run(now=None, runner=None):
-    """Une exécution de sauvegarde auto (scheduler ou tests). Enregistre le résultat."""
+    """Une exécution de sauvegarde auto (scheduler ou tests). Enregistre le résultat
+    puis applique la rétention (auto_backup_keep versions par namespace)."""
     now = time.time() if now is None else now
     runner = runner or action_backup_all
     AUTO_BACKUP["running"] = True
@@ -1001,6 +1022,13 @@ def _auto_backup_run(now=None, runner=None):
         ok = bool(r.get("ok"))
         summary = ("%d namespace(s) sauvegardé(s), %d volume(s)" % (r.get("backed_up", 0), r.get("volumes", 0))
                    if ok else (r.get("error") or "échec"))
+        if ok and r.get("root"):
+            removed = 0
+            for res in r.get("results") or []:
+                if res.get("ok") and res.get("ns"):
+                    removed += _prune_backups(r["root"], res["ns"], CONFIG.get("auto_backup_keep", 15))
+            if removed:
+                summary += " ; %d ancienne(s) version(s) supprimée(s)" % removed
         AUTO_BACKUP.update({"last_run": now, "last_ok": ok, "last_summary": summary})
         _save_auto_backup_state()
         audit("auto_backup", ok=ok, summary=summary)
@@ -1027,8 +1055,13 @@ def action_auto_backup_status():
     itv = _auto_backup_interval_s()
     last = float(AUTO_BACKUP.get("last_run") or 0)
     enabled = bool(CONFIG.get("auto_backup_enabled"))
+    try:
+        keep = max(1, int(CONFIG.get("auto_backup_keep") or 15))
+    except (TypeError, ValueError):
+        keep = 15
     return {"ok": True, "enabled": enabled,
             "interval_hours": itv / 3600.0,
+            "keep": keep,
             "dest": CONFIG.get("auto_backup_dest") or "",
             "running": bool(AUTO_BACKUP.get("running")),
             "last_run": last or None, "last_ok": AUTO_BACKUP.get("last_ok"),
@@ -3651,7 +3684,12 @@ HTML = r"""<!DOCTYPE html>
   .modal .dm-line{font-size:13px;margin:5px 0;line-height:1.5}
   .modal .dm-need{margin-top:14px}
   .modal-actions{margin-top:18px;display:flex;gap:10px;justify-content:flex-end}
-  .switch{position:relative;width:46px;height:26px;flex:none}
+  /* display:inline-block : hors flexbox, un <label> inline ignorerait width/height
+     (le toggle s'affichait écrasé dans les cartes). */
+  .switch{position:relative;display:inline-block;width:46px;height:26px;flex:none}
+  /* Variante marche/arrêt (sémantique claire) : gris = désactivé, vert = activé. */
+  .switch.onoff .slider{background:#c9ccd1}
+  .switch.onoff input:checked + .slider{background:var(--good)}
   .switch input{opacity:0;width:0;height:0}
   .slider{position:absolute;inset:0;background:var(--teal);border-radius:26px;cursor:pointer;transition:.2s}
   .slider:before{content:"";position:absolute;height:20px;width:20px;left:3px;top:3px;
@@ -3893,14 +3931,20 @@ HTML = r"""<!DOCTYPE html>
     </div>
 
     <div class="card">
-      <h3><span class="step-no">⏱</span>Sauvegarde automatique (planifiée)</h3>
-      <p class="sub">Sauvegarde régulièrement la config PV/PVC de <b>tous les namespaces autorisés par le filtre</b>
-        (tous si aucun filtre) — tant que l'outil est lancé. Au démarrage, une sauvegarde en retard est rattrapée.</p>
+      <h3><span class="step-no">⏱</span>Sauvegarde automatique de la configuration (PV/PVC)</h3>
+      <p class="sub">Sauvegarde régulièrement les <b>manifestes PV/PVC</b> (la « recette » du restore) de tous les
+        namespaces autorisés par le filtre — tant que l'outil est lancé. <b>Pas les données</b> des volumes :
+        elles sont protégées par HYCU (voir « Protéger les données dans HYCU » ci-dessous).</p>
       <div class="row">
-        <div style="flex:none"><label class="fld">Activer</label>
-          <label class="switch"><input type="checkbox" id="abEnabled"><span class="slider"></span></label></div>
-        <div style="flex:none;width:150px"><label class="fld">Intervalle (heures)</label>
+        <div style="flex:none"><label class="fld">Sauvegarde automatique</label>
+          <div style="display:flex;align-items:center;gap:10px;min-height:38px">
+            <label class="switch onoff"><input type="checkbox" id="abEnabled"><span class="slider"></span></label>
+            <b id="abEnabledLbl" style="font-size:13px;color:var(--muted)">Désactivée</b>
+          </div></div>
+        <div style="flex:none;width:140px"><label class="fld">Intervalle (heures)</label>
           <input type="number" id="abInterval" min="1" step="1" value="24"></div>
+        <div style="flex:none;width:190px"><label class="fld">Versions à conserver</label>
+          <input type="number" id="abKeep" min="1" step="1" value="15"></div>
         <div><label class="fld">Dossier de destination (optionnel)</label>
           <input type="text" id="abDest" placeholder="Vide = hycu-backups/"></div>
         <div style="flex:none;align-self:flex-end"><button class="btn" id="abSave">Enregistrer</button></div>
@@ -4522,14 +4566,21 @@ function dlBackupLink(dir, root, label){
   const u="/api/backup/download?path="+encodeURIComponent(dir)+(root?("&root="+encodeURIComponent(root)):"");
   return `<a class="btn ghost" href="${u}" download style="padding:2px 8px;font-size:12px;text-decoration:none;margin-left:6px">⬇ ${esc(label||'Télécharger (.zip)')}</a>`;
 }
-// ----- Sauvegarde automatique planifiée (onglet 1) -----
+// ----- Sauvegarde automatique de la configuration (onglet 1) -----
+function abSyncLbl(){
+  const on=$("#abEnabled").checked, l=$("#abEnabledLbl");
+  l.textContent = on? "Activée" : "Désactivée";
+  l.style.color = on? "var(--good)" : "var(--muted)";
+}
+$("#abEnabled").onchange=abSyncLbl;
 async function loadAutoBackup(){
   const s=await get("/api/auto_backup");
   if(!s || !s.ok) return;
-  $("#abEnabled").checked=!!s.enabled;
+  $("#abEnabled").checked=!!s.enabled; abSyncLbl();
   $("#abInterval").value=Math.round(s.interval_hours||24);
+  $("#abKeep").value=s.keep||15;
   if(!$("#abDest").value) $("#abDest").value=s.dest||"";
-  let txt = s.enabled? "Activée — toutes les "+Math.round(s.interval_hours||24)+" h." : "Désactivée.";
+  let txt = s.enabled? ("Toutes les "+Math.round(s.interval_hours||24)+" h · conserve les "+(s.keep||15)+" dernières versions par namespace.") : "";
   if(s.running) txt+=" Sauvegarde en cours…";
   if(s.last_run) txt+=" Dernière : "+new Date(s.last_run*1000).toLocaleString()+" "+(s.last_ok?"✓":"✕")+" "+(s.last_summary||"");
   if(s.enabled) txt+= s.next_due? (" · Prochaine : "+new Date(s.next_due*1000).toLocaleString()) : " · Première exécution dans moins d'une minute.";
@@ -4538,6 +4589,7 @@ async function loadAutoBackup(){
 $("#abSave").onclick=async()=>{
   const cfg={auto_backup_enabled:$("#abEnabled").checked,
     auto_backup_interval_hours:Math.max(1,parseInt($("#abInterval").value)||24),
+    auto_backup_keep:Math.max(1,parseInt($("#abKeep").value)||15),
     auto_backup_dest:$("#abDest").value.trim()};
   const r=await post("/api/config",{config:cfg});
   $("#abStatus").textContent = r.ok? "Enregistré." : ("Erreur : "+(r.error||""));
@@ -6509,21 +6561,29 @@ I18N_EN += [
     ("Autoriser « ", "Allow « "),
     (" » et réessayer", " » and retry"),
     ("Mise à jour du filtre impossible.", "Could not update the filter."),
-    # Sauvegarde automatique planifiée (onglet 1).
-    ("Sauvegarde automatique (planifiée)", "Automatic backup (scheduled)"),
-    ("Sauvegarde régulièrement la config PV/PVC de <b>tous les namespaces autorisés par le filtre</b>",
-     "Regularly backs up the PV/PVC config of <b>all namespaces allowed by the filter</b>"),
-    ("(tous si aucun filtre) — tant que l'outil est lancé. Au démarrage, une sauvegarde en retard est rattrapée.",
-     "(all if no filter) — while the tool is running. On startup, an overdue backup is caught up."),
-    ("Activer</label>", "Enable</label>"),
+    # Sauvegarde automatique de la configuration (onglet 1).
+    ("Sauvegarde automatique de la configuration (PV/PVC)",
+     "Automatic configuration backup (PV/PVC manifests)"),
+    ("Sauvegarde régulièrement les <b>manifestes PV/PVC</b> (la « recette » du restore) de tous les",
+     "Regularly backs up the <b>PV/PVC manifests</b> (the restore “recipe”) of all"),
+    ("namespaces autorisés par le filtre — tant que l'outil est lancé. <b>Pas les données</b> des volumes :",
+     "namespaces allowed by the filter — while the tool is running. <b>Not the data</b> of the volumes:"),
+    ("elles sont protégées par HYCU (voir « ", "they are protected by HYCU (see « "),
+    (" » ci-dessous).", " » below)."),
+    ("Sauvegarde automatique</label>", "Automatic backup</label>"),
     ("Intervalle (heures)", "Interval (hours)"),
-    ('"Activée — toutes les "', '"Enabled — every "'),
-    ('"Désactivée."', '"Disabled."'),
+    ("Versions à conserver", "Versions to keep"),
+    ('? "Activée" : "Désactivée"', '? "Enabled" : "Disabled"'),
+    (">Désactivée</b>", ">Disabled</b>"),
+    ('"Toutes les "', '"Every "'),
+    ('" h · conserve les "', '" h · keeps the last "'),
+    ('" dernières versions par namespace."', '" versions per namespace."'),
     ("Sauvegarde en cours…", "Backup in progress…"),
     ('" Dernière : "', '" Last: "'),
     ('" · Prochaine : "', '" · Next: "'),
     ('" · Première exécution dans moins d\'une minute."', '" · First run in less than a minute."'),
     (" namespace(s) sauvegardé(s), ", " namespace(s) backed up, "),
+    (" ancienne(s) version(s) supprimée(s)", " old version(s) deleted"),
 ]
 
 _I18N_SORTED = None          # (fr, en) triés du plus long au plus court

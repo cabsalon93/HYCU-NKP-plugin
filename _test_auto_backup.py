@@ -15,7 +15,8 @@ def check(c, m):
 
 tmp = tempfile.mkdtemp()
 old_root = H.CONFIG["backup_root"]
-old_cfg = {k: H.CONFIG.get(k) for k in ("auto_backup_enabled", "auto_backup_interval_hours", "auto_backup_dest")}
+old_cfg = {k: H.CONFIG.get(k) for k in ("auto_backup_enabled", "auto_backup_interval_hours",
+                                        "auto_backup_dest", "auto_backup_keep")}
 H.CONFIG["backup_root"] = tmp
 H.AUTO_BACKUP.update({"last_run": 0.0, "last_ok": None, "last_summary": "", "running": False})
 try:
@@ -65,11 +66,39 @@ try:
     s = H.action_auto_backup_status()
     check(s["ok"] and s["enabled"] and s["last_run"] == 2000.0 and s["next_due"] == 2000.0 + 24 * 3600,
           "statut UI complet (échéance calculée)")
+    check(s["keep"] == 15, "rétention par défaut : 15 versions")
 
-    # Redémarrage simulé : l'état est rechargé depuis le disque.
+    # Rétention : 20 fausses sauvegardes -> ne garde que les 15 plus récentes.
+    ns_dir = os.path.join(tmp, "wordpress")
+    for i in range(20):
+        d = os.path.join(ns_dir, "2026-07-%02d_00-00-00_000000" % (i + 1))
+        os.makedirs(d)
+        with open(os.path.join(d, "index.json"), "w", encoding="utf-8") as f:
+            json.dump({"volumes": []}, f)
+    # Un dossier étranger SANS index.json ne doit jamais être supprimé.
+    os.makedirs(os.path.join(ns_dir, "notes-perso"))
+    removed = H._prune_backups(tmp, "wordpress", 15)
+    kept = [d for d in os.listdir(ns_dir) if os.path.isfile(os.path.join(ns_dir, d, "index.json"))]
+    check(removed == 5 and len(kept) == 15, "rétention : 5 supprimées, 15 conservées")
+    check(min(kept) == "2026-07-06_00-00-00_000000", "les PLUS ANCIENNES sont supprimées")
+    check(os.path.isdir(os.path.join(ns_dir, "notes-perso")), "dossier étranger (sans index.json) intact")
+    check(H._prune_backups(tmp, "wordpress", 15) == 0, "rétention idempotente")
+
+    # La rétention est appliquée par l'exécution auto (résumé enrichi).
+    def runner_with_results(dest):
+        return {"ok": True, "backed_up": 1, "volumes": 2, "root": tmp,
+                "results": [{"ns": "wordpress", "ok": True}]}
+    H.CONFIG["auto_backup_keep"] = 10
+    H._auto_backup_run(now=3000.0, runner=runner_with_results)
+    left = [d for d in os.listdir(ns_dir) if os.path.isfile(os.path.join(ns_dir, d, "index.json"))]
+    check(len(left) == 10, "exécution auto : rétention appliquée (10 gardées)")
+    check("5 ancienne(s) version(s) supprimée(s)" in H.AUTO_BACKUP["last_summary"],
+          "résumé mentionne les versions supprimées")
+
+    # Redémarrage simulé : l'état est rechargé depuis le disque (dernier passage = 3000).
     H.AUTO_BACKUP.update({"last_run": 0.0, "last_ok": None, "last_summary": ""})
     H._load_auto_backup_state()
-    check(H.AUTO_BACKUP["last_run"] == 2000.0, "état rechargé après redémarrage")
+    check(H.AUTO_BACKUP["last_run"] == 3000.0, "état rechargé après redémarrage")
 finally:
     H.CONFIG["backup_root"] = old_root
     for k, v in old_cfg.items():

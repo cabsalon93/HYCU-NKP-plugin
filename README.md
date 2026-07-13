@@ -124,11 +124,13 @@ cleanup described in the HYCU procedure).
   running the tool), e.g. `D:\backups\hycu` or `/mnt/backups`; the
   `<namespace>/<timestamp>/` subfolder is created there automatically.
 
-- **Automatic backup (scheduled)**: enable it to back up the config of **all
+- **Automatic configuration backup (scheduled)**: enable it to back up the
+  PV/PVC **manifests** (not the volume data — that is HYCU's job) of **all
   namespaces allowed by the filter** at a regular interval (default 24 h), for
   as long as the tool is running. The last run is persisted, so an overdue
-  backup is caught up at startup. Keys: `auto_backup_enabled`,
-  `auto_backup_interval_hours`, `auto_backup_dest`.
+  backup is caught up at startup, and only the most recent versions are kept
+  per namespace (15 by default). Keys: `auto_backup_enabled`,
+  `auto_backup_interval_hours`, `auto_backup_keep`, `auto_backup_dest`.
 
 **Copy the backup folder off the cluster** (separate storage): it is your safety
 net.
@@ -213,6 +215,7 @@ Copy `hycu_config.example.json` → `hycu_config.json`. Also editable via the
 | `strip_claimref` | `false` | `true` = remove `claimRef` entirely from the PV (lets the recreated PVC rebind). `false` = keep `claimRef` (name+namespace) without uid/resourceVersion. |
 | `auto_backup_enabled` | `false` | Scheduled automatic backup of all namespaces allowed by the filter, while the tool runs. |
 | `auto_backup_interval_hours` | `24` | Interval between automatic backups (hours, minimum 0.25). |
+| `auto_backup_keep` | `15` | Retention: number of backup versions kept per namespace (oldest pruned after each automatic run). |
 | `auto_backup_dest` | `""` | Destination folder for automatic backups (empty = `hycu-backups/`). |
 | `require_context_confirm` | `true` | Require retyping the context before any real action. |
 | `host` / `port` | `127.0.0.1` / `8765` | Listen address. **Do not expose** `host` outside the local loopback. |

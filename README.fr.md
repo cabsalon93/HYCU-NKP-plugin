@@ -121,11 +121,14 @@ manifestes décrit dans la procédure HYCU).
   machine qui exécute l'outil), p. ex. `D:\sauvegardes\hycu` ou `/mnt/backups` ; le
   sous-dossier `<namespace>/<horodatage>/` y est créé automatiquement.
 
-- **Sauvegarde automatique (planifiée)** : activez-la pour sauvegarder la config de
-  **tous les namespaces autorisés par le filtre** à intervalle régulier (24 h par
-  défaut), tant que l'outil est lancé. Le dernier passage est persisté : une
-  sauvegarde en retard est rattrapée au démarrage. Clés : `auto_backup_enabled`,
-  `auto_backup_interval_hours`, `auto_backup_dest`.
+- **Sauvegarde automatique de la configuration (planifiée)** : activez-la pour
+  sauvegarder les **manifestes** PV/PVC (pas les données des volumes — c'est le
+  rôle de HYCU) de **tous les namespaces autorisés par le filtre** à intervalle
+  régulier (24 h par défaut), tant que l'outil est lancé. Le dernier passage est
+  persisté : une sauvegarde en retard est rattrapée au démarrage, et seules les
+  versions les plus récentes sont conservées par namespace (15 par défaut).
+  Clés : `auto_backup_enabled`, `auto_backup_interval_hours`, `auto_backup_keep`,
+  `auto_backup_dest`.
 
 **Copiez le dossier de sauvegarde hors du cluster** (autre stockage) : c'est votre filet
 de sécurité.
@@ -214,6 +217,7 @@ l'onglet **⚙ Réglages** de l'interface. Toutes les clés sont optionnelles.
 | `strip_claimref` | `false` | `true` = retirer entièrement `claimRef` du PV (laisse le PVC recréé rebinder). `false` = conserver `claimRef` (name+namespace) sans uid/resourceVersion. |
 | `auto_backup_enabled` | `false` | Sauvegarde automatique planifiée de tous les namespaces autorisés par le filtre, tant que l'outil tourne. |
 | `auto_backup_interval_hours` | `24` | Intervalle entre deux sauvegardes automatiques (heures, minimum 0,25). |
+| `auto_backup_keep` | `15` | Rétention : nombre de versions conservées par namespace (les plus anciennes sont supprimées après chaque passage automatique). |
 | `auto_backup_dest` | `""` | Dossier de destination des sauvegardes automatiques (vide = `hycu-backups/`). |
 | `require_context_confirm` | `true` | Exiger la re-saisie du contexte avant toute action réelle. |
 | `host` / `port` | `127.0.0.1` / `8765` | Adresse d'écoute. **Ne pas exposer** `host` hors de la boucle locale. |
