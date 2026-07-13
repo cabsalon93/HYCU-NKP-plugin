@@ -206,7 +206,7 @@ def save_config(updates):
 
 # Version horodatée de la build (format AAAAMMJJ-HHMM). À incrémenter à chaque
 # changement notable du programme ; affichée dans l'en-tête de l'interface.
-VERSION = "20260708-1500"
+VERSION = "20260713-1030"
 
 # Jeton anti-CSRF généré au démarrage, injecté dans la page et exigé sur les POST.
 CSRF_TOKEN = secrets.token_urlsafe(32)
@@ -215,6 +215,15 @@ CSRF_TOKEN = secrets.token_urlsafe(32)
 # du serveur. Jamais écrits sur disque. Effacés à l'arrêt et sur déconnexion.
 SESSION_CREDS = {"hycu": None, "nutanix": None, "prismcentral": None}   # creds en RAM par système
 CRED_LOCK = threading.Lock()
+
+# Session de NAVIGATEUR courante (cookie de session « hycu_sess », sans expiration :
+# il meurt avec le navigateur). Les identifiants HYCU/Nutanix sont liés à UNE session
+# de navigateur : charger la page sans le cookie de la session courante (navigateur
+# relancé, autre navigateur, fenêtre privée) VERROUILLE les connexions — identifiants
+# effacés, phrase secrète / mots de passe redemandés. Sans cela, un serveur qui tourne
+# longtemps (mode conteneur) garderait les connexions ouvertes pour quiconque rouvre
+# la page. Un simple rechargement (F5) dans le même navigateur conserve la session.
+UI_SESSION = {"id": None}
 
 # Hôtes considérés comme locaux (anti-DNS-rebinding). ::1 = IPv6 loopback.
 ALLOWED_HOSTS = ("127.0.0.1", "localhost", "::1")
@@ -1829,6 +1838,31 @@ def action_disconnect(payload):
     return {"ok": True, "system": system, "connected": False}
 
 
+def check_ui_session(cookie_header):
+    """Lie les identifiants (SESSION_CREDS) à une session de navigateur.
+
+    Appelée au chargement de la page ("/"). Si le cookie « hycu_sess » porte l'id
+    de la session courante, rien ne change (rechargement F5). Sinon — premier
+    chargement, navigateur relancé, autre navigateur — une nouvelle session est
+    ouverte et les identifiants en mémoire sont EFFACÉS : la phrase secrète du
+    coffre (ou les mots de passe) sont redemandés à chaque nouvelle session.
+    Renvoie la valeur Set-Cookie à poser, ou None si la session est inchangée."""
+    m = re.search(r"(?:^|;\s*)hycu_sess=([A-Za-z0-9_-]+)", cookie_header or "")
+    tok = m.group(1) if m else None
+    with CRED_LOCK:
+        cur = UI_SESSION["id"]
+        if tok and cur and hmac.compare_digest(tok, cur):
+            return None
+        UI_SESSION["id"] = secrets.token_urlsafe(24)
+        locked = [k for k, v in SESSION_CREDS.items() if v]
+        for k in SESSION_CREDS:
+            SESSION_CREDS[k] = None
+        new_id = UI_SESSION["id"]
+    if locked:
+        audit("creds_locked", reason="new_browser_session", systems=sorted(locked))
+    return "hycu_sess=%s; Path=/; HttpOnly; SameSite=Strict" % new_id
+
+
 def action_conn_status():
     out = {}
     for s in ("hycu", "nutanix", "prismcentral"):
@@ -3222,9 +3256,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path = parsed.path
         qs = {k: v[0] for k, v in urllib.parse.parse_qs(parsed.query).items()}
         if path == "/":
+            set_cookie = check_ui_session(self.headers.get("Cookie"))
             page = _html_for_lang(self._lang())
             return self._send(200, page.replace("__CSRF_TOKEN__", CSRF_TOKEN)
-                              .replace("__VERSION__", VERSION).replace("__LOGO__", _logo_markup()), "text/html")
+                              .replace("__VERSION__", VERSION).replace("__LOGO__", _logo_markup()),
+                              "text/html", {"Set-Cookie": set_cookie} if set_cookie else None)
         try:
             if path == "/api/context":
                 return self._json(action_context())

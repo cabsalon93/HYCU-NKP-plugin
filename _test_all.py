@@ -21,6 +21,7 @@ SUITES = [
     "_test_inplace_refresh",  # rafraîchissement PV après restore in-place (disque changé)
     "_test_fixes",           # correctifs revue : V2 reprise, V4 redirection/schéma, V7/V8 clone, V9 tri disques
     "_test_download",        # téléchargement .zip d'une sauvegarde + garde anti-traversée
+    "_test_session_lock",    # identifiants liés à la session navigateur (re-déverrouillage exigé)
 ]
 
 
