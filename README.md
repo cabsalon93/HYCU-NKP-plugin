@@ -21,20 +21,61 @@ an **IQN** (legacy iSCSI clusters); the tool derives the `volumeHandle` from it.
 
 ---
 
-## 1. Prerequisites
+## 1. How it works
 
-- **Python 3.7+** (no library to install — a single file, stdlib only).
-- **`kubectl`** installed and configured on the **right context** (the target
-  cluster). The current context is displayed at the top of the page.
-- Sufficient RBAC rights: `get/list/delete` on `pv`, `pvc`, `pods`;
-  `get/patch/scale` on `deployments`/`statefulsets`; `patch` on `pv`/`pvc`
-  (finalizer unblocking).
-- On the HYCU/Nutanix side: the restored/cloned Volume Group must exist, and you
-  must be able to copy its **reference** from the HYCU UI or Prism — the **VG
-  UUID** (suffix of the `volumeHandle` `NutanixVolumes-<uuid>` and of the
-  `ntnx-k8s-<uuid>` target), or the **IQN** on legacy iSCSI clusters.
+```
+   HYCU (backups)                                      Kubernetes / NKP cluster
+   protected Nutanix Volume Groups                     application + "live" PVC/PV
+          │                                                     ▲
+          │ 1. Clone or restore the VG at the chosen point      │ 6. Restart (scale-up,
+          │    (HYCU API — or manually in the HYCU UI)          │    original replicas) then
+          ▼                                                     │    verification: PVC Bound,
+   New restored/cloned Nutanix VG                               │    pods Running
+          │                                                     │
+          │ 2. VG reference (UUID) fetched via Prism            │
+          ▼                                                     │
+   PV manifest rebuilt from the config backup                   │
+   (derived volumeHandle, runtime attributes purged,            │
+    cloned VG disk rewritten via Prism Central v4)              │
+          │                                                     │
+          │ 3. Stop the app (scale-down, replicas remembered)   │
+          │ 4. delete PV/PVC + patch finalizers                 │
+          ▼                                                     │
+   5. apply the new PV/PVC → they point to the cloned VG ───────┘
+```
 
-## 2. Installation & launch — two ways to run the tool
+The tool invents nothing: it **orchestrates `kubectl`** (JSON manifests) and the
+**HYCU / Prism REST APIs** (pure Python stdlib, no dependency). The **configuration
+backup** (tab 1) provides the PV/PVC "skeleton"; **HYCU provides the data** (the
+Volume Groups). Every step is logged, the sequence stops at the first failure (the
+app stays stopped, never restarted at 0 replicas), and **simulation mode** (default)
+shows the whole sequence without executing anything.
+
+## 2. Prerequisites
+
+**Common to both launch modes:**
+
+- A **kubeconfig** with sufficient RBAC rights on the target cluster:
+  `get/list/delete` on `pv`, `pvc`, `pods`; `get/patch/scale` on
+  `deployments`/`statefulsets`; `patch` on `pv`/`pvc` (finalizer unblocking).
+- **kubectl ≥ 1.23** (the tool uses `kubectl wait --for=jsonpath`).
+- On the HYCU/Nutanix side: the restored/cloned Volume Group must exist and its
+  **reference** (UUID) be known — **automatic** with the HYCU/Prism connectors
+  (Connections tab); otherwise copy it from the HYCU UI or Prism
+  (`NutanixVolumes-<uuid>`, `ntnx-k8s-<uuid>` target, or IQN on legacy iSCSI
+  clusters).
+
+**Depending on the launch mode (see §3):**
+
+- **Option A — Python mode (on the workstation)**: **Python 3.7+** (stdlib only,
+  no library to install) and **`kubectl`** installed on the workstation,
+  configured on the right context (displayed at the top of the page).
+- **Option B — Kubernetes application**: **nothing to install on the
+  workstation** — Python and `kubectl` are **bundled in the image**. You only
+  need the rights to deploy into a cluster namespace (and `kubectl` somewhere to
+  run the access `port-forward`).
+
+## 3. Installation & launch — two ways to run the tool
 
 |  | **Option A — Python mode** | **Option B — Kubernetes application** |
 |---|---|---|
