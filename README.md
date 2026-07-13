@@ -1,207 +1,217 @@
-# Outil HYCU · Restauration Kubernetes sur Nutanix
+# HYCU Tool · Kubernetes Restore on Nutanix
 
-Interface web guidée pour **sauvegarder et restaurer** les applications Kubernetes
-dont les volumes (PVC = Volume Groups Nutanix) sont protégés par **HYCU**.
+> 🇫🇷 Version française : **[README.fr.md](README.fr.md)**
 
-L'outil remplace la procédure manuelle (≈ 20 commandes `kubectl` + édition de YAML)
-par quelques clics. À la restauration, la **seule saisie** est la **référence du
-Volume Group** cloné/restauré — son **UUID** (CSI Nutanix moderne / NKP : le VG est
-attaché directement à la VM worker, **plus d'IQN**), un `volumeHandle`, ou un **IQN**
-(clusters iSCSI hérités). L'outil en dérive le `volumeHandle`, régénère le manifeste
-du PV, puis enchaîne `scale-down → delete → patch finalizer → apply → scale-up →
-vérification`.
+Guided web interface to **back up and restore** Kubernetes applications whose
+volumes (PVC = Nutanix Volume Groups) are protected by **HYCU**.
 
-> ⚠️ **Outil destructif.** Il supprime et recrée des PV/PVC. Le mode **Simulation
-> (dry-run) est activé par défaut**. Testez toujours sur un namespace de test avant
-> la production, et relisez l'aperçu avant de désactiver la simulation.
+The tool replaces the manual procedure (≈ 20 `kubectl` commands + hand-editing
+YAML) with a few clicks. At restore time, the **only input** required is the
+**reference of the cloned/restored Volume Group** — its **UUID** (modern Nutanix
+CSI / NKP: the VG is attached directly to the worker VM, **no more IQN**), a
+`volumeHandle`, or an **IQN** (legacy iSCSI clusters). The tool derives the
+`volumeHandle` from it, regenerates the PV manifest, then runs
+`scale-down → delete → patch finalizer → apply → scale-up → verification`.
+
+> ⚠️ **Destructive tool.** It deletes and recreates PVs/PVCs. **Simulation
+> (dry-run) mode is enabled by default**. Always test on a test namespace before
+> production, and review the preview before disabling simulation.
 
 ---
 
-## 1. Prérequis
+## 1. Prerequisites
 
-- **Python 3.7+** (aucune librairie à installer — un seul fichier, stdlib uniquement).
-- **`kubectl`** installé et configuré sur le **bon contexte** (le cluster cible).
-  Le contexte courant est affiché en haut de la page.
-- Droits RBAC suffisants : `get/list/delete` sur `pv`, `pvc`, `pods` ;
-  `get/patch/scale` sur `deployments`/`statefulsets` ; `patch` sur `pv`/`pvc`
-  (déblocage des finalizers).
-- Côté HYCU/Nutanix : le Volume Group restauré/cloné doit exister, et vous devez
-  pouvoir copier sa **référence** depuis l'UI HYCU ou Prism — l'**UUID du VG**
-  (suffixe du `volumeHandle` `NutanixVolumes-<uuid>` et de la cible `ntnx-k8s-<uuid>`),
-  ou l'**IQN** sur les clusters iSCSI hérités.
+- **Python 3.7+** (no library to install — a single file, stdlib only).
+- **`kubectl`** installed and configured on the **right context** (the target
+  cluster). The current context is displayed at the top of the page.
+- Sufficient RBAC rights: `get/list/delete` on `pv`, `pvc`, `pods`;
+  `get/patch/scale` on `deployments`/`statefulsets`; `patch` on `pv`/`pvc`
+  (finalizer unblocking).
+- On the HYCU/Nutanix side: the restored/cloned Volume Group must exist, and you
+  must be able to copy its **reference** from the HYCU UI or Prism — the **VG
+  UUID** (suffix of the `volumeHandle` `NutanixVolumes-<uuid>` and of the
+  `ntnx-k8s-<uuid>` target), or the **IQN** on legacy iSCSI clusters.
 
-## 2. Installation & lancement
+## 2. Installation & launch
 
-**Mode python** (par défaut) :
+**Python mode** (default):
 ```bash
 python3 hycu_k8s_nutanix.py
 ```
 
-Le navigateur s'ouvre sur <http://127.0.0.1:8765> (sinon, ouvrez-le manuellement).
-`Ctrl+C` pour arrêter. Les sauvegardes et le journal d'audit sont écrits dans
-`./hycu-backups/`.
+The browser opens at <http://127.0.0.1:8765> (otherwise, open it manually).
+`Ctrl+C` to stop. Backups and the audit log are written to `./hycu-backups/`.
 
-**Mode conteneur** (Docker ou Kubernetes) : la **même image** empaquette ce script et
-embarque `kubectl`, pour les postes sans Python. Le comportement est piloté par
-variables d'environnement (même code, deux emballages). Guides : vue d'ensemble
-**[docs/docker.md](docs/docker.md)** · démarrage **[Docker](docs/docker-demarrage.md)** ·
-démarrage **[Kubernetes](docs/kubernetes-demarrage.md)**.
+**Container mode** (Docker or Kubernetes): the **same image** packages this
+script and bundles `kubectl`, for workstations without Python. Behaviour is
+driven by environment variables (same code, two packagings). Guides: overview
+**[docs/docker.md](docs/docker.md)** · getting started
+**[Docker](docs/docker-demarrage.md)** · getting started
+**[Kubernetes](docs/kubernetes-demarrage.md)**.
 ```bash
-docker compose -f deploy/docker-compose.yml up      # puis http://127.0.0.1:8765
+docker compose -f deploy/docker-compose.yml up      # then http://127.0.0.1:8765
 ```
 
-#### Fournir le kubeconfig en mode Kubernetes
+#### Providing the kubeconfig in Kubernetes mode
 
-Dans l'image, `kubectl` est embarqué et lit `KUBECONFIG=/home/app/.kube/config` : il
-n'y a donc **aucune option en ligne de commande** à passer. Le kubeconfig se fournit
-via un **Secret** monté à cet emplacement.
+In the image, `kubectl` is bundled and reads `KUBECONFIG=/home/app/.kube/config`:
+there is therefore **no command-line option** to pass. The kubeconfig is provided
+via a **Secret** mounted at that location.
 
-Utilisez un kubeconfig **autonome** (token de ServiceAccount + CA, **sans** exec-plugin
-type `aws`/`gcloud`/`oidc`, qui ne fonctionne pas dans le conteneur). Le script
-[deploy/k8s/make-kubeconfig.sh](deploy/k8s/make-kubeconfig.sh) le fabrique depuis le
-ServiceAccount `hycu-operator` créé par [deploy/k8s/rbac.yaml](deploy/k8s/rbac.yaml).
+Use a **self-contained** kubeconfig (ServiceAccount token + CA, **without**
+`aws`/`gcloud`/`oidc`-style exec-plugins, which do not work inside the
+container). The script
+[deploy/k8s/make-kubeconfig.sh](deploy/k8s/make-kubeconfig.sh) builds one from
+the `hycu-operator` ServiceAccount created by
+[deploy/k8s/rbac.yaml](deploy/k8s/rbac.yaml).
 
-Créez ensuite le Secret (nom et namespace attendus par
-[deploy/k8s/hycu.yaml](deploy/k8s/hycu.yaml)) :
+Then create the Secret (name and namespace expected by
+[deploy/k8s/hycu.yaml](deploy/k8s/hycu.yaml)):
 
 ```bash
 kubectl -n hycu create secret generic hycu-kubeconfig --from-file=config=./kubeconfig
 ```
 
-- `-n hycu` : namespace où tourne l'outil.
-- `hycu-kubeconfig` : nom du Secret référencé par le déploiement.
-- `--from-file=config=./kubeconfig` : la **clé** doit être `config` (montée en
-  `/home/app/.kube/config`) ; `./kubeconfig` est votre fichier local.
+- `-n hycu`: namespace where the tool runs.
+- `hycu-kubeconfig`: name of the Secret referenced by the deployment.
+- `--from-file=config=./kubeconfig`: the **key** must be `config` (mounted as
+  `/home/app/.kube/config`); `./kubeconfig` is your local file.
 
-Pour **remplacer** un kubeconfig existant, ajoutez `--dry-run=client -o yaml | kubectl apply -f -` :
+To **replace** an existing kubeconfig, add `--dry-run=client -o yaml | kubectl apply -f -`:
 
 ```bash
 kubectl -n hycu create secret generic hycu-kubeconfig \
   --from-file=config=./kubeconfig --dry-run=client -o yaml | kubectl apply -f -
 ```
 
-Guide complet : **[docs/kubernetes-demarrage.md](docs/kubernetes-demarrage.md)**.
+Full guide: **[docs/kubernetes-demarrage.md](docs/kubernetes-demarrage.md)**.
 
-**Premier lancement** : si `hycu_config.json` n'existe pas encore, un **assistant
-de configuration** s'affiche automatiquement (binaire kubectl, contextes/namespaces
-autorisés, garde-fous) et génère le fichier pour vous. Vous pouvez aussi le créer à
-la main à partir du modèle :
+**First launch**: if `hycu_config.json` does not exist yet, a **configuration
+wizard** is shown automatically (kubectl binary, allowed contexts/namespaces,
+guardrails) and generates the file for you. You can also create it by hand from
+the template:
 
 ```bash
-cp hycu_config.example.json hycu_config.json   # puis éditer (voir §5)
+cp hycu_config.example.json hycu_config.json   # then edit (see §5)
 ```
 
-Tout reste modifiable ensuite via l'onglet **⚙ Réglages**.
+Everything remains editable afterwards via the **⚙ Settings** tab.
 
-### Langue / Language
+### Language / Langue
 
-L'interface est **bilingue français / anglais** : le bouton **EN** / **FR** dans
-l'en-tête bascule la langue (page **et** messages du serveur). Le choix est mémorisé
-par navigateur (cookie `hycu_lang`) ; le français est la langue par défaut.
+The UI is **bilingual French / English**: the **EN** / **FR** button in the
+header switches the language (page **and** server messages). The choice is
+remembered per browser (`hycu_lang` cookie); French is the default.
 
-*The UI is bilingual French / English: the **EN** / **FR** button in the header
-switches the language (page **and** server messages). The choice is remembered per
-browser (`hycu_lang` cookie); French is the default.*
+*L'interface est bilingue français / anglais : le bouton **EN** / **FR** dans
+l'en-tête bascule la langue (page **et** messages du serveur). Le choix est
+mémorisé par navigateur (cookie `hycu_lang`) ; le français est la langue par
+défaut.*
 
-## 3. Déroulé d'une restauration (les 3 onglets)
+## 3. Restore walkthrough (the 3 tabs)
 
-### Onglet 1 — Sauvegarder
-Choisissez un namespace → **Sauvegarder ce namespace**. L'outil exporte et nettoie
-tous les PV/PVC (équivaut aux boucles `kubectl get … -o yaml` + nettoyage manuel des
-manifestes décrit dans la procédure HYCU).
+### Tab 1 — Back up
+Pick a namespace → **Back up this namespace**. The tool exports and cleans all
+PVs/PVCs (equivalent to the `kubectl get … -o yaml` loops + manual manifest
+cleanup described in the HYCU procedure).
 
-- **Sauvegarder tous (filtrés)** : sauvegarde en une fois **tous les namespaces
-  autorisés** par le filtre (`namespace_filter`), ou **tous** les namespaces du cluster
-  si aucun filtre. Un namespace sans PVC est **ignoré** (pas une erreur) ; un récapitulatif
-  par namespace est affiché.
-- **Dossier de destination (optionnel)** : par défaut, les sauvegardes vont dans
-  `hycu-backups/` (à côté du programme). Vous pouvez indiquer un **autre dossier** (sur la
-  machine qui exécute l'outil), p. ex. `D:\sauvegardes\hycu` ou `/mnt/backups` ; le
-  sous-dossier `<namespace>/<horodatage>/` y est créé automatiquement.
+- **Back up all (filtered)**: backs up in one go **all namespaces allowed** by
+  the filter (`namespace_filter`), or **all** namespaces of the cluster if no
+  filter. A namespace without PVCs is **skipped** (not an error); a per-namespace
+  summary is displayed.
+- **Destination folder (optional)**: by default, backups go to `hycu-backups/`
+  (next to the program). You can specify a **different folder** (on the machine
+  running the tool), e.g. `D:\backups\hycu` or `/mnt/backups`; the
+  `<namespace>/<timestamp>/` subfolder is created there automatically.
 
-**Copiez le dossier de sauvegarde hors du cluster** (autre stockage) : c'est votre filet
-de sécurité.
+**Copy the backup folder off the cluster** (separate storage): it is your safety
+net.
 
-### Onglet 2 — Restaurer
-1. Côté **HYCU** : restaurez ou clonez le Volume Group (suffixe « 0000 »).
-2. Dans l'outil : choisissez le namespace, le **type d'opération** (Clone ou
-   Restauration sur place), puis **cochez le(s) PVC** à restaurer (plusieurs
-   volumes d'une même app = une seule transaction : un arrêt, un redémarrage).
-3. **Sauvegarde de configuration à restaurer** : l'outil reconstruit les PV/PVC (le
-   « squelette ») à partir d'une **sauvegarde de config** (onglet 1). S'il en existe
-   plusieurs, un **menu déroulant** permet de **choisir laquelle** (horodatage + nombre
-   de volumes + contexte) ; par défaut la **plus récente**. C'est indépendant du **point
-   de restauration HYCU** (les *données* du Volume Group), qui se choisit séparément.
-   - Cas du **namespace détruit** : il n'y a plus de PVC « live » à lire — la
-     reconstruction s'appuie **entièrement** sur la sauvegarde de config sélectionnée.
-   - **Dossier personnalisé** : cochez « Lire les sauvegardes depuis un dossier
-     personnalisé » et indiquez le chemin si vos sauvegardes ne sont pas dans
-     `hycu-backups/` (p. ex. recopiées sur un partage). La liste et la lecture des
-     manifestes viennent alors de ce dossier.
-4. Pour chaque volume coché, indiquez la **référence du VG** correspondant — l'**UUID
-   du VG** (ou un `volumeHandle`, ou un IQN legacy). Le bouton **« Réf. VG auto »** la
-   récupère depuis Prism ; l'orchestration HYCU la remplit automatiquement. En clone,
-   le nom du nouveau PV est pré-rempli et modifiable.
-5. **Prévisualiser le plan** : vérifiez les remplacements dérivés (`volumeHandle`,
-   UUID du VG), la **purge des attributs runtime** du VG source, le passage du PV
-   source en **Retain**, et la séquence.
-6. En **mode réel** : retapez le nom du contexte pour confirmer, puis **Lancer**.
+### Tab 2 — Restore
+1. On the **HYCU** side: restore or clone the Volume Group (“0000” suffix).
+2. In the tool: pick the namespace, the **operation type** (Clone or In-place
+   restore), then **tick the PVC(s)** to restore (several volumes of the same
+   app = a single transaction: one stop, one restart).
+3. **Configuration backup to restore from**: the tool rebuilds the PVs/PVCs (the
+   “skeleton”) from a **config backup** (tab 1). If several exist, a **dropdown**
+   lets you **choose which one** (timestamp + volume count + context); the
+   **most recent** is the default. This is independent from the **HYCU restore
+   point** (the Volume Group *data*), which is chosen separately.
+   - **Destroyed namespace** case: there are no more “live” PVCs to read — the
+     rebuild relies **entirely** on the selected config backup.
+   - **Custom folder**: tick “Read backups from a custom folder” and enter the
+     path if your backups are not in `hycu-backups/` (e.g. copied to a share).
+     The listing and manifest reads then come from that folder.
+4. For each ticked volume, enter the **reference of the matching VG** — the
+   **VG UUID** (or a `volumeHandle`, or a legacy IQN). The **“Auto VG ref”**
+   button fetches it from Prism; the HYCU orchestration fills it automatically.
+   In clone mode, the new PV name is pre-filled and editable.
+5. **Preview the plan**: check the derived replacements (`volumeHandle`, VG
+   UUID), the **purge of the source VG's runtime attributes**, the switch of the
+   source PV to **Retain**, and the sequence.
+6. In **real mode**: retype the context name to confirm, then **Launch**.
 
-> Si une étape échoue, la séquence **s'arrête** et l'application est **laissée
-> arrêtée** (réplicas à 0) pour ne pas redémarrer sur des volumes incohérents. Le
-> message indique l'étape en cause. Corrigez puis **relancez** : les réplicas cibles
-> d'origine sont mémorisés (jamais redémarrés à 0).
+> If a step fails, the sequence **stops** and the application is **left
+> stopped** (replicas at 0) so it does not restart on inconsistent volumes. The
+> message states the failing step. Fix, then **relaunch**: the original target
+> replicas are remembered (never restarted at 0).
 
-### Onglet 3 — Vérifier
-Confirme que les PVC sont **Bound** et que les pods tournent. Le bouton
-**Suivi auto** rafraîchit jusqu'à 10 fois.
+### Tab 3 — Verify
+Confirms the PVCs are **Bound** and the pods are running. The **Auto-track**
+button refreshes up to 10 times.
 
-## 4. Sécurité
+## 4. Security
 
-- Le serveur **n'écoute que sur `127.0.0.1`** (jamais exposé au réseau).
-- Protection **anti-CSRF / anti-DNS-rebinding** : vérification des en-têtes `Host`
-  et `Origin`/`Referer`, et **jeton anti-CSRF** exigé sur chaque action.
-- **Dry-run par défaut** ; confirmation du contexte avant toute action réelle.
-- **Journal d'audit** append-only : `hycu-backups/audit.log` (horodaté : namespace,
-  volumes, mode, dry/réel, résultat).
-- **Lecture des sauvegardes bornée** : par défaut, seuls les chemins **sous
-  `hycu-backups/`** sont lisibles (défense contre une lecture hors zone). Un **dossier
-  personnalisé** n'est ouvert que si **vous le désignez explicitement** dans l'onglet
-  Restaurer ; un chemin hors de cette zone reste refusé.
+- The server **only listens on `127.0.0.1`** (never exposed to the network).
+- **Anti-CSRF / anti-DNS-rebinding** protection: `Host` and `Origin`/`Referer`
+  header checks, and an **anti-CSRF token** required on every action.
+- **Dry-run by default**; context confirmation before any real action.
+- **Browser-session-bound credentials**: HYCU/Nutanix credentials are tied to
+  **one browser session** (`hycu_sess` session cookie). Opening the page from a
+  restarted browser, another browser, or a private window **locks the
+  connections** — credentials are wiped from memory and the vault master
+  passphrase (or the passwords) must be entered again. A simple reload (F5) in
+  the same browser keeps the session.
+- Append-only **audit log**: `hycu-backups/audit.log` (timestamped: namespace,
+  volumes, mode, dry/real, result).
+- **Bounded backup reads**: by default, only paths **under `hycu-backups/`** are
+  readable (defence against out-of-zone reads). A **custom folder** is only
+  opened if **you explicitly designate it** in the Restore tab; a path outside
+  that zone is still refused.
 
-## 5. Configuration (`hycu_config.json`) — adaptation par client
+## 5. Configuration (`hycu_config.json`) — per-customer adaptation
 
-Copiez `hycu_config.example.json` → `hycu_config.json`. Modifiable aussi via
-l'onglet **⚙ Réglages** de l'interface. Toutes les clés sont optionnelles.
+Copy `hycu_config.example.json` → `hycu_config.json`. Also editable via the
+**⚙ Settings** tab of the UI. All keys are optional.
 
-| Clé | Défaut | Rôle |
+| Key | Default | Role |
 |---|---|---|
-| `kubectl_path` | `"kubectl"` | Binaire kubectl. Ex. `"microk8s kubectl"`, `"k3s kubectl"`, ou chemin complet. |
-| `allowed_contexts` | `[]` | Liste blanche de contextes kubectl. `[]` = tous. En mode réel, un contexte hors liste est **refusé**. |
-| `namespace_filter` | `[]` | Liste blanche de namespaces. `[]` = tous. |
-| `wait_timeout` | `120` | Attente max (s) d'une suppression / d'un passage `Bound` / de l'arrêt des pods. |
-| `subprocess_margin` | `30` | Marge (s) du timeout subprocess au-dessus de `wait_timeout` (pour ne pas tuer `kubectl wait` avant son verdict). |
-| `clone_name_suffix` | `"0000"` | Convention HYCU pour le nom du PV cloné (suggestion pré-remplie, modifiable). |
-| `volume_handle_prefix` | `""` | **Vide = auto-détecté** depuis le PV existant (suit le driver CSI du client). Ne renseigner que pour forcer un préfixe. |
-| `strip_claimref` | `false` | `true` = retirer entièrement `claimRef` du PV (laisse le PVC recréé rebinder). `false` = conserver `claimRef` (name+namespace) sans uid/resourceVersion. |
-| `require_context_confirm` | `true` | Exiger la re-saisie du contexte avant toute action réelle. |
-| `host` / `port` | `127.0.0.1` / `8765` | Adresse d'écoute. **Ne pas exposer** `host` hors de la boucle locale. |
-| `open_browser` | `true` | Ouvrir le navigateur au démarrage. |
-| `hycu_url` | `""` | URL du contrôleur HYCU, ex. `https://hycu.exemple.com:8443` (port 8443). Vide = connecteur HYCU désactivé. |
-| `hycu_api_base` | `/rest/v1.0` | Base de l'API REST HYCU (**dépend de la version** — voir §8). |
-| `hycu_test_path` | `/vms` | Endpoint GET utilisé pour tester la connexion (relevez-le dans le REST API Explorer). |
-| `hycu_verify_tls` | `false` | Vérifier le certificat TLS HYCU (souvent auto-signé → `false`). |
-| `nutanix_url` | `""` | URL de Prism **Element**, ex. `https://prism.exemple.com:9440`. Vide = désactivé. |
-| `nutanix_api_base` | `/PrismGateway/services/rest/v2.0` | Base de l'API Prism Element v2. |
-| `nutanix_verify_tls` | `false` | Vérifier le certificat TLS Prism Element. |
-| `prismcentral_url` | `""` | URL de Prism **Central**, ex. `https://pc.exemple.com:9440`. Vide = désactivé. |
-| `prismcentral_api_base` | `/api/nutanix/v3` | Base de l'API Prism Central v3. |
-| `prismcentral_verify_tls` | `false` | Vérifier le certificat TLS Prism Central. |
+| `kubectl_path` | `"kubectl"` | kubectl binary. E.g. `"microk8s kubectl"`, `"k3s kubectl"`, or full path. |
+| `allowed_contexts` | `[]` | Whitelist of kubectl contexts. `[]` = all. In real mode, a context outside the list is **refused**. |
+| `namespace_filter` | `[]` | Whitelist of namespaces. `[]` = all. |
+| `wait_timeout` | `120` | Max wait (s) for a deletion / a `Bound` transition / pod shutdown. |
+| `subprocess_margin` | `30` | Margin (s) of the subprocess timeout above `wait_timeout` (so `kubectl wait` is not killed before its verdict). |
+| `clone_name_suffix` | `"0000"` | HYCU convention for the cloned PV name (pre-filled suggestion, editable). |
+| `volume_handle_prefix` | `""` | **Empty = auto-detected** from the existing PV (follows the customer's CSI driver). Only set to force a prefix. |
+| `strip_claimref` | `false` | `true` = remove `claimRef` entirely from the PV (lets the recreated PVC rebind). `false` = keep `claimRef` (name+namespace) without uid/resourceVersion. |
+| `require_context_confirm` | `true` | Require retyping the context before any real action. |
+| `host` / `port` | `127.0.0.1` / `8765` | Listen address. **Do not expose** `host` outside the local loopback. |
+| `open_browser` | `true` | Open the browser at startup. |
+| `hycu_url` | `""` | HYCU controller URL, e.g. `https://hycu.example.com:8443` (port 8443). Empty = HYCU connector disabled. |
+| `hycu_api_base` | `/rest/v1.0` | HYCU REST API base (**version-dependent** — see §8). |
+| `hycu_test_path` | `/vms` | GET endpoint used to test the connection (look it up in the REST API Explorer). |
+| `hycu_verify_tls` | `false` | Verify the HYCU TLS certificate (often self-signed → `false`). |
+| `nutanix_url` | `""` | Prism **Element** URL, e.g. `https://prism.example.com:9440`. Empty = disabled. |
+| `nutanix_api_base` | `/PrismGateway/services/rest/v2.0` | Prism Element v2 API base. |
+| `nutanix_verify_tls` | `false` | Verify the Prism Element TLS certificate. |
+| `prismcentral_url` | `""` | Prism **Central** URL, e.g. `https://pc.example.com:9440`. Empty = disabled. |
+| `prismcentral_api_base` | `/api/nutanix/v3` | Prism Central v3 API base. |
+| `prismcentral_verify_tls` | `false` | Verify the Prism Central TLS certificate. |
 
-> Les **identifiants** HYCU/Nutanix ne sont **jamais** dans la config : ils sont saisis
-> dans l'onglet **Connexions** et gardés en mémoire le temps de la session uniquement.
+> HYCU/Nutanix **credentials** are **never** in the config: they are entered in
+> the **Connections** tab and kept in memory for the session only.
 
-### Exemple — un client « microk8s », 2 namespaces, cluster de prod verrouillé
+### Example — a “microk8s” customer, 2 namespaces, locked-down prod cluster
 ```json
 {
   "kubectl_path": "microk8s kubectl",
@@ -211,101 +221,113 @@ l'onglet **⚙ Réglages** de l'interface. Toutes les clés sont optionnelles.
 }
 ```
 
-## 6. À valider sur le cluster du client avant la prod
+## 6. To validate on the customer's cluster before production
 
-Ces points dépendent de l'environnement et **ne peuvent pas être vérifiés sans le
-vrai cluster** :
+These points depend on the environment and **cannot be verified without the real
+cluster**:
 
-1. **`hypervisorAttachedDiskUUIDs` (point #1)** : sur le CSI Nutanix moderne (NKP), le
-   VG est attaché à la VM worker et le PV porte `volumeAttributes.hypervisorAttachedDiskUUIDs`
-   = UUID du **disque attaché du VG source**. L'outil le **purge** du PV cloné (option
-   `clone_strip_runtime_attrs`, défaut `true`) pour que le driver le repeuple à l'attach.
-   **À confirmer sur un PV cloné réel** : le driver localise bien le volume par
-   `volumeHandle` seul (montage OK) — sinon il faudra réécrire ce champ avec l'UUID du
-   disque **cloné** plutôt que le purger.
-2. **`Retain` du PV source (perte de données)** : avant de supprimer l'ancien PV/PVC,
-   l'outil passe le PV source en `persistentVolumeReclaimPolicy: Retain` (option
-   `retain_source_pv`, défaut `true`) pour que le CSI **ne supprime pas** le Volume
-   Group Nutanix (reclaim=Delete par défaut). Vérifier que le VG source survit bien.
-3. **UUID ↔ VG cloné** : l'UUID saisi doit être celui du VG **cloné**, pas du source
-   (avertissement si identique) ni le **nom** du VG `pvc-<uuid>` (avertissement dédié).
-4. **Re-protection HYCU** : après un clone, ré-assigner la politique de protection
-   au nouveau Volume Group (rappelé dans le plan ; non automatisé).
-5. **Scénarios de test** : restore mono-PVC, restore **multi-PVC**, et surtout
-   **abort → relance** (vérifier que l'app revient à son nombre de réplicas
-   d'origine, pas à 0), et un PVC bloqué en `Terminating`.
-6. `kubectl wait --for=jsonpath` nécessite **kubectl ≥ 1.23**.
+1. **`hypervisorAttachedDiskUUIDs` (point #1)**: on the modern Nutanix CSI
+   (NKP), the VG is attached to the worker VM and the PV carries
+   `volumeAttributes.hypervisorAttachedDiskUUIDs` = UUID of the **source VG's
+   attached disk**. The tool **purges** it from the cloned PV (option
+   `clone_strip_runtime_attrs`, default `true`) so the driver repopulates it at
+   attach time. **To confirm on a real cloned PV**: the driver locates the
+   volume by `volumeHandle` alone (mount OK) — otherwise this field will need to
+   be rewritten with the **cloned** disk's UUID rather than purged.
+2. **`Retain` on the source PV (data loss)**: before deleting the old PV/PVC,
+   the tool switches the source PV to `persistentVolumeReclaimPolicy: Retain`
+   (option `retain_source_pv`, default `true`) so the CSI **does not delete**
+   the Nutanix Volume Group (reclaim=Delete by default). Verify the source VG
+   does survive.
+3. **UUID ↔ cloned VG**: the UUID entered must be that of the **cloned** VG, not
+   the source (warning if identical) nor the VG **name** `pvc-<uuid>` (dedicated
+   warning).
+4. **HYCU re-protection**: after a clone, re-assign the protection policy to the
+   new Volume Group (reminded in the plan; not automated).
+5. **Test scenarios**: single-PVC restore, **multi-PVC** restore, and above all
+   **abort → relaunch** (verify the app comes back to its original replica
+   count, not 0), and a PVC stuck in `Terminating`.
+6. `kubectl wait --for=jsonpath` requires **kubectl ≥ 1.23**.
 
-## 7. Dépannage
+## 7. Troubleshooting
 
-| Symptôme | Piste |
+| Symptom | Lead |
 |---|---|
-| « Contexte : indisponible » | `kubectl` absent du PATH ou contexte non configuré. |
-| « Namespace non autorisé » | Le namespace n'est pas dans `namespace_filter`. |
-| « Contexte non autorisé » | Le contexte courant n'est pas dans `allowed_contexts`. |
-| PVC/PV reste `Terminating` | L'outil patche les finalizers automatiquement ; sinon vérifier qu'aucun pod ne monte encore le volume. |
-| « Jeton anti-CSRF invalide » | Rechargez la page (le jeton est régénéré à chaque démarrage). |
-| Séquence « interrompue » | Lire l'étape en cause dans le log, corriger, **relancer** (réplicas mémorisés). |
+| “Context: unavailable” | `kubectl` missing from PATH or context not configured. |
+| “Namespace not allowed” | The namespace is not in `namespace_filter`. |
+| “Context not allowed” | The current context is not in `allowed_contexts`. |
+| PVC/PV stuck in `Terminating` | The tool patches finalizers automatically; otherwise check no pod still mounts the volume. |
+| “Invalid anti-CSRF token” | Reload the page (the token is regenerated at each startup). |
+| Connections ask to be unlocked again | Expected: a new browser session (restarted browser, private window) locks the credentials — enter the vault passphrase again. |
+| “Interrupted” sequence | Read the failing step in the log, fix, **relaunch** (replicas remembered). |
 
-## 8. Connexions HYCU / Nutanix (onglet « Connexions »)
+## 8. HYCU / Nutanix connections (“Connections” tab)
 
-Connexions **optionnelles** (en stdlib, aucune dépendance) : sans elles, le flux
-manuel (coller la référence du VG) reste pleinement utilisable.
+**Optional** connections (stdlib only, no dependency): without them, the manual
+flow (pasting the VG reference) remains fully usable.
 
-- **Nutanix Prism (lecture seule)** — deux zones de connexion : **Prism Element** (API v2)
-  et **Prism Central** (API v3, multi-cluster). Dans l'onglet Restaurer, le bouton
-  **« Réf. VG auto (Nutanix) »** recherche le Volume Group cloné et **remplit son UUID**
-  automatiquement (plus de copier-coller). Il utilise la source connectée — Prism Element
-  en priorité, sinon Prism Central.
-- **HYCU (actions)** — lister les **Volume Groups protégés** et leurs **points de
-  restauration**, choisir **Clone** ou **Restauration sur place**, puis **déclencher**
-  et suivre le job. **Mode simulation par défaut** : l'appel exact (méthode + URL + corps)
-  est affiché **avant** tout envoi réel.
+- **Nutanix Prism (read-only)** — two connection zones: **Prism Element** (v2
+  API) and **Prism Central** (v3 API, multi-cluster). In the Restore tab, the
+  **“Auto VG ref (Nutanix)”** button searches for the cloned Volume Group and
+  **fills in its UUID** automatically (no more copy-paste). It uses the
+  connected source — Prism Element first, otherwise Prism Central.
+- **HYCU (actions)** — list the **protected Volume Groups** and their **restore
+  points**, choose **Clone** or **In-place restore**, then **trigger** and track
+  the job. **Simulation mode by default**: the exact call (method + URL + body)
+  is displayed **before** anything is actually sent.
 
-**Identifiants** : saisis dans l'onglet, **gardés en mémoire** le temps de la session,
-**jamais écrits** sur disque ni dans la config (mode par défaut, le plus sûr). Effacés à la
-déconnexion / à l'arrêt.
+**Credentials**: entered in the tab, **kept in memory** for the duration of the
+**browser session**, **never written** to disk nor to the config (default mode,
+the safest). Wiped on disconnect, on shutdown, and whenever a **new browser
+session** opens the page (restarted browser, private window — see §4).
 
-### Mémoriser les connexions (coffre chiffré, optionnel)
+### Remembering connections (encrypted vault, optional)
 
-L'onglet Connexions propose un coffre chiffré pour ne pas re-saisir les identifiants à
-chaque session :
+The Connections tab offers an encrypted vault so you don't have to re-enter
+credentials every session:
 
-- Les identifiants sont chiffrés dans **`hycu_secrets.enc`** (à côté du programme), protégé
-  par une **phrase secrète maîtresse** que **vous seul connaissez** — elle n'est jamais stockée.
-- Boutons : **Enregistrer (chiffrer)** · **Charger (déchiffrer)** · **Oublier** (supprime le fichier).
-- **Pourquoi pas MD5 ?** MD5 (comme tout hachage) est **à sens unique** : on ne pourrait jamais
-  récupérer le mot de passe pour se reconnecter. Le coffre utilise donc un **chiffrement
-  réversible** : clé dérivée de la phrase par **PBKDF2-HMAC-SHA256** (200 000 itérations),
-  flux HMAC-SHA256, et **scellé d'intégrité** (détecte une mauvaise phrase ou une altération).
-- Construction en **stdlib pure** (aucune dépendance) ; pragmatique mais robuste pour un outil
-  local mono-opérateur. Si une assurance cryptographique maximale est requise, **gardez le mode
-  RAM seulement** (n'utilisez pas le coffre) et re-saisissez les identifiants à chaque session.
+- Credentials are encrypted into **`hycu_secrets.enc`** (next to the program),
+  protected by a **master passphrase** that **only you know** — it is never
+  stored. At each **new browser session**, the tool asks for this passphrase
+  again to unlock the connections.
+- Buttons: **Save (encrypt)** · **Load (decrypt)** · **Forget** (deletes the
+  file).
+- **Why not MD5?** MD5 (like any hash) is **one-way**: the password could never
+  be recovered to reconnect. The vault therefore uses **reversible encryption**:
+  key derived from the passphrase with **PBKDF2-HMAC-SHA256** (200,000
+  iterations), HMAC-SHA256 stream, and an **integrity seal** (detects a wrong
+  passphrase or tampering).
+- Built in **pure stdlib** (no dependency); pragmatic but robust for a local
+  single-operator tool. If maximum cryptographic assurance is required, **stay
+  in RAM-only mode** (do not use the vault) and re-enter credentials each
+  session.
 
-> Config : `remember_credentials` passe à `true` quand un coffre existe ; `pbkdf2_iterations`
-> règle le coût de dérivation. Aucun secret n'est jamais écrit dans `hycu_config.json`.
+> Config: `remember_credentials` switches to `true` when a vault exists;
+> `pbkdf2_iterations` tunes the derivation cost. No secret is ever written to
+> `hycu_config.json`.
 
-### HYCU 5.2 (R-Cloud Hybrid Cloud Edition) — endpoints vérifiés
+### HYCU 5.2 (R-Cloud Hybrid Cloud Edition) — verified endpoints
 
-API REST sur le **port 8443**, base `/rest/v1.0`. Endpoints **vérifiés sur 5.2** (Swagger
-`/rest/v1.0/api-docs`) et utilisés par l'outil :
+REST API on **port 8443**, base `/rest/v1.0`. Endpoints **verified on 5.2**
+(Swagger `/rest/v1.0/api-docs`) and used by the tool:
 
-| Action | Appel HYCU 5.2 |
+| Action | HYCU 5.2 call |
 |---|---|
-| Lister les Volume Groups protégés | `GET /rest/v1.0/volumegroups` |
-| Lister les points de restauration d'un VG | `GET /rest/v1.0/volumegroups/{vgUuid}/backups` |
-| Déclencher restore/clone | `POST /rest/v1.0/volumegroups/vgrestore` (corps `RestoreSpecDTO`) |
-| État d'un job | `GET /rest/v1.0/jobs/{jobUuid}` |
+| List protected Volume Groups | `GET /rest/v1.0/volumegroups` |
+| List a VG's restore points | `GET /rest/v1.0/volumegroups/{vgUuid}/backups` |
+| Trigger restore/clone | `POST /rest/v1.0/volumegroups/vgrestore` (body `RestoreSpecDTO`) |
+| Job status | `GET /rest/v1.0/jobs/{jobUuid}` |
 
-- **Authentification** (onglet Connexions) :
-  - **Basic** : utilisateur/mot de passe d'un administrateur du groupe d'infrastructure.
-  - **Clé API** : générée dans HYCU via **Aide → API Keys** ; **obligatoire si le 2FA est
-    activé**. Transmise en `Authorization: Bearer <clé>` (schéma confirmé).
-- Corps `vgrestore` envoyé : `backupUuid` (= point de restauration), `createVolumeGroup`
-  (`true` = clone / `false` = sur place), `vgName` (clone), `startVgRestore`, `restoreSource`
-  (`AUTO`). Le **mode simulation** montre ce corps avant envoi.
+- **Authentication** (Connections tab):
+  - **Basic**: user/password of an administrator of the infrastructure group.
+  - **API key**: generated in HYCU via **Help → API Keys**; **required if 2FA is
+    enabled**. Sent as `Authorization: Bearer <key>` (confirmed scheme).
+- `vgrestore` body sent: `backupUuid` (= restore point), `createVolumeGroup`
+  (`true` = clone / `false` = in-place), `vgName` (clone), `startVgRestore`,
+  `restoreSource` (`AUTO`). **Simulation mode** shows this body before sending.
 
-> Si votre version diffère, tous les chemins se relèvent dans **Aide → REST API Explorer**
-> de l'appliance et s'ajustent via `hycu_api_base` / `hycu_test_path` + le mode simulation.
-> Sécurité : `*_verify_tls` à `false` accepte les certificats auto-signés des appliances ;
-> passez à `true` avec une PKI interne valide.
+> If your version differs, all paths can be looked up in the appliance's
+> **Help → REST API Explorer** and adjusted via `hycu_api_base` /
+> `hycu_test_path` + simulation mode. Security: `*_verify_tls` at `false`
+> accepts appliances' self-signed certificates; switch to `true` with a valid
+> internal PKI.
