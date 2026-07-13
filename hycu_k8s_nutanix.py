@@ -213,7 +213,7 @@ def save_config(updates):
 
 # Version horodatée de la build (format AAAAMMJJ-HHMM). À incrémenter à chaque
 # changement notable du programme ; affichée dans l'en-tête de l'interface.
-VERSION = "20260714-0030"
+VERSION = "20260714-0930"
 
 # Jeton anti-CSRF généré au démarrage, injecté dans la page et exigé sur les POST.
 CSRF_TOKEN = secrets.token_urlsafe(32)
@@ -3866,8 +3866,8 @@ HTML = r"""<!DOCTYPE html>
     <div class="wiz-head">
       <div class="wiz-brand">__LOGO__</div>
       <h2 style="margin-top:10px">Protection Kubernetes sur Nutanix</h2>
-      <div style="color:var(--teal);font-weight:700;font-size:13px;margin-top:2px">Plugin pour HYCU Enterprise Cloud</div>
-      <div class="hint" style="font-style:italic;margin-top:6px">Plugin gratuit, fourni « tel quel », sans aucune garantie ni engagement de HYCU.</div>
+      <div style="color:#B8B4FC;font-weight:700;font-size:13px;margin-top:2px">Plugin pour HYCU Enterprise Cloud</div>
+      <div style="font-style:italic;margin-top:6px;font-size:12px;color:#fff">Plugin gratuit, fourni « tel quel », sans aucune garantie ni engagement de HYCU.</div>
     </div>
     <div class="wiz-body" style="font-size:13px">
       <div style="display:grid;grid-template-columns:auto 1fr;gap:6px 14px;align-items:baseline">
