@@ -6,12 +6,14 @@ Interface web guidée pour **sauvegarder et restaurer** les applications Kuberne
 dont les volumes (PVC = Volume Groups Nutanix) sont protégés par **HYCU**.
 
 L'outil remplace la procédure manuelle (≈ 20 commandes `kubectl` + édition de YAML)
-par quelques clics. À la restauration, la **seule saisie** est la **référence du
-Volume Group** cloné/restauré — son **UUID** (CSI Nutanix moderne / NKP : le VG est
-attaché directement à la VM worker, **plus d'IQN**), un `volumeHandle`, ou un **IQN**
-(clusters iSCSI hérités). L'outil en dérive le `volumeHandle`, régénère le manifeste
-du PV, puis enchaîne `scale-down → delete → patch finalizer → apply → scale-up →
-vérification`.
+par quelques clics. **Avec le connecteur HYCU**, la restauration tient en un clic :
+l'outil clone/restaure les Volume Groups dans HYCU, récupère leurs références,
+régénère les manifestes PV/PVC et enchaîne `scale-down → delete → patch finalizer →
+apply → scale-up → vérification`. **Sans lui** (flux manuel), la seule saisie est la
+**référence du Volume Group** cloné/restauré — son **UUID** (CSI Nutanix moderne /
+NKP : le VG est attaché directement à la VM worker, **plus d'IQN**), un
+`volumeHandle`, ou un **IQN** (clusters iSCSI hérités) ; l'outil en dérive le
+`volumeHandle`.
 
 > ⚠️ **Outil destructif.** Il supprime et recrée des PV/PVC. Le mode **Simulation
 > (dry-run) est activé par défaut**. Testez toujours sur un namespace de test avant
@@ -155,6 +157,9 @@ de sécurité.
    - **Restauration sur place** : rien d'autre à sélectionner — **« Lancer la
      restauration sur place »** est prêt d'emblée (arrêt → restore in-place
      HYCU → redémarrage).
+   - Les noms générés (VG cloné, nouveau PV) sont des valeurs par défaut
+     correctes, rangées dans le volet **Avancé** replié de chaque volume —
+     ouvrez-le seulement pour les modifier ou saisir une référence à la main.
 4. **Sans HYCU** (flux manuel) : restaurez/clonez chaque VG dans HYCU vous-même,
    collez son **UUID** par volume dans le volet **Avancé** (ou « Rechercher le
    VG dans Prism »), puis **« Continuer : vérifier et lancer »**.
@@ -173,6 +178,11 @@ de sécurité.
 > Une barre **« action suivante »** flottante guide le parcours (remplir les
 > références VG → prévisualiser → lancer) sans avoir à faire défiler la page,
 > et l'indicateur d'étapes reste visible pendant le défilement.
+
+> Confort : l'en-tête affiche en permanence les **pastilles de connexion
+> HYCU / PE / PC** (cliquer les ouvre l'onglet Connexions), le namespace choisi
+> est partagé entre les trois onglets, et vos derniers choix (namespace, type
+> d'opération, dossiers) sont mémorisés par navigateur.
 
 ### Onglet 3 — Vérifier
 Confirme que les PVC sont **Bound** et que les pods tournent. Le **Suivi auto**
@@ -276,7 +286,7 @@ vrai cluster** :
 | Symptôme | Piste |
 |---|---|
 | « Contexte : indisponible » | `kubectl` absent du PATH ou contexte non configuré. |
-| « Namespace non autorisé » | Le namespace n'est pas dans `namespace_filter`. |
+| « Namespace non autorisé » | Le namespace n'est pas dans `namespace_filter`. Dans l'onglet Vérifier, le bouton **« Autoriser « ns » et réessayer »** l'ajoute en un clic ; un namespace créé par un clone d'application est ajouté automatiquement. |
 | « Contexte non autorisé » | Le contexte courant n'est pas dans `allowed_contexts`. |
 | PVC/PV reste `Terminating` | L'outil patche les finalizers automatiquement ; sinon vérifier qu'aucun pod ne monte encore le volume. |
 | « Jeton anti-CSRF invalide » | Rechargez la page (le jeton est régénéré à chaque démarrage). |
@@ -289,10 +299,11 @@ Connexions **optionnelles** (en stdlib, aucune dépendance) : sans elles, le flu
 manuel (coller la référence du VG) reste pleinement utilisable.
 
 - **Nutanix Prism (lecture seule)** — deux zones de connexion : **Prism Element** (API v2)
-  et **Prism Central** (API v3, multi-cluster). Dans l'onglet Restaurer, le bouton
-  **« Réf. VG auto (Nutanix) »** recherche le Volume Group cloné et **remplit son UUID**
-  automatiquement (plus de copier-coller). Il utilise la source connectée — Prism Element
-  en priorité, sinon Prism Central.
+  et **Prism Central** (API v3, multi-cluster). Dans l'onglet Restaurer, le
+  flux HYCU groupé s'appuie sur Prism pour **remplir automatiquement les UUID des VG
+  clonés** (plus de copier-coller), et le volet **Avancé** de chaque volume propose un
+  bouton **« Rechercher le VG dans Prism »** pour le flux manuel. Il utilise la source
+  connectée — Prism Element en priorité, sinon Prism Central.
 - **HYCU (actions)** — lister les **Volume Groups protégés** et leurs **points de
   restauration**, choisir **Clone** ou **Restauration sur place**, puis **déclencher**
   et suivre le job. **Mode simulation par défaut** : l'appel exact (méthode + URL + corps)

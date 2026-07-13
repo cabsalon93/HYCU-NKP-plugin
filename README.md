@@ -6,12 +6,14 @@ Guided web interface to **back up and restore** Kubernetes applications whose
 volumes (PVC = Nutanix Volume Groups) are protected by **HYCU**.
 
 The tool replaces the manual procedure (≈ 20 `kubectl` commands + hand-editing
-YAML) with a few clicks. At restore time, the **only input** required is the
-**reference of the cloned/restored Volume Group** — its **UUID** (modern Nutanix
-CSI / NKP: the VG is attached directly to the worker VM, **no more IQN**), a
-`volumeHandle`, or an **IQN** (legacy iSCSI clusters). The tool derives the
-`volumeHandle` from it, regenerates the PV manifest, then runs
+YAML) with a few clicks. **With the HYCU connector**, restoring is a single
+click: the tool clones/restores the Volume Groups in HYCU, retrieves their
+references, rebuilds the PV/PVC manifests and runs
 `scale-down → delete → patch finalizer → apply → scale-up → verification`.
+**Without it** (manual flow), the only input is the **reference of the
+cloned/restored Volume Group** — its **UUID** (modern Nutanix CSI / NKP: the VG
+is attached directly to the worker VM, **no more IQN**), a `volumeHandle`, or
+an **IQN** (legacy iSCSI clusters); the tool derives the `volumeHandle` from it.
 
 > ⚠️ **Destructive tool.** It deletes and recreates PVs/PVCs. **Simulation
 > (dry-run) mode is enabled by default**. Always test on a test namespace before
@@ -154,6 +156,9 @@ net.
      displayed — ready to launch.
    - **In-place restore**: nothing else to select — **“Launch the in-place
      restore”** is ready immediately (stop → HYCU in-place restore → restart).
+   - The generated names (cloned VG, new PV) are sensible defaults, tucked away
+     in each volume's collapsed **Advanced** section — open it only to override
+     them or to enter a reference manually.
 4. **Without HYCU** (manual flow): restore/clone each VG in HYCU yourself,
    paste its **UUID** per volume in the **Advanced** section (or use “Search the
    VG in Prism”), then click **“Continue: review and launch”**.
@@ -172,6 +177,11 @@ net.
 > A floating **“next action” bar** guides you through the flow (fill the VG
 > references → preview → launch) without having to scroll the page, and the
 > step indicator stays visible while scrolling.
+
+> Comfort features: the header shows permanent **HYCU / PE / PC connection
+> dots** (click them to open the Connections tab), the selected namespace is
+> shared across the three tabs, and your last choices (namespace, operation
+> type, folders) are remembered per browser.
 
 ### Tab 3 — Verify
 Confirms the PVCs are **Bound** and the pods are running. **Auto-track**
@@ -277,7 +287,7 @@ cluster**:
 | Symptom | Lead |
 |---|---|
 | “Context: unavailable” | `kubectl` missing from PATH or context not configured. |
-| “Namespace not allowed” | The namespace is not in `namespace_filter`. |
+| “Namespace not allowed” | The namespace is not in `namespace_filter`. In the Verify tab, the **“Allow « ns » and retry”** button adds it in one click; a namespace created by an application clone is added automatically. |
 | “Context not allowed” | The current context is not in `allowed_contexts`. |
 | PVC/PV stuck in `Terminating` | The tool patches finalizers automatically; otherwise check no pod still mounts the volume. |
 | “Invalid anti-CSRF token” | Reload the page (the token is regenerated at each startup). |
@@ -291,8 +301,9 @@ flow (pasting the VG reference) remains fully usable.
 
 - **Nutanix Prism (read-only)** — two connection zones: **Prism Element** (v2
   API) and **Prism Central** (v3 API, multi-cluster). In the Restore tab, the
-  **“Auto VG ref (Nutanix)”** button searches for the cloned Volume Group and
-  **fills in its UUID** automatically (no more copy-paste). It uses the
+  HYCU batch flow uses Prism to **fill in the cloned VG UUIDs** automatically
+  (no more copy-paste), and each volume's **Advanced** section offers a
+  **“Search for the VG in Prism”** button for the manual flow. It uses the
   connected source — Prism Element first, otherwise Prism Central.
 - **HYCU (actions)** — list the **protected Volume Groups** and their **restore
   points**, choose **Clone** or **In-place restore**, then **trigger** and track

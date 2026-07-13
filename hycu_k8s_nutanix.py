@@ -213,7 +213,7 @@ def save_config(updates):
 
 # Version horodatée de la build (format AAAAMMJJ-HHMM). À incrémenter à chaque
 # changement notable du programme ; affichée dans l'en-tête de l'interface.
-VERSION = "20260713-2340"
+VERSION = "20260714-0030"
 
 # Jeton anti-CSRF généré au démarrage, injecté dans la page et exigé sur les POST.
 CSRF_TOKEN = secrets.token_urlsafe(32)
@@ -1756,7 +1756,11 @@ def action_verify(ns):
 
 def action_get_config():
     return {"config": CONFIG, "defaults": DEFAULT_CONFIG,
-            "exists": os.path.isfile(CONFIG_PATH)}
+            "exists": os.path.isfile(CONFIG_PATH),
+            # Chemins affichés dans la fenêtre « À propos ».
+            "config_path": CONFIG_PATH,
+            "audit_log": os.path.join(CONFIG["backup_root"], "audit.log"),
+            "backup_root": CONFIG["backup_root"]}
 
 
 def action_set_config(payload):
@@ -3856,6 +3860,30 @@ HTML = r"""<!DOCTYPE html>
   </div>
 </div>
 
+<!-- ===================== À PROPOS ===================== -->
+<div id="aboutModal" class="wiz" style="display:none">
+  <div class="wiz-card" style="max-width:560px">
+    <div class="wiz-head">
+      <div class="wiz-brand">__LOGO__</div>
+      <h2 style="margin-top:10px">Protection Kubernetes sur Nutanix</h2>
+      <div style="color:var(--teal);font-weight:700;font-size:13px;margin-top:2px">Plugin pour HYCU Enterprise Cloud</div>
+      <div class="hint" style="font-style:italic;margin-top:6px">Plugin gratuit, fourni « tel quel », sans aucune garantie ni engagement de HYCU.</div>
+    </div>
+    <div class="wiz-body" style="font-size:13px">
+      <div style="display:grid;grid-template-columns:auto 1fr;gap:6px 14px;align-items:baseline">
+        <b>Version :</b><code>__VERSION__</code>
+        <b>Journal d'audit :</b><code id="aboutAudit" style="word-break:break-all">…</code>
+        <b>Configuration :</b><code id="aboutCfg" style="word-break:break-all">…</code>
+        <b>Sauvegardes :</b><code id="aboutBk" style="word-break:break-all">…</code>
+      </div>
+    </div>
+    <div class="wiz-foot">
+      <span></span>
+      <button class="btn" id="aboutClose">Fermer</button>
+    </div>
+  </div>
+</div>
+
 <!-- ===================== FILTRE DES NAMESPACES ===================== -->
 <div id="nsFilter" class="wiz" style="display:none">
   <div class="wiz-card">
@@ -3892,7 +3920,7 @@ HTML = r"""<!DOCTYPE html>
     __LOGO__
     <h1><span class="wm">HYCU</span>Protection Kubernetes sur Nutanix<small>Sauvegarde &amp; restauration guidées · Nutanix</small></h1>
   </div>
-  <div class="ctx"><span id="hdrConn" class="hdrconn" title="État des connexions — cliquer pour ouvrir l'onglet Connexions"></span>Contexte kubectl : <b id="ctx">…</b><span id="ctxWarn"></span> · <span class="ver" title="Version de la build">v:__VERSION__</span><button id="langBtn" class="langbtn" type="button" title="Afficher l'interface en anglais">EN</button></div>
+  <div class="ctx"><span id="hdrConn" class="hdrconn" title="État des connexions — cliquer pour ouvrir l'onglet Connexions"></span>Contexte kubectl : <b id="ctx">…</b><span id="ctxWarn"></span> · <span class="ver" title="Version de la build">v:__VERSION__</span><button id="langBtn" class="langbtn" type="button" title="Afficher l'interface en anglais">EN</button><button id="aboutBtn" class="langbtn" type="button" title="À propos de cet outil">?</button></div>
 </header>
 
 <div class="wrap">
@@ -4289,6 +4317,16 @@ function switchTab(tab){
 }
 navBtns.forEach(b=>b.onclick=()=>switchTab(b.dataset.tab));
 $("#hdrConn").onclick=()=>switchTab("connect");
+
+// ----- Fenêtre « À propos » (bouton ? de l'en-tête) -----
+$("#aboutBtn").onclick=async()=>{
+  const r=await get("/api/config");
+  $("#aboutAudit").textContent=r.audit_log||"—";
+  $("#aboutCfg").textContent=r.config_path||"—";
+  $("#aboutBk").textContent=r.backup_root||"—";
+  $("#aboutModal").style.display="flex";
+};
+$("#aboutClose").onclick=()=>{ $("#aboutModal").style.display="none"; };
 
 // ----- Barre « action suivante » du parcours Restaurer (anti-scroll) -----
 // La page Restaurer est longue : cette barre flottante rend l'étape suivante
@@ -6584,6 +6622,16 @@ I18N_EN += [
     ('" · Première exécution dans moins d\'une minute."', '" · First run in less than a minute."'),
     (" namespace(s) sauvegardé(s), ", " namespace(s) backed up, "),
     (" ancienne(s) version(s) supprimée(s)", " old version(s) deleted"),
+    # Fenêtre « À propos » (bouton ? de l'en-tête).
+    ("À propos de cet outil", "About this tool"),
+    ("Plugin pour HYCU Enterprise Cloud", "Plugin for HYCU Enterprise Cloud"),
+    ("Plugin gratuit, fourni « tel quel », sans aucune garantie ni engagement de HYCU.",
+     "This is a free plugin, provided as-is, without any warranty or engagement from HYCU."),
+    ("<b>Version :</b>", "<b>Version:</b>"),
+    ("<b>Journal d'audit :</b>", "<b>Audit log:</b>"),
+    ("<b>Configuration :</b>", "<b>Configuration:</b>"),
+    ("<b>Sauvegardes :</b>", "<b>Backups:</b>"),
+    (">Fermer</button>", ">Close</button>"),
 ]
 
 _I18N_SORTED = None          # (fr, en) triés du plus long au plus court
