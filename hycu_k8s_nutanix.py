@@ -206,7 +206,7 @@ def save_config(updates):
 
 # Version horodatée de la build (format AAAAMMJJ-HHMM). À incrémenter à chaque
 # changement notable du programme ; affichée dans l'en-tête de l'interface.
-VERSION = "20260713-1700"
+VERSION = "20260713-2000"
 
 # Jeton anti-CSRF généré au démarrage, injecté dans la page et exigé sur les POST.
 CSRF_TOKEN = secrets.token_urlsafe(32)
@@ -3500,13 +3500,11 @@ HTML = r"""<!DOCTYPE html>
            align-items:center;gap:12px;max-width:92vw;background:var(--ink);color:#fff;
            border-radius:12px;padding:10px 16px;font-size:13px;box-shadow:0 6px 24px rgba(27,12,51,.35)}
   .nextbar.show{display:flex}
+  /* Dégagement : la barre flottante ne doit jamais recouvrir le dernier bouton. */
+  #tab-restore{padding-bottom:64px}
   .nextbar .btn{margin:0}
   @keyframes pulseGlow{0%{box-shadow:0 0 0 0 rgba(173,255,0,.7)}100%{box-shadow:0 0 0 14px rgba(173,255,0,0)}}
   .pulse{animation:pulseGlow 1s ease-out 3}
-  /* Panneau HYCU groupé (onglet Restaurer) : une ligne compacte par volume. */
-  .hyrow{border:1px solid var(--line);border-radius:8px;padding:8px 10px;margin-top:8px;background:#fff}
-  .hyrow .nm{font-weight:600;font-size:13px}
-  .hyrow .row{margin-top:6px}
   /* Pastilles d'état des connexions dans l'en-tête (cliquables -> onglet Connexions). */
   .hdrconn{display:inline-flex;gap:10px;margin-right:12px;cursor:pointer;vertical-align:1px}
   .hdrconn .hc{font-size:10px;font-weight:700;letter-spacing:.5px;color:#B8B4FC}
@@ -3853,8 +3851,8 @@ HTML = r"""<!DOCTYPE html>
     <div class="card" id="rsConfig" style="display:none">
       <h3><span class="step-no">2</span>Restaurer les données (Volume Groups)</h3>
       <div id="rsFlowGuide" class="rsGuide"></div>
-      <div id="rsHyPanel"></div>
       <div id="rsVolCfgs"></div>
+      <div id="rsHyActions"></div>
       <div id="rsInplaceRunWrap" style="display:none;margin-top:14px;border-top:1px solid var(--line);padding-top:12px">
         <p class="sub" style="margin:4px 0 8px"><b>Arrêt de l'application → restore in-place HYCU → redémarrage.</b> Aucune référence à saisir.</p>
         <button class="btn" id="rsInplaceRun" disabled>Lancer la restauration sur place</button>
@@ -4571,11 +4569,15 @@ function rebuildVolCfgs(){
   const ntOn = (conn.nutanix && conn.nutanix.connected) || (conn.prismcentral && conn.prismcentral.connected);
   const hyOn = conn.hycu && conn.hycu.connected;
   const inplaceOrch = hyOn && state.mode==="inplace";
-  // Une carte MINIMALE par volume : nom + état de la référence ; la saisie manuelle
-  // et la recherche Prism sont repliées dans « Avancé » (le panneau HYCU au-dessus
-  // remplit les références tout seul).
+  // Une carte ÉPURÉE par volume : à l'écran, seulement « volume → VG HYCU » et le
+  // point de restauration (rempli en asynchrone par buildHyPanel). Tout le reste —
+  // noms générés (VG cloné, nouveau PV) et saisie manuelle de la référence — vit
+  // dans UN SEUL volet « Avancé » replié : ce sont des valeurs par défaut correctes.
   $("#rsVolCfgs").innerHTML = chks.map(c=>{
     const pvc=c.dataset.pvc, pv=c.dataset.pv;
+    const vgNameRow = (hyOn && state.mode==="clone")
+      ? `<label class="fld">Nom du VG cloné</label>
+         <input type="text" class="hyVgName" data-pvc="${esc(pvc)}" value="${esc(pvc+'-'+cloneStamp())}">` : "";
     const nameRow = state.mode==="clone"
       ? `<label class="fld">Nom du nouveau PV</label>
          <input type="text" class="rsName" data-pvc="${esc(pvc)}" value="${esc(suggestName(pv))}">` : "";
@@ -4583,10 +4585,14 @@ function rebuildVolCfgs(){
       ? `<button class="btn ghost ntRefBtn" data-pvc="${esc(pvc)}" style="margin-top:6px">Rechercher le VG dans Prism</button>
          <div class="ntpick" data-pvc="${esc(pvc)}"></div>` : "";
     const advOpen = hyOn ? "" : "open";   // sans HYCU, la saisie manuelle est la seule voie -> volet ouvert
-    return `<div class="vol-cfg"><div class="nm">${esc(pvc)} <span class="hint">(PV ${esc(pv||'—')})</span> <span class="refStat hint" data-pvc="${esc(pvc)}" style="margin:0"></span></div>
-      ${nameRow}
+    const advSum = hyOn ? "Avancé (optionnel) — noms générés, saisie manuelle"
+                        : "Référence du VG (obligatoire) & noms générés";
+    return `<div class="vol-cfg" data-pvc="${esc(pvc)}">
+      <div class="nm">${esc(pvc)} <span class="hint">(PV ${esc(pv||'—')})</span> <span class="hint vgLabel" data-pvc="${esc(pvc)}" style="margin:0"></span> <span class="refStat hint" data-pvc="${esc(pvc)}" style="margin:0"></span></div>
+      <div class="hySlot" data-pvc="${esc(pvc)}"></div>
       <details class="rsAdv" ${advOpen}>
-        <summary class="rsAdvSum">Avancé — référence du VG (saisie manuelle / Prism)</summary>
+        <summary class="rsAdvSum">${advSum}</summary>
+        ${vgNameRow}${nameRow}
         <textarea class="rsRef" data-pvc="${esc(pvc)}" placeholder="5b4d284b-7109-4e82-4c71-7d0e36ecb5ab  (UUID du VG, ou NutanixVolumes-&lt;uuid&gt;, ou IQN legacy)"></textarea>${ntRow}
       </details></div>`;
   }).join("");
@@ -4606,15 +4612,28 @@ function rebuildVolCfgs(){
       : "Restaurez le VG dans HYCU, collez son UUID par volume (volet <b>Avancé</b>), puis <b>Continuer : vérifier et lancer</b>. <span class='hint'>Connectez HYCU pour automatiser.</span>";
   } else {
     guide = hyOn
-      ? "Cliquez <b>Restaurer les VG depuis HYCU</b> : les volumes sont clonés au point choisi et les références remplies automatiquement, puis le plan s'affiche."
+      ? "Choisissez un <b>point de restauration</b> par volume (le plus récent est pré-sélectionné), puis cliquez <b>Restaurer les VG depuis HYCU</b> — références et plan s'enchaînent automatiquement."
       : "Clonez chaque VG dans HYCU, collez son UUID par volume (volet <b>Avancé</b>), puis <b>Continuer : vérifier et lancer</b>. <span class='hint'>Connectez HYCU pour automatiser.</span>";
   }
   $("#rsFlowGuide").innerHTML = guide;
   // Barre « action suivante » + état des références en direct.
-  document.querySelectorAll(".rsRef").forEach(t=>t.addEventListener("input",()=>{ refreshRefStats(); updateNextBar(); }));
+  document.querySelectorAll(".rsRef").forEach(t=>t.addEventListener("input",()=>{ refreshRefStats(); syncContinueVisibility(); updateNextBar(); }));
   refreshRefStats();
-  buildHyPanel();       // panneau HYCU groupé (asynchrone) — vide si HYCU non connecté
+  rsFullOrch=false;     // recalculé par buildHyPanel selon la couverture HYCU
+  buildHyPanel();       // remplit les points de restauration (asynchrone) — rien si HYCU non connecté
   updateNextBar();
+}
+// « Continuer : vérifier et lancer » n'est utile que pour le flux manuel : quand
+// TOUS les volumes passent par le bouton HYCU groupé (plan automatique), on le
+// masque pour ne laisser qu'UNE action à l'écran. Il réapparaît si l'utilisateur
+// remplit les références à la main (volet Avancé).
+let rsFullOrch=false;
+function syncContinueVisibility(){
+  const hyOn = conn.hycu && conn.hycu.connected;
+  if(state.mode==="inplace" && hyOn){ $("#rsContinueWrap").style.display="none"; return; }
+  const items=collectItems();
+  const allFilled=items.length && items.every(i=>(i.new_ref||"").trim());
+  $("#rsContinueWrap").style.display = (rsFullOrch && !allFilled)? "none":"block";
 }
 // État « référence remplie / à remplir » affiché à côté de chaque volume.
 // En sur-place orchestré la référence n'est pas requise -> pas d'état.
@@ -4629,22 +4648,24 @@ function refreshRefStats(){
 let rsHyMatch=null;   // cache de la correspondance PVC↔VG HYCU pour le namespace courant
 let hyPanelSeq=0;     // jeton anti-rendu périmé (la sélection peut changer pendant les fetch)
 // --------- Panneau HYCU groupé : TOUS les volumes cochés en un seul geste ---------
-// Clone : une ligne par volume (VG + point de restauration + nom du clone), un seul
-// bouton « Restaurer les VG depuis HYCU » qui clone tout et remplit les références.
-// Sur place : mêmes lignes sans nom ; le point le plus récent est pré-sélectionné
-// automatiquement -> le bouton « Lancer la restauration sur place » est prêt d'emblée.
+// Remplit le point de restauration DANS la carte de chaque volume (.hySlot), puis
+// rend l'action globale (#rsHyActions). Clone : UN SEUL bouton « Restaurer les VG
+// depuis HYCU » qui clone tout et remplit les références. Sur place : le point le
+// plus récent est pré-sélectionné -> le lancement est prêt d'emblée.
 async function buildHyPanel(){
-  const panel=$("#rsHyPanel");
+  const actions=$("#rsHyActions");
   const hyOn = conn.hycu && conn.hycu.connected;
   const chks=[...document.querySelectorAll(".rsChk:checked")].map(c=>c.dataset.pvc);
-  if(!hyOn || !chks.length){ panel.innerHTML=""; return; }
+  actions.innerHTML="";
+  if(!hyOn || !chks.length) return;
   const seq=++hyPanelSeq;
-  panel.innerHTML='<div class="hint" style="margin-top:8px"><span class="spin"></span> Recherche des Volume Groups HYCU…</div>';
+  document.querySelectorAll("#rsVolCfgs .hySlot").forEach(s=>
+    s.innerHTML='<div class="hint" style="margin-top:4px"><span class="spin"></span> Recherche du Volume Group HYCU…</div>');
   const ns=$("#rsNs").value;
   if(!rsHyMatch || rsHyMatch.ns!==ns){
     const r=await get("/api/hycu/match?ns="+encodeURIComponent(ns));
     if(seq!==hyPanelSeq) return;
-    if(!r.ok){ panel.innerHTML=errBox(r.error); return; }
+    if(!r.ok){ document.querySelectorAll("#rsVolCfgs .hySlot").forEach(s=>s.innerHTML=errBox(r.error)); return; }
     rsHyMatch={ns, matches:r.matches||[]};
   }
   const rows=await Promise.all(chks.map(async pvc=>{
@@ -4656,36 +4677,46 @@ async function buildHyPanel(){
   }));
   if(seq!==hyPanelSeq) return;
   const isClone = state.mode==="clone";
-  panel.innerHTML = rows.map(r=>{
-    if(!r.matched) return `<div class="hyrow" data-pvc="${esc(r.pvc)}"><div class="nm">${esc(r.pvc)}</div>
-      <div class="warnbox" style="margin-top:6px">Aucun Volume Group HYCU associé — utilisez le volet <b>Avancé</b> de ce volume ci-dessous.</div></div>`;
-    const opts=(r.points||[]).map((p,i)=>`<option value="${esc(p.id)}"${i===0?' selected':''}>${esc(p.time||p.id)}${p.status?(' · '+esc(p.status)):''}${i===0?' (le plus récent)':''}</option>`).join("");
-    const body = r.rpErr? `<div class="warnbox" style="margin-top:6px">${esc(r.rpErr)}</div>`
-      : (!opts? '<div class="warnbox" style="margin-top:6px">Aucun point de restauration pour ce VG.</div>'
-      : `<div class="row">
-           <div><label class="fld">Point de restauration</label><select class="hyRp" data-pvc="${esc(r.pvc)}" data-vg="${esc(r.vg)}" data-name="${esc(r.vgName)}">${opts}</select></div>
-           ${isClone?`<div><label class="fld">Nom du VG cloné</label><input type="text" class="hyVgName" data-pvc="${esc(r.pvc)}" value="${esc((r.vgName||r.pvc)+'-'+cloneStamp())}"></div>`:""}
-         </div>
-         <div class="hyStat" data-pvc="${esc(r.pvc)}"></div>`);
-    return `<div class="hyrow" data-pvc="${esc(r.pvc)}">
-      <div class="nm">${esc(r.pvc)} <span class="hint">→ VG HYCU <b>${esc(r.vgName||r.vg)}</b>${r.kind!=='exact'?' <span class="sim">(correspondance '+esc(r.kind)+' — à vérifier)</span>':''}</span></div>
-      ${body}</div>`;
-  }).join("");
+  rows.forEach(r=>{
+    const slot=document.querySelector(`#rsVolCfgs .hySlot[data-pvc="${CSS.escape(r.pvc)}"]`);
+    if(!slot) return;
+    const card=slot.closest(".vol-cfg");
+    if(!r.matched){
+      slot.innerHTML='<div class="warnbox" style="margin-top:6px">Aucun Volume Group HYCU associé — collez la référence dans « Avancé ».</div>';
+      const d=card&&card.querySelector("details.rsAdv"); if(d) d.open=true;
+      return;
+    }
+    const lbl=card&&card.querySelector(".vgLabel");
+    if(lbl) lbl.innerHTML='→ VG HYCU <b>'+esc(r.vgName||r.vg)+'</b>'+(r.kind!=='exact'?' <span class="sim">(correspondance '+esc(r.kind)+' — à vérifier)</span>':'');
+    if(r.rpErr){ slot.innerHTML=`<div class="warnbox" style="margin-top:6px">${esc(r.rpErr)}</div>`; return; }
+    if(!(r.points||[]).length){ slot.innerHTML='<div class="warnbox" style="margin-top:6px">Aucun point de restauration pour ce VG.</div>'; return; }
+    const opts=r.points.map((p,i)=>`<option value="${esc(p.id)}"${i===0?' selected':''}>${esc(p.time||p.id)}${p.status?(' · '+esc(p.status)):''}${i===0?' (le plus récent)':''}</option>`).join("");
+    slot.innerHTML=`<label class="fld">Point de restauration</label>
+      <select class="hyRp" data-pvc="${esc(r.pvc)}" data-vg="${esc(r.vg)}" data-name="${esc(r.vgName)}">${opts}</select>
+      <div class="hyStat" data-pvc="${esc(r.pvc)}"></div>`;
+    // Nom du VG cloné (volet Avancé) : basé sur le VG source dès qu'on le connaît,
+    // sauf si l'utilisateur a déjà touché au champ.
+    const nameEl=card&&card.querySelector(".hyVgName");
+    if(nameEl && !nameEl.dataset.touched && r.vgName) nameEl.value=r.vgName+"-"+cloneStamp();
+  });
+  document.querySelectorAll(".hyVgName").forEach(i=>i.oninput=()=>{ i.dataset.touched="1"; });
   const ready=rows.filter(r=>r.matched && !r.rpErr && (r.points||[]).length);
   if(isClone){
     if(ready.length){
-      panel.insertAdjacentHTML("beforeend",
-        `<div style="margin-top:10px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+      actions.innerHTML=
+        `<div style="margin-top:12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
            <button class="btn" id="hyBatchGo">Restaurer les VG depuis HYCU (${ready.length} volume(s))</button>
            <span class="hint" style="margin:0">Clone les VG au point choisi et remplit les références — aucune donnée écrasée.</span>
-         </div>`);
+         </div>`;
       $("#hyBatchGo").onclick=hyBatchRun;
     }
+    rsFullOrch = ready.length===chks.length && ready.length>0;
+    syncContinueVisibility();
   } else {
     // Sur place : pré-sélectionner le point le plus récent de chaque volume.
     rsInplaceSel={};
     ready.forEach(r=>{ rsInplaceSel[r.pvc]={source_vg_uuid:r.vg, restore_point_id:r.points[0].id, vg_name:r.vgName}; });
-    panel.querySelectorAll(".hyRp").forEach(sel=>sel.onchange=()=>{
+    document.querySelectorAll("#rsVolCfgs .hyRp").forEach(sel=>sel.onchange=()=>{
       rsInplaceSel[sel.dataset.pvc]={source_vg_uuid:sel.dataset.vg, restore_point_id:sel.value, vg_name:sel.dataset.name};
       updateInplaceRunBtn();
     });
@@ -4714,11 +4745,12 @@ async function lookupVgUuid(vgName){
 // Clone TOUS les volumes prêts dans HYCU (séquentiel : suivi lisible ligne par ligne),
 // remplit les références, puis construit le plan automatiquement.
 async function hyBatchRun(){
-  const rows=[...document.querySelectorAll("#rsHyPanel .hyrow")].map(div=>{
+  const rows=[...document.querySelectorAll("#rsVolCfgs .vol-cfg")].map(div=>{
     const sel=div.querySelector(".hyRp"); if(!sel || !sel.value) return null;
     const nameEl=div.querySelector(".hyVgName");
+    const newName=(nameEl&&nameEl.value.trim()) || ((sel.dataset.name||div.dataset.pvc)+"-"+cloneStamp());
     return {pvc:div.dataset.pvc, vg:sel.dataset.vg, rp:sel.value,
-            newName:(nameEl?nameEl.value.trim():""), stat:div.querySelector(".hyStat")};
+            newName, stat:div.querySelector(".hyStat")};
   }).filter(Boolean);
   if(!rows.length) return;
   const live=!dry();
@@ -6250,7 +6282,8 @@ I18N_EN += [
      "Stop the application → HYCU in-place restore → restart.</b> No reference to enter."),
     ("Continuer : vérifier et lancer", "Continue: review and launch"),
     ("Nom du nouveau PV", "New PV name"),
-    ("Avancé — référence du VG (saisie manuelle / Prism)", "Advanced — VG reference (manual entry / Prism)"),
+    ("Avancé (optionnel) — noms générés, saisie manuelle", "Advanced (optional) — generated names, manual entry"),
+    ("Référence du VG (obligatoire) & noms générés", "VG reference (required) & generated names"),
     ("✓ référence remplie", "✓ reference filled"),
     ("— référence à remplir", "— reference to fill"),
     ("Choisissez un <b>point de restauration</b> par volume (le plus récent est pré-sélectionné), puis <b>Lancer la restauration sur place</b>.",
@@ -6260,12 +6293,11 @@ I18N_EN += [
     ("Clonez chaque VG dans HYCU, collez son UUID par volume (volet <b>Avancé</b>), puis <b>",
      "Clone each VG in HYCU, paste its UUID per volume (<b>Advanced</b> section), then <b>"),
     ("Connectez HYCU pour automatiser.", "Connect HYCU to automate."),
-    ("Cliquez <b>Restaurer les VG depuis HYCU</b> : les volumes sont clonés au point choisi et les références remplies automatiquement, puis le plan s'affiche.",
-     "Click <b>Restore the VGs from HYCU</b>: the volumes are cloned at the chosen point, the references are filled automatically, then the plan is displayed."),
-    ("Recherche des Volume Groups HYCU…", "Searching for the HYCU Volume Groups…"),
+    ("Choisissez un <b>point de restauration</b> par volume (le plus récent est pré-sélectionné), puis cliquez <b>Restaurer les VG depuis HYCU</b> — références et plan s'enchaînent automatiquement.",
+     "Choose a <b>restore point</b> per volume (the most recent is pre-selected), then click <b>Restore the VGs from HYCU</b> — references and plan follow automatically."),
     ("points indisponibles", "restore points unavailable"),
-    ("Aucun Volume Group HYCU associé — utilisez le volet <b>Avancé</b> de ce volume ci-dessous.",
-     "No HYCU Volume Group matched — use this volume's <b>Advanced</b> section below."),
+    ("Aucun Volume Group HYCU associé — collez la référence dans « Avancé ».",
+     "No HYCU Volume Group matched — paste the reference under “Advanced”."),
     (" (le plus récent)", " (most recent)"),
     ("Aucun point de restauration pour ce VG.", "No restore point for this VG."),
     ("→ VG HYCU <b>", "→ HYCU VG <b>"),
