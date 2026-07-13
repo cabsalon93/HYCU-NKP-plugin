@@ -21,20 +21,60 @@ NKP : le VG est attaché directement à la VM worker, **plus d'IQN**), un
 
 ---
 
-## 1. Prérequis
+## 1. Fonctionnement (How it works)
 
-- **Python 3.7+** (aucune librairie à installer — un seul fichier, stdlib uniquement).
-- **`kubectl`** installé et configuré sur le **bon contexte** (le cluster cible).
-  Le contexte courant est affiché en haut de la page.
-- Droits RBAC suffisants : `get/list/delete` sur `pv`, `pvc`, `pods` ;
-  `get/patch/scale` sur `deployments`/`statefulsets` ; `patch` sur `pv`/`pvc`
-  (déblocage des finalizers).
-- Côté HYCU/Nutanix : le Volume Group restauré/cloné doit exister, et vous devez
-  pouvoir copier sa **référence** depuis l'UI HYCU ou Prism — l'**UUID du VG**
-  (suffixe du `volumeHandle` `NutanixVolumes-<uuid>` et de la cible `ntnx-k8s-<uuid>`),
-  ou l'**IQN** sur les clusters iSCSI hérités.
+```
+   HYCU (sauvegardes)                                  Cluster Kubernetes / NKP
+   Volume Groups Nutanix protégés                      application + PVC/PV « live »
+          │                                                     ▲
+          │ 1. Clone ou restore du VG au point choisi           │ 6. Redémarrage (scale-up,
+          │    (API HYCU — ou manuellement dans l'UI HYCU)      │    réplicas d'origine) puis
+          ▼                                                     │    vérification : PVC Bound,
+   Nouveau VG Nutanix restauré/cloné                            │    pods Running
+          │                                                     │
+          │ 2. Référence (UUID) du VG récupérée via Prism       │
+          ▼                                                     │
+   Manifeste PV régénéré depuis la sauvegarde de config         │
+   (volumeHandle dérivé, attributs runtime purgés,              │
+    disque du VG cloné réécrit via Prism Central v4)            │
+          │                                                     │
+          │ 3. Arrêt de l'app (scale-down, réplicas mémorisés)  │
+          │ 4. delete PV/PVC + patch des finalizers             │
+          ▼                                                     │
+   5. apply des nouveaux PV/PVC → pointent le VG cloné ─────────┘
+```
 
-## 2. Installation & lancement — deux façons de lancer l'outil
+L'outil n'invente rien : il **orchestre `kubectl`** (manifestes JSON) et les **API REST
+HYCU / Prism** (stdlib Python uniquement, aucune dépendance). La **sauvegarde de
+configuration** (onglet 1) fournit le « squelette » PV/PVC ; **HYCU fournit les données**
+(les Volume Groups). Chaque étape est journalisée, la séquence s'arrête au premier
+échec (l'app reste arrêtée, jamais redémarrée à 0 réplica), et le **mode simulation**
+(défaut) montre toute la séquence sans rien exécuter.
+
+## 2. Prérequis
+
+**Communs aux deux modes de lancement :**
+
+- Un **kubeconfig** avec des droits RBAC suffisants sur le cluster cible :
+  `get/list/delete` sur `pv`, `pvc`, `pods` ; `get/patch/scale` sur
+  `deployments`/`statefulsets` ; `patch` sur `pv`/`pvc` (déblocage des finalizers).
+- **kubectl ≥ 1.23** (l'outil utilise `kubectl wait --for=jsonpath`).
+- Côté HYCU/Nutanix : le Volume Group restauré/cloné doit exister et sa **référence**
+  (UUID) être connue — **automatique** avec les connecteurs HYCU/Prism (onglet
+  Connexions) ; sinon copiez-la depuis l'UI HYCU ou Prism (`NutanixVolumes-<uuid>`,
+  cible `ntnx-k8s-<uuid>`, ou IQN sur les clusters iSCSI hérités).
+
+**Selon le mode de lancement (voir §3) :**
+
+- **Option A — mode Python (sur le poste)** : **Python 3.7+** (stdlib uniquement,
+  aucune librairie à installer) et **`kubectl`** installés sur le poste, configurés
+  sur le bon contexte (affiché en haut de la page).
+- **Option B — application Kubernetes** : **rien à installer sur le poste** — Python
+  et `kubectl` sont **embarqués dans l'image**. Il faut seulement les droits pour
+  déployer dans un namespace du cluster (et `kubectl` quelque part pour faire le
+  `port-forward` d'accès).
+
+## 3. Installation & lancement — deux façons de lancer l'outil
 
 |  | **Option A — Mode Python** | **Option B — Application Kubernetes** |
 |---|---|---|
@@ -118,7 +158,7 @@ autorisés, garde-fous) et génère le fichier pour vous. Vous pouvez aussi le c
 la main à partir du modèle :
 
 ```bash
-cp hycu_config.example.json hycu_config.json   # puis éditer (voir §5)
+cp hycu_config.example.json hycu_config.json   # puis éditer (voir §6)
 ```
 
 Tout reste modifiable ensuite via l'onglet **⚙ Réglages**.
@@ -133,7 +173,7 @@ par navigateur (cookie `hycu_lang`) ; le français est la langue par défaut.
 switches the language (page **and** server messages). The choice is remembered per
 browser (`hycu_lang` cookie); French is the default.*
 
-## 3. Déroulé d'une restauration (les 3 onglets)
+## 4. Déroulé d'une restauration (les 3 onglets)
 
 ### Onglet 1 — Sauvegarder
 Choisissez un namespace → **Sauvegarder ce namespace**. L'outil exporte et nettoie
@@ -217,7 +257,7 @@ Running ; plafond ~10 min — recliquez pour arrêter). Après une restauration 
 un clone **réel**, l'outil bascule automatiquement sur cet onglet et démarre le
 suivi.
 
-## 4. Sécurité
+## 5. Sécurité
 
 - Le serveur **n'écoute que sur `127.0.0.1`** (jamais exposé au réseau).
 - Protection **anti-CSRF / anti-DNS-rebinding** : vérification des en-têtes `Host`
@@ -236,7 +276,7 @@ suivi.
   personnalisé** n'est ouvert que si **vous le désignez explicitement** dans l'onglet
   Restaurer ; un chemin hors de cette zone reste refusé.
 
-## 5. Configuration (`hycu_config.json`) — adaptation par client
+## 6. Configuration (`hycu_config.json`) — adaptation par client
 
 Copiez `hycu_config.example.json` → `hycu_config.json`. Modifiable aussi via
 l'onglet **⚙ Réglages** de l'interface. Toutes les clés sont optionnelles.
@@ -259,7 +299,7 @@ l'onglet **⚙ Réglages** de l'interface. Toutes les clés sont optionnelles.
 | `host` / `port` | `127.0.0.1` / `8765` | Adresse d'écoute. **Ne pas exposer** `host` hors de la boucle locale. |
 | `open_browser` | `true` | Ouvrir le navigateur au démarrage. |
 | `hycu_url` | `""` | URL du contrôleur HYCU, ex. `https://hycu.exemple.com:8443` (port 8443). Vide = connecteur HYCU désactivé. |
-| `hycu_api_base` | `/rest/v1.0` | Base de l'API REST HYCU (**dépend de la version** — voir §8). |
+| `hycu_api_base` | `/rest/v1.0` | Base de l'API REST HYCU (**dépend de la version** — voir §9). |
 | `hycu_test_path` | `/vms` | Endpoint GET utilisé pour tester la connexion (relevez-le dans le REST API Explorer). |
 | `hycu_verify_tls` | `false` | Vérifier le certificat TLS HYCU (souvent auto-signé → `false`). |
 | `nutanix_url` | `""` | URL de Prism **Element**, ex. `https://prism.exemple.com:9440`. Vide = désactivé. |
@@ -282,7 +322,7 @@ l'onglet **⚙ Réglages** de l'interface. Toutes les clés sont optionnelles.
 }
 ```
 
-## 6. À valider sur le cluster du client avant la prod
+## 7. À valider sur le cluster du client avant la prod
 
 Ces points dépendent de l'environnement et **ne peuvent pas être vérifiés sans le
 vrai cluster** :
@@ -307,7 +347,7 @@ vrai cluster** :
    d'origine, pas à 0), et un PVC bloqué en `Terminating`.
 6. `kubectl wait --for=jsonpath` nécessite **kubectl ≥ 1.23**.
 
-## 7. Dépannage
+## 8. Dépannage
 
 | Symptôme | Piste |
 |---|---|
@@ -319,7 +359,7 @@ vrai cluster** :
 | Les connexions redemandent le déverrouillage | Comportement attendu : une nouvelle session navigateur (navigateur relancé, fenêtre privée) verrouille les identifiants — re-saisissez la phrase secrète du coffre. |
 | Séquence « interrompue » | Lire l'étape en cause dans le log, corriger, **relancer** (réplicas mémorisés). |
 
-## 8. Connexions HYCU / Nutanix (onglet « Connexions »)
+## 9. Connexions HYCU / Nutanix (onglet « Connexions »)
 
 Connexions **optionnelles** (en stdlib, aucune dépendance) : sans elles, le flux
 manuel (coller la référence du VG) reste pleinement utilisable.
@@ -338,7 +378,7 @@ manuel (coller la référence du VG) reste pleinement utilisable.
 **Identifiants** : saisis dans l'onglet, **gardés en mémoire** le temps de la **session
 navigateur**, **jamais écrits** sur disque ni dans la config (mode par défaut, le plus
 sûr). Effacés à la déconnexion, à l'arrêt, et dès qu'une **nouvelle session navigateur**
-ouvre la page (navigateur relancé, fenêtre privée — voir §4).
+ouvre la page (navigateur relancé, fenêtre privée — voir §5).
 
 ### Mémoriser les connexions (coffre chiffré, optionnel)
 

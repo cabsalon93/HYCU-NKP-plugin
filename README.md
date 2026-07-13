@@ -121,7 +121,7 @@ guardrails) and generates the file for you. You can also create it by hand from
 the template:
 
 ```bash
-cp hycu_config.example.json hycu_config.json   # then edit (see §5)
+cp hycu_config.example.json hycu_config.json   # then edit (see §6)
 ```
 
 Everything remains editable afterwards via the **⚙ Settings** tab.
@@ -137,7 +137,7 @@ l'en-tête bascule la langue (page **et** messages du serveur). Le choix est
 mémorisé par navigateur (cookie `hycu_lang`) ; le français est la langue par
 défaut.*
 
-## 3. Restore walkthrough (the 3 tabs)
+## 4. Restore walkthrough (the 3 tabs)
 
 ### Tab 1 — Back up
 Pick a namespace → **Back up this namespace**. The tool exports and cleans all
@@ -216,7 +216,7 @@ refreshes every ~3 s until the state is stable (all PVCs Bound, pods Running;
 ~10 min cap — click again to stop). After a **real** restore or clone, the tool
 switches to this tab automatically and starts tracking.
 
-## 4. Security
+## 5. Security
 
 - The server **only listens on `127.0.0.1`** (never exposed to the network).
 - **Anti-CSRF / anti-DNS-rebinding** protection: `Host` and `Origin`/`Referer`
@@ -235,7 +235,7 @@ switches to this tab automatically and starts tracking.
   opened if **you explicitly designate it** in the Restore tab; a path outside
   that zone is still refused.
 
-## 5. Configuration (`hycu_config.json`) — per-customer adaptation
+## 6. Configuration (`hycu_config.json`) — per-customer adaptation
 
 Copy `hycu_config.example.json` → `hycu_config.json`. Also editable via the
 **⚙ Settings** tab of the UI. All keys are optional.
@@ -258,7 +258,7 @@ Copy `hycu_config.example.json` → `hycu_config.json`. Also editable via the
 | `host` / `port` | `127.0.0.1` / `8765` | Listen address. **Do not expose** `host` outside the local loopback. |
 | `open_browser` | `true` | Open the browser at startup. |
 | `hycu_url` | `""` | HYCU controller URL, e.g. `https://hycu.example.com:8443` (port 8443). Empty = HYCU connector disabled. |
-| `hycu_api_base` | `/rest/v1.0` | HYCU REST API base (**version-dependent** — see §8). |
+| `hycu_api_base` | `/rest/v1.0` | HYCU REST API base (**version-dependent** — see §9). |
 | `hycu_test_path` | `/vms` | GET endpoint used to test the connection (look it up in the REST API Explorer). |
 | `hycu_verify_tls` | `false` | Verify the HYCU TLS certificate (often self-signed → `false`). |
 | `nutanix_url` | `""` | Prism **Element** URL, e.g. `https://prism.example.com:9440`. Empty = disabled. |
@@ -281,7 +281,7 @@ Copy `hycu_config.example.json` → `hycu_config.json`. Also editable via the
 }
 ```
 
-## 6. To validate on the customer's cluster before production
+## 7. To validate on the customer's cluster before production
 
 These points depend on the environment and **cannot be verified without the real
 cluster**:
@@ -309,7 +309,7 @@ cluster**:
    count, not 0), and a PVC stuck in `Terminating`.
 6. `kubectl wait --for=jsonpath` requires **kubectl ≥ 1.23**.
 
-## 7. Troubleshooting
+## 8. Troubleshooting
 
 | Symptom | Lead |
 |---|---|
@@ -321,7 +321,7 @@ cluster**:
 | Connections ask to be unlocked again | Expected: a new browser session (restarted browser, private window) locks the credentials — enter the vault passphrase again. |
 | “Interrupted” sequence | Read the failing step in the log, fix, **relaunch** (replicas remembered). |
 
-## 8. HYCU / Nutanix connections (“Connections” tab)
+## 9. HYCU / Nutanix connections (“Connections” tab)
 
 **Optional** connections (stdlib only, no dependency): without them, the manual
 flow (pasting the VG reference) remains fully usable.
@@ -340,7 +340,7 @@ flow (pasting the VG reference) remains fully usable.
 **Credentials**: entered in the tab, **kept in memory** for the duration of the
 **browser session**, **never written** to disk nor to the config (default mode,
 the safest). Wiped on disconnect, on shutdown, and whenever a **new browser
-session** opens the page (restarted browser, private window — see §4).
+session** opens the page (restarted browser, private window — see §5).
 
 ### Remembering connections (encrypted vault, optional)
 
