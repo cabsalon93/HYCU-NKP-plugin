@@ -5,9 +5,7 @@
 Guided web interface to **back up and restore** Kubernetes applications whose
 volumes (PVC = Nutanix Volume Groups) are protected by **HYCU**.
 
-The tool replaces the manual procedure (≈ 20 `kubectl` commands + hand-editing
-YAML) with a few clicks. **With the HYCU connector**, restoring is a single
-click: the tool clones/restores the Volume Groups in HYCU, retrieves their
+The tool clones/restores the Volume Groups in HYCU, retrieves their
 references, rebuilds the PV/PVC manifests and runs
 `scale-down → delete → patch finalizer → apply → scale-up → verification`.
 **Without it** (manual flow), the only input is the **reference of the
