@@ -213,7 +213,7 @@ def save_config(updates):
 
 # Version horodatée de la build (format AAAAMMJJ-HHMM). À incrémenter à chaque
 # changement notable du programme ; affichée dans l'en-tête de l'interface.
-VERSION = "20260714-0930"
+VERSION = "20260714-1000"
 
 # Jeton anti-CSRF généré au démarrage, injecté dans la page et exigé sur les POST.
 CSRF_TOKEN = secrets.token_urlsafe(32)
@@ -4120,7 +4120,7 @@ HTML = r"""<!DOCTYPE html>
       <label class="fld">Authentification</label>
       <div class="seg" id="hyAuthMode">
         <button class="on" data-mode="basic">Basic (utilisateur)</button>
-        <button data-mode="apikey">Clé API (2FA)</button>
+        <button data-mode="apikey">Clé API</button>
       </div>
       <div id="hyBasicFields" class="row">
         <div><label class="fld">Identifiant</label><input type="text" id="hyUser" autocomplete="off"></div>
@@ -6041,7 +6041,7 @@ I18N_EN += [
     ("URL HYCU (port 8443)", "HYCU URL (port 8443)"),
     ("Authentification", "Authentication"),
     (">Basic (utilisateur)<", ">Basic (user)<"),
-    (">Clé API (2FA)<", ">API key (2FA)<"),
+    (">Clé API<", ">API key<"),
     (">Identifiant<", ">Username<"),
     (">Mot de passe<", ">Password<"),
     (">Clé API <", ">API key <"),
