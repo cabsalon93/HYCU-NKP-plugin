@@ -178,6 +178,14 @@ Choisissez un namespace → **Sauvegarder ce namespace**. L'outil exporte et net
 tous les PV/PVC (équivaut aux boucles `kubectl get … -o yaml` + nettoyage manuel des
 manifestes décrit dans la procédure HYCU).
 
+- **Instantané de configuration étendue** : en plus des manifestes PV/PVC, la
+  sauvegarde capture aussi les autres ressources du namespace (Deployments,
+  StatefulSets, Services, ConfigMaps, Secrets, Ingress…) dans `resources.json` —
+  lecture seule, n'échoue jamais la sauvegarde PV/PVC. **Les données des Secrets
+  sont masquées par défaut** (structure conservée, valeurs remplacées par
+  `__REDACTED__` ; `config_backup_include_secret_data` pour les conserver). C'est
+  un **instantané de config** (référence / restore manuel) — la restauration
+  automatique reste centrée PV/PVC. Désactivable via `config_backup_full: false`.
 - **Sauvegarder tous (filtrés)** : sauvegarde en une fois **tous les namespaces
   autorisés** par le filtre (`namespace_filter`), ou **tous** les namespaces du cluster
   si aucun filtre. Un namespace sans PVC est **ignoré** (pas une erreur) ; un récapitulatif
@@ -273,6 +281,12 @@ suivi.
   `hycu-backups/`** sont lisibles (défense contre une lecture hors zone). Un **dossier
   personnalisé** n'est ouvert que si **vous le désignez explicitement** dans l'onglet
   Restaurer ; un chemin hors de cette zone reste refusé.
+- **Supervision** (`GET /metrics`) : un endpoint Prometheus expose des indicateurs
+  d'état (outil actif, opération en cours, sauvegarde auto activée/dernière
+  exécution/dernier succès, état des connexions) — **aucune donnée sensible**.
+  Comme le reste de l'outil, il est **local uniquement** (même garde `Host`/`Origin`) :
+  scrutez-le via un `kubectl port-forward` ou un sidecar sur la loopback, jamais
+  directement sur le réseau.
 
 ## 6. Configuration (`hycu_config.json`) — adaptation par client
 
@@ -292,6 +306,9 @@ l'onglet **⚙ Réglages** de l'interface. Toutes les clés sont optionnelles.
 | `auto_backup_enabled` | `false` | Sauvegarde automatique planifiée de tous les namespaces autorisés par le filtre, tant que l'outil tourne. |
 | `auto_backup_interval_hours` | `24` | Intervalle entre deux sauvegardes automatiques (heures, minimum 0,25). |
 | `auto_backup_keep` | `15` | Rétention : nombre de versions conservées par namespace (les plus anciennes sont supprimées après chaque passage automatique). |
+| `config_backup_full` | `true` | Capturer aussi les ressources non-PV/PVC du namespace (Deployments, Services, Secrets…) dans `resources.json`. |
+| `config_backup_kinds` | *(liste par défaut)* | Types de ressources namespacées exportés par l'instantané de config étendue. |
+| `config_backup_include_secret_data` | `false` | `false` = données des Secrets masquées sur disque ; `true` = conservées en clair (uniquement si le dossier de sauvegarde est lui-même protégé). |
 | `auto_backup_dest` | `""` | Dossier de destination des sauvegardes automatiques (vide = `hycu-backups/`). |
 | `require_context_confirm` | `true` | Exiger la re-saisie du contexte avant toute action réelle. |
 | `host` / `port` | `127.0.0.1` / `8765` | Adresse d'écoute. **Ne pas exposer** `host` hors de la boucle locale. |

@@ -85,6 +85,16 @@ CONFIG_PATH = os.path.join(os.getcwd(), "hycu_config.json")
 # Coffre d'identifiants chiffré (optionnel), protégé par une phrase secrète maîtresse.
 SECRETS_PATH = os.path.join(os.getcwd(), "hycu_secrets.enc")
 
+# Types de ressources namespacées exportées par la sauvegarde de configuration
+# ÉTENDUE (au-delà des PV/PVC). Liste volontairement restreinte aux objets utiles à
+# reconstruire une application ; les objets éphémères/gérés (pods, replicasets) sont exclus.
+CONFIG_BACKUP_KINDS_DEFAULT = [
+    "deployment", "statefulset", "daemonset", "cronjob", "job",
+    "service", "ingress", "configmap", "secret", "serviceaccount",
+    "role", "rolebinding", "networkpolicy", "poddisruptionbudget",
+    "horizontalpodautoscaler",
+]
+
 DEFAULT_CONFIG = {
     "host": "127.0.0.1",            # jamais exposé hors machine locale
     "port": 8765,
@@ -117,6 +127,16 @@ DEFAULT_CONFIG = {
     # réelle (le seul filet en cas d'échec d'apply). True = sauvegarder d'abord, abandonner
     # si la sauvegarde échoue.
     "backup_before_restore": True,
+    # Sauvegarde de configuration ÉTENDUE : en plus des PV/PVC, exporter aussi les
+    # autres ressources du namespace (Deployments, Services, ConfigMaps, Secrets...).
+    # LECTURE SEULE ; c'est un INSTANTANÉ de config (référence / restore manuel), NON
+    # utilisé par la restauration automatique (qui reste centrée PV/PVC). True = activé.
+    "config_backup_full": True,
+    "config_backup_kinds": list(CONFIG_BACKUP_KINDS_DEFAULT),   # types namespacés exportés
+    # False (défaut sûr) = les DONNÉES des Secrets sont MASQUÉES sur disque (structure
+    # conservée, valeurs remplacées par « __REDACTED__ »). True = secrets en clair dans
+    # la sauvegarde (à n'activer que si le dossier de sauvegarde est lui-même protégé).
+    "config_backup_include_secret_data": False,
     # Sauvegarde AUTOMATIQUE planifiée : tant que l'outil tourne, sauvegarde la config
     # PV/PVC de tous les namespaces autorisés par namespace_filter, à intervalle régulier.
     "auto_backup_enabled": False,
@@ -193,6 +213,10 @@ def load_config():
                     CONFIG[k] = v
         except Exception as e:  # config illisible : on garde les défauts
             print("Configuration illisible (%s) : valeurs par défaut utilisées." % e)
+    # backup_root vide (ex. laissé "" dans le fichier d'exemple) -> défaut, sinon
+    # os.makedirs("") planterait au démarrage.
+    if not (CONFIG.get("backup_root") or "").strip():
+        CONFIG["backup_root"] = DEFAULT_CONFIG["backup_root"]
     _apply_env_overrides()
     return CONFIG
 
@@ -213,7 +237,7 @@ def save_config(updates):
 
 # Version horodatée de la build (format AAAAMMJJ-HHMM). À incrémenter à chaque
 # changement notable du programme ; affichée dans l'en-tête de l'interface.
-VERSION = "20260714-1000"
+VERSION = "20260714-1400"
 
 # Jeton anti-CSRF généré au démarrage, injecté dans la page et exigé sur les POST.
 CSRF_TOKEN = secrets.token_urlsafe(32)
@@ -488,6 +512,55 @@ def clean_pvc(pvc):
     _strip_meta(meta)
     meta.pop("finalizers", None)
     return pvc
+
+
+def _clean_resource(obj, include_secret_data=False):
+    """Nettoie un manifeste namespacé quelconque pour un instantané de config :
+    retire `status` et les métadonnées runtime. Cas particuliers :
+      - ServiceAccount : on retire la liste `secrets` (tokens auto-générés) ;
+      - Secret : par défaut, les DONNÉES sont MASQUÉES (pas de secret en clair sur
+        disque) ; la structure (clés, type) est conservée."""
+    kind = (obj.get("kind") or "").lower()
+    obj.pop("status", None)
+    meta = obj.get("metadata", {})
+    _strip_meta(meta)
+    meta.pop("finalizers", None)
+    if kind == "serviceaccount":
+        obj.pop("secrets", None)
+    if kind == "secret" and not include_secret_data:
+        if isinstance(obj.get("data"), dict):
+            obj["data"] = {k: "__REDACTED__" for k in obj["data"]}
+        obj.pop("stringData", None)
+        ann = meta.setdefault("annotations", {})
+        ann["hycu.backup/secret-data"] = "redacted"
+    return obj
+
+
+def _backup_namespace_resources(ns, d):
+    """Sauvegarde de configuration ÉTENDUE (lecture seule) : exporte les ressources du
+    namespace au-delà des PV/PVC (Deployments, Services, ConfigMaps, Secrets...). Écrit
+    `resources.json` dans le dossier de sauvegarde `d`.
+
+    Robuste : un type refusé (RBAC) ou inconnu est IGNORÉ, jamais une erreur — la
+    sauvegarde PV/PVC ne doit jamais échouer à cause de cet extra. Renvoie
+    (nombre d'objets, liste des types ignorés)."""
+    kinds = CONFIG.get("config_backup_kinds") or CONFIG_BACKUP_KINDS_DEFAULT
+    include_secret = bool(CONFIG.get("config_backup_include_secret_data"))
+    out, skipped = [], []
+    for kind in kinds:
+        data, err = kubectl_json(["get", kind, "-n", ns])
+        if err or not data:
+            skipped.append(kind)
+            continue
+        for item in data.get("items", []):
+            try:
+                out.append(_clean_resource(json.loads(json.dumps(item)), include_secret))
+            except Exception:
+                pass
+    with open(os.path.join(d, "resources.json"), "w", encoding="utf-8") as f:
+        json.dump({"namespace": ns, "kinds": kinds, "secret_data_included": include_secret,
+                   "items": out}, f, indent=2)
+    return len(out), skipped
 
 
 # ------------------------------------------------------------------------------
@@ -904,12 +977,23 @@ def action_backup(ns, dest=None):
                 entry["analysis"] = analyse_pv(clean_v)
         index["volumes"].append(entry)
 
+    # Instantané de configuration ÉTENDUE (Deployments, Services, Secrets…) — lecture
+    # seule, additif, n'échoue jamais la sauvegarde PV/PVC (voir _backup_namespace_resources).
+    resources_count = None
+    if CONFIG.get("config_backup_full", True):
+        try:
+            resources_count, _skipped = _backup_namespace_resources(ns, d)
+            index["resources_count"] = resources_count
+            files.append("resources.json")
+        except Exception as e:
+            print("Sauvegarde de config étendue (%s) ignorée : %s" % (ns, e))
+
     with open(os.path.join(d, "index.json"), "w", encoding="utf-8") as f:
         json.dump(index, f, indent=2)
 
-    audit("backup", namespace=ns, dir=d, count=len(items))
+    audit("backup", namespace=ns, dir=d, count=len(items), resources=resources_count)
     return {"ok": True, "error": None, "dir": d, "root": root, "count": len(items),
-            "files": files, "volumes": index["volumes"]}
+            "files": files, "volumes": index["volumes"], "resources_count": resources_count}
 
 
 def action_backup_all(dest=None):
@@ -1067,6 +1151,40 @@ def action_auto_backup_status():
             "last_run": last or None, "last_ok": AUTO_BACKUP.get("last_ok"),
             "last_summary": AUTO_BACKUP.get("last_summary") or "",
             "next_due": (last + itv) if (enabled and last) else None}
+
+
+def action_metrics_text():
+    """Métriques au format texte Prometheus (exposition 0.0.4).
+
+    Servies UNIQUEMENT en local (mêmes gardes Host/Origin que tout le reste : jamais
+    exposées au réseau). Pour un scraping Prometheus réel, passez par un `kubectl
+    port-forward` ou un sidecar sur la loopback du Pod. Aucune donnée sensible n'est
+    exposée : uniquement des compteurs d'état."""
+    itv = _auto_backup_interval_s()
+    last = float(AUTO_BACKUP.get("last_run") or 0)
+    out = []
+
+    def metric(name, value, help_, typ="gauge", labels=""):
+        out.append("# HELP %s %s\n# TYPE %s %s\n%s%s %s\n"
+                    % (name, help_, name, typ, name, labels, value))
+
+    metric("hycu_build_info", 1, "Version de build (label version).", labels='{version="%s"}' % VERSION)
+    metric("hycu_up", 1, "1 si l'outil répond.")
+    metric("hycu_operation_running", 1 if ACTION_LOCK.locked() else 0,
+           "1 si une opération destructive (restore/clone) est en cours.")
+    metric("hycu_auto_backup_enabled", 1 if CONFIG.get("auto_backup_enabled") else 0,
+           "1 si la sauvegarde automatique de configuration est activée.")
+    metric("hycu_auto_backup_interval_seconds", int(itv), "Intervalle configuré (s).")
+    metric("hycu_auto_backup_last_run_timestamp_seconds", int(last),
+           "Horodatage Unix de la dernière sauvegarde automatique (0 si jamais).", typ="counter")
+    metric("hycu_auto_backup_last_success", 1 if AUTO_BACKUP.get("last_ok") else 0,
+           "1 si la dernière sauvegarde automatique a réussi.")
+    # État des connexions (par système) — un seul bloc HELP/TYPE, plusieurs lignes.
+    out.append("# HELP hycu_connected 1 si le système externe est connecté (session en cours).\n"
+               "# TYPE hycu_connected gauge\n")
+    for sysname in ("hycu", "nutanix", "prismcentral"):
+        out.append('hycu_connected{system="%s"} %d\n' % (sysname, 1 if SESSION_CREDS.get(sysname) else 0))
+    return "".join(out)
 
 
 # ------------------------------------------------------------------------------
@@ -3418,6 +3536,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._send(200, page.replace("__CSRF_TOKEN__", CSRF_TOKEN)
                               .replace("__VERSION__", VERSION).replace("__LOGO__", _logo_markup()),
                               "text/html", {"Set-Cookie": set_cookie} if set_cookie else None)
+        if path == "/metrics":
+            # Format Prometheus, texte brut, local uniquement (garde _origin_ok ci-dessus).
+            return self._send(200, action_metrics_text(), "text/plain; version=0.0.4")
         try:
             if path == "/api/context":
                 return self._json(action_context())
@@ -4646,8 +4767,10 @@ $("#bkRun").onclick=async()=>{
     return `<li class="logline"><span class="ic ok">✓</span>
      <span><b>${esc(v.pvc)}</b> → PV ${esc(v.pv||"—")} ${tag}</span></li>`;
   }).join("");
+  const resLine = (r.resources_count!=null)
+    ? ` <span class="hint">+ ${r.resources_count} ressource(s) de config (Deployments, Services, Secrets…)</span>` : "";
   $("#bkOut").innerHTML=`<div class="note">${r.count} volume(s) sauvegardé(s) dans
-     <code>${esc(r.dir)}</code>${dlBackupLink(r.dir, r.root)}</div><ul class="pvc-list" style="margin-top:10px">${rows}</ul>
+     <code>${esc(r.dir)}</code>${resLine}${dlBackupLink(r.dir, r.root)}</div><ul class="pvc-list" style="margin-top:10px">${rows}</ul>
      <div class="warnbox">⚠ Récupérez cette sauvegarde <b>hors du cluster</b> via ⬇ Télécharger (.zip) — ou copiez le dossier vers un autre stockage : c'est votre filet de sécurité en cas de sinistre.</div>`;
 };
 $("#bkRunAll").onclick=async()=>{
@@ -5735,6 +5858,8 @@ I18N_EN += [
     ("Assigner + sauvegarder maintenant", "Assign + back up now"),
     ("</span>Sauvegarde…", "</span>Backing up…"),
     (" volume(s) sauvegardé(s) dans", " volume(s) backed up to"),
+    (" ressource(s) de config (Deployments, Services, Secrets…)",
+     " config resource(s) (Deployments, Services, Secrets…)"),
     ("(IQN détecté)", "(IQN detected)"),
     ("⚠ Récupérez cette sauvegarde <b>hors du cluster</b> via ⬇ Télécharger (.zip) — ou copiez le dossier vers un autre stockage : c'est votre filet de sécurité en cas de sinistre.",
      "⚠ Get this backup <b>off the cluster</b> via ⬇ Download (.zip) — or copy the folder to other storage: it is your safety net in a disaster."),

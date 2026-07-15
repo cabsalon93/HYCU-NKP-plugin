@@ -1,11 +1,25 @@
 {
-  "_aide": "Copiez ce fichier en 'hycu_config.json' (à côté du programme) puis adaptez les valeurs. Les clés inconnues comme celle-ci sont ignorées. Détail de chaque clé : voir README.md.",
+  "_aide": "Copiez ce fichier en 'hycu_config.json' (à côté du programme) puis adaptez les valeurs. TOUTES les clés sont optionnelles : une clé absente prend sa valeur par défaut, une clé inconnue (comme celle-ci) est ignorée. Détail de chaque clé : voir README.md §6. Les identifiants HYCU/Nutanix ne sont JAMAIS ici (saisis dans l'onglet Connexions, gardés en RAM).",
 
+  "_section_kubectl": "— Accès au cluster —",
   "kubectl_path": "kubectl",
+  "kube_context": "",
+  "kubeconfig_path": "",
   "allowed_contexts": [],
   "namespace_filter": [],
+
+  "_section_serveur": "— Serveur local & stockage —",
+  "host": "127.0.0.1",
+  "port": 8765,
+  "open_browser": true,
+  "backup_root": "",
+
+  "_section_timeouts": "— Délais & garde-fous —",
   "wait_timeout": 120,
   "subprocess_margin": 30,
+  "require_context_confirm": true,
+
+  "_section_restore": "— Comportement de restauration / clone —",
   "clone_name_suffix": "0000",
   "volume_handle_prefix": "",
   "strip_claimref": false,
@@ -13,14 +27,36 @@
   "clone_fix_disk_uuids": true,
   "clone_require_disk_uuids": true,
   "retain_source_pv": true,
-  "backup_before_restore": true,
   "inplace_refresh_pv_disk": true,
-  "require_context_confirm": true,
-  "open_browser": true,
+  "backup_before_restore": true,
 
+  "_section_backup_config": "— Sauvegarde de configuration étendue —",
+  "config_backup_full": true,
+  "config_backup_kinds": [
+    "deployment", "statefulset", "daemonset", "cronjob", "job",
+    "service", "ingress", "configmap", "secret", "serviceaccount",
+    "role", "rolebinding", "networkpolicy", "poddisruptionbudget",
+    "horizontalpodautoscaler"
+  ],
+  "config_backup_include_secret_data": false,
+
+  "_section_backup_auto": "— Sauvegarde automatique planifiée —",
+  "auto_backup_enabled": false,
+  "auto_backup_interval_hours": 24,
+  "auto_backup_keep": 15,
+  "auto_backup_dest": "",
+
+  "_section_coffre": "— Coffre d'identifiants chiffré (optionnel) —",
+  "remember_credentials": false,
+  "pbkdf2_iterations": 200000,
+
+  "_section_marque": "— Personnalisation —",
+  "logo_path": "",
+
+  "_section_connecteurs": "— Connecteurs HYCU / Nutanix (endpoints NON secrets) —",
   "hycu_url": "",
   "hycu_api_base": "/rest/v1.0",
-  "hycu_test_path": "/vms",
+  "hycu_test_path": "/volumegroups",
   "hycu_verify_tls": false,
   "nutanix_url": "",
   "nutanix_api_base": "/PrismGateway/services/rest/v2.0",
