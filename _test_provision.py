@@ -62,7 +62,33 @@ try:
     check(CALLS and CALLS[0]["restore_point_id"] == "rp-latest",
           "point de restauration le plus récent choisi par défaut")
 
+    print("\n== VG supprimé du cluster : identité HYCU résolue depuis l'UUID Nutanix ==")
+    HYU = "cccccccc-dddd-eeee-ffff-000000000000"     # uuid HYCU (≠ externalId Nutanix SRC)
+    CALLS.clear()
+    H._hycu_list_vgs = lambda: ([{"uuid": HYU, "name": "pvc-orig", "externalId": SRC, "hasBackups": True}], None)
+    seen_src = {}
+    def rp_by_src(src):
+        seen_src["last"] = src
+        # Seul l'uuid HYCU renvoie des points ; l'UUID Nutanix n'en renvoie pas.
+        if src == HYU:
+            return {"ok": True, "points": [{"id": "rp-x", "time": "t", "restorable": True}]}
+        return {"ok": True, "points": []}
+    H.action_hycu_restore_points = rp_by_src
+    def fake_restore2(p):
+        CALLS.append(p); return {"ok": True, "dry": False, "job_id": "job-2"}
+    H.action_hycu_restore = fake_restore2
+    H.action_hycu_job = lambda jid: {"ok": True, "status": "OK"}
+    H.action_nutanix_vgs = lambda query="": {"ok": True, "vgs": [{"name": query, "uuid": NEW}]}
+    r = H.action_hycu_provision_clone({"volumes": [{"pvc": "data", "source_vg_uuid": SRC, "vg_name": "pvc-orig"}],
+                                       "dry": False})
+    check(r["ok"] and r["items"][0]["new_ref"] == NEW,
+          "VG source (Nutanix) résolu vers l'identité HYCU -> points trouvés -> clone -> UUID")
+    check(CALLS and CALLS[0]["source_uuid"] == HYU, "le clone HYCU utilise l'uuid HYCU résolu")
+
     print("\n== Découverte : ambiguïté jamais tranchée au hasard ==")
+    H.action_hycu_restore_points = lambda src: {"ok": True, "points": [
+        {"id": "rp-latest", "time": "2026-09-25 01:00", "restorable": True}]}
+    H._hycu_list_vgs = s_list
     H.action_nutanix_vgs = lambda query="": {"ok": True, "vgs": [
         {"name": query, "uuid": NEW}, {"name": query, "uuid": "99999999-0000-0000-0000-000000000000"}]}
     H._hycu_list_vgs = lambda: ([], None)

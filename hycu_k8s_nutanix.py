@@ -307,7 +307,7 @@ def save_config(updates):
 
 # Version horodatée de la build (format AAAAMMJJ-HHMM). À incrémenter à chaque
 # changement notable du programme ; affichée dans l'en-tête de l'interface.
-VERSION = "20260925-0330"
+VERSION = "20260925-0420"
 
 # Jeton anti-CSRF généré au démarrage, injecté dans la page et exigé sur les POST.
 CSRF_TOKEN = secrets.token_urlsafe(32)
@@ -3512,8 +3512,11 @@ def _execute_restore_locked(payload, log=None):
             disk_ok = _set_clone_disk_uuids(r.get("manifest"), r.get("new_volume_handle"), dry, log)
             if not disk_ok and not dry and CONFIG.get("clone_require_disk_uuids", True):
                 aborted = True
-                abort_detail = ("disque du VG cloné introuvable pour %s (Prism Central requis) — "
-                                "PV non recréé pour éviter un volume non attachable" % pvc_name)
+                abort_detail = ("disque introuvable pour le Volume Group de %s — soit Prism Central "
+                                "n'est pas connecté, soit ce Volume Group n'existe plus (supprimé avec "
+                                "le namespace). Dans ce cas, décochez « réutiliser les volumes d'origine » "
+                                "et utilisez « Créer les volumes automatiquement via HYCU ». PV non recréé "
+                                "pour éviter un volume non attachable" % pvc_name)
                 break
 
         if dry:
@@ -5062,6 +5065,40 @@ def _discover_vg_uuid_by_name(name):
     return None, "Volume Group « %s » introuvable après le clone (Prism/HYCU)." % name
 
 
+def _resolve_hycu_vg(source_uuid, vg_name=None):
+    """Identité HYCU (uuid) d'un Volume Group à partir de son UUID Nutanix (externalId)
+    ou de son NOM. Nécessaire pour lister les points de restauration d'un VG même s'il a
+    été SUPPRIMÉ du cluster (HYCU conserve le catalogue de sauvegardes sous SA propre
+    identité, distincte de l'externalId Nutanix). Renvoie (hycu_uuid, erreur) ; (None,None)
+    si simplement introuvable. L'ambiguïté n'est jamais tranchée au hasard."""
+    su = (source_uuid or "").strip().lower()
+    nm = (vg_name or "").strip().lower()
+    try:
+        items, herr = _hycu_list_vgs()
+    except Exception as e:
+        return None, str(e)
+    if herr:
+        return None, herr
+    items = items or []
+    if su:                                        # 1) déjà l'uuid HYCU ?
+        for v in items:
+            if isinstance(v, dict) and (v.get("uuid") or "").lower() == su:
+                return v["uuid"], None
+        for v in items:                           # 2) par externalId == UUID Nutanix
+            if isinstance(v, dict):
+                m = UUID_RE.search(v.get("externalId") or "")
+                if m and m.group(0).lower() == su and v.get("uuid"):
+                    return v["uuid"], None
+    if nm:                                        # 3) par nom (nom du VG = nom du PV CSI)
+        uniq = list(dict.fromkeys(v["uuid"] for v in items
+                    if isinstance(v, dict) and (v.get("name") or "").strip().lower() == nm and v.get("uuid")))
+        if len(uniq) == 1:
+            return uniq[0], None
+        if len(uniq) > 1:
+            return None, "Plusieurs Volume Groups HYCU nommés « %s » : ambiguïté." % vg_name
+    return None, None
+
+
 def _await_hycu_job(job_id, timeout_s=600, poll_s=3):
     """Attend la fin d'un job HYCU. Renvoie (ok, dernier_statut, erreur)."""
     if not job_id:
@@ -5115,14 +5152,33 @@ def action_hycu_provision_clone(payload):
                     "(re-lancez l'analyse HYCU)." % (pvc or "?"), "items": [], "log": log}
         # Nom imposé, UNIQUE : garantit une découverte non ambiguë par le nom.
         new_name = re.sub(r"[^a-zA-Z0-9-]", "-", "hycurestore-%s-%s-%d" % (pvc, ts, i))[:60].strip("-")
+        # Identité HYCU du VG source : les points de restauration se listent avec l'uuid
+        # HYCU, distinct de l'externalId Nutanix. Résolu depuis l'UUID Nutanix ou le nom
+        # (le VG peut avoir été SUPPRIMÉ du cluster ; HYCU garde son catalogue).
+        hy_src = src
         rp = (v.get("restore_point_id") or "").strip()
         if not rp:
-            pts = action_hycu_restore_points(src)
-            good = [p for p in (pts.get("points") or []) if p.get("restorable", True)]
+            good = [p for p in (action_hycu_restore_points(hy_src).get("points") or [])
+                    if p.get("restorable", True)]
+            if not good:
+                resolved, rerr = _resolve_hycu_vg(src, v.get("vg_name"))
+                if rerr:
+                    return {"ok": False, "error": "Volume « %s » : %s" % (pvc, rerr), "items": [], "log": log}
+                if resolved and resolved.lower() != hy_src.lower():
+                    hy_src = resolved
+                    log.append(logentry("Identité HYCU du VG résolue pour %s" % pvc,
+                                        stdout="%s -> %s" % (src, hy_src)))
+                    good = [p for p in (action_hycu_restore_points(hy_src).get("points") or [])
+                            if p.get("restorable", True)]
             if not good:
                 return {"ok": False, "error": "Volume « %s » : aucun point de restauration HYCU "
-                        "disponible pour le VG source." % pvc, "items": [], "log": log}
+                        "trouvé pour ce Volume Group. Vérifiez que l'application est (ou était) "
+                        "protégée dans HYCU." % pvc, "items": [], "log": log}
             rp = good[0].get("id")
+        else:
+            resolved, _ = _resolve_hycu_vg(src, v.get("vg_name"))
+            if resolved:
+                hy_src = resolved
         if dry:
             log.append(logentry("Plan : HYCU clonera le VG %s (point %s) -> nouveau VG « %s », "
                                 "puis l'UUID sera découvert automatiquement." % (src, rp, new_name),
@@ -5131,7 +5187,7 @@ def action_hycu_provision_clone(payload):
             continue
         # Réel : déclencher le clone HYCU (nom imposé), attendre, découvrir l'UUID.
         rr = action_hycu_restore({"restore_point_id": rp, "mode": "clone", "new_name": new_name,
-                                  "source_uuid": src, "dry": False})
+                                  "source_uuid": hy_src, "dry": False})
         if not rr.get("ok"):
             return {"ok": False, "error": "Volume « %s » : clone HYCU refusé : %s"
                     % (pvc, rr.get("error")), "items": items, "log": log}
@@ -5790,6 +5846,7 @@ def action_dr_backups():
         # à l'assistant de PRÉ-REMPLIR le champ en récupération (aucune saisie manuelle).
         vol_refs = {}
         vol_hycu = {}       # identité HYCU du VG (contrat P1) : source des points de restauration
+        vol_names = {}      # nom du VG (contrat, sinon nom du PV) : indice de résolution HYCU
         for v in (idx.get("volumes") or []):
             vh = ((v.get("analysis") or {}).get("old_volume_handle")) or ""
             m = UUID_RE.search(vh)
@@ -5798,6 +5855,9 @@ def action_dr_backups():
             hy = ((v.get("restore_contract") or {}).get("hycu_source_uuid")) or ""
             if v.get("pvc") and hy:
                 vol_hycu[v["pvc"]] = hy
+            nm = ((v.get("restore_contract") or {}).get("vg_name")) or v.get("pv") or ""
+            if v.get("pvc") and nm:
+                vol_names[v["pvc"]] = nm
         out.append({"path": dirpath, "restorable_here": restorable,
                     "namespace": idx.get("namespace") or "",
                     "timestamp": os.path.basename(dirpath), "created": idx.get("created") or "",
@@ -5807,6 +5867,7 @@ def action_dr_backups():
                     "volumes": [v.get("pvc") for v in (idx.get("volumes") or [])],
                     "vol_refs": vol_refs,
                     "vol_hycu": vol_hycu,
+                    "vol_names": vol_names,
                     "resources_count": idx.get("resources_count"),
                     "has_resources": os.path.isfile(os.path.join(dirpath, "resources.json")),
                     "imported": rel.split(os.sep)[0] == "_imports"})
@@ -10013,9 +10074,11 @@ $("#drReuse").onchange=drSyncReuse;
 // qu'il inscrit dans la grille (aucune saisie). Simulation = plan seulement.
 $("#drAuto").onclick=async()=>{
   const b=drSel(); if(!b) return;
-  const refs=(b&&b.vol_refs)||{}, hy=(b&&b.vol_hycu)||{};
-  // Source pour HYCU = l'identité HYCU du VG (contrat) si disponible, sinon l'UUID Nutanix.
-  const volumes=[...document.querySelectorAll(".drRef")].map(t=>({pvc:t.dataset.pvc, source_vg_uuid:hy[t.dataset.pvc]||refs[t.dataset.pvc]||""}));
+  const refs=(b&&b.vol_refs)||{}, hy=(b&&b.vol_hycu)||{}, names=(b&&b.vol_names)||{};
+  // Source pour HYCU = l'identité HYCU du VG (contrat) si disponible, sinon l'UUID Nutanix ;
+  // le nom du VG aide à retrouver un VG SUPPRIMÉ du cluster dans le catalogue HYCU.
+  const volumes=[...document.querySelectorAll(".drRef")].map(t=>({pvc:t.dataset.pvc,
+    source_vg_uuid:hy[t.dataset.pvc]||refs[t.dataset.pvc]||"", vg_name:names[t.dataset.pvc]||""}));
   if(!volumes.length || volumes.some(v=>!v.source_vg_uuid)){
     $("#drErr").innerHTML=errBox("UUID du VG source absent de la sauvegarde : automatisation impossible, saisissez les UUID manuellement."); return; }
   $("#drErr").innerHTML=""; $("#drLog").innerHTML='<div class="hint"><span class="spin"></span>HYCU : création des volumes…</div>';
@@ -10857,9 +10920,9 @@ I18N_EN += [
      ". The scale-down will not stop them — stop them manually"),
     ("(DaemonSet/Job/Operator/pod nu) avant de continuer.", "(DaemonSet/Job/Operator/bare pod) before continuing."),
     ("attente de l'arrêt des pods", "waiting for the pods to stop"),
-    ("disque du VG cloné introuvable pour ", "cloned VG disk not found for "),
-    (" (Prism Central requis) —", " (Prism Central required) —"),
-    ("PV non recréé pour éviter un volume non attachable", "PV not recreated to avoid an unattachable volume"),
+    ("disque introuvable pour le Volume Group de ", "disk not found for the Volume Group of "),
+    (" — soit Prism Central n'est pas connecté, soit ce Volume Group n'existe plus (supprimé avec le namespace). Dans ce cas, décochez « réutiliser les volumes d'origine » et utilisez « Créer les volumes automatiquement via HYCU ». PV non recréé pour éviter un volume non attachable",
+     " — either Prism Central is not connected, or this Volume Group no longer exists (deleted with the namespace). In that case, untick “reuse the original volumes” and use “Create the volumes automatically via HYCU”. PV not recreated to avoid an unattachable volume"),
     ("Protection du VG source : PV ", "Protecting the source VG: PV "),
     ("Protection du VG : PV ", "Protecting the VG: PV "),
     ("Évite que la suppression du PV/PVC ne supprime le Volume Group Nutanix",
