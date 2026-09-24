@@ -237,7 +237,7 @@ def save_config(updates):
 
 # Version horodatée de la build (format AAAAMMJJ-HHMM). À incrémenter à chaque
 # changement notable du programme ; affichée dans l'en-tête de l'interface.
-VERSION = "20260714-1400"
+VERSION = "20260924-1200"
 
 # Jeton anti-CSRF généré au démarrage, injecté dans la page et exigé sur les POST.
 CSRF_TOKEN = secrets.token_urlsafe(32)
@@ -1188,6 +1188,135 @@ def action_metrics_text():
 
 
 # ------------------------------------------------------------------------------
+# Vues « à la HYCU » (lecture seule) : Applications (namespaces + protection /
+# conformité) et Tâches (historique des opérations, tiré du journal d'audit).
+# ------------------------------------------------------------------------------
+def _backup_freshness_s():
+    """Âge maximal d'une sauvegarde de config pour être « conforme » : l'intervalle
+    de la sauvegarde automatique si elle est activée, sinon 24 h (+10 % de marge)."""
+    base = _auto_backup_interval_s() if CONFIG.get("auto_backup_enabled") else 24 * 3600.0
+    return base * 1.1
+
+
+def _backup_epoch(b):
+    """Horodatage (epoch) d'une sauvegarde : champ `created` de l'index, sinon mtime."""
+    created = (b.get("index") or {}).get("created")
+    if created:
+        try:
+            return datetime.datetime.fromisoformat(str(created)).timestamp()
+        except ValueError:
+            pass
+    try:
+        return os.path.getmtime(b["path"])
+    except OSError:
+        return None
+
+
+def action_applications():
+    """Namespaces autorisés vus comme des « applications » Kubernetes, avec leur
+    état de protection de configuration. Lecture seule : 1 appel kubectl (liste des
+    namespaces), le reste vient des sauvegardes sur disque (dossier par défaut +
+    dossier de la sauvegarde automatique s'il diffère)."""
+    info = action_namespaces()
+    names = info.get("namespaces") or []
+    roots = [None]
+    ab_dest = (CONFIG.get("auto_backup_dest") or "").strip()
+    if ab_dest and os.path.abspath(os.path.expanduser(ab_dest)) != os.path.abspath(CONFIG["backup_root"]):
+        roots.append(ab_dest)
+    now, fresh = time.time(), _backup_freshness_s()
+    apps = []
+    for ns in names:
+        bks = []
+        for root in roots:
+            try:
+                bks.extend(list_backups(ns, root))
+            except OSError:
+                pass
+        stamps = [t for t in (_backup_epoch(b) for b in bks) if t]
+        last = max(stamps) if stamps else None
+        latest = max(bks, key=lambda b: _backup_epoch(b) or 0) if bks else None
+        apps.append({"name": ns, "backups": len(bks), "last_backup": last,
+                     "protected": bool(bks),
+                     "compliant": bool(last and (now - last) <= fresh),
+                     "volumes": len(((latest or {}).get("index") or {}).get("volumes") or []) if latest else None})
+    return {"ok": bool(info.get("ok")), "error": info.get("error"), "apps": apps,
+            "freshness_hours": round(fresh / 3600.0, 1),
+            "policy": {"enabled": bool(CONFIG.get("auto_backup_enabled")),
+                       "interval_hours": _auto_backup_interval_s() / 3600.0}}
+
+
+# Événements d'audit présentés comme des « tâches » (le reste — connexions,
+# coffre, filtre — relève du journal de sécurité, pas des opérations).
+JOB_EVENTS = ("backup", "backup_all", "auto_backup", "restore_end", "clone_app",
+              "orchestrate_inplace", "hycu_restore", "hycu_protect")
+
+
+def _read_audit_tail(max_bytes=1024 * 1024):
+    """Dernières lignes du journal d'audit (au plus `max_bytes`), décodées en JSON."""
+    path = os.path.join(CONFIG["backup_root"], "audit.log")
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - max_bytes))
+            raw = f.read().decode("utf-8", errors="replace")
+    except OSError:
+        return []
+    lines = raw.splitlines()
+    if size > max_bytes and lines:
+        lines = lines[1:]                     # première ligne probablement tronquée
+    out = []
+    for line in lines:
+        try:
+            rec = json.loads(line)
+            if isinstance(rec, dict):
+                out.append(rec)
+        except ValueError:
+            pass
+    return out
+
+
+def _job_status(rec):
+    """success | failed | simulation — même lecture que les états de tâche HYCU."""
+    if rec.get("dry"):
+        return "simulation"
+    if rec.get("ok") is False or rec.get("aborted"):
+        return "failed"
+    return "success"
+
+
+def action_jobs(limit=200):
+    """Historique des opérations (plus récentes d'abord) + compteurs + activité des
+    7 derniers jours, pour la page Tâches et le tableau de bord. Lecture seule."""
+    jobs = []
+    for rec in _read_audit_tail():
+        ev = rec.get("event")
+        if ev not in JOB_EVENTS:
+            continue
+        jobs.append({"ts": rec.get("ts"), "event": ev, "status": _job_status(rec),
+                     "namespace": rec.get("namespace") or rec.get("target_namespace") or "",
+                     "target_namespace": rec.get("target_namespace") or "",
+                     "detail": rec.get("summary") or rec.get("mode") or "",
+                     "volumes": rec.get("count") if ev == "backup" else None})
+    jobs.reverse()
+    counts = {"success": 0, "failed": 0, "simulation": 0}
+    for j in jobs:
+        counts[j["status"]] = counts.get(j["status"], 0) + 1
+    today = datetime.date.today()
+    days = [(today - datetime.timedelta(days=i)).isoformat() for i in range(6, -1, -1)]
+    per_day = {d: {"success": 0, "failed": 0, "simulation": 0} for d in days}
+    for j in jobs:
+        d = str(j.get("ts") or "")[:10]
+        if d in per_day:
+            per_day[d][j["status"]] += 1
+    with OP_LOCK:
+        running = sum(1 for op in OPERATIONS.values() if not op.get("done"))
+    return {"ok": True, "jobs": jobs[:max(1, int(limit))], "counts": counts,
+            "running": running + (1 if AUTO_BACKUP.get("running") else 0),
+            "days": [{"date": d, **per_day[d]} for d in days]}
+
+
+# ------------------------------------------------------------------------------
 # Workloads (scale down/up) et attente active
 # ------------------------------------------------------------------------------
 def _scan_workloads(ns):
@@ -1982,7 +2111,7 @@ def _rest(system, method, path, body=None, timeout=30):
     """Appel REST avec les identifiants de session (hycu/nutanix)."""
     base, api, verify = _system_cfg(system)
     if not base:
-        return {"ok": False, "error": "URL %s non configurée (onglet Réglages)." % system.upper()}
+        return {"ok": False, "error": "URL %s non configurée (⚙ Sources)." % system.upper()}
     creds = SESSION_CREDS.get(system)
     if not creds:
         return {"ok": False, "error": "Non connecté à %s." % system.upper()}
@@ -1995,7 +2124,7 @@ def _rest_raw(system, method, raw_path, body=None, timeout=30):
     `/api/volumes/v4.0.b1/...`, celle qu'utilise réellement le CSI Nutanix)."""
     base, _, verify = _system_cfg(system)
     if not base:
-        return {"ok": False, "error": "URL %s non configurée (onglet Réglages)." % system.upper()}
+        return {"ok": False, "error": "URL %s non configurée (⚙ Sources)." % system.upper()}
     creds = SESSION_CREDS.get(system)
     if not creds:
         return {"ok": False, "error": "Non connecté à %s." % system.upper()}
@@ -2034,7 +2163,7 @@ def action_connect(payload):
         return {"ok": False, "error": "Système inconnu."}
     base, api, verify = _system_cfg(system)
     if not base:
-        return {"ok": False, "error": "URL %s non configurée (onglet Réglages)." % system.upper()}
+        return {"ok": False, "error": "URL %s non configurée (⚙ Sources)." % system.upper()}
 
     mode = payload.get("auth_mode", "basic")
     if mode == "apikey":
@@ -3562,6 +3691,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._json(action_conn_status())
             if path == "/api/auto_backup":
                 return self._json(action_auto_backup_status())
+            if path == "/api/applications":
+                return self._json(action_applications())
+            if path == "/api/jobs":
+                return self._json(action_jobs())
             if path == "/api/op_status":
                 return self._json(action_op_status(qs.get("id", "")))
             if path == "/api/nutanix/vgs":
@@ -3732,190 +3865,349 @@ HTML = r"""<!DOCTYPE html>
 <meta name="csrf-token" content="__CSRF_TOKEN__">
 <title>HYCU · Kubernetes sur Nutanix</title>
 <style>
+  /* ==========================================================================
+     Charte « HYCU Enterprise Cloud » — couleurs PRÉLEVÉES sur l'interface HYCU
+     (aucune autre teinte : pas d'accent fluo, pas de dégradé).
+       barre du haut #41327C · action/sélection #7530F0 · fond #F3F4F9
+       titres #4B5274 · texte #3D4464 / #2A2E44 · gris #A5A8B9 · filets #AFC2D6
+       succès #05A274 (anneau clair #9BDAC7) · échec #E9605A · avertissement #CA923E
+     ========================================================================== */
   :root{
-    /* Palette officielle HYCU : violet (marque), gris (neutres), chartreuse (accent) */
-    --ink:#1B0C33;        /* HP0 Black Purple */
-    --paper:#F2F4F8;      /* HG11 Ghost Gray */
-    --line:#DDE1E6;       /* HG10 Lighter Gray */
-    --teal:#721EF2;       /* HP4 Solid Purple (action principale) */
-    --teal-d:#43128E;     /* HP2 HYCU Purple (survol / accents) */
-    --accent:#ADFF00;     /* HC8 Chartreuse (énergie / surlignage) */
-    --amber:#c46b18; --red:#9c2b22;
-    --muted:#565C63;      /* gris assombri pour contraste AA (≥4.5:1 sur fond clair) */
-    --card:#FFFFFF; --good:#5c7a00; --warn:#c46b18;
+    --top:#41327C; --purple:#7530F0; --purple-d:#5F22D6; --purple-t:#EFE8FD;
+    --bg:#F3F4F9; --card:#FFFFFF; --title:#4B5274; --text:#3D4464; --strong:#2A2E44;
+    --muted:#6B7089; --grey:#A5A8B9; --rule:#AFC2D6; --line:#E3E7EE;
+    --green:#05A274; --green-l:#9BDAC7; --red:#E9605A; --orange:#CA923E; --blue:#6688FF;
+    /* alias historiques (utilisés par du HTML/JS existant) */
+    --ink:var(--strong); --paper:var(--bg); --teal:var(--purple); --teal-d:var(--top);
+    --accent:var(--purple); --amber:var(--orange); --good:var(--green); --warn:var(--orange);
   }
   *{box-sizing:border-box}
-  body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
-       background:var(--paper);color:var(--ink);line-height:1.5}
-  .mono,code,pre,textarea,.tag{font-family:"SF Mono",ui-monospace,Menlo,Consolas,monospace}
-  header{background:var(--ink);color:#fff;padding:18px 22px;
-         display:flex;flex-wrap:wrap;gap:14px;align-items:center;justify-content:space-between}
-  header h1{margin:0;font-size:19px;font-weight:700;letter-spacing:.2px}
-  header h1 small{display:block;font-size:11px;color:#B8B4FC;font-weight:400;
-                  text-transform:uppercase;letter-spacing:1.5px;margin-top:3px}
-  .brand{display:flex;align-items:center;gap:13px}
-  .logo{flex:none;display:block;height:38px;width:auto;max-width:180px}
-  .wm{color:var(--accent);font-weight:800;letter-spacing:2px;margin-right:8px}
-  .ctx{font-size:12px;color:#E9E6FF;font-weight:600}
-  .ver{font-family:ui-monospace,Consolas,monospace;font-size:11px;color:#C9C4FF;font-weight:600;opacity:.85}
-  .langbtn{background:none;border:1px solid #6b5aa8;color:#E9E6FF;border-radius:6px;padding:3px 10px;
-           font-size:11px;font-weight:700;letter-spacing:1px;cursor:pointer;margin-left:10px;vertical-align:1px}
-  .langbtn:hover{border-color:var(--accent);color:var(--accent)}
-  /* Focus clavier visible partout (accessibilité). */
+  html,body{height:100%}
+  body{margin:0;font-family:Ubuntu,"Segoe UI",system-ui,-apple-system,Roboto,Arial,sans-serif;
+       background:var(--bg);color:var(--text);font-size:14px;line-height:1.45}
+  .mono,code,pre,textarea,.tag{font-family:"Ubuntu Mono",Consolas,"SF Mono",Menlo,monospace}
+  code{font-size:12.5px}
+  a{color:var(--purple)}
   button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible,[tabindex]:focus-visible{
-    outline:3px solid var(--accent);outline-offset:2px;border-radius:4px}
-  /* Stepper (fil conducteur du parcours Restaurer) : collant sous le bandeau
-     simulation pour rester visible malgré la longueur de la page, et cliquable
-     (chaque pastille fait défiler vers sa carte). */
-  .stepper{display:flex;gap:8px;flex-wrap:wrap;position:sticky;top:54px;z-index:35;
-           background:var(--paper);padding:8px 0 10px;margin:-8px 0 8px}
-  .stepper .st{font-size:12px;font-weight:600;color:var(--muted);background:#EEF0F6;border-radius:20px;
-               padding:5px 12px;cursor:pointer;border:1px solid transparent;user-select:none}
-  .stepper .st:hover{border-color:var(--teal)}
-  .stepper .st.on{background:var(--teal);color:#fff}
-  .stepper .st.done{background:#E6F0CC;color:var(--good)}
-  /* Barre « action suivante » du parcours Restaurer : flottante en bas de fenêtre,
-     pour que l'étape suivante (prévisualiser / lancer) reste visible sans scroller. */
-  .nextbar{position:fixed;left:50%;transform:translateX(-50%);bottom:16px;z-index:60;display:none;
-           align-items:center;gap:12px;max-width:92vw;background:var(--ink);color:#fff;
-           border-radius:12px;padding:10px 16px;font-size:13px;box-shadow:0 6px 24px rgba(27,12,51,.35)}
-  .nextbar.show{display:flex}
-  /* Dégagement : la barre flottante ne doit jamais recouvrir le dernier bouton. */
-  #tab-restore{padding-bottom:64px}
-  .nextbar .btn{margin:0}
-  @keyframes pulseGlow{0%{box-shadow:0 0 0 0 rgba(173,255,0,.7)}100%{box-shadow:0 0 0 14px rgba(173,255,0,0)}}
-  .pulse{animation:pulseGlow 1s ease-out 3}
-  /* Pastilles d'état des connexions dans l'en-tête (cliquables -> onglet Connexions). */
-  .hdrconn{display:inline-flex;gap:10px;margin-right:12px;cursor:pointer;vertical-align:1px}
-  .hdrconn .hc{font-size:10px;font-weight:700;letter-spacing:.5px;color:#B8B4FC}
-  .hdrconn:hover .hc{color:#fff}
-  .ctx b{color:#fff}
-  .ctx .bad{color:#f3b0a8}
-  .wrap{max-width:980px;margin:0 auto;padding:22px}
-  .dry{display:flex;align-items:center;gap:10px;background:#F3F2FF;border:1px solid #D0CEFB;
-       border-radius:8px;padding:10px 14px;font-size:13px;margin-bottom:18px;color:#43128E;
-       position:sticky;top:0;z-index:40}
-  .dry.live{background:#fbe9e7;border-color:#e3a9a2;color:#7a221b}
-  /* Mode réel : bandeau rouge fixe en haut de fenêtre, visible même en scrollant. */
-  .realbar{position:fixed;top:0;left:0;right:0;height:5px;background:var(--red);z-index:200;display:none}
+    outline:2px solid var(--purple);outline-offset:2px}
+
+  /* ---------- Barre du haut ---------- */
+  .topbar{position:sticky;top:0;z-index:70;height:64px;background:var(--top);color:#fff;
+          display:flex;align-items:center;justify-content:space-between;padding:0 22px}
+  .tb-brand{display:flex;align-items:center;gap:10px;color:#fff;text-decoration:none}
+  .tb-brand .logo{height:30px;width:auto;display:block}
+  .tb-word{font-size:27px;font-weight:700;letter-spacing:.5px}
+  .tb-word sup{font-size:9px;font-weight:400;margin-left:1px}
+  .tb-prod{font-size:13px;color:#fff;opacity:.85;border-left:1px solid rgba(255,255,255,.35);
+           padding-left:12px;margin-left:4px}
+  .tb-right{display:flex;align-items:center;gap:20px}
+  .tb-link{display:flex;align-items:center;gap:8px;color:#fff;font-size:14px;cursor:pointer;
+           background:none;border:none;padding:0;font-family:inherit}
+  .tb-link u{text-underline-offset:3px}
+  .tb-ico{background:none;border:none;color:#fff;cursor:pointer;padding:0;display:flex;align-items:center}
+  .tb-ico svg,.tb-link svg{display:block}
+  .tb-ico:hover,.tb-link:hover{opacity:.8}
+  .tb-lang{background:none;border:1px solid rgba(255,255,255,.55);color:#fff;border-radius:4px;
+           padding:2px 9px;font-size:12px;font-weight:700;cursor:pointer;font-family:inherit}
+  .hdrconn{display:flex;gap:10px;cursor:pointer}
+  .hdrconn .hc{font-size:11px;font-weight:700;color:#fff;letter-spacing:.3px;display:flex;align-items:center}
+  .ctx{display:none}
+  #ctxWarn .bad{color:#fff;background:var(--red);border-radius:3px;padding:0 6px;font-size:11px;margin-left:6px}
+
+  /* ---------- Coquille : barre latérale + contenu ---------- */
+  .shell{display:flex;align-items:flex-start;min-height:calc(100vh - 64px)}
+  nav.sidebar{position:sticky;top:64px;flex:none;width:204px;height:calc(100vh - 64px);background:#fff;
+              display:flex;flex-direction:column;padding:12px 0 10px;border-right:1px solid var(--line);
+              border-radius:0 10px 0 0;margin-top:0}
+  nav.sidebar button{display:flex;align-items:center;gap:13px;width:calc(100% - 16px);margin:2px 8px;
+              background:none;border:none;border-radius:6px;padding:9px 12px;font-size:14px;color:var(--strong);
+              cursor:pointer;text-align:left;font-family:inherit}
+  nav.sidebar button svg{flex:none;width:24px;height:24px;color:var(--top)}
+  nav.sidebar button:hover{background:var(--purple-t)}
+  nav.sidebar button.on{background:var(--purple);color:#fff}
+  nav.sidebar button.on svg{color:#fff}
+  nav.sidebar .sb-sep{height:1px;background:var(--grey);opacity:.5;margin:10px 22px}
+  nav.sidebar .sb-foot{margin-top:auto;text-align:center;color:var(--grey);font-size:12px}
+  nav.sidebar .sb-col{background:none;border:none;color:var(--top);cursor:pointer;width:auto;margin:0 auto 6px;
+              display:block;padding:4px 10px}
+  nav.sidebar .sb-col svg{width:20px;height:20px}
+  nav.sidebar .sb-col:hover{background:none;opacity:.7}
+  body.sb-min nav.sidebar{width:64px}
+  body.sb-min nav.sidebar button .nl{display:none}
+  body.sb-min nav.sidebar button{justify-content:center;padding:9px 0}
+  body.sb-min nav.sidebar .sb-col svg{transform:rotate(180deg)}
+  body.sb-min nav.sidebar .ver{display:none}
+  main.wrap{flex:1;min-width:0;padding:18px 26px 40px}
+
+  /* ---------- En-tête de page (titre + actions à droite) ---------- */
+  .pagehead{display:flex;align-items:center;justify-content:space-between;gap:16px;margin:2px 0 14px;flex-wrap:wrap}
+  .ptitle{margin:0;font-size:27px;font-weight:500;color:var(--title);display:flex;align-items:center;gap:10px}
+  .ptitle .crumb{color:var(--title);cursor:pointer;text-decoration:none}
+  .ptitle .crumb:hover{text-decoration:underline}
+  .ptitle .sep{font-size:22px;color:var(--grey)}
+  .pacts{display:flex;gap:22px;align-items:center;flex-wrap:wrap}
+  .pact{display:flex;align-items:center;gap:7px;background:none;border:none;padding:4px 0;cursor:pointer;
+        font-size:14px;color:var(--text);font-family:inherit}
+  .pact svg{width:22px;height:22px;color:var(--top);flex:none}
+  .pact:hover:not(:disabled){color:var(--purple)}
+  .pact:disabled{color:var(--grey);cursor:not-allowed}
+  .pact:disabled svg{color:var(--grey)}
+  .refresh{background:none;border:none;cursor:pointer;color:var(--top);padding:0;display:flex}
+  .refresh svg{width:22px;height:22px}
+  .refresh.busy svg{animation:sp .9s linear infinite}
+
+  /* ---------- Bandeau simulation / mode réel ---------- */
+  .dry{display:flex;align-items:center;gap:12px;background:#fff;border:1px solid var(--line);
+       border-left:4px solid var(--purple);border-radius:4px;padding:8px 14px;font-size:13px;margin-bottom:16px;
+       color:var(--text)}
+  .dry b{color:var(--strong)}
+  .dry.live{border-left-color:var(--red);background:#FDF0EF}
+  .dry.live b{color:var(--red)}
+  .realbar{position:fixed;top:0;left:0;right:0;height:4px;background:var(--red);z-index:200;display:none}
   body.realmode .realbar{display:block}
-  body.realmode header{box-shadow:inset 0 -3px 0 var(--red)}
-  /* Modale de confirmation des actions destructives. */
-  .modal-bg{position:fixed;inset:0;background:rgba(20,12,40,.55);display:flex;align-items:center;
-            justify-content:center;z-index:300;padding:16px}
-  .modal{background:#fff;border-radius:12px;max-width:540px;width:100%;padding:22px;
-         box-shadow:0 24px 70px rgba(0,0,0,.4)}
-  .modal h3{margin:0 0 10px;color:var(--red);font-size:17px}
-  .modal .dm-line{font-size:13px;margin:5px 0;line-height:1.5}
-  .modal .dm-need{margin-top:14px}
-  .modal-actions{margin-top:18px;display:flex;gap:10px;justify-content:flex-end}
-  /* display:inline-block : hors flexbox, un <label> inline ignorerait width/height
-     (le toggle s'affichait écrasé dans les cartes). */
-  .switch{position:relative;display:inline-block;width:46px;height:26px;flex:none}
-  /* Variante marche/arrêt (sémantique claire) : gris = désactivé, vert = activé. */
-  .switch.onoff .slider{background:#c9ccd1}
-  .switch.onoff input:checked + .slider{background:var(--good)}
-  .switch input{opacity:0;width:0;height:0}
-  .slider{position:absolute;inset:0;background:var(--teal);border-radius:26px;cursor:pointer;transition:.2s}
-  .slider:before{content:"";position:absolute;height:20px;width:20px;left:3px;top:3px;
-                 background:#fff;border-radius:50%;transition:.2s}
-  input:checked + .slider{background:var(--red)}
-  input:checked + .slider:before{transform:translateX(20px)}
-  nav{display:flex;gap:4px;border-bottom:2px solid var(--line);margin-bottom:22px;flex-wrap:wrap}
-  nav button{background:none;border:none;padding:11px 18px;font-size:14px;cursor:pointer;
-             color:var(--muted);border-bottom:3px solid transparent;margin-bottom:-2px}
-  nav button.on{color:var(--teal-d);border-bottom-color:var(--teal);font-weight:700}
-  .step-no{display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;
-           border-radius:50%;background:var(--teal);color:#fff;font-size:13px;font-weight:700;
-           margin-right:8px;flex:none}
-  .card{background:var(--card);border:1px solid var(--line);border-radius:10px;
-        padding:18px 20px;margin-bottom:16px}
-  .card h3{margin:0 0 4px;font-size:16px;display:flex;align-items:center}
-  .card p.sub{margin:0 0 14px;color:var(--muted);font-size:13px}
-  label.fld{display:block;font-size:12px;text-transform:uppercase;letter-spacing:.8px;
-            color:var(--muted);margin:12px 0 5px}
-  select,input[type=text],input[type=password],textarea{width:100%;padding:9px 11px;border:1px solid var(--line);
-        border-radius:7px;background:#fff;font-size:13px;color:var(--ink)}
-  select:focus,input[type=text]:focus,input[type=password]:focus,textarea:focus{outline:none;border-color:var(--teal);
-        box-shadow:0 0 0 3px rgba(114,30,242,.15)}
-  .conn-dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:#c9ccd1;margin-right:6px;vertical-align:0}
-  .conn-dot.on{background:var(--accent);box-shadow:0 0 0 3px rgba(173,255,0,.25)}
-  textarea{resize:vertical;min-height:46px}
+
+  /* ---------- Cartes, champs, boutons ---------- */
+  .card{background:var(--card);border-radius:6px;padding:18px 20px;margin-bottom:16px;
+        box-shadow:0 1px 2px rgba(65,50,124,.06)}
+  .card h3{margin:0 0 4px;font-size:17px;font-weight:500;color:var(--title);display:flex;align-items:center}
+  .card p.sub{margin:0 0 12px;color:var(--muted);font-size:13px}
+  .step-no{display:inline-flex;align-items:center;justify-content:center;min-width:24px;height:24px;padding:0 5px;
+           border-radius:12px;background:var(--purple-t);color:var(--top);font-size:12px;font-weight:700;
+           margin-right:9px;flex:none}
+  label.fld{display:block;font-size:13px;color:var(--text);margin:12px 0 5px}
+  select,input[type=text],input[type=password],input[type=number],textarea{width:100%;padding:8px 11px;
+        border:1px solid var(--rule);border-radius:4px;background:#fff;font-size:14px;color:var(--strong);
+        font-family:inherit;min-height:38px}
+  select{appearance:none;-webkit-appearance:none;padding-right:34px;cursor:pointer;
+        background:#fff url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'><path d='M1 1.5l5 5 5-5' fill='none' stroke='%2341327C' stroke-width='1.8'/></svg>") no-repeat right 12px center}
+  select:focus,input:focus,textarea:focus{outline:none;border-color:var(--purple);box-shadow:0 0 0 2px var(--purple-t)}
+  input[type=checkbox]{accent-color:var(--purple);width:15px;height:15px;vertical-align:-2px}
+  textarea{resize:vertical;min-height:46px;font-size:12.5px}
   .row{display:flex;gap:12px;flex-wrap:wrap}
   .row > div{flex:1;min-width:180px}
-  .btn{background:var(--teal);color:#fff;border:none;border-radius:7px;padding:10px 18px;
-       font-size:13px;cursor:pointer;font-weight:700;letter-spacing:.3px}
-  .btn:hover{background:var(--teal-d)}
+  .btn{background:var(--purple);color:#fff;border:1px solid var(--purple);border-radius:4px;padding:8px 20px;
+       font-size:14px;cursor:pointer;font-weight:500;font-family:inherit;min-height:38px;
+       display:inline-flex;align-items:center;justify-content:center;gap:6px}
+  .btn:hover{background:var(--purple-d);border-color:var(--purple-d)}
   .btn:disabled{opacity:.45;cursor:not-allowed}
-  .btn.ghost{background:#fff;color:var(--teal-d);border:1px solid var(--teal)}
-  .btn.danger{background:var(--red)}
-  .btn.danger:hover{background:#7a221b}
-  .seg{display:inline-flex;border:1px solid var(--line);border-radius:7px;overflow:hidden}
-  .seg button{background:#fff;border:none;padding:8px 14px;font-size:12px;cursor:pointer;color:var(--muted)}
-  .seg button.on{background:var(--teal-d);color:#fff}
-  .pvc-list{list-style:none;padding:0;margin:0}
-  .pvc-list li{display:flex;align-items:center;gap:12px;padding:10px 12px;border:1px solid var(--line);
-               border-radius:8px;margin-bottom:8px;background:#fff}
-  .pvc-list li.sel{border-color:var(--teal);background:#F3F2FF;box-shadow:inset 3px 0 0 var(--accent)}
-  .pvc-list .nm{font-weight:600;font-size:13px}
-  .pvc-list .meta{font-size:11px;color:var(--muted)}
-  .vol-cfg{border:1px solid var(--line);border-radius:8px;padding:12px;margin:8px 0;background:#fff}
+  .btn.ghost{background:#fff;color:var(--top);border:1px solid var(--top)}
+  .btn.ghost:hover{background:var(--purple-t)}
+  .btn.danger{background:var(--red);border-color:var(--red)}
+  .btn.danger:hover{background:#D64B45;border-color:#D64B45}
+  .lnk{background:none;border:none;padding:6px 4px;color:var(--strong);text-decoration:underline;
+       text-underline-offset:3px;cursor:pointer;font-size:14px;font-family:inherit}
+  .lnk:hover{color:var(--purple)}
+  .seg{display:inline-flex;border:1px solid var(--rule);border-radius:4px;overflow:hidden}
+  .seg button{background:#fff;border:none;border-right:1px solid var(--rule);padding:8px 16px;font-size:13px;
+              cursor:pointer;color:var(--text);font-family:inherit}
+  .seg button:last-child{border-right:none}
+  .seg button.on{background:var(--top);color:#fff}
+  .conn-dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:var(--grey);margin-right:6px;vertical-align:0}
+  .conn-dot.on{background:var(--green)}
+  .topbar .conn-dot{background:rgba(255,255,255,.45)}
+  .topbar .conn-dot.on{background:#fff}
+  .switch{position:relative;display:inline-block;width:38px;height:20px;flex:none}
+  .switch input{opacity:0;width:0;height:0}
+  .slider{position:absolute;inset:0;background:var(--red);border-radius:20px;cursor:pointer;transition:.2s}
+  .slider:before{content:"";position:absolute;height:14px;width:14px;left:3px;top:3px;background:#fff;
+                 border-radius:50%;transition:.2s}
+  input:checked + .slider{background:var(--purple)}
+  input:checked + .slider:before{transform:translateX(18px)}
+  .switch.onoff .slider{background:#fff;border:1px solid var(--rule)}
+  .switch.onoff .slider:before{background:#C9B8F7;top:2px;left:2px}
+  .switch.onoff input:checked + .slider{background:var(--purple);border-color:var(--purple)}
+  .switch.onoff input:checked + .slider:before{background:#fff}
+
+  /* ---------- Tableaux « entités » (Applications, Tâches, Sources, Politiques) ---------- */
+  .tcard{background:#fff;border-radius:6px;box-shadow:0 1px 2px rgba(65,50,124,.06);overflow:hidden}
+  .tbar{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:12px 16px;flex-wrap:wrap}
+  .tbar input[type=text]{width:230px;min-height:36px}
+  .tbar .tinfo{font-size:13px;color:var(--text)}
+  table.ht{width:100%;border-collapse:collapse;font-size:14px}
+  table.ht th{text-align:left;font-size:11.5px;font-weight:700;letter-spacing:.4px;text-transform:uppercase;
+              color:var(--top);padding:10px 12px;border-bottom:1px solid var(--rule);white-space:nowrap;
+              border-right:1px solid var(--line)}
+  table.ht th:last-child{border-right:none}
+  table.ht td{padding:11px 12px;color:var(--text);border-bottom:1px solid #F0F2F6;vertical-align:middle}
+  table.ht tr:last-child td{border-bottom:none}
+  table.ht tbody tr:hover td{background:#FAF8FF}
+  table.ht tbody tr.sel td{background:var(--purple-t)}
+  table.ht tbody tr.clk{cursor:pointer}
+  table.ht .cb{width:36px;text-align:center}
+  table.ht .ctr{text-align:center}
+  .tempty{padding:26px;text-align:center;color:var(--muted);font-size:14px}
+  /* Icônes d'état HYCU : pastille pleine, symbole blanc */
+  .st,.ic.ok,.ic.ko,.ic.sim{display:inline-flex;width:18px;height:18px;border-radius:50%;flex:none;
+      color:transparent !important;font-size:0 !important;vertical-align:middle;
+      background-repeat:no-repeat;background-position:center;background-size:18px 18px}
+  .st.ok,.ic.ok{background-color:var(--green);background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'><path d='M5.2 9.3l2.5 2.5 5-5.3' stroke='white' stroke-width='1.9' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>")}
+  .st.ko,.ic.ko{background-color:var(--red);background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'><path d='M6 6l6 6M12 6l-6 6' stroke='white' stroke-width='1.9' stroke-linecap='round'/></svg>")}
+  .st.wn{background-color:var(--orange);background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'><path d='M9 4.8v5.2' stroke='white' stroke-width='2' stroke-linecap='round'/><circle cx='9' cy='13' r='1.15' fill='white'/></svg>")}
+  .st.na{background-color:#8C91A5;background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'><path d='M7 7.1a2.1 2.1 0 1 1 3 1.9c-.7.4-1 .8-1 1.6' stroke='white' stroke-width='1.7' fill='none' stroke-linecap='round'/><circle cx='9' cy='13.2' r='1.05' fill='white'/></svg>")}
+  .st.sim,.ic.sim{background-color:var(--blue);background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'><circle cx='9' cy='9' r='3.3' stroke='white' stroke-width='1.7' fill='none'/></svg>")}
+  .st.run{background-color:var(--purple);background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'><path d='M7.3 5.8v6.4l5-3.2z' fill='white'/></svg>")}
+
+  /* ---------- Tableau de bord ---------- */
+  .dgrid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:18px}
+  .dgrid .span2{grid-column:span 2}
+  .dtitle{margin:0 0 8px;font-size:26px;font-weight:500;color:var(--title);display:flex;align-items:center;gap:8px}
+  .dgrid > div{display:flex;flex-direction:column}
+  .dcard{flex:1;background:#fff;border-radius:6px;padding:18px;min-height:250px;box-shadow:0 1px 2px rgba(65,50,124,.06)}
+  .donut{display:block;margin:4px auto 10px}
+  .dnums{display:grid;grid-template-columns:1fr 1fr;text-align:center}
+  .dnums > div + div{border-left:1px solid var(--line)}
+  .dnums .l{font-size:14px;color:var(--text)}
+  .dnums .v{font-size:32px;font-weight:300;color:var(--title)}
+  .dnums .v.bad{color:var(--red)}
+  .dlist{list-style:none;margin:0;padding:0}
+  .dlist li{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:9px 0;
+            border-bottom:1px solid #F0F2F6;font-size:14px}
+  .dlist li:last-child{border-bottom:none}
+  .dlist .k{color:var(--text)} .dlist .v{color:var(--strong);font-weight:500;text-align:right}
+  .dbig{font-size:30px;font-weight:300;color:var(--title);margin:6px 0 2px}
+  .jcounts{display:grid;grid-template-columns:repeat(4,1fr);text-align:center;margin-top:10px}
+  .jcounts .n{font-size:15px;color:var(--strong)} .jcounts .l{font-size:13px;color:var(--text)}
+  .jcounts .st{width:20px;height:20px;margin:3px 0}
+
+  /* ---------- Modales HYCU (assistants) ---------- */
+  .hmodal-bg,.wiz,.modal-bg{position:fixed;inset:0;background:rgba(42,46,68,.45);display:flex;align-items:center;
+       justify-content:center;z-index:1000;padding:18px}
+  .hmodal,.wiz-card,.modal{background:#fff;border-radius:4px;width:100%;max-width:620px;max-height:94vh;
+       display:flex;flex-direction:column;box-shadow:0 12px 40px rgba(42,46,68,.35)}
+  .hm-head,.wiz-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 18px;
+       border-bottom:1px solid var(--rule);color:var(--title);background:#fff;border-radius:4px 4px 0 0}
+  .hm-head h2{flex:1;min-width:0;line-height:1.25}
+  .hm-head h2,.wiz-head h2{margin:0;font-size:22px;font-weight:500;color:var(--title)}
+  .hm-head h2 .sep{color:var(--title);margin:0 6px}
+  .hm-ico{display:flex;gap:14px;align-items:center}
+  .hm-ico button{background:none;border:none;cursor:pointer;color:var(--top);padding:0;font-size:22px;line-height:1;
+                 font-family:inherit;font-weight:700}
+  .hm-body,.wiz-body{padding:16px 18px;overflow:auto}
+  .hm-foot,.wiz-foot{display:flex;align-items:center;justify-content:flex-end;gap:14px;padding:12px 18px;
+       border-top:1px solid var(--rule)}
+  .wiz-foot{justify-content:space-between}
+  .hm-foot .btn,.wiz-foot .btn:not(.ghost){min-width:92px}
+  .wiz-foot .btn.ghost,.modal-actions .btn.ghost{background:none;border:none;color:var(--strong);
+       text-decoration:underline;text-underline-offset:3px;min-height:0;padding:6px 4px}
+  .wiz-brand{display:none}
+  .wiz-head{flex-direction:column;align-items:stretch}
+  .wiz-bar{height:4px;background:var(--line);border-radius:4px;overflow:hidden;margin-top:10px}
+  .wiz-bar span{display:block;height:100%;width:0;background:var(--purple);transition:width .3s}
+  .wiz-body h3{margin:0 0 6px;font-size:17px;font-weight:500;color:var(--title)}
+  .wiz-body p.q{color:var(--muted);font-size:13px;margin:0 0 14px}
+  .wiz-opt{display:block;border:1px solid var(--rule);border-radius:4px;padding:12px 14px;margin:8px 0;cursor:pointer}
+  .wiz-opt.sel{border-color:var(--purple);box-shadow:0 0 0 1px var(--purple)}
+  .wiz-opt b{font-size:14px;color:var(--strong)} .wiz-opt .d{font-size:13px;color:var(--text);margin-top:2px}
+  .wiz-recap{background:var(--strong);color:#E6E8F0;border-radius:4px;padding:14px;font-size:12px;white-space:pre-wrap;
+             font-family:"Ubuntu Mono",Consolas,monospace}
+  .chip{display:inline-block;border:1px solid var(--rule);border-radius:4px;padding:6px 13px;margin:4px 6px 4px 0;
+        font-size:13px;cursor:pointer;background:#fff;color:var(--text)}
+  .chip.sel{background:var(--purple);color:#fff;border-color:var(--purple)}
+  /* « À propos » : en-tête sombre (logo blanc) */
+  .wiz-head.dark{background:var(--top);color:#fff;border-bottom:none}
+  .wiz-head.dark h2{color:#fff}
+  .wiz-head.dark .wiz-brand{display:block}
+  .wiz-head.dark .logo{height:34px;width:auto}
+  /* Modale de confirmation (actions destructives) */
+  .modal{max-width:540px;padding:0}
+  .modal h3{margin:0;padding:14px 18px;border-bottom:1px solid var(--rule);color:var(--red);font-size:20px;font-weight:500}
+  .modal #dmBody,.modal .dm-need{padding:0 18px}
+  .modal #dmBody{padding-top:12px}
+  .modal .dm-line{font-size:14px;margin:6px 0;line-height:1.5}
+  .modal .dm-need{margin:10px 0 4px}
+  .modal-actions{margin-top:14px;display:flex;gap:14px;justify-content:flex-end;padding:12px 18px;border-top:1px solid var(--rule)}
+  /* Cartes d'option (choix du type de restauration) */
+  .opt{display:flex;gap:18px;align-items:flex-start;border:1px solid var(--rule);border-radius:4px;padding:16px 18px;
+       margin-bottom:12px;cursor:pointer;background:#fff}
+  .opt:hover{border-color:var(--top)}
+  .opt.sel{border-color:var(--purple);box-shadow:0 0 0 1px var(--purple)}
+  .opt svg{flex:none;width:52px;height:52px;color:var(--top)}
+  .opt b{display:block;font-size:15px;color:var(--strong);margin-bottom:4px;font-weight:700}
+  .opt span{font-size:14px;color:var(--text)}
+  .fbox{border:1px solid var(--rule);border-radius:4px;padding:8px 11px;min-height:38px;display:flex;align-items:center;
+        gap:8px;background:#fff;color:var(--strong)}
+  .fbox .dim{color:var(--muted)}
+
+  /* ---------- Listes, états, journaux (contenus générés par le JS) ---------- */
+  .pvc-list{list-style:none;padding:0;margin:0;border:1px solid var(--rule);border-radius:4px;overflow:hidden}
+  .pvc-list:empty{display:none}
+  .pvc-list li{display:flex;align-items:center;gap:12px;padding:10px 12px;border-bottom:1px solid #F0F2F6;background:#fff}
+  .pvc-list li:last-child{border-bottom:none}
+  .pvc-list li.sel{background:var(--purple-t)}
+  .pvc-list .nm{font-weight:500;font-size:14px;color:var(--strong)}
+  .pvc-list .meta{font-size:12px;color:var(--muted)}
+  .pvc-list > .hint{padding:10px 12px;margin:0}
+  .vol-cfg{border:1px solid var(--rule);border-radius:4px;padding:12px 14px;margin:10px 0;background:#fff}
+  .vol-cfg > .nm{font-weight:500;color:var(--strong)}
   .vol-cfg.disabled{opacity:.5}
-  .rsAdv{margin-top:8px;border:1px solid var(--line);border-radius:8px;background:#faf9fc;padding:6px 10px}
-  .rsAdvSum{cursor:pointer;font-weight:600;font-size:13px;color:#5a4b86;user-select:none}
+  .rsAdv{margin-top:10px;border:1px solid var(--line);border-radius:4px;background:#FAFBFD;padding:6px 10px}
+  .rsAdvSum{cursor:pointer;font-weight:500;font-size:13px;color:var(--top);user-select:none}
   .rsAdv[open] .rsAdvSum{margin-bottom:8px}
   .rsManualPlain{border:none;background:none;padding:0}
   .rsManualPlain > .rsAdvSum{display:none}
-  .rsGuide{margin:0 0 10px;padding:8px 12px;border-left:3px solid var(--accent);background:#f3f0fb;border-radius:6px;font-size:13px}
-  .badge{font-size:10px;padding:2px 8px;border-radius:20px;text-transform:uppercase;letter-spacing:.5px}
-  .b-bound{background:#eefcc4;color:#4f6b00} .b-lost{background:#fbe9e7;color:var(--red)}
-  .b-pending{background:#fff7e8;color:var(--amber)} .b-na{background:#eee;color:#777}
-  pre.box{background:#1B0C33;color:#E2E0FD;border-radius:8px;padding:14px;font-size:12px;
+  .rsGuide{margin:0 0 12px;padding:9px 12px;border-left:3px solid var(--purple);background:#F7F5FD;border-radius:0 4px 4px 0;
+           font-size:13px;color:var(--text)}
+  .badge{font-size:11px;padding:2px 8px;border-radius:10px;font-weight:500}
+  .b-bound{background:#E1F4EE;color:var(--green)} .b-lost{background:#FCE9E8;color:var(--red)}
+  .b-pending{background:#F8EFE0;color:var(--orange)} .b-na{background:#EEF0F5;color:var(--muted)}
+  pre.box{background:var(--strong);color:#E6E8F0;border-radius:4px;padding:12px 14px;font-size:12px;
           overflow:auto;max-height:340px;white-space:pre-wrap;word-break:break-word}
-  .repl{font-size:12px;border:1px dashed var(--line);border-radius:8px;padding:10px;margin:10px 0;background:#fff}
-  .repl div{margin:4px 0} .repl .k{color:var(--teal-d);font-weight:600}
-  .repl .old{color:var(--red);text-decoration:line-through} .repl .new{color:var(--teal-d)}
+  .repl{font-size:13px;border:1px solid var(--line);border-radius:4px;padding:10px 12px;margin:10px 0;background:#FAFBFD}
+  .repl div{margin:4px 0} .repl .k{color:var(--top);font-weight:500}
+  .repl .old{color:var(--red);text-decoration:line-through} .repl .new{color:var(--green)}
   ol.plan{margin:6px 0 0;padding-left:20px;font-size:13px}
   ol.plan li{margin:3px 0}
-  .logline{display:flex;gap:8px;font-size:12px;padding:6px 0;border-bottom:1px solid var(--line)}
-  .logline .ic{flex:none;width:18px;text-align:center}
-  .ok{color:var(--good)} .ko{color:var(--red)} .sim{color:var(--amber)}
-  .hint{font-size:12px;color:var(--muted);margin-top:8px}
-  .note{background:#F3F2FF;border-left:3px solid var(--teal);padding:10px 14px;border-radius:0 8px 8px 0;
-        font-size:13px;margin-top:14px;color:#2F0F61}
-  .warnbox{background:#fff7e8;border-left:3px solid var(--amber);padding:10px 14px;border-radius:0 8px 8px 0;
-        font-size:13px;margin-top:10px;color:#7a4a10}
-  .err{background:#fbe9e7;border-left:3px solid var(--red);padding:10px 14px;border-radius:0 8px 8px 0;
-       font-size:13px;color:#7a221b;margin-top:10px}
-  .spin{display:inline-block;width:14px;height:14px;border:2px solid #ffffff80;border-top-color:#fff;
+  .logline{display:flex;gap:8px;align-items:flex-start;font-size:13px;padding:7px 0;border-bottom:1px solid #F0F2F6}
+  .logline .ic{margin-top:1px}
+  .ok{color:var(--green)} .ko{color:var(--red)} .sim{color:var(--orange)}
+  .hint{font-size:12.5px;color:var(--muted);margin-top:8px}
+  .note{background:#F7F5FD;border-left:3px solid var(--purple);padding:10px 14px;border-radius:0 4px 4px 0;
+        font-size:13px;margin-top:12px;color:var(--text)}
+  .warnbox{background:#FBF5EB;border-left:3px solid var(--orange);padding:10px 14px;border-radius:0 4px 4px 0;
+        font-size:13px;margin-top:10px;color:#6E4E17}
+  .err{background:#FDF0EF;border-left:3px solid var(--red);padding:10px 14px;border-radius:0 4px 4px 0;
+       font-size:13px;color:#8E2F2A;margin-top:10px}
+  .spin{display:inline-block;width:14px;height:14px;border:2px solid rgba(255,255,255,.5);border-top-color:#fff;
         border-radius:50%;animation:sp .7s linear infinite;vertical-align:-2px;margin-right:6px}
+  .hint .spin,.note .spin,.tempty .spin,td .spin,.dcard .spin{border-color:var(--purple-t);border-top-color:var(--purple)}
   @keyframes sp{to{transform:rotate(360deg)}}
-  .jbar{height:8px;background:#E2E0FD;border-radius:6px;overflow:hidden;margin-top:6px}
-  .jbar span{display:block;height:100%;width:0;background:var(--teal);transition:width .4s}
-  /* ----- Assistant de configuration (premier lancement) ----- */
-  .wiz{position:fixed;inset:0;background:rgba(27,12,51,.6);backdrop-filter:blur(3px);
-       display:flex;align-items:center;justify-content:center;z-index:1000;padding:18px}
-  .wiz-card{background:#fff;border-radius:16px;max-width:580px;width:100%;
-            box-shadow:0 24px 70px rgba(0,0,0,.35);display:flex;flex-direction:column;max-height:94vh}
-  .wiz-head{background:var(--ink);color:#fff;padding:22px 26px;border-radius:16px 16px 0 0}
-  .wiz-brand{font-weight:800;letter-spacing:4px;font-size:13px;color:var(--accent)}
-  .wiz-head h2{margin:6px 0 14px;font-size:21px}
-  .wiz-bar{height:5px;background:#3a2a5e;border-radius:5px;overflow:hidden}
-  .wiz-bar span{display:block;height:100%;width:0;background:var(--accent);transition:width .3s}
-  .wiz-body{padding:24px 26px;overflow:auto}
-  .wiz-body h3{margin:0 0 6px;font-size:17px}
-  .wiz-body p.q{color:var(--muted);font-size:13px;margin:0 0 16px}
-  .wiz-foot{display:flex;align-items:center;justify-content:space-between;gap:12px;
-            padding:14px 26px;border-top:1px solid var(--line)}
-  .wiz-opt{display:block;border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin:8px 0;cursor:pointer}
-  .wiz-opt.sel{border-color:var(--teal);background:#F3F2FF;box-shadow:inset 3px 0 0 var(--accent)}
-  .wiz-opt b{font-size:14px} .wiz-opt .d{font-size:12px;color:var(--muted);margin-top:2px}
-  .chip{display:inline-block;border:1px solid var(--line);border-radius:20px;padding:6px 13px;margin:4px 6px 4px 0;
-        font-size:12px;cursor:pointer;background:#fff}
-  .chip.sel{background:var(--teal);color:#fff;border-color:var(--teal)}
-  .wiz-recap{background:#1B0C33;color:#E2E0FD;border-radius:8px;padding:14px;font-size:12px;white-space:pre-wrap;
-             font-family:"SF Mono",ui-monospace,Menlo,Consolas,monospace}
-  @media(max-width:560px){.wrap{padding:14px}header{padding:14px}}
+  .jbar{height:6px;background:var(--line);border-radius:3px;overflow:hidden;margin-top:6px}
+  .jbar span{display:block;height:100%;width:0;background:var(--purple);transition:width .4s}
+  @keyframes pulseRing{0%{box-shadow:0 0 0 0 rgba(117,48,240,.55)}100%{box-shadow:0 0 0 12px rgba(117,48,240,0)}}
+  .pulse{animation:pulseRing 1s ease-out 3}
+  /* Anciens éléments de navigation du parcours Restaurer : remplacés par l'assistant */
+  .stepper,#rsNextBar{display:none !important}
+  .step-no{display:none}
+  .dq{display:inline-flex;align-items:center;justify-content:center;width:17px;height:17px;border:1.5px solid var(--grey);
+      border-radius:50%;font-size:11px;font-weight:700;color:var(--grey);cursor:help;vertical-align:middle}
+  /* Superposition : filtre / assistant / déverrouillage au-dessus des modales HYCU,
+     confirmation destructive au-dessus de tout. */
+  .wiz{z-index:1050} .modal-bg{z-index:1100}
+  /* Contenus existants hébergés dans les modales HYCU : sans cadre de carte, sans
+     titre (le titre est dans l'en-tête de la modale). */
+  .hm-body .card{box-shadow:none;padding:0;margin:0 0 14px;border-radius:0}
+  .hm-body .card > h3{display:none}
+  .hm-body .card > p.sub:first-of-type{margin-top:0}
+  /* Assistant de restauration : une seule action principale, dans le pied de modale. */
+  #mRestore #hyBatchGo,#mRestore #rsInplaceRun,#mRestore #rsContinueWrap,#mRestore #rsGo,
+  #mRestore #rsFlowGuide{display:none !important}
+  #mRestore #rsPlan > p.sub,#mRestore .card > p.sub{display:none}
+  #rsVolCfgs .vol-cfg > .nm > span:first-of-type{display:none}   /* « (PV …) » : déjà dans la liste */
+  #mRestore #rsInplaceRunWrap{border-top:none !important;padding-top:0 !important}
+  #rsWizMode.sim{background:var(--purple-t);color:var(--top)} #rsWizMode.live{background:#FCE9E8;color:var(--red)}
+  /* Sources : une fiche de connexion à la fois (choisie dans le tableau) */
+  #tab-connect > .card{border:1px solid var(--rule);box-shadow:none}
+  #srcBody tr.clk td:first-child{font-weight:500;color:var(--strong)}
+
+  @media(max-width:1100px){.dgrid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+  @media(max-width:900px){
+    body:not(.sb-open) nav.sidebar{width:64px}
+    body:not(.sb-open) nav.sidebar button .nl,body:not(.sb-open) nav.sidebar .ver{display:none}
+    body:not(.sb-open) nav.sidebar button{justify-content:center;padding:9px 0}
+    .tb-prod,.hdrconn{display:none}
+  }
+  @media(max-width:600px){main.wrap{padding:14px}.dgrid{grid-template-columns:1fr}.dgrid .span2{grid-column:auto}
+    .tb-link u{display:none}}
 </style>
 </head>
 <body>
@@ -3984,7 +4276,7 @@ HTML = r"""<!DOCTYPE html>
 <!-- ===================== À PROPOS ===================== -->
 <div id="aboutModal" class="wiz" style="display:none">
   <div class="wiz-card" style="max-width:560px">
-    <div class="wiz-head">
+    <div class="wiz-head dark">
       <div class="wiz-brand">__LOGO__</div>
       <h2 style="margin-top:10px">Protection Kubernetes sur Nutanix</h2>
       <div style="color:#B8B4FC;font-weight:700;font-size:13px;margin-top:2px">Plugin pour HYCU Enterprise Cloud</div>
@@ -4036,15 +4328,30 @@ HTML = r"""<!DOCTYPE html>
   </div>
 </div>
 
-<header>
-  <div class="brand">
-    __LOGO__
-    <h1><span class="wm">HYCU</span>Protection Kubernetes sur Nutanix<small>Sauvegarde &amp; restauration guidées · Nutanix</small></h1>
+<header class="topbar">
+  <a class="tb-brand" id="tbHome" href="#" title="Tableau de bord">__LOGO__<span class="tb-word">HYCU<sup>®</sup></span><span class="tb-prod">Kubernetes · Nutanix</span></a>
+  <div class="tb-right">
+    <span id="hdrConn" class="hdrconn" title="État des sources — cliquer pour ouvrir les Sources"></span>
+    <button class="tb-link" id="ctxLink" type="button" title="Cluster Kubernetes ciblé (contexte kubectl) — cliquer pour le changer"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="16" height="6.5" rx="1.3"/><rect x="4" y="13.5" width="16" height="6.5" rx="1.3"/><path d="M7.6 7.25h.01M7.6 16.75h.01"/></svg><u id="ctx">…</u><span id="ctxWarn"></span></button>
+    <button class="tb-ico" id="srcBtn" type="button" title="Sources (HYCU, Prism Central, Prism Element)"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></button>
+    <button class="tb-ico" id="aboutBtn" type="button" title="À propos de cet outil"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9.4"/><path d="M9.6 9.4a2.5 2.5 0 0 1 4.9.8c0 1.7-2.5 2.1-2.5 3.8"/><circle cx="12" cy="17.1" r=".7" fill="currentColor" stroke="none"/></svg></button>
+    <button id="langBtn" class="tb-lang" type="button" title="Afficher l'interface en anglais">EN</button>
   </div>
-  <div class="ctx"><span id="hdrConn" class="hdrconn" title="État des connexions — cliquer pour ouvrir l'onglet Connexions"></span>Contexte kubectl : <b id="ctx">…</b><span id="ctxWarn"></span> · <span class="ver" title="Version de la build">v:__VERSION__</span><button id="langBtn" class="langbtn" type="button" title="Afficher l'interface en anglais">EN</button><button id="aboutBtn" class="langbtn" type="button" title="À propos de cet outil">?</button></div>
 </header>
 
-<div class="wrap">
+<div class="shell">
+<nav class="sidebar" role="tablist" aria-label="Sections de l'outil">
+  <button class="on" role="tab" aria-selected="true" data-tab="dashboard"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4.2 17.5a8.6 8.6 0 1 1 15.6 0"/><path d="M12 13.4l4.2-4.2"/><circle cx="12" cy="13.6" r="1.4"/></svg><span class="nl">Tableau de bord</span></button>
+  <div class="sb-sep"></div>
+  <button role="tab" aria-selected="false" data-tab="apps"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3.5" y="3.5" width="7" height="7" rx="1.2"/><rect x="13.5" y="3.5" width="7" height="7" rx="1.2"/><rect x="3.5" y="13.5" width="7" height="7" rx="1.2"/><circle cx="17" cy="17" r="3.6"/></svg><span class="nl">Applications</span></button>
+  <div class="sb-sep"></div>
+  <button role="tab" aria-selected="false" data-tab="policies"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l7.5 3v5.4c0 4.6-3.2 8.3-7.5 9.6-4.3-1.3-7.5-5-7.5-9.6V6z"/><path d="M8.6 12.1l2.4 2.4 4.4-4.8"/></svg><span class="nl">Politiques</span></button>
+  <div class="sb-sep"></div>
+  <button role="tab" aria-selected="false" data-tab="jobs"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4.5" y="3.5" width="15" height="17" rx="1.6"/><path d="M8 8.5h8M8 12h8M8 15.5h5"/></svg><span class="nl">Tâches</span></button>
+  <button role="tab" aria-selected="false" data-tab="settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 20v-5M5 11V4M12 20v-8M12 8V4M19 20v-3M19 13V4"/><path d="M3 15h4M10 8h4M17 17h4"/></svg><span class="nl">Réglages</span></button>
+  <div class="sb-foot"><button class="sb-col" id="sbCol" type="button" title="Réduire / déployer le menu"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg></button><span class="ver">v__VERSION__</span></div>
+</nav>
+<main class="wrap">
   <div id="kubeBanner"></div>
   <div class="dry" id="dryBar">
     <label class="switch"><input type="checkbox" id="dry" checked><span class="slider"></span></label>
@@ -4052,38 +4359,49 @@ HTML = r"""<!DOCTYPE html>
       Désactivez-le seulement quand vous êtes prêt à agir réellement.</div>
   </div>
 
-  <nav role="tablist" aria-label="Sections de l'outil">
-    <button class="on" role="tab" aria-selected="true" data-tab="backup">1 · Sauvegarder</button>
-    <button role="tab" aria-selected="false" data-tab="restore">2 · Restaurer</button>
-    <button role="tab" aria-selected="false" data-tab="verify">3 · Vérifier</button>
-    <button role="tab" aria-selected="false" data-tab="connect">Connexions</button>
-    <button role="tab" aria-selected="false" data-tab="settings">⚙ Réglages</button>
-  </nav>
 
-  <!-- ===================== SAUVEGARDE ===================== -->
-  <section id="tab-backup">
-    <div class="card">
-      <h3><span class="step-no">1</span>Sauvegarder les volumes d'un namespace</h3>
-      <p class="sub">Exporte et nettoie automatiquement tous les PV et PVC du namespace.
-        Équivaut aux boucles kubectl + nettoyage manuel des manifestes.</p>
-      <label class="fld">Namespace</label>
-      <div class="row">
-        <div><select id="bkNs"></select></div>
-        <div style="flex:none"><button class="btn ghost nsEdit" title="Filtrer la liste des namespaces">✎ Filtrer</button></div>
-        <div style="flex:none"><button class="btn" id="bkRun">Sauvegarder ce namespace</button></div>
-        <div style="flex:none"><button class="btn ghost" id="bkRunAll" title="Sauvegarder tous les namespaces autorisés par le filtre (tous si aucun filtre)">Sauvegarder tous (filtrés)</button></div>
-      </div>
-      <label class="fld" style="margin-top:10px">Dossier de destination (optionnel)</label>
-      <input type="text" id="bkDest" placeholder="Vide = hycu-backups/ (à côté du programme). Ex. D:\sauvegardes\hycu  ou  /mnt/backups">
-      <div class="hint" style="margin-top:4px">Chemin sur la machine qui exécute l'outil. Le sous-dossier &lt;namespace&gt;/&lt;horodatage&gt; est créé automatiquement.</div>
-      <div id="bkOut"></div>
+  <!-- ===================== TABLEAU DE BORD ===================== -->
+  <section id="tab-dashboard">
+    <div class="dgrid">
+      <div><h2 class="dtitle">Applications <span class="dq" title="Anneau extérieur : namespaces ayant au moins une sauvegarde de configuration (protection). Anneau intérieur : sauvegarde récente, dans l'intervalle de la politique (conformité).">?</span></h2><div class="dcard" id="dbApps"></div></div>
+      <div><h2 class="dtitle">Politique <span class="dq" title="Politique de sauvegarde automatique de la configuration (manifestes PV/PVC et ressources).">?</span></h2><div class="dcard" id="dbPolicy"></div></div>
+      <div><h2 class="dtitle">Sources <span class="dq" title="Systèmes enregistrés via l'engrenage en haut à droite : HYCU, Prism Element, Prism Central.">?</span></h2><div class="dcard" id="dbSources"></div></div>
+      <div><h2 class="dtitle">Cluster <span class="dq" title="Cluster Kubernetes ciblé par kubectl.">?</span></h2><div class="dcard" id="dbCluster"></div></div>
+      <div class="span2"><h2 class="dtitle">Tâches <span class="dq" title="Opérations des 7 derniers jours (sauvegardes, restaurations, clones), d'après le journal d'audit.">?</span></h2><div class="dcard" id="dbJobs"></div></div>
+      <div class="span2"><h2 class="dtitle">Dernières tâches</h2><div class="dcard" id="dbLast"></div></div>
     </div>
-
+  </section>
+  <!-- ===================== APPLICATIONS ===================== -->
+  <section id="tab-apps" style="display:none">
+    <div class="pagehead"><h1 class="ptitle">Applications <button class="refresh" id="appsRefresh" type="button" title="Actualiser"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19.4 12.6a7.5 7.5 0 1 1-2.3-5.9"/><path d="M19.6 4.4v4h-4"/></svg></button></h1>
+      <div class="pacts">
+        <button class="pact" id="actBackup" type="button" disabled><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19.6 12.5a7.6 7.6 0 1 1-2.1-5.8"/><path d="M19.8 4.3v3.9h-3.9"/><path d="M12 8.3v4l2.6 1.9"/></svg><span>Sauvegarder</span></button>
+        <button class="pact" id="actRestore" type="button" disabled><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4.4 12.5a7.6 7.6 0 1 0 2.1-5.8"/><path d="M4.2 4.3v3.9h3.9"/><path d="M12 8.3v4l2.6 1.9"/></svg><span>Restaurer</span></button>
+        <button class="pact" id="actPolicy" type="button" disabled><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l7.5 3v5.4c0 4.6-3.2 8.3-7.5 9.6-4.3-1.3-7.5-5-7.5-9.6V6z"/><path d="M12 8.8v6.4M8.8 12h6.4"/></svg><span>Définir la politique</span></button>
+        <button class="pact" id="actVerify" type="button" disabled><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="8.6"/><path d="M8.3 12.2l2.5 2.5 5-5.3"/></svg><span>Vérifier</span></button>
+      </div></div>
+    <div class="tcard">
+      <div class="tbar"><input type="text" id="appsSearch" placeholder="Rechercher" autocomplete="off">
+        <div style="display:flex;align-items:center;gap:14px"><span class="tinfo" id="appsInfo"></span>
+          <button class="pact nsEdit" type="button" title="Filtrer la liste des namespaces"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5h16l-6.2 7.4V19l-3.6-1.8v-4.8z"/></svg></button></div></div>
+      <table class="ht"><thead><tr><th class="cb"><input type="checkbox" id="appsAll" title="Tout sélectionner"></th>
+        <th>Nom</th><th>Type</th><th>Politique</th><th class="ctr">Conformité</th><th class="ctr">Protection</th>
+        <th>Dernière sauvegarde</th><th class="ctr">Versions</th></tr></thead>
+        <tbody id="appsBody"><tr><td colspan="8" class="tempty"><span class="spin"></span></td></tr></tbody></table>
+    </div>
+  </section>
+  <!-- ===================== POLITIQUES ===================== -->
+  <section id="tab-policies" style="display:none">
+    <div class="pagehead"><h1 class="ptitle">Politiques</h1></div>
+    <div class="tcard" style="margin-bottom:16px">
+      <table class="ht"><thead><tr><th>Nom</th><th>Objet protégé</th><th>Fréquence</th><th>Rétention</th><th>Cible</th><th class="ctr">État</th></tr></thead>
+        <tbody id="polBody"></tbody></table>
+    </div>
     <div class="card">
       <h3><span class="step-no">⏱</span>Sauvegarde automatique de la configuration (PV/PVC)</h3>
       <p class="sub">Sauvegarde régulièrement les <b>manifestes PV/PVC</b> (la « recette » du restore) de tous les
         namespaces autorisés par le filtre — tant que l'outil est lancé. <b>Pas les données</b> des volumes :
-        elles sont protégées par HYCU (voir « Protéger les données dans HYCU » ci-dessous).</p>
+        elles sont protégées par HYCU (<b>Applications → Définir la politique</b>).</p>
       <div class="row">
         <div style="flex:none"><label class="fld">Sauvegarde automatique</label>
           <div style="display:flex;align-items:center;gap:10px;min-height:38px">
@@ -4101,13 +4419,119 @@ HTML = r"""<!DOCTYPE html>
       <div class="hint" id="abStatus" style="margin-top:8px"></div>
     </div>
 
+    <div class="card" id="polHycuCard">
+      <h3>Politiques HYCU (données des volumes)</h3>
+      <p class="sub">Politiques définies dans HYCU, assignables aux Volume Groups d'une application via
+        <b>Applications → Définir la politique</b>.</p>
+      <div id="polHycu"></div>
+    </div>
+  </section>
+  <!-- ===================== TÂCHES ===================== -->
+  <section id="tab-jobs" style="display:none">
+    <div class="pagehead"><h1 class="ptitle">Tâches <button class="refresh" id="jobsRefresh" type="button" title="Actualiser"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19.4 12.6a7.5 7.5 0 1 1-2.3-5.9"/><path d="M19.6 4.4v4h-4"/></svg></button></h1></div>
+    <div class="tcard" style="margin-bottom:16px;padding:14px 16px"><div class="jcounts" id="jobsCounts" style="margin-top:0"></div></div>
+    <div class="tcard">
+      <div class="tbar"><input type="text" id="jobsSearch" placeholder="Rechercher" autocomplete="off"><span class="tinfo" id="jobsInfo"></span></div>
+      <table class="ht"><thead><tr><th>Tâche</th><th>Application</th><th>Détail</th><th>Démarrée</th><th class="ctr">État</th></tr></thead>
+        <tbody id="jobsBody"><tr><td colspan="5" class="tempty"><span class="spin"></span></td></tr></tbody></table>
+    </div>
+  </section>
+
+  <!-- ===================== VÉRIFICATION ===================== -->
+  <section id="tab-verify" style="display:none">
+    <div class="pagehead"><h1 class="ptitle"><a class="crumb" data-go="apps">Applications</a><span class="sep">›</span>Vérification</h1></div>
+    <div class="card">
+      <h3><span class="step-no">3</span>Vérifier l'état d'un namespace</h3>
+      <p class="sub">Confirme que les PVC sont liés (Bound) et que les pods tournent.</p>
+      <label class="fld">Namespace</label>
+      <div class="row">
+        <div><select id="vfNs"></select></div>
+        <div style="flex:none"><button class="btn ghost nsEdit" title="Filtrer la liste des namespaces">✎ Filtrer</button></div>
+        <div style="flex:none"><button class="btn" id="vfRun">Vérifier</button></div>
+        <div style="flex:none"><button class="btn ghost" id="vfAuto" title="Rafraîchit la vérification toutes les ~3 s et s'arrête dès que tous les PVC sont Bound et les pods Running (10 min max) ; recliquez pour arrêter">Suivi auto (jusqu'à stable)</button></div>
+      </div>
+      <div id="vfOut"></div>
+    </div>
+  </section>
+
+  <!-- ===================== RÉGLAGES ===================== -->
+  <section id="tab-settings" style="display:none">
+    <div class="pagehead"><h1 class="ptitle">Réglages</h1></div>
+    <div class="card">
+      <h3><span class="step-no">⎈</span>Cluster cible (contexte kubectl)</h3>
+      <p class="sub">Choisissez explicitement le cluster, au lieu de suivre le contexte courant.
+        L'outil ajoute <code>--context</code> (et <code>--kubeconfig</code>) à chaque commande kubectl.</p>
+      <label class="fld">Fichier kubeconfig (vide = défaut ~/.kube/config)</label>
+      <input type="text" id="cfgKubeconfig" placeholder="%USERPROFILE%\.kube\config">
+      <div class="row" style="margin-top:6px">
+        <div><label class="fld">Contexte</label><select id="cfgContext"></select></div>
+        <div style="flex:none;align-self:flex-end"><button class="btn ghost" id="ctxList">Lister les contextes</button></div>
+      </div>
+      <div style="margin-top:12px"><button class="btn" id="ctxApply">Utiliser ce contexte</button>
+        <span class="hint" id="ctxMsg" style="margin:0"></span></div>
+    </div>
+
+    <div class="card">
+      <h3><span class="step-no">⚙</span>Réglages (adaptation par client)</h3>
+      <p class="sub">Ces réglages sont enregistrés dans <code>hycu_config.json</code> à côté du programme.
+        Laissez vide ce que vous ne voulez pas contraindre.</p>
+      <div class="row">
+        <div><label class="fld">Binaire kubectl</label><input type="text" id="cfgKubectl" placeholder="kubectl"></div>
+        <div><label class="fld">Préfixe volumeHandle (vide = auto)</label><input type="text" id="cfgVhPrefix" placeholder="auto-détecté"></div>
+      </div>
+      <div class="row">
+        <div><label class="fld">Contextes autorisés (séparés par des virgules ; vide = tous)</label><input type="text" id="cfgCtx" placeholder="prod-cluster, dr-cluster"></div>
+        <div><label class="fld">Namespaces autorisés (vide = tous)</label><input type="text" id="cfgNs" placeholder="wordpress, bo-dev"></div>
+      </div>
+      <div class="row">
+        <div><label class="fld">Timeout d'attente (s)</label><input type="text" id="cfgWait" placeholder="120"></div>
+        <div><label class="fld">Suffixe de nom de clone</label><input type="text" id="cfgSuffix" placeholder="0000"></div>
+      </div>
+      <label class="fld" style="margin-top:14px"><input type="checkbox" id="cfgConfirm" style="width:auto"> Exiger la confirmation du contexte avant toute action réelle</label>
+      <label class="fld"><input type="checkbox" id="cfgStrip" style="width:auto"> Retirer entièrement claimRef du PV (laisser le PVC rebinder)</label>
+      <div style="margin-top:14px"><button class="btn" id="cfgSave">Enregistrer les réglages</button> <span class="hint" id="cfgMsg"></span></div>
+    </div>
+  </section>
+</main>
+</div>
+
+<div id="mBackup" class="hmodal-bg" style="display:none">
+  <div class="hmodal" style="max-width:640px">
+    <div class="hm-head"><h2 id="mBackupTitle">Sauvegarde de configuration</h2><div class="hm-ico"><button type="button" data-close="mBackup" title="Fermer">✕</button></div></div>
+    <div class="hm-body">
+    <div class="card">
+      <h3><span class="step-no">1</span>Sauvegarder les volumes d'un namespace</h3>
+      <p class="sub">Exporte et nettoie automatiquement tous les PV et PVC du namespace.
+        Équivaut aux boucles kubectl + nettoyage manuel des manifestes.</p>
+      <div id="bkNsRow"><label class="fld">Namespace</label>
+      <div class="row">
+        <div><select id="bkNs"></select></div>
+        <div style="flex:none"><button class="btn ghost nsEdit" title="Filtrer la liste des namespaces">✎ Filtrer</button></div>
+        <div style="flex:none"><button class="btn" id="bkRun">Sauvegarder ce namespace</button></div>
+        <div style="flex:none"><button class="btn ghost" id="bkRunAll" title="Sauvegarder tous les namespaces autorisés par le filtre (tous si aucun filtre)">Sauvegarder tous (filtrés)</button></div>
+      </div></div>
+      <div id="bkSelInfo" style="display:none"><label class="fld">Namespaces sélectionnés</label><div class="fbox" id="bkSelList"></div></div>
+      <label class="fld" style="margin-top:10px">Dossier de destination (optionnel)</label>
+      <input type="text" id="bkDest" placeholder="Vide = hycu-backups/ (à côté du programme). Ex. D:\sauvegardes\hycu  ou  /mnt/backups">
+      <div class="hint" style="margin-top:4px">Chemin sur la machine qui exécute l'outil. Le sous-dossier &lt;namespace&gt;/&lt;horodatage&gt; est créé automatiquement.</div>
+      <div id="bkOut"></div>
+    </div>
+
+    </div>
+    <div class="hm-foot" id="mBackupFoot"><button class="lnk" type="button" data-close="mBackup">Fermer</button><button class="btn" id="bkRunSel" type="button" style="display:none">Sauvegarder la sélection</button></div>
+  </div>
+</div>
+<div id="mPolicy" class="hmodal-bg" style="display:none">
+  <div class="hmodal" style="max-width:700px">
+    <div class="hm-head"><h2 id="mPolicyTitle">Définir la politique</h2><div class="hm-ico"><button type="button" data-close="mPolicy" title="Fermer">✕</button></div></div>
+    <div class="hm-body">
     <div class="card" id="bkProtectCard">
       <h3><span class="step-no">2</span>Protéger les données dans HYCU</h3>
       <p class="sub">L'export ci-dessus ne sauvegarde que les <b>manifestes</b> (la « recette » du restore).
         Les <b>données</b> vivent dans les Volume Groups Nutanix : seul HYCU les sauvegarde réellement.
         Ici, on associe les PVC du namespace aux Volume Groups HYCU, on assigne une politique, et on lance
         une sauvegarde.</p>
-      <div id="bkProtectOff" class="warnbox">Connectez-vous à HYCU (onglet <b>Connexions</b>) pour activer cette section.</div>
+      <div id="bkProtectOff" class="warnbox">Enregistrez la source HYCU (⚙ en haut à droite) pour activer cette section.</div>
       <div id="bkProtectOn" style="display:none">
         <button class="btn ghost" id="bkMatch">Analyser la correspondance PVC ↔ Volume Group HYCU</button>
         <div id="bkMatchOut"></div>
@@ -4123,24 +4547,40 @@ HTML = r"""<!DOCTYPE html>
         </div>
       </div>
     </div>
-  </section>
-
+    </div>
+    <div class="hm-foot" id="mPolicyFoot"><button class="lnk" type="button" data-close="mPolicy">Fermer</button></div>
+  </div>
+</div>
+<div id="mRestore" class="hmodal-bg" style="display:none">
+  <div class="hmodal" style="max-width:760px">
+    <div class="hm-head"><h2 id="mRestoreTitle">Restauration de l'application</h2><div class="hm-ico"><button type="button" data-close="mRestore" title="Fermer">✕</button></div></div>
+    <div class="hm-body">
   <!-- ===================== RESTAURATION ===================== -->
-  <section id="tab-restore" style="display:none">
+  <section id="tab-restore">
     <div class="stepper" id="rsStepper">
       <span class="st on" data-st="1">1 · Volumes</span>
       <span class="st" data-st="2">2 · Configurer</span>
       <span class="st" data-st="3">3 · Lancer</span>
     </div>
+    <div id="rsPgType">
+      <div class="opt" data-kind="cloneapp"><svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="4" y="27" width="16" height="16" rx="2"/><circle cx="35.5" cy="35" r="8.5"/><path d="M27.5 12.5a8.3 8.3 0 1 1 3 6.3"/><path d="M27 6.8v5.4h5.4"/></svg><div><b>Restaurer toute l'application (copie)</b><span>Restaure le stockage et les objets de l'application (workloads, dépendances) dans le même namespace (suffixe) ou dans un autre. L'original n'est pas modifié.</span></div></div>
+      <div class="opt" data-kind="inplace"><svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="19" cy="10.5" rx="12" ry="4.5"/><path d="M7 10.5v25c0 2.5 5.4 4.5 12 4.5"/><path d="M31 10.5v10"/><path d="M7 23c0 2.5 5.4 4.5 12 4.5"/><path d="M27.3 36.3a8.2 8.2 0 1 0 2.4-5.8"/><path d="M27 26.6v4.9h4.9"/></svg><div><b>Restaurer le stockage sur place</b><span>Restaure les données dans les volumes d'origine. L'application est arrêtée puis redémarrée.</span></div></div>
+      <div class="opt" data-kind="reattach"><svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="16" cy="10.5" rx="11" ry="4.3"/><path d="M5 10.5v25c0 2.4 4.9 4.3 11 4.3s11-1.9 11-4.3v-25"/><path d="M5 23c0 2.4 4.9 4.3 11 4.3s11-1.9 11-4.3"/><path d="M32 23.5h11M38.5 18.5l5 5-5 5"/></svg><div><b>Restaurer le stockage vers de nouveaux volumes</b><span>Restaure vers de nouveaux Volume Groups et y rattache l'application. Les volumes d'origine sont conservés.</span></div></div>
+    </div>
+    <div id="rsPgForm" style="display:none">
+      <div class="row" style="margin-bottom:4px">
+        <div><label class="fld" style="margin-top:0">Application</label><div class="fbox" id="rsWizApp"></div></div>
+        <div><label class="fld" style="margin-top:0">Cluster cible</label><div class="fbox" id="rsWizCluster"></div></div>
+      </div>
     <div class="card">
       <h3><span class="step-no">1</span>Choisir le namespace et les volumes</h3>
       <p class="sub">Cochez le(s) volume(s) à restaurer — plusieurs volumes = une seule transaction.</p>
-      <label class="fld">Namespace</label>
+      <div id="rsNsRow" style="display:none"><label class="fld">Namespace</label>
       <div class="row">
         <div><select id="rsNs"></select></div>
         <div style="flex:none;align-self:flex-end"><button class="btn ghost nsEdit" title="Filtrer la liste des namespaces">✎ Filtrer</button></div>
-      </div>
-      <label class="fld" style="margin-top:8px"><input type="checkbox" id="rsCustomDir" style="width:auto"> Lire les sauvegardes depuis un dossier personnalisé</label>
+      </div></div>
+      <label class="fld" id="rsCustomDirLbl" style="margin-top:8px"><input type="checkbox" id="rsCustomDir" style="width:auto"> Lire les sauvegardes depuis un dossier personnalisé</label>
       <div id="rsCustomDirWrap" style="display:none;margin-top:4px">
         <input type="text" id="rsBackupRoot" placeholder="Ex. D:\sauvegardes\hycu  ou  /mnt/backups  (dossier contenant &lt;namespace&gt;/&lt;horodatage&gt;/)">
         <div class="hint" style="margin-top:4px">Les sauvegardes lues (et utilisées pour la restauration) seront cherchées ici, au lieu de <code>hycu-backups/</code>.</div>
@@ -4150,14 +4590,14 @@ HTML = r"""<!DOCTYPE html>
         <select id="rsBackupSel"></select>
         <div class="hint" style="margin-top:4px">Manifestes PV/PVC (le « squelette ») — indépendant du point de restauration HYCU des <b>données</b>.<a id="rsBackupDl" href="#" download style="display:none;margin-left:6px;text-decoration:none">⬇ Télécharger (.zip)</a></div>
       </div>
-      <label class="fld">Type d'opération</label>
+      <div id="rsModeRow" style="display:none"><label class="fld">Type d'opération</label>
       <div class="seg" id="rsMode">
         <button class="on" data-mode="clone">Clone (nouveau VG)</button>
         <button data-mode="inplace">Restauration sur place</button>
-      </div>
+      </div></div>
       <div id="rsCloneSubWrap">
-        <label class="fld">Que faire du clone ?</label>
-        <div class="seg" id="rsCloneSub">
+        <label class="fld" style="display:none">Que faire du clone ?</label>
+        <div class="seg" id="rsCloneSub" style="display:none">
           <button class="on" data-sub="reattach">Rattacher à l'app existante</button>
           <button data-sub="cloneapp">Cloner l'application</button>
         </div>
@@ -4176,6 +4616,7 @@ HTML = r"""<!DOCTYPE html>
             <span class="hint">— nécessaire pour que les pods démarrent dans l'autre namespace</span></label>
         </div>
       </div>
+      <label class="fld">Volumes à restaurer</label>
       <ul class="pvc-list" id="rsPvcs" style="margin-top:12px"></ul>
     </div>
 
@@ -4196,6 +4637,9 @@ HTML = r"""<!DOCTYPE html>
       <div id="rsErr"></div>
     </div>
 
+    <details class="rsAdv" id="rsAdvWrap"><summary class="rsAdvSum">Avancé — dossier de sauvegardes personnalisé</summary><div id="rsAdvBody"></div></details>
+    </div>
+    <div id="rsPgPlan" style="display:none">
     <div class="card" id="rsPlan" style="display:none">
       <h3><span class="step-no">3</span>Vérifier puis lancer</h3>
       <p class="sub">Vérifiez les remplacements dérivés et la séquence, puis lancez.</p>
@@ -4211,31 +4655,28 @@ HTML = r"""<!DOCTYPE html>
       </div>
       <div id="rsLog"></div>
     </div>
+    </div>
     <div class="nextbar" id="rsNextBar"><span id="rsNextTxt"></span><button class="btn" id="rsNextBtn"></button></div>
   </section>
 
-  <!-- ===================== VÉRIFICATION ===================== -->
-  <section id="tab-verify" style="display:none">
-    <div class="card">
-      <h3><span class="step-no">3</span>Vérifier l'état d'un namespace</h3>
-      <p class="sub">Confirme que les PVC sont liés (Bound) et que les pods tournent.</p>
-      <label class="fld">Namespace</label>
-      <div class="row">
-        <div><select id="vfNs"></select></div>
-        <div style="flex:none"><button class="btn ghost nsEdit" title="Filtrer la liste des namespaces">✎ Filtrer</button></div>
-        <div style="flex:none"><button class="btn" id="vfRun">Vérifier</button></div>
-        <div style="flex:none"><button class="btn ghost" id="vfAuto" title="Rafraîchit la vérification toutes les ~3 s et s'arrête dès que tous les PVC sont Bound et les pods Running (10 min max) ; recliquez pour arrêter">Suivi auto (jusqu'à stable)</button></div>
-      </div>
-      <div id="vfOut"></div>
     </div>
-  </section>
-
+    <div class="hm-foot" id="mRestoreFoot"><span id="rsWizMode" class="badge" style="margin-right:auto"></span><button class="lnk" type="button" data-close="mRestore">Fermer</button><button class="lnk" type="button" id="rsWizBack">Retour</button><button class="btn" type="button" id="rsWizGo">Suivant</button></div>
+  </div>
+</div>
+<div id="mSources" class="hmodal-bg" style="display:none">
+  <div class="hmodal" style="max-width:860px">
+    <div class="hm-head"><h2 id="mSourcesTitle">Sources</h2><div class="hm-ico"><button type="button" data-close="mSources" title="Fermer">✕</button></div></div>
+    <div class="hm-body">
+      <p class="hint" style="margin:0 0 12px">Enregistrez ici les systèmes utilisés par l'outil. Les identifiants restent en mémoire le temps de la session (ou dans le coffre chiffré si vous le choisissez).</p>
+      <div class="tcard" style="box-shadow:none;border:1px solid var(--rule);margin-bottom:14px">
+        <table class="ht"><thead><tr><th>Nom</th><th>Type</th><th>URL</th><th class="ctr">État</th></tr></thead><tbody id="srcBody"></tbody></table>
+      </div>
   <!-- ===================== CONNEXIONS ===================== -->
-  <section id="tab-connect" style="display:none">
+  <section id="tab-connect">
     <div class="card">
       <h3><span class="step-no">H</span>HYCU — connexion</h3>
       <p class="sub">Pour lister les points de restauration et orchestrer le clone/restore d'un Volume Group
-        depuis l'onglet <b>Restaurer</b>. Les identifiants restent <b>en mémoire</b> le temps de la session — jamais écrits sur disque.</p>
+        depuis l'assistant de restauration (<b>Applications → Restaurer</b>). Les identifiants restent <b>en mémoire</b> le temps de la session — jamais écrits sur disque.</p>
       <label class="fld">URL HYCU (port 8443)</label>
       <input type="text" id="hyUrl" placeholder="https://hycu.exemple.com:8443">
       <label class="fld">Authentification</label>
@@ -4263,7 +4704,7 @@ HTML = r"""<!DOCTYPE html>
     <div class="card">
       <h3><span class="step-no">N</span>Nutanix Prism Element — connexion</h3>
       <p class="sub">Récupère automatiquement la référence (UUID) du Volume Group cloné (lecture seule, API v2)
-        dans l'onglet Restaurer. Identifiants en mémoire de session uniquement.</p>
+        dans l'assistant de restauration. Identifiants en mémoire de session uniquement.</p>
       <label class="fld">URL Prism Element</label>
       <input type="text" id="ntUrl" placeholder="https://prism-element.exemple.com:9440">
       <div class="row">
@@ -4317,43 +4758,9 @@ HTML = r"""<!DOCTYPE html>
     </div>
   </section>
 
-  <!-- ===================== RÉGLAGES ===================== -->
-  <section id="tab-settings" style="display:none">
-    <div class="card">
-      <h3><span class="step-no">⎈</span>Cluster cible (contexte kubectl)</h3>
-      <p class="sub">Choisissez explicitement le cluster, au lieu de suivre le contexte courant.
-        L'outil ajoute <code>--context</code> (et <code>--kubeconfig</code>) à chaque commande kubectl.</p>
-      <label class="fld">Fichier kubeconfig (vide = défaut ~/.kube/config)</label>
-      <input type="text" id="cfgKubeconfig" placeholder="%USERPROFILE%\.kube\config">
-      <div class="row" style="margin-top:6px">
-        <div><label class="fld">Contexte</label><select id="cfgContext"></select></div>
-        <div style="flex:none;align-self:flex-end"><button class="btn ghost" id="ctxList">Lister les contextes</button></div>
-      </div>
-      <div style="margin-top:12px"><button class="btn" id="ctxApply">Utiliser ce contexte</button>
-        <span class="hint" id="ctxMsg" style="margin:0"></span></div>
     </div>
-
-    <div class="card">
-      <h3><span class="step-no">⚙</span>Réglages (adaptation par client)</h3>
-      <p class="sub">Ces réglages sont enregistrés dans <code>hycu_config.json</code> à côté du programme.
-        Laissez vide ce que vous ne voulez pas contraindre.</p>
-      <div class="row">
-        <div><label class="fld">Binaire kubectl</label><input type="text" id="cfgKubectl" placeholder="kubectl"></div>
-        <div><label class="fld">Préfixe volumeHandle (vide = auto)</label><input type="text" id="cfgVhPrefix" placeholder="auto-détecté"></div>
-      </div>
-      <div class="row">
-        <div><label class="fld">Contextes autorisés (séparés par des virgules ; vide = tous)</label><input type="text" id="cfgCtx" placeholder="prod-cluster, dr-cluster"></div>
-        <div><label class="fld">Namespaces autorisés (vide = tous)</label><input type="text" id="cfgNs" placeholder="wordpress, bo-dev"></div>
-      </div>
-      <div class="row">
-        <div><label class="fld">Timeout d'attente (s)</label><input type="text" id="cfgWait" placeholder="120"></div>
-        <div><label class="fld">Suffixe de nom de clone</label><input type="text" id="cfgSuffix" placeholder="0000"></div>
-      </div>
-      <label class="fld" style="margin-top:14px"><input type="checkbox" id="cfgConfirm" style="width:auto"> Exiger la confirmation du contexte avant toute action réelle</label>
-      <label class="fld"><input type="checkbox" id="cfgStrip" style="width:auto"> Retirer entièrement claimRef du PV (laisser le PVC rebinder)</label>
-      <div style="margin-top:14px"><button class="btn" id="cfgSave">Enregistrer les réglages</button> <span class="hint" id="cfgMsg"></span></div>
-    </div>
-  </section>
+    <div class="hm-foot" id="mSourcesFoot"><button class="lnk" type="button" data-close="mSources">Fermer</button></div>
+  </div>
 </div>
 
 <script>
@@ -4384,7 +4791,7 @@ function errHint(raw){
   if(/\b404\b|api-docs|endpoint.*not found/.test(e)) return "Endpoint introuvable — vérifiez l'URL de base et la version d'API (⚙ Réglages).";
   if(/certificat|certificate|ssl|tls|self.?signed/.test(e)) return "Certificat TLS — cochez/décochez « Vérifier le certificat TLS » dans Connexions selon votre PKI.";
   if(/timeout|timed out|délai|connexion impossible|connection failed|refused|unreachable|injoignable|getaddrinfo|name or service|errno|10061|10060/.test(e)) return "Hôte injoignable — vérifiez l'URL:port (HYCU 8443, Prism 9440), le réseau et le pare-feu.";
-  if(/non connecté|connectez-vous|not connected|connect to at least|connect to hycu/.test(e)) return "Connectez-vous d'abord dans l'onglet Connexions.";
+  if(/non connecté|connectez-vous|not connected|connect to at least|connect to hycu/.test(e)) return "Enregistrez d'abord la source (⚙ en haut à droite).";
   if(/namespace.*(non autorisé|autorisé|not allowed)|(non autorisé).*namespace/.test(e)) return "Namespace hors liste autorisée — voir ⚙ Réglages → namespaces autorisés.";
   if(/contexte.*non autorisé|context.*not allowed|allowed_contexts/.test(e)) return "Contexte kubectl hors liste autorisée — voir ⚙ Réglages.";
   if(/confirmation du contexte|context confirmation/.test(e)) return "Retapez le nom exact du contexte cible pour confirmer (mode réel).";
@@ -4424,20 +4831,28 @@ document.querySelectorAll("#rsStepper .st").forEach(s=>s.onclick=()=>{
   const el = n===1? document.querySelector("#tab-restore .card") : (n===2? $("#rsConfig") : $("#rsPlan"));
   if(el && el.style.display!=="none") el.scrollIntoView({behavior:"smooth",block:"start"});
 });
-const navBtns=[...document.querySelectorAll("nav button")];
-// Changement d'onglet — utilisé par les clics ET par les bascules programmées
-// (ex. ouverture automatique de Vérifier après une restauration réelle).
+const navBtns=[...document.querySelectorAll("nav button[data-tab]")];
+// Pages (barre latérale) — navigation « à la HYCU ». Les opérations (sauvegarde,
+// restauration, politique, sources) s'ouvrent en MODALES depuis une page, comme dans
+// HYCU. switchTab() accepte encore les anciens noms d'onglet (backup/restore/connect)
+// pour les appels programmés existants, et les redirige vers la modale correspondante.
+const PAGES=["dashboard","apps","policies","jobs","verify","settings"];
+let curPage="dashboard";
 function switchTab(tab){
-  navBtns.forEach(x=>{ const on=x.dataset.tab===tab; x.classList.toggle("on",on); x.setAttribute("aria-selected",on?"true":"false"); });
-  ["backup","restore","verify","connect","settings"].forEach(t=>$("#tab-"+t).style.display="none");
+  if(tab==="connect") return openSources();
+  if(tab==="restore") return openRestoreModal(state.ns);
+  if(tab==="backup") return openBackupModal(state.ns?[state.ns]:[]);
+  closeAllModals();
+  const navTab = tab==="verify" ? "apps" : tab;     // Vérification = sous-page d'Applications
+  navBtns.forEach(x=>{ const on=x.dataset.tab===navTab; x.classList.toggle("on",on); x.setAttribute("aria-selected",on?"true":"false"); });
+  PAGES.forEach(t=>$("#tab-"+t).style.display="none");
   $("#tab-"+tab).style.display="block";
-  applyGlobalNs();                                   // l'onglet ouvert reflète le namespace courant
-  if(tab==="restore" && state.ns && state.pvcNs!==state.ns) loadPvcs();   // recharger si le ns a changé ailleurs
-  if(tab==="backup" && bkMatchNs && bkMatchNs!==state.ns) clearBkProtect();
-  updateNextBar();                                   // la barre « action suivante » ne vit que dans Restaurer
+  applyGlobalNs();                                   // la page ouverte reflète le namespace courant
+  curPage=tab; onPageShown(tab);
+  window.scrollTo({top:0});
 }
 navBtns.forEach(b=>b.onclick=()=>switchTab(b.dataset.tab));
-$("#hdrConn").onclick=()=>switchTab("connect");
+$("#hdrConn").onclick=()=>openSources();
 
 // ----- Fenêtre « À propos » (bouton ? de l'en-tête) -----
 $("#aboutBtn").onclick=async()=>{
@@ -4572,8 +4987,8 @@ async function initApp(){
   loadConfig();
   loadAutoBackup();
   await loadConnStatus();                     // ATTENDRE que `conn` soit prêt (sinon la popup
-  loadPvcs();                                 // de déverrouillage ne s'affichait jamais)
-  maybePromptUnlock();                        // coffre présent + rien de connecté -> déverrouillage
+  maybePromptUnlock();                        // de déverrouillage ne s'affichait jamais)
+  onPageShown(curPage);                       // (re)charge les données de la page affichée
 }
 (async()=>{
   const cfg = await get("/api/config");
@@ -4621,7 +5036,7 @@ function buildWizSteps(){
   wizSteps = [
     {render:()=>`<h3>Première configuration</h3>
       <p class="q">Aucun fichier <code>hycu_config.json</code> n'a été trouvé. Quelques questions
-      pour le générer — vous pourrez tout modifier ensuite dans l'onglet ⚙ Réglages.</p>
+      pour le générer — vous pourrez tout modifier ensuite dans la page Réglages.</p>
       <label class="fld">Langue de l'interface</label>
       <div id="wLang">${[["fr","Français"],["en","English"]].map(([code,lbl])=>
         `<span class="chip ${PAGE_LANG===code?'sel':''}" data-lang="${code}">${lbl}</span>`).join("")}</div>
@@ -4797,11 +5212,7 @@ function clearBkProtect(){ bkMatches=[]; bkMatchNs=null; $("#bkMatchOut").innerH
 // Re-protection HYCU après un clone : bascule sur l'onglet Sauvegarder, cible le bon
 // namespace et lance l'analyse de correspondance (puis l'utilisateur choisit la politique).
 function goReprotect(ns){
-  const tab=document.querySelector('nav button[data-tab="backup"]'); if(tab) tab.click();
-  if(ns){ $("#bkNs").value=ns; }
-  clearBkProtect();
-  window.scrollTo({top:0, behavior:"smooth"});
-  setTimeout(()=>$("#bkMatch").click(), 50);   // lance l'analyse + affiche le formulaire de protection
+  openPolicyModal(ns || $("#bkNs").value);      // HYCU : « Définir la politique » (analyse lancée d'office)
 }
 $("#bkNs").onchange=()=>{ state.ns=$("#bkNs").value; savePref("ns",state.ns); applyGlobalNs(); clearBkProtect(); };  // ns global + invalide l'analyse
 $("#vfNs").onchange=()=>{ state.ns=$("#vfNs").value; savePref("ns",state.ns); applyGlobalNs(); };
@@ -4922,9 +5333,12 @@ function renderRsPvcs(pvcs, src){
      <li><input type="checkbox" style="width:auto" class="rsChk" data-pvc="${esc(p.name)}" data-pv="${esc(p.pv||'')}">
        <div style="flex:1"><div class="nm">${esc(p.name)}</div>
        <div class="meta">PV ${esc(p.pv||'—')} · source : ${src}</div></div>${badge(p.phase)}</li>`).join("")
-     : `<div class="hint">Aucun PVC. Sauvegardez d'abord ce namespace dans l'onglet 1.</div>`;
+     : `<div class="hint">Aucun volume. Sauvegardez d'abord la configuration de cette application (Applications → Sauvegarder).</div>`;
   document.querySelectorAll(".rsChk").forEach(c=>c.onchange=rebuildVolCfgs);
   $("#rsConfig").style.display="none"; $("#rsPlan").style.display="none"; setRsStep(1);
+  // Assistant de restauration : comme dans HYCU, TOUS les volumes de l'application
+  // sont présélectionnés (l'opérateur peut en décocher).
+  if(rsAutoCheck && pvcs.length){ document.querySelectorAll(".rsChk").forEach(c=>c.checked=true); rebuildVolCfgs(); }
   updateNextBar();
 }
 // Horodatage epoch en secondes (≈ `date -u +%s`) : sert de suffixe UNIQUE à chaque clone,
@@ -5202,7 +5616,7 @@ $("#rsInplaceRun").onclick=async()=>{
       :(r.ok?'<div class="note">Restauration sur place terminée.</div>':'<div class="err">Des étapes ont échoué.</div>'));
   $("#rsInplaceLog").innerHTML=head+lines;
   if(!r.dry && r.ok && !r.aborted){
-    $("#rsInplaceLog").insertAdjacentHTML("afterbegin",'<div class="note">Ouverture de l\'onglet Vérifier…</div>');
+    $("#rsInplaceLog").insertAdjacentHTML("afterbegin",'<div class="note">Ouverture de la vérification…</div>');
     setTimeout(()=>gotoVerify(ipBody.namespace,true),1200);
   }
 };
@@ -5346,7 +5760,7 @@ $("#rsGo").onclick=async()=>{
         $("#rsLog").insertAdjacentHTML("beforeend",'<div style="margin-top:8px"><button class="btn" id="rsGoVerify">Vérifier l\'application maintenant →</button></div>');
         $("#rsGoVerify").onclick=()=>gotoVerify(tgt,true);
       } else {
-        $("#rsLog").insertAdjacentHTML("afterbegin",'<div class="note">Ouverture de l\'onglet Vérifier…</div>');
+        $("#rsLog").insertAdjacentHTML("afterbegin",'<div class="note">Ouverture de la vérification…</div>');
         setTimeout(()=>gotoVerify(tgt,true),1200);
       }
     }
@@ -5391,7 +5805,7 @@ $("#rsGo").onclick=async()=>{
       $("#rsLog").insertAdjacentHTML("beforeend",'<div style="margin-top:8px"><button class="btn" id="rsGoVerify">Vérifier l\'application maintenant →</button></div>');
       $("#rsGoVerify").onclick=()=>gotoVerify($("#rsNs").value,true);
     } else {
-      $("#rsLog").insertAdjacentHTML("afterbegin",'<div class="note">Ouverture de l\'onglet Vérifier…</div>');
+      $("#rsLog").insertAdjacentHTML("afterbegin",'<div class="note">Ouverture de la vérification…</div>');
       setTimeout(()=>gotoVerify($("#rsNs").value,true),1200);
     }
   }
@@ -5523,6 +5937,7 @@ async function loadConnStatus(){
 function renderHdrConn(){
   $("#hdrConn").innerHTML=[["HYCU",conn.hycu],["PE",conn.nutanix],["PC",conn.prismcentral]]
     .map(([l,x])=>`<span class="hc">${connDot(!!(x&&x.connected))}${l}</span>`).join("");
+  renderSourcesTable();
 }
 function loadVaultStatus(){
   const present = conn && conn.vault && conn.vault.present;
@@ -5541,7 +5956,7 @@ function renderKubeBanner(){
   };
   const tip=tips[ctxInfo.kubectl_hint]||tips.other;
   el.innerHTML=`<div class="warnbox" style="margin-bottom:14px">⚠ ${tip}
-    <div class="hint" style="margin-top:6px">Les onglets <b>Sauvegarder</b>, <b>Restaurer</b> (séquence Kubernetes) et <b>Vérifier</b> nécessitent kubectl. Les connexions <b>HYCU / Nutanix</b> fonctionnent, elles, sans kubectl.${ctxInfo.error?`<br><code style="color:#7a221b">${esc(ctxInfo.error)}</code>`:''}</div></div>`;
+    <div class="hint" style="margin-top:6px">Les opérations <b>Sauvegarder</b>, <b>Restaurer</b> (séquence Kubernetes) et <b>Vérifier</b> nécessitent kubectl. Les connexions <b>HYCU / Nutanix</b> fonctionnent, elles, sans kubectl.${ctxInfo.error?`<br><code style="color:#7a221b">${esc(ctxInfo.error)}</code>`:''}</div></div>`;
   el.style.display="block";
 }
 async function vaultAction(url, needPass){
@@ -5722,8 +6137,435 @@ $("#nsSave").onclick=async()=>{
   $("#nsFilter").style.display="none";
   await refreshNamespaces();
   $("#cfgNs").value=(r.filter||[]).join(", ");   // garder l'onglet Réglages cohérent
+  onPageShown(curPage);                          // Applications / tableau de bord à jour
 };
 refreshDry();
+
+// ============================================================================
+// Interface « HYCU Enterprise Cloud » : pages (Tableau de bord, Applications,
+// Politiques, Tâches) et modales d'opération (Sauvegarde, Définir la politique,
+// Restauration, Sources). Les blocs d'origine (mêmes IDs, même logique testée)
+// sont hébergés dans ces modales : ce code se contente de les piloter.
+// ============================================================================
+var rsAutoCheck=false;            // assistant ouvert : volumes présélectionnés (cf. renderRsPvcs)
+var pageTimer=null;
+const MODALS=["mBackup","mPolicy","mRestore","mSources"];
+function openModal(id){ $("#"+id).style.display="flex"; }
+function closeModal(id){
+  const m=$("#"+id); if(!m || m.style.display==="none") return;
+  m.style.display="none";
+  if(id==="mRestore") rsAutoCheck=false;
+  if(id!=="mSources") onPageShown(curPage);        // l'opération a pu changer l'état affiché
+}
+function closeAllModals(){ MODALS.forEach(closeModal); }
+document.querySelectorAll("[data-close]").forEach(b=>b.onclick=()=>closeModal(b.dataset.close));
+document.addEventListener("keydown",e=>{
+  if(e.key!=="Escape") return;
+  if($("#dangerModal").style.display!=="none" || $("#nsFilter").style.display!=="none") return;
+  const open=MODALS.filter(id=>$("#"+id).style.display!=="none");
+  if(open.length) closeModal(open[open.length-1]);
+});
+function bindGo(root){ (root||document).querySelectorAll("[data-go]").forEach(a=>a.onclick=e=>{ e.preventDefault(); switchTab(a.dataset.go); }); }
+bindGo();
+
+// ----- Barre du haut / barre latérale -----
+$("#srcBtn").onclick=()=>openSources();
+$("#ctxLink").onclick=()=>switchTab("settings");
+$("#tbHome").onclick=e=>{ e.preventDefault(); switchTab("dashboard"); };
+$("#sbCol").onclick=()=>{ const m=!document.body.classList.contains("sb-min");
+  document.body.classList.toggle("sb-min",m); savePref("sbMin",m); };
+if(prefs().sbMin) document.body.classList.add("sb-min");
+
+// ----- Petits formats -----
+const AGO={now:"à l'instant", min:"il y a %d min", h:"il y a %d h", d:"il y a %d j"};
+function fmtAgo(ts){
+  if(!ts) return "";
+  const s=Math.max(0, Date.now()/1000-ts);
+  if(s<60) return AGO.now;
+  if(s<3600) return AGO.min.replace("%d", Math.round(s/60));
+  if(s<86400) return AGO.h.replace("%d", Math.round(s/3600));
+  return AGO.d.replace("%d", Math.round(s/86400));
+}
+function fmtTs(iso){ if(!iso) return "—"; const d=new Date(iso); return isNaN(d)? String(iso) : d.toLocaleString(); }
+function stIc(kind, title){
+  const g={ok:"✓", ko:"✕", wn:"!", na:"?", sim:"○", run:"▸"}[kind]||"?";
+  return `<span class="st ${kind}" title="${esc(title||"")}">${g}</span>`;
+}
+function dnums(l1, v1, l2, v2){
+  return `<div class="dnums"><div><div class="l">${l1}</div><div class="v">${v1}</div></div>`+
+         `<div><div class="l">${l2}</div><div class="v">${v2}</div></div></div>`;
+}
+// Anneaux « à la HYCU » : extérieur (épais) = première mesure, intérieur (fin) = seconde.
+function donutSVG(outer, inner){
+  const clamp=v=>Math.max(0, Math.min(100, v||0));
+  const R1=62, R2=47, C1=2*Math.PI*R1, C2=2*Math.PI*R2, o=clamp(outer), i=clamp(inner);
+  return `<svg class="donut" width="164" height="164" viewBox="0 0 164 164" aria-hidden="true">
+    <circle cx="82" cy="82" r="76" fill="none" stroke="#9BDAC7" stroke-width="5"/>
+    <circle cx="82" cy="82" r="${R1}" fill="none" stroke="#F6D3D1" stroke-width="15"/>
+    <circle cx="82" cy="82" r="${R1}" fill="none" stroke="#05A274" stroke-width="15"
+            stroke-dasharray="${(C1*o/100).toFixed(1)} ${C1.toFixed(1)}" transform="rotate(-90 82 82)"/>
+    <circle cx="82" cy="82" r="${R2}" fill="none" stroke="#EEF0F5" stroke-width="5"/>
+    <circle cx="82" cy="82" r="${R2}" fill="none" stroke="#9BDAC7" stroke-width="5"
+            stroke-dasharray="${(C2*i/100).toFixed(1)} ${C2.toFixed(1)}" transform="rotate(-90 82 82)"/>
+  </svg>`;
+}
+
+// ----- Pages : chargement des données à l'affichage (+ rafraîchissement) -----
+function onPageShown(tab){
+  clearInterval(pageTimer); pageTimer=null;
+  const every=(fn, ms)=>{ pageTimer=setInterval(()=>{ if(document.visibilityState==="visible") fn(); }, ms); };
+  if(tab==="dashboard"){ loadDashboard(); every(loadDashboard, 30000); }
+  else if(tab==="apps") loadApps();
+  else if(tab==="jobs"){ loadJobs(); every(loadJobs, 5000); }
+  else if(tab==="policies") loadPolicies();
+}
+
+// ============================ Applications ============================
+let apps=[], appsSel=new Set(), appsFresh=24, appsPolicy={};
+async function loadApps(){
+  $("#appsRefresh").classList.add("busy");
+  const r=await get("/api/applications");
+  $("#appsRefresh").classList.remove("busy");
+  apps=r.apps||[]; appsFresh=r.freshness_hours||24; appsPolicy=r.policy||{};
+  const names=new Set(apps.map(a=>a.name));
+  [...appsSel].forEach(n=>{ if(!names.has(n)) appsSel.delete(n); });
+  if(!r.ok && !apps.length){
+    $("#appsBody").innerHTML=`<tr><td colspan="8">${errBox(r.error||"kubectl ?")}</td></tr>`;
+    updateAppActs(); return r;
+  }
+  renderApps(); return r;
+}
+function appPolicyLabel(){
+  return appsPolicy.enabled ? ("Configuration auto · "+Math.round(appsPolicy.interval_hours||24)+" h") : "Aucune";
+}
+function appsVisible(){
+  const q=($("#appsSearch").value||"").trim().toLowerCase();
+  return apps.filter(a=>!q || a.name.toLowerCase().includes(q));
+}
+function renderApps(){
+  const rows=appsVisible();
+  $("#appsInfo").textContent=rows.length+" application(s)";
+  if(!rows.length){
+    $("#appsBody").innerHTML=`<tr><td colspan="8" class="tempty">${apps.length
+      ? "Aucune application ne correspond à la recherche."
+      : "Aucun namespace à afficher — vérifiez le contexte kubectl ou le filtre des namespaces."}</td></tr>`;
+  } else {
+    $("#appsBody").innerHTML=rows.map(a=>{
+      const sel=appsSel.has(a.name);
+      const comp = a.compliant ? stIc("ok","Sauvegarde de configuration récente")
+                 : (a.protected ? stIc("ko","Dernière sauvegarde plus ancienne que "+appsFresh+" h")
+                                : stIc("na","Jamais sauvegardée"));
+      const prot = a.protected ? stIc("ok", a.backups+" sauvegarde(s) de configuration")
+                               : stIc("na","Aucune sauvegarde de configuration");
+      const last = a.last_backup ? esc(fmtAgo(a.last_backup)) : '<span style="color:var(--muted)">Jamais</span>';
+      return `<tr class="clk${sel?' sel':''}" data-ns="${esc(a.name)}">
+        <td class="cb"><input type="checkbox" tabindex="-1" ${sel?"checked":""}></td>
+        <td style="color:var(--strong);font-weight:500">${esc(a.name)}</td>
+        <td>Application Kubernetes</td><td>${esc(appPolicyLabel())}</td>
+        <td class="ctr">${comp}</td><td class="ctr">${prot}</td><td>${last}</td>
+        <td class="ctr">${a.backups||0}</td></tr>`;
+    }).join("");
+    document.querySelectorAll("#appsBody tr.clk").forEach(tr=>tr.onclick=()=>{
+      const n=tr.dataset.ns; appsSel.has(n) ? appsSel.delete(n) : appsSel.add(n); renderApps(); });
+  }
+  $("#appsAll").checked = rows.length>0 && rows.every(a=>appsSel.has(a.name));
+  updateAppActs();
+}
+function selApps(){ return apps.map(a=>a.name).filter(n=>appsSel.has(n)); }
+function updateAppActs(){
+  const n=selApps().length;
+  $("#actBackup").disabled = !n;
+  ["#actRestore","#actPolicy","#actVerify"].forEach(id=>$(id).disabled = n!==1);
+}
+$("#appsSearch").oninput=renderApps;
+$("#appsAll").onchange=()=>{ const on=$("#appsAll").checked;
+  appsVisible().forEach(a=>on ? appsSel.add(a.name) : appsSel.delete(a.name)); renderApps(); };
+$("#appsRefresh").onclick=()=>loadApps();
+$("#actBackup").onclick=()=>openBackupModal(selApps());
+$("#actRestore").onclick=()=>openRestoreModal(selApps()[0]);
+$("#actPolicy").onclick=()=>openPolicyModal(selApps()[0]);
+$("#actVerify").onclick=()=>gotoVerify(selApps()[0], false);
+
+// ============================ Modale Sauvegarde ============================
+// Actions principales dans le pied de modale (comme HYCU) : on y DÉPLACE les boutons
+// existants — leurs gestionnaires d'événements suivent l'élément.
+$("#mBackupFoot").append($("#bkRunAll"), $("#bkRun"));
+let bkSel=[];
+function openBackupModal(list){
+  bkSel=(list||[]).filter(Boolean);
+  const multi=bkSel.length>1;
+  $("#bkOut").innerHTML="";
+  $("#bkNsRow").style.display = multi ? "none" : "";
+  $("#bkSelInfo").style.display = multi ? "" : "none";
+  $("#bkRun").style.display = multi ? "none" : "";
+  $("#bkRunAll").style.display = multi ? "none" : "";
+  $("#bkRunSel").style.display = multi ? "" : "none";
+  if(multi){ $("#bkSelList").textContent=bkSel.join(", ");
+             $("#bkRunSel").textContent="Sauvegarder la sélection ("+bkSel.length+")"; }
+  else if(bkSel[0]){ state.ns=bkSel[0]; applyGlobalNs(); }
+  openModal("mBackup");
+}
+$("#bkRunSel").onclick=async()=>{
+  const b=$("#bkRunSel"), dest=$("#bkDest").value.trim(); b.disabled=true;
+  let lines="", ok=0;
+  for(const ns of bkSel){
+    $("#bkOut").innerHTML=`<div class="hint"><span class="spin"></span>${esc(ns)}…</div><ul class="dlist">${lines}</ul>`;
+    const r=await post("/api/backup",{ns, dest});
+    if(r.ok) ok++;
+    lines+=`<li><span class="k" style="display:flex;gap:10px;align-items:center">${stIc(r.ok?"ok":"ko")}${esc(ns)}</span>`+
+           `<span class="v" style="font-weight:400">${r.ok ? r.count+" volume(s)" : esc(r.error||"")}</span></li>`;
+  }
+  $("#bkOut").innerHTML=`<div class="note">${ok}/${bkSel.length} namespace(s) sauvegardé(s).</div><ul class="dlist" style="margin-top:8px">${lines}</ul>`;
+  b.disabled=false;
+};
+
+// ============================ Modale Définir la politique ============================
+function openPolicyModal(ns){
+  if(ns){ state.ns=ns; applyGlobalNs(); $("#bkNs").value=ns; }
+  clearBkProtect();
+  $("#mPolicyTitle").innerHTML=esc("Définir la politique")+(ns ? '<span class="sep">›</span>'+esc(ns) : "");
+  openModal("mPolicy");
+  if(conn.hycu && conn.hycu.connected) setTimeout(()=>$("#bkMatch").click(), 30);   // analyse : lecture seule
+}
+
+// ============================ Modale Sources (engrenage) ============================
+const SRC=[{key:"hycu", name:"HYCU", type:"Sauvegarde & restauration (API REST)"},
+           {key:"nutanix", name:"Prism Element", type:"Nutanix — Volume Groups (API v2)"},
+           {key:"prismcentral", name:"Prism Central", type:"Nutanix — multi-cluster (API v3/v4)"},
+           {key:"vault", name:"Coffre d'identifiants", type:"Mémorisation chiffrée (optionnel)"}];
+let srcIdx=0;
+function renderSourcesTable(){
+  const body=$("#srcBody"); if(!body) return;
+  body.innerHTML=SRC.map((s,i)=>{
+    let url="—", st;
+    if(s.key==="vault"){
+      st = (conn.vault && conn.vault.present) ? stIc("ok","Coffre présent") : stIc("na","Aucun coffre");
+    } else {
+      const x=conn[s.key]||{}; url=x.url||"—";
+      st = x.connected ? stIc("ok","Connecté") : (x.configured ? stIc("wn","Configuré, non connecté") : stIc("na","Non configuré"));
+    }
+    return `<tr class="clk${i===srcIdx?' sel':''}" data-i="${i}"><td>${esc(s.name)}</td><td>${esc(s.type)}</td>`+
+           `<td><code>${esc(url)}</code></td><td class="ctr">${st}</td></tr>`;
+  }).join("");
+  body.querySelectorAll("tr").forEach(tr=>tr.onclick=()=>{ srcIdx=+tr.dataset.i; showSourceCard(); renderSourcesTable(); });
+}
+function showSourceCard(){
+  [...document.querySelectorAll("#tab-connect > .card")].forEach((c,i)=>c.style.display = i===srcIdx ? "" : "none");
+}
+function openSources(i){
+  if(typeof i==="number") srcIdx=i;
+  renderSourcesTable(); showSourceCard(); openModal("mSources");
+}
+
+// ============================ Politiques ============================
+async function loadPolicies(){
+  await loadAutoBackup();
+  const s=await get("/api/auto_backup")||{};
+  const on=!!s.enabled;
+  $("#polBody").innerHTML=`<tr class="clk" id="polRow">
+    <td style="color:var(--strong);font-weight:500">Configuration Kubernetes</td>
+    <td>Manifestes PV/PVC et ressources des namespaces du filtre</td>
+    <td>${on ? "Toutes les "+Math.round(s.interval_hours||24)+" h" : "—"}</td>
+    <td>${s.keep||15} versions</td>
+    <td><code>${esc(s.dest||"hycu-backups/")}</code></td>
+    <td class="ctr">${on ? stIc("ok","Activée") : stIc("na","Désactivée")}</td></tr>`;
+  $("#polRow").onclick=()=>$("#abEnabled").scrollIntoView({behavior:"smooth", block:"center"});
+  if(conn.hycu && conn.hycu.connected){
+    $("#polHycu").innerHTML='<div class="hint"><span class="spin"></span></div>';
+    const p=await get("/api/hycu/policies");
+    $("#polHycu").innerHTML = !p.ok ? errBox(p.error) : ((p.policies||[]).length
+      ? `<div class="tcard" style="box-shadow:none;border:1px solid var(--rule)"><table class="ht"><thead><tr><th>Nom</th><th>UUID</th></tr></thead><tbody>`+
+        p.policies.map(x=>`<tr><td>${esc(x.name||"—")}</td><td><code>${esc(x.uuid||"")}</code></td></tr>`).join("")+`</tbody></table></div>`
+      : '<div class="hint">Aucune politique HYCU.</div>');
+  } else {
+    $("#polHycu").innerHTML='<div class="warnbox">Enregistrez la source HYCU (⚙ en haut à droite) pour afficher ses politiques.</div>';
+  }
+}
+$("#abSave").addEventListener("click", ()=>setTimeout(()=>{ if(curPage==="policies") loadPolicies(); }, 900));
+
+// ============================ Tâches ============================
+const JOB_LBL={backup:"Sauvegarde de configuration", backup_all:"Sauvegarde de configuration (lot)",
+  auto_backup:"Sauvegarde automatique", restore_end:"Restauration Kubernetes (PV/PVC)",
+  clone_app:"Clone d'application", orchestrate_inplace:"Restauration sur place",
+  hycu_restore:"Restauration HYCU (Volume Group)", hycu_protect:"Protection HYCU"};
+const JOB_ST={success:["ok","Succès"], failed:["ko","Échec"], simulation:["sim","Simulation"]};
+let jobsData=null;
+async function loadJobs(){
+  $("#jobsRefresh").classList.add("busy");
+  const r=await get("/api/jobs");
+  $("#jobsRefresh").classList.remove("busy");
+  jobsData=r; renderJobs(); return r;
+}
+function jobCounts(r){
+  const c=(r&&r.counts)||{};
+  const cell=(n, ic, l)=>`<div><div class="n">${n}</div>${ic}<div class="l">${l}</div></div>`;
+  return cell(c.success||0, stIc("ok"), "Succès") + cell(c.failed||0, stIc("ko"), "Échec") +
+         cell(c.simulation||0, stIc("sim"), "Simulation") +
+         cell((r&&r.running)||0, stIc("run"), "En cours");
+}
+function jobRowData(j){
+  const st=JOB_ST[j.status]||["na", j.status];
+  const app = (j.target_namespace && j.target_namespace!==j.namespace)
+    ? esc(j.namespace)+" → "+esc(j.target_namespace) : esc(j.namespace||"—");
+  const det = j.volumes!=null ? j.volumes+" volume(s)" : (j.detail||"");
+  return {st, app, det, lbl: JOB_LBL[j.event]||j.event};
+}
+function renderJobs(){
+  const r=jobsData||{};
+  $("#jobsCounts").innerHTML=jobCounts(r);
+  const q=($("#jobsSearch").value||"").trim().toLowerCase();
+  const rows=(r.jobs||[]).filter(j=>!q || (JOB_LBL[j.event]||j.event).toLowerCase().includes(q)
+                                        || (j.namespace||"").toLowerCase().includes(q));
+  $("#jobsInfo").textContent=rows.length+" tâche(s)";
+  $("#jobsBody").innerHTML = rows.length ? rows.map(j=>{ const d=jobRowData(j);
+      return `<tr><td style="color:var(--strong)">${esc(d.lbl)}</td><td>${d.app}</td><td>${esc(d.det)}</td>`+
+             `<td>${esc(fmtTs(j.ts))}</td><td class="ctr">${stIc(d.st[0], d.st[1])}</td></tr>`; }).join("")
+    : `<tr><td colspan="5" class="tempty">Aucune tâche enregistrée pour l'instant.</td></tr>`;
+}
+$("#jobsSearch").oninput=renderJobs;
+$("#jobsRefresh").onclick=()=>loadJobs();
+
+// ============================ Tableau de bord ============================
+function jobsChart(days){
+  if(!days || !days.length) return "";
+  const W=560, H=170, pl=30, pr=26, pt=10, pb=24, n=days.length;
+  const mx=Math.max(4, ...days.map(d=>Math.max(d.success, d.failed, d.simulation)));
+  const top=Math.ceil(mx/4)*4;
+  const X=i=>pl+i*(W-pl-pr)/Math.max(1, n-1), Y=v=>pt+(H-pt-pb)*(1-v/top);
+  let g="";
+  for(let k=0;k<=4;k++){ const v=top*k/4, y=Y(v).toFixed(1);
+    g+=`<line x1="${pl}" y1="${y}" x2="${W-pr}" y2="${y}" stroke="#D5DAE3" stroke-dasharray="4 4"/>`+
+       `<text x="${pl-7}" y="${(+y+4).toFixed(1)}" text-anchor="end" font-size="10" fill="#6B7089">${Math.round(v)}</text>`; }
+  const serie=(key, col)=>`<polyline points="${days.map((d,i)=>X(i).toFixed(1)+","+Y(d[key]).toFixed(1)).join(" ")}" fill="none" stroke="${col}" stroke-width="1.6"/>`+
+    days.map((d,i)=>`<circle cx="${X(i).toFixed(1)}" cy="${Y(d[key]).toFixed(1)}" r="3" fill="${col}"/>`).join("");
+  const lbl=days.map((d,i)=>`<text x="${X(i).toFixed(1)}" y="${H-6}" text-anchor="middle" font-size="10" fill="#6B7089">${d.date.slice(8,10)}/${d.date.slice(5,7)}</text>`).join("");
+  return `<svg viewBox="0 0 ${W} ${H}" width="100%" style="display:block" aria-hidden="true">${g}${serie("simulation","#6688FF")}${serie("failed","#E9605A")}${serie("success","#05A274")}${lbl}</svg>`;
+}
+async function loadDashboard(){
+  const [a, j, ab]=await Promise.all([get("/api/applications"), get("/api/jobs"), get("/api/auto_backup")]);
+  const list=a.apps||[], n=list.length;
+  const prot=n ? Math.round(100*list.filter(x=>x.protected).length/n) : 0;
+  const comp=n ? Math.round(100*list.filter(x=>x.compliant).length/n) : 0;
+  $("#dbApps").innerHTML=donutSVG(prot, comp)+dnums("Protection", prot+"%", "Conformité", comp+"%");
+
+  const on=!!ab.enabled;
+  $("#dbPolicy").innerHTML=`<div style="display:flex;align-items:center;gap:10px;margin:4px 0 10px">${on ? stIc("ok") : stIc("na")}
+      <span class="dbig" style="margin:0">${on ? "Activée" : "Désactivée"}</span></div>
+    <ul class="dlist">
+      <li><span class="k">Fréquence</span><span class="v">${on ? "Toutes les "+Math.round(ab.interval_hours||24)+" h" : "—"}</span></li>
+      <li><span class="k">Rétention</span><span class="v">${ab.keep||15} versions</span></li>
+      <li><span class="k">Dernière exécution</span><span class="v">${ab.last_run ? esc(fmtAgo(ab.last_run))+" "+stIc(ab.last_ok?"ok":"ko") : "—"}</span></li>
+      <li><span class="k">Prochaine exécution</span><span class="v">${ab.next_due ? esc(new Date(ab.next_due*1000).toLocaleString()) : "—"}</span></li>
+    </ul>`;
+
+  const keys=["hycu","nutanix","prismcentral"];
+  const nConn=keys.filter(k=>conn[k] && conn[k].connected).length;
+  const nConf=keys.filter(k=>conn[k] && conn[k].configured).length;
+  $("#dbSources").innerHTML=donutSVG(Math.round(100*nConn/3), Math.round(100*nConf/3))+
+    dnums("Connectées", nConn+"/3", "Configurées", nConf+"/3");
+  $("#dbSources").style.cursor="pointer"; $("#dbSources").onclick=()=>openSources();
+
+  $("#dbCluster").innerHTML=`<div class="dbig" style="font-size:21px;word-break:break-all">${esc(ctxInfo.context||"—")}</div>
+    <div class="hint" style="margin:0 0 8px">Contexte kubectl</div>
+    <ul class="dlist">
+      <li><span class="k">kubectl</span><span class="v">${ctxInfo.kubectl_ok ? stIc("ok","Opérationnel") : stIc("ko","Indisponible")}</span></li>
+      <li><span class="k">Applications (namespaces)</span><span class="v">${n}</span></li>
+      <li><span class="k">Filtre des namespaces</span><span class="v">${($("#cfgNs").value||"").trim() ? "Actif" : "Aucun"}</span></li>
+      <li><span class="k">Mode</span><span class="v">${dry() ? "Simulation" : '<span class="ko">Réel</span>'}</span></li>
+    </ul>`;
+
+  $("#dbJobs").innerHTML=jobsChart(j.days)+`<div class="jcounts">${jobCounts(j)}</div>`;
+  const last=(j.jobs||[]).slice(0, 6);
+  $("#dbLast").innerHTML = last.length
+    ? `<ul class="dlist">`+last.map(x=>{ const d=jobRowData(x);
+        return `<li><span class="k" style="display:flex;align-items:center;gap:10px">${stIc(d.st[0], d.st[1])}<span>${esc(d.lbl)}`+
+               `${x.namespace ? ' <span style="color:var(--muted)">· '+d.app+'</span>' : ''}</span></span>`+
+               `<span class="v" style="font-weight:400;color:var(--muted)">${esc(fmtTs(x.ts))}</span></li>`; }).join("")+
+      `</ul><div style="margin-top:8px"><a href="#" class="lnk" data-go="jobs">Voir toutes les tâches</a></div>`
+    : `<div class="tempty">Aucune tâche enregistrée pour l'instant.</div>`;
+  bindGo($("#dbLast"));
+}
+
+// ============================ Assistant de restauration ============================
+const RS_TITLE="Restauration de l'application";
+const RS_KINDS={cloneapp:"Restaurer toute l'application (copie)",
+                inplace:"Restaurer le stockage sur place",
+                reattach:"Restaurer le stockage vers de nouveaux volumes"};
+var rsWizPage="type", rsWizKind=null, rsWizAct=null, rsWizHtml="";
+$("#rsAdvBody").append($("#rsCustomDirLbl"), $("#rsCustomDirWrap"));   // options avancées repliées
+function rsKindFromState(){ return state.mode==="inplace" ? "inplace" : (state.cloneSub==="cloneapp" ? "cloneapp" : "reattach"); }
+function rsSyncOpts(){ document.querySelectorAll("#rsPgType .opt").forEach(o=>o.classList.toggle("sel", o.dataset.kind===rsWizKind)); }
+document.querySelectorAll("#rsPgType .opt").forEach(o=>{
+  o.onclick=()=>{ rsWizKind=o.dataset.kind; rsSyncOpts(); rsWizSync(); };
+  o.ondblclick=()=>{ rsWizKind=o.dataset.kind; rsToForm(); };
+});
+function rsShowPage(p){
+  rsWizPage=p;
+  $("#rsPgType").style.display = p==="type" ? "block" : "none";
+  $("#rsPgForm").style.display = p==="form" ? "block" : "none";
+  $("#rsPgPlan").style.display = p==="plan" ? "block" : "none";
+  $("#mRestoreTitle").innerHTML = p==="type" ? esc(RS_TITLE)
+    : esc(RS_TITLE)+'<span class="sep">›</span>'+esc(RS_KINDS[rsWizKind]||"");
+  $("#rsWizBack").style.display = p==="type" ? "none" : "";
+  const b=$("#mRestore .hm-body"); if(b) b.scrollTop=0;
+  rsWizSync();
+}
+function openRestoreModal(ns){
+  ns = ns || state.ns || $("#rsNs").value; if(!ns) return;
+  state.ns=ns; applyGlobalNs();
+  rsWizKind=rsKindFromState(); rsSyncOpts();
+  $("#rsWizApp").textContent=ns;
+  $("#rsWizCluster").innerHTML=`<b>${esc(ctxInfo.context||"—")}</b>`;
+  ["#rsLog","#rsInplaceLog","#rsErr"].forEach(id=>$(id).innerHTML="");
+  if($("#rsCustomDir").checked) $("#rsAdvWrap").open=true;
+  rsShowPage("type");
+  openModal("mRestore");
+}
+async function rsToForm(){
+  if(!rsWizKind) return;
+  const k=rsWizKind, clk=sel=>{ const b=document.querySelector(sel); if(b) b.click(); };
+  if(k==="inplace") clk('#rsMode button[data-mode="inplace"]');
+  else { clk('#rsMode button[data-mode="clone"]');
+         clk('#rsCloneSub button[data-sub="'+(k==="cloneapp" ? "cloneapp" : "reattach")+'"]'); }
+  rsShowPage("form");
+  rsAutoCheck=true;
+  $("#rsPlan").style.display="none";
+  $("#rsPvcs").innerHTML='<div class="hint"><span class="spin"></span>Chargement des volumes…</div>';
+  await loadPvcs();
+  rsWizSync();
+}
+// Le récapitulatif s'affiche (plan construit) -> page 3 de l'assistant.
+new MutationObserver(()=>{
+  if($("#mRestore").style.display!=="none" && rsWizPage==="form" && $("#rsPlan").style.display!=="none") rsShowPage("plan");
+}).observe($("#rsPlan"), {attributes:true, attributeFilter:["style"]});
+// UNE action principale dans le pied de modale, qui relaie le bouton d'origine adapté
+// à l'étape (clone HYCU groupé, restauration sur place, construction du plan, lancement).
+function rsWizSync(){
+  const go=$("#rsWizGo"); let lbl="Suivant", dis=false, act=null, src=null;
+  if(rsWizPage==="type"){ dis=!rsWizKind; act=rsToForm; }
+  else if(rsWizPage==="form"){
+    const n=document.querySelectorAll(".rsChk:checked").length;
+    const hyOn=!!(conn.hycu && conn.hycu.connected);
+    if(state.mode==="inplace" && hyOn){ src=$("#rsInplaceRun"); lbl="Restaurer"; }
+    else {
+      const items=collectItems(), filled=items.length>0 && items.every(i=>(i.new_ref||"").trim());
+      const batch=$("#hyBatchGo");
+      if(batch && !filled){ src=batch; lbl="Restaurer"; }
+      else { dis=!n; act=()=>$("#rsPreview").click(); }
+    }
+    if(src){ dis=!n || src.disabled; act=()=>src.click(); }
+  } else { src=$("#rsGo"); lbl=(src.textContent||"").trim() || "Lancer"; dis=src.disabled; act=()=>src.click(); }
+  const busy = src && src.querySelector(".spin");
+  const html = busy ? '<span class="spin"></span>'+esc((src.textContent||"").trim()) : esc(lbl);
+  if(html!==rsWizHtml){ go.innerHTML=html; rsWizHtml=html; }
+  go.disabled=dis; rsWizAct=act;
+  const live=!dry(), m=$("#rsWizMode");
+  m.textContent = live ? "Mode réel" : "Simulation";
+  m.className="badge "+(live ? "live" : "sim");
+}
+$("#rsWizGo").onclick=()=>{ if(rsWizAct && !$("#rsWizGo").disabled) rsWizAct(); };
+$("#rsWizBack").onclick=()=>rsShowPage(rsWizPage==="plan" ? "form" : "type");
+setInterval(()=>{ if($("#mRestore").style.display!=="none") rsWizSync(); }, 300);
 
 // ----- Langue FR/EN : cookie lu par le serveur, page + messages retraduits au rechargement -----
 const PAGE_LANG="fr";
@@ -5850,8 +6692,8 @@ I18N_EN += [
     ("Ici, on associe les PVC du namespace aux Volume Groups HYCU, on assigne une politique, et on lance",
      "Here we match the namespace's PVCs to HYCU Volume Groups, assign a policy, and trigger"),
     ("une sauvegarde.</p>", "a backup.</p>"),
-    ("Connectez-vous à HYCU (onglet <b>Connexions</b>) pour activer cette section.",
-     "Connect to HYCU (see the <b>Connections</b> tab) to enable this section."),
+    ("Enregistrez la source HYCU (⚙ en haut à droite) pour activer cette section.",
+     "Register the HYCU source (⚙ at the top right) to enable this section."),
     ("Analyser la correspondance PVC ↔ Volume Group HYCU", "Analyze the PVC ↔ HYCU Volume Group mapping"),
     ("Politique HYCU à assigner (optionnel)", "HYCU policy to assign (optional)"),
     ("Sauvegarde complète (forceFull)", "Full backup (forceFull)"),
@@ -5979,8 +6821,8 @@ I18N_EN += [
     ('"dernière sauvegarde"', '"latest backup"'),
     ('"sauvegarde choisie"', '"selected backup"'),
     ('phase:"sauvegardé"', 'phase:"backed up"'),
-    ("Aucun PVC. Sauvegardez d'abord ce namespace dans l'onglet 1.",
-     "No PVC. Back up this namespace first in tab 1."),
+    ("Aucun volume. Sauvegardez d'abord la configuration de cette application (Applications → Sauvegarder).",
+     "No volume. First back up this application's configuration (Applications → Back up)."),
     ("· source : ", "· source: "),
     ("Nom du nouveau PV (modifiable)", "New PV name (editable)"),
     ("Rechercher le VG dans Prism", "Search for the VG in Prism"),
@@ -6161,8 +7003,8 @@ I18N_EN += [
     ("HYCU — connexion", "HYCU — connection"),
     ("Pour lister les points de restauration et orchestrer le clone/restore d'un Volume Group",
      "To list restore points and orchestrate the clone/restore of a Volume Group"),
-    ("depuis l'onglet <b>Restaurer</b>. Les identifiants restent <b>en mémoire</b> le temps de la session — jamais écrits sur disque.",
-     "from the <b>Restore</b> tab. Credentials stay <b>in memory</b> for the session — never written to disk."),
+    ("depuis l'assistant de restauration (<b>Applications → Restaurer</b>). Les identifiants restent <b>en mémoire</b> le temps de la session — jamais écrits sur disque.",
+     "from the restore wizard (<b>Applications → Restore</b>). Credentials stay <b>in memory</b> for the session — never written to disk."),
     ("URL HYCU (port 8443)", "HYCU URL (port 8443)"),
     ("Authentification", "Authentication"),
     (">Basic (utilisateur)<", ">Basic (user)<"),
@@ -6181,8 +7023,8 @@ I18N_EN += [
     ("Nutanix Prism Element — connexion", "Nutanix Prism Element — connection"),
     ("Récupère automatiquement la référence (UUID) du Volume Group cloné (lecture seule, API v2)",
      "Automatically fetches the cloned Volume Group's reference (UUID) (read-only, API v2)"),
-    ("dans l'onglet Restaurer. Identifiants en mémoire de session uniquement.",
-     "in the Restore tab. Credentials kept in session memory only."),
+    ("dans l'assistant de restauration. Identifiants en mémoire de session uniquement.",
+     "in the restore wizard. Credentials kept in session memory only."),
     ("URL Prism Element", "Prism Element URL"),
     ("Nutanix Prism Central — connexion", "Nutanix Prism Central — connection"),
     ("Alternative multi-cluster (API v3). Sert aussi à récupérer la référence (UUID) du Volume Group",
@@ -6218,8 +7060,8 @@ I18N_EN += [
     ("Langue de l'interface", "Interface language"),
     ("Aucun fichier <code>hycu_config.json</code> n'a été trouvé. Quelques questions",
      "No <code>hycu_config.json</code> file was found. A few questions"),
-    ("pour le générer — vous pourrez tout modifier ensuite dans l'onglet ⚙ Réglages.",
-     "to generate it — you can change everything later in the ⚙ Settings tab."),
+    ("pour le générer — vous pourrez tout modifier ensuite dans la page Réglages.",
+     "to generate it — you can change everything later in the Settings page."),
     ("Quel binaire kubectl utiliser ?", "Which kubectl binary should be used?"),
     ("Choisissez la distribution, ou saisissez une commande / un chemin personnalisé.",
      "Pick the distribution, or enter a custom command / path."),
@@ -6267,8 +7109,8 @@ I18N_EN += [
      "<b>No kubectl configuration found.</b> Check <code>%USERPROFILE%\\\\.kube\\\\config</code> (or the <code>KUBECONFIG</code> variable), then reload."),
     ("<b>Cluster injoignable via kubectl.</b> Vérifiez la connectivité réseau et vos droits (RBAC) sur l'API server.",
      "<b>Cluster unreachable via kubectl.</b> Check network connectivity and your RBAC rights on the API server."),
-    ("Les onglets <b>Sauvegarder</b>, <b>Restaurer</b> (séquence Kubernetes) et <b>Vérifier</b> nécessitent kubectl. Les connexions <b>HYCU / Nutanix</b> fonctionnent, elles, sans kubectl.",
-     "The <b>Back up</b>, <b>Restore</b> (Kubernetes sequence) and <b>Verify</b> tabs require kubectl. The <b>HYCU / Nutanix</b> connections work without kubectl."),
+    ("Les opérations <b>Sauvegarder</b>, <b>Restaurer</b> (séquence Kubernetes) et <b>Vérifier</b> nécessitent kubectl. Les connexions <b>HYCU / Nutanix</b> fonctionnent, elles, sans kubectl.",
+     "The <b>Back up</b>, <b>Restore</b> (Kubernetes sequence) and <b>Verify</b> operations require kubectl. The <b>HYCU / Nutanix</b> connections work without kubectl."),
     # Recherche de VG Nutanix + suivi de job
     ("Chargement des Volume Groups…", "Loading Volume Groups…"),
     ("rechercher le VG cloné par nom…", "search the cloned VG by name…"),
@@ -6298,7 +7140,7 @@ I18N_EN += [
      "TLS certificate — tick/untick “Verify the TLS certificate” in Connections to match your PKI."),
     ("Hôte injoignable — vérifiez l'URL:port (HYCU 8443, Prism 9440), le réseau et le pare-feu.",
      "Host unreachable — check the URL:port (HYCU 8443, Prism 9440), the network and the firewall."),
-    ("Connectez-vous d'abord dans l'onglet Connexions.", "Connect first in the Connections tab."),
+    ("Enregistrez d'abord la source (⚙ en haut à droite).", "Register the source first (⚙ at the top right)."),
     ("Namespace hors liste autorisée — voir ⚙ Réglages → namespaces autorisés.",
      "Namespace not in the allowed list — see ⚙ Settings → allowed namespaces."),
     ("Contexte kubectl hors liste autorisée — voir ⚙ Réglages.",
@@ -6483,7 +7325,7 @@ I18N_EN += [
     ("HTTP %s", "HTTP %s"),
     ("Connexion impossible : ", "Connection failed: "),
     ("Erreur TLS : ", "TLS error: "),
-    (" non configurée (onglet Réglages).", " not configured (Settings tab)."),
+    (" non configurée (⚙ Sources).", " not configured (⚙ Sources)."),
     ("Non connecté à ", "Not connected to "),
     ("Système inconnu.", "Unknown system."),
     ("Clé API requise.", "API key required."),
@@ -6650,8 +7492,8 @@ I18N_EN += [
 
 # --- Fluidité du parcours : pastilles d'en-tête, barre « action suivante », suivi auto ---
 I18N_EN += [
-    ("État des connexions — cliquer pour ouvrir l'onglet Connexions",
-     "Connection status — click to open the Connections tab"),
+    ("État des sources — cliquer pour ouvrir les Sources",
+     "Source status — click to open Sources"),
     ("Plan prêt — dernière étape :", "Plan ready — final step:"),
     ("Tous les points de restauration sont sélectionnés.", "All restore points are selected."),
     (" point(s) de restauration sélectionné(s).", " restore point(s) selected."),
@@ -6660,7 +7502,7 @@ I18N_EN += [
     ("Aller au lancement", "Go to launch"),
     ("Voir les volumes", "Show the volumes"),
     (r"Vérifier l\'application maintenant →", r"Verify the application now →"),
-    (r"Ouverture de l\'onglet Vérifier…", r"Opening the Verify tab…"),
+    ("Ouverture de la vérification…", "Opening the verification…"),
 ]
 
 # --- Parcours Restaurer simplifié : panneau HYCU groupé, textes allégés ---
@@ -6757,6 +7599,156 @@ I18N_EN += [
     ("<b>Configuration :</b>", "<b>Configuration:</b>"),
     ("<b>Sauvegardes :</b>", "<b>Backups:</b>"),
     (">Fermer</button>", ">Close</button>"),
+]
+
+# --- Interface « HYCU Enterprise Cloud » : pages, modales, assistant de restauration ---
+I18N_EN += [
+    # Barre du haut / barre latérale
+    ("Cluster Kubernetes ciblé (contexte kubectl) — cliquer pour le changer",
+     "Target Kubernetes cluster (kubectl context) — click to change it"),
+    ("Sources (HYCU, Prism Central, Prism Element)", "Sources (HYCU, Prism Central, Prism Element)"),
+    ('title="Tableau de bord"', 'title="Dashboard"'),
+    ('<span class="nl">Tableau de bord</span>', '<span class="nl">Dashboard</span>'),
+    ('<span class="nl">Politiques</span>', '<span class="nl">Policies</span>'),
+    ('<span class="nl">Tâches</span>', '<span class="nl">Jobs</span>'),
+    ('<span class="nl">Réglages</span>', '<span class="nl">Settings</span>'),
+    ("Réduire / déployer le menu", "Collapse / expand the menu"),
+    ("Sections de l'outil", "Tool sections"),
+    ('title="Fermer"', 'title="Close"'),
+    ('title="Actualiser"', 'title="Refresh"'),
+    ('placeholder="Rechercher"', 'placeholder="Search"'),
+    ('title="Tout sélectionner"', 'title="Select all"'),
+    # Tableau de bord
+    ('<h2 class="dtitle">Politique ', '<h2 class="dtitle">Policy '),
+    ('<h2 class="dtitle">Tâches ', '<h2 class="dtitle">Jobs '),
+    ('<h2 class="dtitle">Dernières tâches</h2>', '<h2 class="dtitle">Recent jobs</h2>'),
+    ("Anneau extérieur : namespaces ayant au moins une sauvegarde de configuration (protection). Anneau intérieur : sauvegarde récente, dans l'intervalle de la politique (conformité).",
+     "Outer ring: namespaces with at least one configuration backup (protection). Inner ring: recent backup, within the policy interval (compliance)."),
+    ("Politique de sauvegarde automatique de la configuration (manifestes PV/PVC et ressources).",
+     "Automatic configuration backup policy (PV/PVC manifests and resources)."),
+    ("Systèmes enregistrés via l'engrenage en haut à droite : HYCU, Prism Element, Prism Central.",
+     "Systems registered via the gear at the top right: HYCU, Prism Element, Prism Central."),
+    ("Cluster Kubernetes ciblé par kubectl.", "Kubernetes cluster targeted by kubectl."),
+    ("Opérations des 7 derniers jours (sauvegardes, restaurations, clones), d'après le journal d'audit.",
+     "Operations over the last 7 days (backups, restores, clones), from the audit log."),
+    ('dnums("Protection"', 'dnums("Protection"'),
+    ('"Conformité"', '"Compliance"'),
+    ('"Connectées"', '"Connected"'),
+    ('"Configurées"', '"Configured"'),
+    ('<span class="k">Fréquence</span>', '<span class="k">Frequency</span>'),
+    ('<span class="k">Rétention</span>', '<span class="k">Retention</span>'),
+    ('<span class="k">Dernière exécution</span>', '<span class="k">Last run</span>'),
+    ('<span class="k">Prochaine exécution</span>', '<span class="k">Next run</span>'),
+    ('>Contexte kubectl</div>', '>kubectl context</div>'),
+    ('"Opérationnel"', '"Operational"'),
+    ('"Indisponible"', '"Unavailable"'),
+    ('<span class="k">Filtre des namespaces</span>', '<span class="k">Namespace filter</span>'),
+    ('? "Actif" : "Aucun"', '? "Active" : "None"'),
+    ('<span class="ko">Réel</span>', '<span class="ko">Real</span>'),
+    ("Voir toutes les tâches", "View all jobs"),
+    ("à l'instant", "just now"),
+    ('"il y a %d min"', '"%d min ago"'),
+    ('"il y a %d h"', '"%d h ago"'),
+    ('"il y a %d j"', '"%d d ago"'),
+    # Applications
+    ('<span>Sauvegarder</span>', '<span>Back up</span>'),
+    ('<span>Restaurer</span>', '<span>Restore</span>'),
+    ('<span>Vérifier</span>', '<span>Verify</span>'),
+    ("Définir la politique", "Set Policy"),
+    ('<th>Nom</th>', '<th>Name</th>'),
+    ('<th>Politique</th>', '<th>Policy</th>'),
+    ('<th class="ctr">Conformité</th>', '<th class="ctr">Compliance</th>'),
+    ('<th>Dernière sauvegarde</th>', '<th>Last backup</th>'),
+    ('<td>Application Kubernetes</td>', '<td>Kubernetes application</td>'),
+    ('"Configuration auto · "', '"Automatic configuration · "'),
+    (': "Aucune";', ': "None";'),
+    ("Aucune application ne correspond à la recherche.", "No application matches the search."),
+    ("Aucun namespace à afficher — vérifiez le contexte kubectl ou le filtre des namespaces.",
+     "No namespace to display — check the kubectl context or the namespace filter."),
+    ("Sauvegarde de configuration récente", "Recent configuration backup"),
+    ("Dernière sauvegarde plus ancienne que ", "Last backup older than "),
+    ("Jamais sauvegardée", "Never backed up"),
+    (" sauvegarde(s) de configuration", " configuration backup(s)"),
+    ("Aucune sauvegarde de configuration", "No configuration backup"),
+    ('>Jamais</span>', '>Never</span>'),
+    # Politiques
+    ('<h1 class="ptitle">Politiques</h1>', '<h1 class="ptitle">Policies</h1>'),
+    ('<th>Objet protégé</th>', '<th>Protected object</th>'),
+    ('<th>Fréquence</th>', '<th>Frequency</th>'),
+    ('<th>Rétention</th>', '<th>Retention</th>'),
+    ('<th>Cible</th>', '<th>Target</th>'),
+    ('<th class="ctr">État</th>', '<th class="ctr">Status</th>'),
+    ("Configuration Kubernetes", "Kubernetes configuration"),
+    ("Manifestes PV/PVC et ressources des namespaces du filtre", "PV/PVC manifests and resources of the filtered namespaces"),
+    (" versions</td>", " versions</td>"),
+    ('"Activée")', '"Enabled")'),
+    ('"Désactivée")', '"Disabled")'),
+    ("Politiques HYCU (données des volumes)", "HYCU policies (volume data)"),
+    ("Politiques définies dans HYCU, assignables aux Volume Groups d'une application via",
+     "Policies defined in HYCU, assignable to an application's Volume Groups via"),
+    ("elles sont protégées par HYCU (<b>Applications", "they are protected by HYCU (<b>Applications"),
+    ("Aucune politique HYCU.", "No HYCU policy."),
+    ("Enregistrez la source HYCU (⚙ en haut à droite) pour afficher ses politiques.",
+     "Register the HYCU source (⚙ at the top right) to display its policies."),
+    # Tâches
+    ('<h1 class="ptitle">Tâches ', '<h1 class="ptitle">Jobs '),
+    ('<th>Tâche</th>', '<th>Job</th>'),
+    ('<th>Détail</th>', '<th>Details</th>'),
+    ('<th>Démarrée</th>', '<th>Started</th>'),
+    ('"Sauvegarde de configuration (lot)"', '"Configuration backup (batch)"'),
+    ("Sauvegarde de configuration", "Configuration backup"),
+    ('"Sauvegarde automatique"', '"Automatic backup"'),
+    ('"Restauration Kubernetes (PV/PVC)"', '"Kubernetes restore (PV/PVC)"'),
+    ('"Clone d\'application"', '"Application clone"'),
+    ('"Restauration sur place"', '"In-place restore"'),
+    ('"Restauration HYCU (Volume Group)"', '"HYCU restore (Volume Group)"'),
+    ('"Protection HYCU"', '"HYCU protection"'),
+    ('"Succès"', '"Success"'),
+    ('"Échec"', '"Failed"'),
+    ('"En cours"', '"In progress"'),
+    ('" tâche(s)"', '" job(s)"'),
+    ("Aucune tâche enregistrée pour l'instant.", "No job recorded yet."),
+    # Vérification / Réglages
+    ('<span class="sep">›</span>Vérification</h1>', '<span class="sep">›</span>Verification</h1>'),
+    ('<h1 class="ptitle">Réglages</h1>', '<h1 class="ptitle">Settings</h1>'),
+    # Modales
+    ("Restauration de l'application", "Application restore"),
+    ("Sauvegarder la sélection", "Back up the selection"),
+    ('<label class="fld">Namespaces sélectionnés</label>', '<label class="fld">Selected namespaces</label>'),
+    (" namespace(s) sauvegardé(s).</div>", " namespace(s) backed up.</div>"),
+    ('id="rsWizBack">Retour</button>', 'id="rsWizBack">Back</button>'),
+    ('id="rsWizGo">Suivant</button>', 'id="rsWizGo">Next</button>'),
+    ('"Suivant"', '"Next"'),
+    ('lbl="Restaurer"', 'lbl="Restore"'),
+    ('|| "Lancer"', '|| "Launch"'),
+    ('"Mode réel"', '"Real mode"'),
+    # Assistant de restauration : types
+    ("Restaurer toute l'application (copie)", "Restore the whole application (copy)"),
+    ("Restaurer le stockage sur place", "Restore storage in place"),
+    ("Restaurer le stockage vers de nouveaux volumes", "Restore storage to new volumes"),
+    ("Restaure le stockage et les objets de l'application (workloads, dépendances) dans le même namespace (suffixe) ou dans un autre. L'original n'est pas modifié.",
+     "Restores the application storage and objects (workloads, dependencies) into the same namespace (suffix) or another one. The original is not modified."),
+    ("Restaure les données dans les volumes d'origine. L'application est arrêtée puis redémarrée.",
+     "Restores the data into the original volumes. The application is stopped, then restarted."),
+    ("Restaure vers de nouveaux Volume Groups et y rattache l'application. Les volumes d'origine sont conservés.",
+     "Restores to new Volume Groups and attaches the application to them. The original volumes are kept."),
+    ('>Cluster cible</label>', '>Target cluster</label>'),
+    ('<label class="fld">Volumes à restaurer</label>', '<label class="fld">Volumes to restore</label>'),
+    ("Avancé — dossier de sauvegardes personnalisé", "Advanced — custom backup folder"),
+    ("Chargement des volumes…", "Loading volumes…"),
+    # Sources
+    ("Enregistrez ici les systèmes utilisés par l'outil. Les identifiants restent en mémoire le temps de la session (ou dans le coffre chiffré si vous le choisissez).",
+     "Register here the systems used by the tool. Credentials stay in memory for the session (or in the encrypted vault if you choose it)."),
+    ('"Sauvegarde & restauration (API REST)"', '"Backup & restore (REST API)"'),
+    ('"Nutanix — Volume Groups (API v2)"', '"Nutanix — Volume Groups (v2 API)"'),
+    ('"Nutanix — multi-cluster (API v3/v4)"', '"Nutanix — multi-cluster (v3/v4 API)"'),
+    ('"Coffre d\'identifiants"', '"Credentials vault"'),
+    ('"Mémorisation chiffrée (optionnel)"', '"Encrypted storage (optional)"'),
+    ('"Coffre présent"', '"Vault present"'),
+    ('"Aucun coffre"', '"No vault"'),
+    ('"Connecté"', '"Connected"'),
+    ('"Configuré, non connecté"', '"Configured, not connected"'),
+    ('"Non configuré"', '"Not configured"'),
 ]
 
 _I18N_SORTED = None          # (fr, en) triés du plus long au plus court

@@ -44,7 +44,7 @@ an **IQN** (legacy iSCSI clusters); the tool derives the `volumeHandle` from it.
 
 The tool invents nothing: it **orchestrates `kubectl`** (JSON manifests) and the
 **HYCU / Prism REST APIs** (pure Python stdlib, no dependency). The **configuration
-backup** (tab 1) provides the PV/PVC "skeleton"; **HYCU provides the data** (the
+backup** (Applications → Back up) provides the PV/PVC "skeleton"; **HYCU provides the data** (the
 Volume Groups). Every step is logged, the sequence stops at the first failure (the
 app stays stopped, never restarted at 0 replicas), and **simulation mode** (default)
 shows the whole sequence without executing anything.
@@ -59,7 +59,7 @@ shows the whole sequence without executing anything.
 - **kubectl ≥ 1.23** (the tool uses `kubectl wait --for=jsonpath`).
 - On the HYCU/Nutanix side: the restored/cloned Volume Group must exist and its
   **reference** (UUID) be known — **automatic** with the HYCU/Prism connectors
-  (Connections tab); otherwise copy it from the HYCU UI or Prism
+  (⚙ Sources); otherwise copy it from the HYCU UI or Prism
   (`NutanixVolumes-<uuid>`, `ntnx-k8s-<uuid>` target, or IQN on legacy iSCSI
   clusters).
 
@@ -163,7 +163,7 @@ the template:
 cp hycu_config.example.json hycu_config.json   # then edit (see §6)
 ```
 
-Everything remains editable afterwards via the **⚙ Settings** tab.
+Everything remains editable afterwards via the **Settings** page.
 
 ### Language / Langue
 
@@ -176,11 +176,32 @@ l'en-tête bascule la langue (page **et** messages du serveur). Le choix est
 mémorisé par navigateur (cookie `hycu_lang`) ; le français est la langue par
 défaut.*
 
-## 4. Restore walkthrough (the 3 tabs)
+## 4. Using the tool — HYCU Enterprise Cloud interface
 
-### Tab 1 — Back up
-Pick a namespace → **Back up this namespace**. The tool exports and cleans all
-PVs/PVCs (equivalent to the `kubectl get … -o yaml` loops + manual manifest
+The interface follows the **HYCU Enterprise Cloud** look and workflow: HYCU
+colours, a **top bar** (HYCU logo, target cluster, ⚙ **Sources**, `?` **About**,
+EN/FR), a **left menu** of pages, and every operation starts from an **entity
+list**: select a row, click an **action at the top right**, and a **wizard**
+guides you. A slim banner always shows whether **simulation mode** (default) or
+**real mode** is active.
+
+| Page / element | What it does |
+|---|---|
+| **Dashboard** | HYCU-style tiles: *Applications* (protection / compliance rings), *Policy* (automatic configuration backup), *Sources* (connected / configured), *Cluster* (kubectl context), 7-day *Jobs* chart and *Recent jobs*. |
+| **Applications** | One row per allowed namespace (= Kubernetes application): policy, **Compliance**, **Protection**, last backup, versions. Actions: **Back up**, **Restore**, **Set Policy**, **Verify**; funnel icon = namespace filter. |
+| **Policies** | The automatic **configuration** backup policy (frequency, retention, target) and the **HYCU policies** (data), read-only. |
+| **Jobs** | History of operations (backups, restores, clones, HYCU protection) with **Success / Failed / Simulation / In progress** counters. |
+| **Settings** | Target cluster (kubeconfig / context) and per-customer settings. |
+| **⚙ (top right)** | **Sources**: register **HYCU**, **Prism Element**, **Prism Central** and the optional encrypted credentials vault. |
+
+Status icons follow HYCU: **green ✓** OK, **red ✕** failed / not compliant,
+**grey ?** unknown / never backed up. An application is **protected** once it has
+at least one configuration backup, and **compliant** when its latest backup is
+within the policy interval (24 h when the automatic backup is disabled).
+
+### Back up (Applications → Back up)
+Select one or several applications → **Back up**. The tool exports and cleans
+all PVs/PVCs (equivalent to the `kubectl get … -o yaml` loops + manual manifest
 cleanup described in the HYCU procedure).
 
 - **Extended configuration snapshot**: alongside the PV/PVC manifests, the backup
@@ -191,76 +212,66 @@ cleanup described in the HYCU procedure).
   to keep them). This is a **config reference/snapshot** — the automated restore
   stays PV/PVC-centric. Disable with `config_backup_full: false`.
 - **Back up all (filtered)**: backs up in one go **all namespaces allowed** by
-  the filter (`namespace_filter`), or **all** namespaces of the cluster if no
-  filter. A namespace without PVCs is **skipped** (not an error); a per-namespace
-  summary is displayed.
-- **Destination folder (optional)**: by default, backups go to `hycu-backups/`
-  (next to the program). You can specify a **different folder** (on the machine
-  running the tool), e.g. `D:\backups\hycu` or `/mnt/backups`; the
-  `<namespace>/<timestamp>/` subfolder is created there automatically.
-
-- **Automatic configuration backup (scheduled)**: enable it to back up the
-  PV/PVC **manifests** (not the volume data — that is HYCU's job) of **all
-  namespaces allowed by the filter** at a regular interval (default 24 h), for
-  as long as the tool is running. The last run is persisted, so an overdue
-  backup is caught up at startup, and only the most recent versions are kept
-  per namespace (15 by default). Keys: `auto_backup_enabled`,
-  `auto_backup_interval_hours`, `auto_backup_keep`, `auto_backup_dest`.
+  the filter, or **all** namespaces of the cluster if no filter. A namespace
+  without PVCs is **skipped** (not an error).
+- **Destination folder (optional)**: by default `hycu-backups/` (next to the
+  program); any folder on the machine running the tool can be used, e.g.
+  `D:\backups\hycu` or `/mnt/backups`.
 
 **Copy the backup folder off the cluster** (separate storage): it is your safety
 net.
 
-### Tab 2 — Restore
-1. Pick the namespace, the **operation type** (Clone or In-place restore), then
-   **tick the volume(s)** to restore (several volumes of the same app = a
-   single transaction: one stop, one restart).
-2. **Configuration backup to restore from**: the tool rebuilds the PVs/PVCs (the
-   “skeleton”) from a **config backup** (tab 1). If several exist, a **dropdown**
-   lets you **choose which one**; the **most recent** is the default. This is
-   independent from the **HYCU restore point** (the Volume Group *data*).
-   - **Destroyed namespace** case: there are no more “live” PVCs to read — the
-     rebuild relies **entirely** on the selected config backup.
-   - **Custom folder**: tick “Read backups from a custom folder” if your
-     backups are not in `hycu-backups/` (e.g. copied to a share).
-3. **With HYCU connected**, a grouped panel lists every ticked volume with its
-   matched Volume Group and its restore points (**most recent pre-selected**):
-   - **Clone**: one single click on **“Restore the VGs from HYCU”** clones every
-     VG at the chosen point, fills the references automatically, and the plan is
-     displayed — ready to launch.
-   - **In-place restore**: nothing else to select — **“Launch the in-place
-     restore”** is ready immediately (stop → HYCU in-place restore → restart).
-   - The generated names (cloned VG, new PV) are sensible defaults, tucked away
-     in each volume's collapsed **Advanced** section — open it only to override
-     them or to enter a reference manually.
-4. **Without HYCU** (manual flow): restore/clone each VG in HYCU yourself,
-   paste its **UUID** per volume in the **Advanced** section (or use “Search the
-   VG in Prism”), then click **“Continue: review and launch”**.
-5. Review the plan (derived `volumeHandle`, purge of the source VG's runtime
-   attributes, switch of the source PV to **Retain**, sequence). In **real
-   mode**: retype the context name to confirm, then **Launch**. The tool then
-   opens the **Verify** tab automatically. A target namespace created by an
-   application clone is **added to the namespace filter automatically**, so
-   Verify/Restore accept it right away.
+### Automatic configuration backup (Policies)
+Enable it to back up the PV/PVC **manifests** (not the volume data — that is
+HYCU's job) of **all namespaces allowed by the filter** at a regular interval
+(default 24 h), for as long as the tool is running. The last run is persisted,
+so an overdue backup is caught up at startup, and only the most recent versions
+are kept per namespace (15 by default). Keys: `auto_backup_enabled`,
+`auto_backup_interval_hours`, `auto_backup_keep`, `auto_backup_dest`.
+
+### Protect the data in HYCU (Applications → Set Policy)
+Matches the application's PVCs with their HYCU Volume Groups (analysis launched
+automatically), assigns a HYCU policy and starts a HYCU backup.
+
+### Restore (Applications → Restore) — the restore wizard
+Select **one** application → **Restore**. As in HYCU's *Application Restore*:
+
+1. **Restore type** (option cards):
+   - **Restore the whole application (copy)** — volumes **and** objects
+     (workloads, dependencies) into the same namespace (suffix) or another one;
+     the original is not modified.
+   - **Restore storage in place** — the data returns into the original volumes;
+     the application is stopped, then restarted.
+   - **Restore storage to new volumes** — new Volume Groups are cloned and the
+     application is re-attached to them; the original volumes are kept.
+2. **Options**: target application and cluster, **configuration backup** to
+   rebuild from (most recent by default), **volumes** (all pre-selected) and one
+   **HYCU restore point** per volume (**most recent pre-selected**). Generated
+   names and manual references stay in each volume's collapsed **Advanced**
+   section; a custom backup folder is under **Advanced** at the bottom.
+3. **Summary**: derived `volumeHandle`, purge of the source VG's runtime
+   attributes, switch of the source PV to **Retain**, planned sequence.
+
+The footer holds **one** primary action (**Next → Restore → Launch**), plus
+*Close* and *Back*, and a badge reminding **Simulation** / **Real mode**. In real
+mode every destructive step asks for confirmation (retype the context name).
+After a real restore the tool opens **Verification** automatically. A target
+namespace created by an application clone is **added to the namespace filter
+automatically**.
+
+**Without HYCU** (manual flow): restore/clone each VG in HYCU yourself, paste its
+**UUID** per volume in the **Advanced** section (or use “Search for the VG in
+Prism”), then **Next** builds the summary.
 
 > If a step fails, the sequence **stops** and the application is **left
 > stopped** (replicas at 0) so it does not restart on inconsistent volumes. The
 > message states the failing step. Fix, then **relaunch**: the original target
 > replicas are remembered (never restarted at 0).
 
-> A floating **“next action” bar** guides you through the flow (fill the VG
-> references → preview → launch) without having to scroll the page, and the
-> step indicator stays visible while scrolling.
-
-> Comfort features: the header shows permanent **HYCU / PE / PC connection
-> dots** (click them to open the Connections tab), the selected namespace is
-> shared across the three tabs, and your last choices (namespace, operation
-> type, folders) are remembered per browser.
-
-### Tab 3 — Verify
+### Verify (Applications → Verify)
 Confirms the PVCs are **Bound** and the pods are running. **Auto-track**
 refreshes every ~3 s until the state is stable (all PVCs Bound, pods Running;
-~10 min cap — click again to stop). After a **real** restore or clone, the tool
-switches to this tab automatically and starts tracking.
+~10 min cap — click again to stop).
 
 ## 5. Security
 
@@ -278,7 +289,7 @@ switches to this tab automatically and starts tracking.
   volumes, mode, dry/real, result).
 - **Bounded backup reads**: by default, only paths **under `hycu-backups/`** are
   readable (defence against out-of-zone reads). A **custom folder** is only
-  opened if **you explicitly designate it** in the Restore tab; a path outside
+  opened if **you explicitly designate it** in the restore wizard (Advanced); a path outside
   that zone is still refused.
 - **Monitoring** (`GET /metrics`): a Prometheus endpoint exposes state gauges
   (tool up, operation in progress, auto-backup enabled/last run/last success,
@@ -289,7 +300,7 @@ switches to this tab automatically and starts tracking.
 ## 6. Configuration (`hycu_config.json`) — per-customer adaptation
 
 Copy `hycu_config.example.json` → `hycu_config.json`. Also editable via the
-**⚙ Settings** tab of the UI. All keys are optional.
+**Settings** page of the UI. All keys are optional.
 
 | Key | Default | Role |
 |---|---|---|
@@ -323,7 +334,7 @@ Copy `hycu_config.example.json` → `hycu_config.json`. Also editable via the
 | `prismcentral_verify_tls` | `false` | Verify the Prism Central TLS certificate. |
 
 > HYCU/Nutanix **credentials** are **never** in the config: they are entered in
-> the **Connections** tab and kept in memory for the session only.
+> **⚙ Sources** and kept in memory for the session only.
 
 ### Example — a “microk8s” customer, 2 namespaces, locked-down prod cluster
 ```json
@@ -368,20 +379,20 @@ cluster**:
 | Symptom | Lead |
 |---|---|
 | “Context: unavailable” | `kubectl` missing from PATH or context not configured. |
-| “Namespace not allowed” | The namespace is not in `namespace_filter`. In the Verify tab, the **“Allow « ns » and retry”** button adds it in one click; a namespace created by an application clone is added automatically. |
+| “Namespace not allowed” | The namespace is not in `namespace_filter`. On the Verification page, the **“Allow « ns » and retry”** button adds it in one click; a namespace created by an application clone is added automatically. |
 | “Context not allowed” | The current context is not in `allowed_contexts`. |
 | PVC/PV stuck in `Terminating` | The tool patches finalizers automatically; otherwise check no pod still mounts the volume. |
 | “Invalid anti-CSRF token” | Reload the page (the token is regenerated at each startup). |
 | Connections ask to be unlocked again | Expected: a new browser session (restarted browser, private window) locks the credentials — enter the vault passphrase again. |
 | “Interrupted” sequence | Read the failing step in the log, fix, **relaunch** (replicas remembered). |
 
-## 9. HYCU / Nutanix connections (“Connections” tab)
+## 9. HYCU / Nutanix sources (⚙ at the top right)
 
 **Optional** connections (stdlib only, no dependency): without them, the manual
 flow (pasting the VG reference) remains fully usable.
 
 - **Nutanix Prism (read-only)** — two connection zones: **Prism Element** (v2
-  API) and **Prism Central** (v3 API, multi-cluster). In the Restore tab, the
+  API) and **Prism Central** (v3 API, multi-cluster). In the restore wizard, the
   HYCU batch flow uses Prism to **fill in the cloned VG UUIDs** automatically
   (no more copy-paste), and each volume's **Advanced** section offers a
   **“Search for the VG in Prism”** button for the manual flow. It uses the
@@ -391,14 +402,14 @@ flow (pasting the VG reference) remains fully usable.
   the job. **Simulation mode by default**: the exact call (method + URL + body)
   is displayed **before** anything is actually sent.
 
-**Credentials**: entered in the tab, **kept in memory** for the duration of the
+**Credentials**: entered in ⚙ Sources, **kept in memory** for the duration of the
 **browser session**, **never written** to disk nor to the config (default mode,
 the safest). Wiped on disconnect, on shutdown, and whenever a **new browser
 session** opens the page (restarted browser, private window — see §5).
 
 ### Remembering connections (encrypted vault, optional)
 
-The Connections tab offers an encrypted vault so you don't have to re-enter
+⚙ Sources offers an encrypted vault so you don't have to re-enter
 credentials every session:
 
 - Credentials are encrypted into **`hycu_secrets.enc`** (next to the program),
@@ -433,7 +444,7 @@ REST API on **port 8443**, base `/rest/v1.0`. Endpoints **verified on 5.2**
 | Trigger restore/clone | `POST /rest/v1.0/volumegroups/vgrestore` (body `RestoreSpecDTO`) |
 | Job status | `GET /rest/v1.0/jobs/{jobUuid}` |
 
-- **Authentication** (Connections tab):
+- **Authentication** (⚙ Sources):
   - **Basic**: user/password of an administrator of the infrastructure group.
   - **API key**: generated in HYCU via **Help → API Keys**; **required if 2FA is
     enabled**. Sent as `Authorization: Bearer <key>` (confirmed scheme).

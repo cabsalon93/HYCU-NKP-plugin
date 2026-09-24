@@ -25,6 +25,7 @@ SUITES = [
     "_test_ns_autoadd",      # namespace créé par un clone -> ajouté au filtre automatiquement
     "_test_auto_backup",     # sauvegarde automatique planifiée (échéance, état, statut)
     "_test_config_backup",   # sauvegarde de config étendue (ressources, masquage Secrets) + /metrics
+    "_test_views",           # vues HYCU : Applications (protection/conformité) + Tâches (audit)
 ]
 
 
