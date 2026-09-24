@@ -3186,8 +3186,11 @@ def _plan_steps(ns, prepared, mode):
 # des différences (sauvegarde vs live) AVANT tout apply. Complète la restauration
 # PV/PVC : ici on répare la CONFIG, pas les volumes.
 # ------------------------------------------------------------------------------
-def _load_backup_resources(backup_path, backup_root=None, allow_dr=False):
-    """(items, erreur) depuis resources.json d'une sauvegarde validée."""
+def _load_backup_resources(backup_path, backup_root=None, allow_dr=False, missing_ok=False):
+    """(items, erreur) depuis resources.json d'une sauvegarde validée.
+    `missing_ok=True` : un resources.json ABSENT n'est pas une erreur — on renvoie
+    ([], None) pour permettre une restauration DÉGRADÉE (PV/PVC seulement). Les gardes
+    de cluster/chemin et les erreurs de lecture restent bloquantes."""
     xerr = _backup_cluster_error(backup_path, backup_root, allow_dr=allow_dr)
     if xerr:
         return None, xerr
@@ -3196,6 +3199,8 @@ def _load_backup_resources(backup_path, backup_root=None, allow_dr=False):
         return None, "Sauvegarde introuvable ou hors de la zone autorisée."
     rp = os.path.join(bp, "resources.json")
     if not os.path.isfile(rp):
+        if missing_ok:
+            return [], None                       # dégradé : volumes seulement, l'appelant avertit
         return None, ("Cette sauvegarde ne contient pas d'instantané de ressources "
                       "(resources.json) : elle est antérieure à la fonction, ou "
                       "config_backup_full était désactivé.")
@@ -5661,6 +5666,7 @@ def action_dr_backups():
                     "volumes": [v.get("pvc") for v in (idx.get("volumes") or [])],
                     "vol_refs": vol_refs,
                     "resources_count": idx.get("resources_count"),
+                    "has_resources": os.path.isfile(os.path.join(dirpath, "resources.json")),
                     "imported": rel.split(os.sep)[0] == "_imports"})
     out.sort(key=lambda b: b.get("created") or "", reverse=True)
     return _ok(backups=out, allowed=bool(CONFIG.get("allow_dr_restore")))
@@ -5719,7 +5725,9 @@ def action_clone_app(payload, log=None):
         return {"ok": False, "error": xerr, "log": []}
     bitems = None
     if from_backup:
-        bitems, berr = _load_backup_resources(backup_path, backup_root, allow_dr=dr)
+        # resources.json ABSENT ne bloque PAS : on restaure les volumes (PV/PVC) et on
+        # avertit que workloads/dépendances ne seront pas recréés (sauvegarde ancienne).
+        bitems, berr = _load_backup_resources(backup_path, backup_root, allow_dr=dr, missing_ok=True)
         if berr:
             return {"ok": False, "error": "Restauration DR : %s" % berr, "log": []}
     # Remap optionnel de la StorageClass (site DR : classes souvent différentes).
@@ -5804,6 +5812,10 @@ def action_clone_app(payload, log=None):
                         "cluster)." % os.path.basename(backup_path or ""))
         if dr_sc:
             warnings.append("StorageClass remappée vers « %s » sur les PV/PVC recréés." % dr_sc)
+        if bitems is None or not bitems:
+            warnings.append("Cette sauvegarde ne contient pas d'instantané de ressources : seuls les "
+                            "volumes (PV/PVC) sont restaurés. Recréez les workloads et dépendances "
+                            "depuis une sauvegarde plus récente, ou manuellement.")
     if dr:
         warnings.append("MODE DR : toutes les sources (workloads, dépendances) proviennent de la "
                         "sauvegarde « %s » — aucune lecture du cluster d'origine." % os.path.basename(backup_path or ""))
@@ -7131,6 +7143,7 @@ HTML = r"""<!DOCTYPE html>
           <div style="flex:none;width:260px"><label class="fld">StorageClass cible (vide = inchangée)</label><input type="text" id="drSc" placeholder="nutanix-volume" autocomplete="off"></div>
           <div style="align-self:flex-end"><label class="fld"><input type="checkbox" id="drRefs" checked style="width:auto"> Recréer les dépendances depuis la sauvegarde (Secrets non masqués, ConfigMaps, ServiceAccounts, Services)</label></div>
         </div>
+        <div class="note" id="drNoRes" style="display:none;margin:8px 0">Cette sauvegarde ne contient <b>que les volumes</b> (pas d'instantané des workloads/dépendances) : elle est antérieure à cette fonction, ou la sauvegarde de config étendue était désactivée. La restauration recréera <b>les volumes (PV/PVC)</b> ; recréez les workloads depuis une sauvegarde plus récente ou manuellement.</div>
         <div id="drReuseWrap" style="display:none;margin:6px 0 4px">
           <label class="fld" style="display:flex;gap:9px;align-items:flex-start;cursor:pointer;font-weight:600">
             <input type="checkbox" id="drReuse" checked style="width:auto;margin-top:2px">
@@ -9820,6 +9833,8 @@ function drRecoverReuse(){ return drMode==="recover" && $("#drReuse").checked; }
 function drRenderVols(){
   const b=drSel();
   $("#drTargetNs").value=b? b.namespace : "";
+  // Honnêteté : sauvegarde sans instantané de ressources -> volumes uniquement.
+  $("#drNoRes").style.display = (b && b.has_resources===false)? "block":"none";
   const refs=(b&&b.vol_refs)||{};
   // En récupération, chaque champ est PRÉ-REMPLI avec l'UUID d'origine (issu de la
   // sauvegarde) : l'humain n'a rien à taper. En DR, les champs restent vides (nouveaux VG).
@@ -11692,6 +11707,10 @@ I18N_EN += [
     ("UUID du Volume Group (8-4-4-4-12)", "Volume Group UUID (8-4-4-4-12)"),
     ("UUID du VG restauré/cloné sur le site cible (8-4-4-4-12)", "UUID of the VG restored/cloned on the target site (8-4-4-4-12)"),
     (" » (le namespace n'existe plus sur le cluster).", " » (the namespace no longer exists on the cluster)."),
+    ("Cette sauvegarde ne contient pas d'instantané de ressources : seuls les volumes (PV/PVC) sont restaurés. Recréez les workloads et dépendances depuis une sauvegarde plus récente, ou manuellement.",
+     "This backup has no resource snapshot: only the volumes (PV/PVC) are restored. Recreate the workloads and dependencies from a more recent backup, or manually."),
+    ("Cette sauvegarde ne contient <b>que les volumes</b> (pas d'instantané des workloads/dépendances) : elle est antérieure à cette fonction, ou la sauvegarde de config étendue était désactivée. La restauration recréera <b>les volumes (PV/PVC)</b> ; recréez les workloads depuis une sauvegarde plus récente ou manuellement.",
+     "This backup contains <b>only the volumes</b> (no snapshot of workloads/dependencies): it predates this feature, or extended config backup was disabled. The restore will recreate <b>the volumes (PV/PVC)</b>; recreate the workloads from a more recent backup or manually."),
     ("Nom de StorageClass cible invalide : « ", "Invalid target StorageClass name: « "),
     ("Restauration DR : ", "DR restore: "),
     ("Liste du bucket impossible : ", "Cannot list the bucket: "),

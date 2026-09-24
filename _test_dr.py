@@ -230,6 +230,43 @@ try:
           "le PV recréé pointe sur le VG d'ORIGINE (déduit de la sauvegarde)")
     kinds3 = {(m.get("kind"), (m.get("metadata") or {}).get("name")) for m in applied3}
     check(("Deployment", "web") in kinds3, "workload recréé (réutilisation du VG d'origine)")
+
+    print("\n== Sauvegarde SANS resources.json : dégradé (volumes seulement), pas de blocage ==")
+    ndir = os.path.join(tmp, "_contexts", "dr-site", "sansres", "2026-09-24_10-00-00_000000")
+    os.makedirs(ndir)
+    pv3 = json.loads(json.dumps(pv2)); pv3["spec"]["claimRef"]["namespace"] = "sansres"
+    with open(os.path.join(ndir, "pv_pvc-orig.json"), "w") as f:
+        json.dump(pv3, f)
+    with open(os.path.join(ndir, "pvc_data.json"), "w") as f:
+        json.dump({**pvc, "metadata": {"name": "data", "namespace": "sansres"}}, f)
+    # PAS de resources.json
+    with open(os.path.join(ndir, "index.json"), "w") as f:
+        json.dump({"namespace": "sansres", "created": "2026-09-24T10:00:00",
+                   "cluster": "dr-site", "cluster_id": "local", "context": "dr-site",
+                   "volumes": [{"pvc": "data", "pv": "pvc-orig", "pv_file": "pv_pvc-orig.json",
+                                "pvc_file": "pvc_data.json",
+                                "analysis": {"old_volume_handle": "NutanixVolumes-" + VG_OLD}}]}, f)
+    invn = {x["namespace"]: x for x in H.action_dr_backups()["backups"]}
+    check(invn.get("sansres", {}).get("has_resources") is False
+          and invn.get("atelier", {}).get("has_resources") is True,
+          "inventaire : has_resources distingue les sauvegardes avec/sans instantané")
+    applied4 = []
+    def capture4(m, basename, dry, label):
+        applied4.append(json.loads(json.dumps(m)))
+        return real_apply(m, basename, dry, label)
+    H._apply_manifest = capture4
+    try:
+        r = H.action_clone_app({"namespace": "sansres", "target_namespace": "sansres",
+                                "backup_path": ndir, "items": [{"pvc": "data", "new_ref": ""}],
+                                "dry": True, "from_backup_only": True, "clone_refs": True})
+    finally:
+        H._apply_manifest = real_apply
+    check(r["ok"], "récupération SANS resources.json : réussie (pas de blocage) : %s" % (r.get("error") or "ok"))
+    kinds4 = {m.get("kind") for m in applied4}
+    check("PersistentVolume" in kinds4 and "PersistentVolumeClaim" in kinds4 and "Deployment" not in kinds4,
+          "volumes recréés, aucun workload (dégradé)")
+    check(any("instantané de ressources" in w for w in (r.get("warnings") or [])),
+          "avertissement clair : volumes seulement")
 finally:
     H.kubectl_json = saved_kj
     H._LOCAL_CTX.update({"name": None, "at": 0.0})
