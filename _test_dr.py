@@ -159,7 +159,8 @@ try:
                    "cluster": "dr-site", "cluster_id": "local", "context": "dr-site",
                    "resources_count": 4,
                    "volumes": [{"pvc": "data", "pv": "pvc-orig", "pv_file": "pv_pvc-orig.json",
-                                "pvc_file": "pvc_data.json"}]}, f)
+                                "pvc_file": "pvc_data.json",
+                                "analysis": {"old_volume_handle": "NutanixVolumes-" + VG_OLD}}]}, f)
 
     inv = H.action_dr_backups()
     here = {x["namespace"]: x["restorable_here"] for x in inv["backups"]}
@@ -208,6 +209,28 @@ try:
                             "target_namespace": "boutique"})
     check(not r["ok"] and "contexte" in (r["error"] or ""),
           "récupération d'une sauvegarde d'un AUTRE contexte : refus sans dérogation DR")
+
+    print("\n== Saisie minimale : réutilisation auto du VG d'origine (new_ref vide) ==")
+    inv2 = [x for x in H.action_dr_backups()["backups"] if x["namespace"] == "atelier"][0]
+    check(inv2.get("vol_refs", {}).get("data") == VG_OLD,
+          "inventaire : UUID d'origine du VG exposé (pré-remplissage sans lecture live)")
+    applied3 = []
+    def capture3(m, basename, dry, label):
+        applied3.append(json.loads(json.dumps(m)))
+        return real_apply(m, basename, dry, label)
+    H._apply_manifest = capture3
+    try:
+        # new_ref VIDE : le serveur doit déduire l'UUID d'origine depuis la sauvegarde.
+        r = H.action_clone_app({**rec, "items": [{"pvc": "data", "new_ref": ""}]})
+    finally:
+        H._apply_manifest = real_apply
+    check(r["ok"], "récupération sans aucun UUID saisi : %s" % (r.get("error") or "ok"))
+    vh3 = [((m.get("spec") or {}).get("csi") or {}).get("volumeHandle")
+           for m in applied3 if m.get("kind") == "PersistentVolume"]
+    check(vh3 == ["NutanixVolumes-" + VG_OLD],
+          "le PV recréé pointe sur le VG d'ORIGINE (déduit de la sauvegarde)")
+    kinds3 = {(m.get("kind"), (m.get("metadata") or {}).get("name")) for m in applied3}
+    check(("Deployment", "web") in kinds3, "workload recréé (réutilisation du VG d'origine)")
 finally:
     H.kubectl_json = saved_kj
     H._LOCAL_CTX.update({"name": None, "at": 0.0})

@@ -302,7 +302,7 @@ def save_config(updates):
 
 # Version horodatée de la build (format AAAAMMJJ-HHMM). À incrémenter à chaque
 # changement notable du programme ; affichée dans l'en-tête de l'interface.
-VERSION = "20260924-2358"
+VERSION = "20260925-0130"
 
 # Jeton anti-CSRF généré au démarrage, injecté dans la page et exigé sur les POST.
 CSRF_TOKEN = secrets.token_urlsafe(32)
@@ -5532,6 +5532,14 @@ def action_dr_backups():
             continue
         rel = os.path.relpath(dirpath, root)
         restorable = _backup_cluster_error(dirpath) is None
+        # UUID du Volume Group d'ORIGINE de chaque volume (dans la sauvegarde) : permet
+        # à l'assistant de PRÉ-REMPLIR le champ en récupération (aucune saisie manuelle).
+        vol_refs = {}
+        for v in (idx.get("volumes") or []):
+            vh = ((v.get("analysis") or {}).get("old_volume_handle")) or ""
+            m = UUID_RE.search(vh)
+            if v.get("pvc") and m:
+                vol_refs[v["pvc"]] = m.group(0)
         out.append({"path": dirpath, "restorable_here": restorable,
                     "namespace": idx.get("namespace") or "",
                     "timestamp": os.path.basename(dirpath), "created": idx.get("created") or "",
@@ -5539,6 +5547,7 @@ def action_dr_backups():
                     "cluster_id": idx.get("cluster_id") or "local",
                     "context": idx.get("context") or "",
                     "volumes": [v.get("pvc") for v in (idx.get("volumes") or [])],
+                    "vol_refs": vol_refs,
                     "resources_count": idx.get("resources_count"),
                     "imported": rel.split(os.sep)[0] == "_imports"})
     out.sort(key=lambda b: b.get("created") or "", reverse=True)
@@ -5574,6 +5583,10 @@ def action_clone_app(payload, log=None):
     # garde inter-cluster/contexte reste appliqué tel quel ; le filtre par noms
     # aussi (le sélecteur d'étiquettes est invérifiable sur un namespace disparu).
     from_backup = bool(payload.get("from_backup_only")) or dr
+    # Récupération d'une application SUPPRIMÉE sur CE cluster (pas de reprise d'activité) :
+    # l'app d'origine n'existe plus, on peut donc réutiliser son Volume Group d'ORIGINE
+    # (aucun risque de multi-attach) et l'UUID est déjà dans la sauvegarde -> saisie nulle.
+    recover = bool(payload.get("from_backup_only")) and not dr
     if from_backup and not backup_path:
         return {"ok": False, "error": "Restauration DR : choisissez une sauvegarde source.", "log": []}
     if not from_backup and not _namespace_allowed(ns):
@@ -5612,19 +5625,29 @@ def action_clone_app(payload, log=None):
     for it in items:
         pvc_name = it.get("pvc")
         new_ref = (it.get("new_ref") or it.get("new_iqn") or "").strip()
-        if not new_ref or not UUID_RE.search(new_ref):
-            return {"ok": False, "error": "Référence du VG cloné manquante/invalide pour « %s » "
-                    "(UUID du VG, volumeHandle, ou IQN)." % pvc_name, "log": []}
         old_pv, _ = _load_old_pv(ns, pvc_name, backup_path, backup_root)
         if old_pv is None:
             return {"ok": False, "error": "Manifeste du PV introuvable pour « %s »." % pvc_name, "log": []}
+        # Récupération : si l'humain n'a rien saisi, on réutilise le VG d'ORIGINE dont
+        # l'UUID est dans la sauvegarde (le PV rebranche sur le volume existant/restauré
+        # à l'identique dans HYCU). Zéro saisie dans le cas courant.
+        if recover and not new_ref:
+            vh = (analyse_pv(old_pv) or {}).get("old_volume_handle") or ""
+            m = UUID_RE.search(vh)
+            if m:
+                new_ref = m.group(0)
+        if not new_ref or not UUID_RE.search(new_ref):
+            return {"ok": False, "error": "Référence du VG cloné manquante/invalide pour « %s » "
+                    "(UUID du VG, volumeHandle, ou IQN)." % pvc_name, "log": []}
         built, err = build_new_pv(old_pv, new_ref, (it.get("new_name") or "").strip(), "clone")
         if err:
             return {"ok": False, "error": "%s : %s" % (pvc_name, err), "log": []}
         # Garde anti-confusion (comme la prévisualisation du restore) : refuser si la réf
         # est l'UUID du VG SOURCE (le clone pointerait vers le MÊME disque que l'app
         # d'origine -> multi-attach/corruption) ou le NOM du VG au lieu de son UUID.
-        if built.get("same_uuid"):
+        # EXCEPTION en récupération : l'app d'origine n'existe plus, réutiliser son VG
+        # d'origine est justement le but (rebranchement à l'identique, pas un clone).
+        if built.get("same_uuid") and not recover:
             return {"ok": False, "error": "« %s » : la référence est identique au volume SOURCE — le clone "
                     "pointerait vers le même disque Nutanix que l'application d'origine (risque de "
                     "multi-attach/corruption). Collez l'UUID du VG CLONÉ." % pvc_name, "log": []}
@@ -6525,6 +6548,9 @@ HTML = r"""<!DOCTYPE html>
   .b-pending{background:#F8EFE0;color:var(--orange)} .b-na{background:#EEF0F5;color:var(--muted)}
   pre.box{background:var(--strong);color:#E6E8F0;border-radius:4px;padding:12px 14px;font-size:12px;
           overflow:auto;max-height:340px;white-space:pre-wrap;word-break:break-word}
+  .drVol{display:flex;align-items:center;gap:12px;margin:7px 0}
+  .drVol .drVolNm{flex:none;width:180px;font-weight:600;font-size:13px;color:var(--ink);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .drVol .drRef{flex:1;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px}
   .repl{font-size:13px;border:1px solid var(--line);border-radius:4px;padding:10px 12px;margin:10px 0;background:#FAFBFD}
   .repl div{margin:4px 0} .repl .k{color:var(--top);font-weight:500}
   .repl .old{color:var(--red);text-decoration:line-through} .repl .new{color:var(--green)}
@@ -6986,7 +7012,7 @@ HTML = r"""<!DOCTYPE html>
         <div style="margin-top:10px"><button class="btn ghost" id="drOpenCfg" type="button">Ouvrir les réglages</button></div></div>
       <div id="drForm" style="display:none">
         <div class="warnbox" id="drWarnDr">Mode <b>reprise d'activité</b> : la garde inter-cluster est levée pour CETTE opération. Toutes les sources proviennent de la sauvegarde choisie ; le cluster cible est le <b>cluster actif</b> (<b id="drCluster"></b>). Restaurez d'abord les Volume Groups dans HYCU vers le site cible, puis collez leurs UUID.</div>
-        <div class="note" id="drWarnRec" style="display:none">Ce namespace n'existe plus sur le cluster <b id="drClusterRec"></b> : l'application va être <b>recréée depuis sa sauvegarde</b> (namespace, PV/PVC, workloads, dépendances non masquées). Restaurez d'abord ses Volume Groups dans HYCU (ou clonez-les), puis collez leurs UUID ci-dessous.</div>
+        <div class="note" id="drWarnRec" style="display:none">Ce namespace n'existe plus sur le cluster <b id="drClusterRec"></b> : l'application va être <b>recréée depuis sa sauvegarde</b> (namespace, PV/PVC, workloads, dépendances non masquées), en réutilisant ses volumes d'origine. Dans le cas courant, rien à saisir : vérifiez la sauvegarde et lancez la restauration.</div>
         <div class="row" style="margin-top:10px">
           <div><label class="fld">Sauvegarde source (tous clusters / imports S3)</label><select id="drBackupSel"></select></div>
           <div style="flex:none;width:220px"><label class="fld">Namespace cible</label><input type="text" id="drTargetNs" autocomplete="off"></div>
@@ -6995,7 +7021,14 @@ HTML = r"""<!DOCTYPE html>
           <div style="flex:none;width:260px"><label class="fld">StorageClass cible (vide = inchangée)</label><input type="text" id="drSc" placeholder="nutanix-volume" autocomplete="off"></div>
           <div style="align-self:flex-end"><label class="fld"><input type="checkbox" id="drRefs" checked style="width:auto"> Recréer les dépendances depuis la sauvegarde (Secrets non masqués, ConfigMaps, ServiceAccounts, Services)</label></div>
         </div>
-        <label class="fld">Volumes — collez l'UUID du VG restauré/cloné sur le site cible</label>
+        <div id="drReuseWrap" style="display:none;margin:6px 0 4px">
+          <label class="fld" style="display:flex;gap:9px;align-items:flex-start;cursor:pointer;font-weight:600">
+            <input type="checkbox" id="drReuse" checked style="width:auto;margin-top:2px">
+            <span>Réutiliser les volumes d'origine de l'application <span class="badge sim">recommandé</span>
+            <span class="hint" style="display:block;font-weight:400;margin-top:3px">Rien à saisir : l'application est rebranchée sur ses volumes Nutanix d'origine (leurs identifiants sont dans la sauvegarde). Décochez seulement si vous avez restauré les données sur de <b>nouveaux</b> volumes dans HYCU.</span></span>
+          </label>
+        </div>
+        <label class="fld" id="drVolsLabel">Volumes — collez l'UUID du VG restauré/cloné sur le site cible</label>
         <div id="drVols"></div>
         <div id="drLog" style="margin-top:10px"></div>
         <div id="drErr"></div>
@@ -9581,8 +9614,11 @@ function rsWizSync(){
   else if(rsWizPage==="dr"){
     const n=document.querySelectorAll(".drRef").length;
     const filled=[...document.querySelectorAll(".drRef")].filter(t=>t.value.trim()).length;
+    // Réutilisation des volumes d'origine : aucun UUID requis (le serveur les déduit
+    // de la sauvegarde). Sinon, tous les volumes doivent avoir une référence.
+    const needRefs = !drRecoverReuse();
     lbl=dry()? "Restaurer (simulation)" : "Restaurer (réel)";
-    dis=!drAllowed || !n || filled<n || drBusy || !$("#drTargetNs").value.trim();
+    dis=!drAllowed || !n || (needRefs && filled<n) || drBusy || !$("#drTargetNs").value.trim();
     act=drRun;
   }
   else if(rsWizPage==="objects"){
@@ -9644,8 +9680,10 @@ async function drOpen(mode, recoverNs){
   if(drMode==="recover"){
     $("#mRestoreTitle").innerHTML=esc(RS_TITLE)+'<span class="sep">›</span>'+esc("Restaurer l'application supprimée « "+recoverNs+" »");
     $("#drWarnDr").style.display="none"; $("#drWarnRec").style.display="block";
+    $("#drReuseWrap").style.display="block"; $("#drReuse").checked=true;
   } else {
     $("#drWarnDr").style.display="block"; $("#drWarnRec").style.display="none";
+    $("#drReuseWrap").style.display="none";
   }
   $("#drCluster").textContent=ctxInfo.context||"—";
   $("#drClusterRec").textContent=ctxInfo.context||"—";
@@ -9665,20 +9703,42 @@ async function drOpen(mode, recoverNs){
 }
 $("#drBackupSel").onchange=()=>drRenderVols();
 function drSel(){ return drBackups[+$("#drBackupSel").value]||null; }
+// Récupération : par défaut on réutilise les volumes d'origine (case cochée) -> aucune
+// saisie. La grille d'UUID n'apparaît que pour la reprise d'activité, ou si l'humain a
+// restauré les données sur de NOUVEAUX volumes (case décochée).
+function drRecoverReuse(){ return drMode==="recover" && $("#drReuse").checked; }
 function drRenderVols(){
   const b=drSel();
   $("#drTargetNs").value=b? b.namespace : "";
+  const refs=(b&&b.vol_refs)||{};
+  // En récupération, chaque champ est PRÉ-REMPLI avec l'UUID d'origine (issu de la
+  // sauvegarde) : l'humain n'a rien à taper. En DR, les champs restent vides (nouveaux VG).
   $("#drVols").innerHTML = b && b.volumes.length? b.volumes.map(v=>
-    `<div class="repl" style="margin-bottom:8px"><div class="nm"><b>${esc(v)}</b></div>
-     <textarea class="drRef" data-pvc="${esc(v)}" rows="1" placeholder="UUID du Volume Group restauré sur le site cible (8-4-4-4-12)" style="width:100%"></textarea></div>`).join("")
+    `<div class="drVol"><div class="drVolNm">${esc(v)}</div>
+     <input type="text" class="drRef" data-pvc="${esc(v)}" spellcheck="false" autocomplete="off"
+       value="${drMode==="recover"&&refs[v]?esc(refs[v]):""}"
+       placeholder="${esc(drMode==="recover"?"UUID du Volume Group (8-4-4-4-12)":"UUID du VG restauré/cloné sur le site cible (8-4-4-4-12)")}"></div>`).join("")
     : '<div class="hint">Aucun volume dans cette sauvegarde.</div>';
   document.querySelectorAll(".drRef").forEach(t=>t.oninput=rsWizSync);
+  drSyncReuse();
+}
+// Bascule d'affichage de la grille selon « réutiliser les volumes d'origine ».
+function drSyncReuse(){
+  const reuse=drRecoverReuse();
+  $("#drVols").style.display = reuse? "none":"block";
+  $("#drVolsLabel").style.display = (drMode==="recover")? (reuse?"none":"block") : "block";
+  if(drMode==="recover") $("#drVolsLabel").textContent="Nouveaux volumes — collez l'identifiant (UUID) fourni par HYCU";
+  else $("#drVolsLabel").textContent="Volumes — collez l'UUID du VG restauré/cloné sur le site cible";
   rsWizSync();
 }
+$("#drReuse").onchange=drSyncReuse;
 $("#drTargetNs").oninput=()=>rsWizSync();
 async function drRun(){
   const b=drSel(); if(!b) return;
-  const items=[...document.querySelectorAll(".drRef")].map(t=>({pvc:t.dataset.pvc, new_ref:t.value.trim()}));
+  // Réutilisation des volumes d'origine : on n'envoie PAS d'UUID, le serveur le déduit
+  // de la sauvegarde (source de vérité). Sinon on transmet ce que l'humain a saisi.
+  const reuse=drRecoverReuse();
+  const items=[...document.querySelectorAll(".drRef")].map(t=>({pvc:t.dataset.pvc, new_ref:reuse?"":t.value.trim()}));
   const live=!dry();
   let confirmedCtx="";
   if(live){
@@ -11521,13 +11581,19 @@ I18N_EN += [
     ("Application supprimée (sauvegardes conservées)", "Deleted application (backups kept)"),
     ("Namespace supprimé du cluster", "Namespace deleted from the cluster"),
     ("Restaurer l'application supprimée « ", "Restore the deleted application « "),
-    ("Ce namespace n'existe plus sur le cluster <b id=\"drClusterRec\"></b> : l'application va être <b>recréée depuis sa sauvegarde</b> (namespace, PV/PVC, workloads, dépendances non masquées). Restaurez d'abord ses Volume Groups dans HYCU (ou clonez-les), puis collez leurs UUID ci-dessous.",
-     "This namespace no longer exists on cluster <b id=\"drClusterRec\"></b>: the application will be <b>recreated from its backup</b> (namespace, PV/PVC, workloads, non-redacted dependencies). First restore its Volume Groups in HYCU (or clone them), then paste their UUIDs below."),
+    ("Ce namespace n'existe plus sur le cluster <b id=\"drClusterRec\"></b> : l'application va être <b>recréée depuis sa sauvegarde</b> (namespace, PV/PVC, workloads, dépendances non masquées), en réutilisant ses volumes d'origine. Dans le cas courant, rien à saisir : vérifiez la sauvegarde et lancez la restauration.",
+     "This namespace no longer exists on cluster <b id=\"drClusterRec\"></b>: the application will be <b>recreated from its backup</b> (namespace, PV/PVC, workloads, non-redacted dependencies), reusing its original volumes. In the common case, nothing to enter: check the backup and start the restore."),
     ("Restauration d'une application SUPPRIMÉE", "Restore of a DELETED application"),
     ("L'application sera RECRÉÉE sur ce cluster depuis la sauvegarde (namespace, PV/PVC, workloads, dépendances non masquées).",
      "The application will be RECREATED on this cluster from the backup (namespace, PV/PVC, workloads, non-redacted dependencies)."),
     ("Récupération « depuis la sauvegarde seule » : workloads et dépendances proviennent de la sauvegarde « ",
      "Recovery “from the backup alone”: workloads and dependencies come from backup « "),
+    ("Réutiliser les volumes d'origine de l'application ", "Reuse the application's original volumes "),
+    ("Rien à saisir : l'application est rebranchée sur ses volumes Nutanix d'origine (leurs identifiants sont dans la sauvegarde). Décochez seulement si vous avez restauré les données sur de <b>nouveaux</b> volumes dans HYCU.",
+     "Nothing to enter: the application is reconnected to its original Nutanix volumes (their IDs are in the backup). Only untick if you restored the data onto <b>new</b> volumes in HYCU."),
+    ("Nouveaux volumes — collez l'identifiant (UUID) fourni par HYCU", "New volumes — paste the ID (UUID) provided by HYCU"),
+    ("UUID du Volume Group (8-4-4-4-12)", "Volume Group UUID (8-4-4-4-12)"),
+    ("UUID du VG restauré/cloné sur le site cible (8-4-4-4-12)", "UUID of the VG restored/cloned on the target site (8-4-4-4-12)"),
     (" » (le namespace n'existe plus sur le cluster).", " » (the namespace no longer exists on the cluster)."),
     ("Nom de StorageClass cible invalide : « ", "Invalid target StorageClass name: « "),
     ("Restauration DR : ", "DR restore: "),
