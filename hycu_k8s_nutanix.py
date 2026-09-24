@@ -5789,11 +5789,15 @@ def action_dr_backups():
         # UUID du Volume Group d'ORIGINE de chaque volume (dans la sauvegarde) : permet
         # à l'assistant de PRÉ-REMPLIR le champ en récupération (aucune saisie manuelle).
         vol_refs = {}
+        vol_hycu = {}       # identité HYCU du VG (contrat P1) : source des points de restauration
         for v in (idx.get("volumes") or []):
             vh = ((v.get("analysis") or {}).get("old_volume_handle")) or ""
             m = UUID_RE.search(vh)
             if v.get("pvc") and m:
                 vol_refs[v["pvc"]] = m.group(0)
+            hy = ((v.get("restore_contract") or {}).get("hycu_source_uuid")) or ""
+            if v.get("pvc") and hy:
+                vol_hycu[v["pvc"]] = hy
         out.append({"path": dirpath, "restorable_here": restorable,
                     "namespace": idx.get("namespace") or "",
                     "timestamp": os.path.basename(dirpath), "created": idx.get("created") or "",
@@ -5802,6 +5806,7 @@ def action_dr_backups():
                     "context": idx.get("context") or "",
                     "volumes": [v.get("pvc") for v in (idx.get("volumes") or [])],
                     "vol_refs": vol_refs,
+                    "vol_hycu": vol_hycu,
                     "resources_count": idx.get("resources_count"),
                     "has_resources": os.path.isfile(os.path.join(dirpath, "resources.json")),
                     "imported": rel.split(os.sep)[0] == "_imports"})
@@ -10008,8 +10013,9 @@ $("#drReuse").onchange=drSyncReuse;
 // qu'il inscrit dans la grille (aucune saisie). Simulation = plan seulement.
 $("#drAuto").onclick=async()=>{
   const b=drSel(); if(!b) return;
-  const refs=(b&&b.vol_refs)||{};
-  const volumes=[...document.querySelectorAll(".drRef")].map(t=>({pvc:t.dataset.pvc, source_vg_uuid:refs[t.dataset.pvc]||""}));
+  const refs=(b&&b.vol_refs)||{}, hy=(b&&b.vol_hycu)||{};
+  // Source pour HYCU = l'identité HYCU du VG (contrat) si disponible, sinon l'UUID Nutanix.
+  const volumes=[...document.querySelectorAll(".drRef")].map(t=>({pvc:t.dataset.pvc, source_vg_uuid:hy[t.dataset.pvc]||refs[t.dataset.pvc]||""}));
   if(!volumes.length || volumes.some(v=>!v.source_vg_uuid)){
     $("#drErr").innerHTML=errBox("UUID du VG source absent de la sauvegarde : automatisation impossible, saisissez les UUID manuellement."); return; }
   $("#drErr").innerHTML=""; $("#drLog").innerHTML='<div class="hint"><span class="spin"></span>HYCU : création des volumes…</div>';
