@@ -30,6 +30,7 @@ SUITES = [
     "_test_s3",              # export S3 optionnel : SigV4 (vecteur AWS), connexion, upload, crochet auto
     "_test_features2",       # rétention GFS, sélecteur d'étiquettes, rapport, chiffrement exports, objets
     "_test_dr",              # reprise d'activité : garde allow_dr_restore, clone depuis la sauvegarde seule
+    "_test_contract",        # contrat de restauration : collecte best-effort à la sauvegarde (HYCU/Prism)
 ]
 
 

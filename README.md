@@ -405,6 +405,7 @@ Copy `hycu_config.example.json` → `hycu_config.json`. Also editable via the
 | `storage_min_free_mb` | `500` | **Free-space floor**: every backup is refused (clear, audited error) when the disk is below it — the tool never fills the disk. `0` = disabled. |
 | `storage_quota_gb` | `0` | **Global quota** of the backup folder: above it, the oldest backups are pruned (the most recent of each application×cluster and the backup of an in-progress restore are always kept). `0` = unlimited. |
 | `config_backup_full` | `true` | Also capture the namespace's non-PV/PVC resources (Deployments, Services, Secrets…) into `resources.json`. |
+| `backup_collect_restore_contract` | `true` | On each backup, collect *best-effort* (never failing the backup) the “restore contract” — Volume Group name/UUID on the HYCU side, disk(s), Prism Element, latest HYCU restore point — to enable a later restore **without manually entering any UUID**, disaster recovery included. Skipped when HYCU/Prism are not connected. |
 | `config_backup_kinds` | *(curated list)* | Namespaced resource kinds exported by the extended config snapshot. |
 | `config_backup_include_secret_data` | `false` | `false` = Secret data redacted on disk; `true` = keep it in clear (only if the backup folder is itself protected). |
 | `auto_backup_dest` | `""` | Destination folder for automatic backups (empty = `hycu-backups/`). |

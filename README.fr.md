@@ -417,6 +417,7 @@ la page **Réglages** de l'interface. Toutes les clés sont optionnelles.
 | `storage_min_free_mb` | `500` | **Plancher d'espace libre** : toute sauvegarde est refusée (erreur claire, auditée) si le disque est en dessous — jamais de disque saturé par l'outil. `0` = désactivé. |
 | `storage_quota_gb` | `0` | **Quota global** du dossier de sauvegardes : au-delà, les plus anciennes sont purgées (la plus récente de chaque application×cluster et la sauvegarde d'une restauration en cours sont toujours gardées). `0` = illimité. |
 | `config_backup_full` | `true` | Capturer aussi les ressources non-PV/PVC du namespace (Deployments, Services, Secrets…) dans `resources.json`. |
+| `backup_collect_restore_contract` | `true` | À chaque sauvegarde, collecter *best-effort* (sans jamais échouer le backup) le « contrat de restauration » — nom/UUID du Volume Group côté HYCU, disque(s), Prism Element, dernier point de restauration HYCU — pour permettre une restauration ultérieure **sans saisie manuelle d'UUID**, y compris en reprise d'activité. Ignoré si HYCU/Prism ne sont pas connectés. |
 | `config_backup_kinds` | *(liste par défaut)* | Types de ressources namespacées exportés par l'instantané de config étendue. |
 | `config_backup_include_secret_data` | `false` | `false` = données des Secrets masquées sur disque ; `true` = conservées en clair (uniquement si le dossier de sauvegarde est lui-même protégé). |
 | `auto_backup_dest` | `""` | Dossier de destination des sauvegardes automatiques (vide = `hycu-backups/`). |

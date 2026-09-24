@@ -39,6 +39,7 @@
 
   "_section_backup_config": "— Sauvegarde de configuration étendue —",
   "config_backup_full": true,
+  "backup_collect_restore_contract": true,
   "config_backup_kinds": [
     "deployment", "statefulset", "daemonset", "cronjob", "job",
     "service", "ingress", "configmap", "secret", "serviceaccount",

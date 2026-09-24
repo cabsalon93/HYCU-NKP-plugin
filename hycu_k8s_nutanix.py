@@ -166,6 +166,11 @@ DEFAULT_CONFIG = {
     # LECTURE SEULE ; c'est un INSTANTANÉ de config (référence / restore manuel), NON
     # utilisé par la restauration automatique (qui reste centrée PV/PVC). True = activé.
     "config_backup_full": True,
+    # « Contrat de restauration » : à chaque sauvegarde, collecter (best-effort, sans
+    # jamais échouer le backup) ce qui rend la RESTAURATION sans saisie manuelle —
+    # UUID/nom du Volume Group côté HYCU/Nutanix, disque(s), Prism Element, dernier
+    # point de restauration HYCU. Requiert HYCU/Prism connectés ; sinon ignoré.
+    "backup_collect_restore_contract": True,
     "config_backup_kinds": list(CONFIG_BACKUP_KINDS_DEFAULT),   # types namespacés exportés
     # False (défaut sûr) = les DONNÉES des Secrets sont MASQUÉES sur disque (structure
     # conservée, valeurs remplacées par « __REDACTED__ »). True = secrets en clair dans
@@ -1873,6 +1878,17 @@ def action_backup(ns, dest=None):
             files.append("resources.json")
         except Exception as e:
             print("Sauvegarde de config étendue (%s) ignorée : %s" % (ns, e))
+
+    # Contrat de restauration (best-effort) : de quoi restaurer plus tard SANS saisie
+    # d'UUID (nom/UUID du VG côté HYCU, disques, Prism Element, dernier point HYCU).
+    # N'échoue jamais la sauvegarde ; ignoré si HYCU/Prism non connectés.
+    if CONFIG.get("backup_collect_restore_contract", True):
+        try:
+            systems = _collect_restore_contract(ns, index["volumes"])
+            if systems:
+                index["systems"] = systems
+        except Exception as e:
+            print("Contrat de restauration (%s) ignoré : %s" % (ns, e))
 
     with open(os.path.join(d, "index.json"), "w", encoding="utf-8") as f:
         json.dump(index, f, indent=2)
@@ -5101,6 +5117,102 @@ def _reject_stale_vgs(ns, uuids):
         return ("Volume Group(s) hors de la correspondance actuelle du namespace « %s » : %s. "
                 "Relancez l'analyse." % (ns, ", ".join(bad)))
     return None
+
+
+def _vg_pe_uuid(vg_uuid):
+    """Best-effort : UUID du Prism Element hébergeant le VG (multi-PE), lu dans l'objet
+    v4 du VG. Renvoie None si Prism non connecté ou champ absent (tolérant au schéma)."""
+    if not SESSION_CREDS.get("prismcentral"):
+        return None
+    try:
+        r = _rest_raw("prismcentral", "GET",
+                      "/api/volumes/v4.0.b1/config/volume-groups/%s" % urllib.parse.quote(str(vg_uuid)))
+    except Exception:
+        return None
+    data = (r.get("json") or {}).get("data") if r.get("ok") else None
+    if not isinstance(data, dict):
+        return None
+    # Le champ exact varie selon les versions : on cherche une référence de cluster.
+    for k in ("clusterReference", "clusterExtId", "cluster_uuid", "clusterUuid"):
+        v = data.get(k)
+        if isinstance(v, str) and UUID_RE.search(v):
+            return UUID_RE.search(v).group(0)
+        if isinstance(v, dict):
+            for kk in ("extId", "uuid"):
+                if isinstance(v.get(kk), str) and UUID_RE.search(v[kk]):
+                    return UUID_RE.search(v[kk]).group(0)
+    return None
+
+
+def _collect_restore_contract(ns, volumes):
+    """« Contrat de restauration » (P1) : enrichit best-effort chaque volume avec ce qui
+    permettra une RESTAURATION SANS SAISIE (nom/UUID du VG côté HYCU, disque(s), Prism
+    Element, dernier point de restauration HYCU). N'échoue JAMAIS la sauvegarde : toute
+    erreur est avalée. Renvoie un bloc `systems` (endpoints utilisés) à joindre à l'index.
+    - `volumes` : la liste index["volumes"] (mutée en place, ajout de `restore_contract`).
+    Requiert HYCU et/ou Prism connectés ; sinon ne fait (presque) rien."""
+    systems = {}
+    hy_on = bool(SESSION_CREDS.get("hycu"))
+    pc_on = bool(SESSION_CREDS.get("prismcentral"))
+    ne_on = bool(SESSION_CREDS.get("nutanix"))
+    if hy_on:
+        b, a, _ = _system_cfg("hycu")
+        systems["hycu"] = {"url": b, "api_base": a}
+    if pc_on or ne_on:
+        src = "prismcentral" if pc_on else "nutanix"
+        b, a, _ = _system_cfg(src)
+        systems["nutanix"] = {"kind": src, "url": b}
+    if not (hy_on or pc_on or ne_on):
+        return systems                                   # rien de connecté : contrat non collecté
+
+    # Index HYCU par externalId (= UUID du VG) — une seule liste pour tout le namespace.
+    by_ext = {}
+    if hy_on:
+        try:
+            items, herr = _hycu_list_vgs()
+            if not herr:
+                for vg in items or []:
+                    m = UUID_RE.search((vg.get("externalId") or "")) if isinstance(vg, dict) else None
+                    if m:
+                        by_ext[m.group(0).lower()] = vg
+        except Exception:
+            by_ext = {}
+
+    for v in volumes:
+        try:
+            vh = ((v.get("analysis") or {}).get("old_volume_handle")) or ""
+            m = UUID_RE.search(vh)
+            if not m:
+                continue
+            vg_uuid = m.group(0)
+            contract = {"vg_uuid": vg_uuid}
+            vg = by_ext.get(vg_uuid.lower())
+            if vg:
+                contract["hycu_source_uuid"] = vg.get("uuid") or vg_uuid
+                contract["vg_name"] = vg.get("name") or v.get("pv")
+                # Dernier point de restauration HYCU (pour aligner les lignes de temps).
+                try:
+                    rp = action_hycu_restore_points(contract["hycu_source_uuid"])
+                    pts = [p for p in (rp.get("points") or []) if p.get("restorable", True)]
+                    if pts:
+                        contract["hycu_latest_backup"] = {"uuid": pts[0].get("id"),
+                                                          "at": pts[0].get("time")}
+                except Exception:
+                    pass
+            if pc_on:
+                try:
+                    disks = _clone_vg_disk_uuids(vg_uuid)
+                    if disks:
+                        contract["disk_extids"] = [x for x in disks.split(",") if x]
+                except Exception:
+                    pass
+                pe = _vg_pe_uuid(vg_uuid)
+                if pe:
+                    contract["pe_uuid"] = pe
+            v["restore_contract"] = contract
+        except Exception:
+            continue                                     # un volume ne doit jamais bloquer les autres
+    return systems
 
 
 def action_hycu_protect(payload):
