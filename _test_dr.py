@@ -231,6 +231,42 @@ try:
     kinds3 = {(m.get("kind"), (m.get("metadata") or {}).get("name")) for m in applied3}
     check(("Deployment", "web") in kinds3, "workload recréé (réutilisation du VG d'origine)")
 
+    print("\n== VG d'origine SUPPRIMÉ : restauration auto via HYCU en un clic (reuse) ==")
+    s_iqn = H.action_nutanix_iqn
+    s_prov = H.action_hycu_provision_clone
+    prov_calls = []
+    H.action_nutanix_iqn = lambda u: {"ok": False, "error": "not found"}   # VG absent du cluster
+    def fake_prov(p):
+        prov_calls.append(p)
+        return {"ok": True, "dry": bool(p.get("dry", True)),
+                "items": [{"pvc": v["pvc"], "new_ref": None} for v in p.get("volumes", [])],
+                "log": [{"ok": True, "dry": True, "label": "Plan HYCU (test)"}]}
+    H.action_hycu_provision_clone = fake_prov
+    applied5 = []
+    def capture5(m, basename, dry, label):
+        applied5.append(json.loads(json.dumps(m)))
+        return real_apply(m, basename, dry, label)
+    H._apply_manifest = capture5
+    with H.CRED_LOCK:
+        H.SESSION_CREDS["hycu"] = {"access": "a", "secret": "b"}
+        H.SESSION_CREDS["prismcentral"] = {"access": "a", "secret": "b"}
+    try:
+        r = H.action_clone_app({**rec, "items": [{"pvc": "data", "new_ref": ""}]})
+    finally:
+        H._apply_manifest = real_apply
+        H.action_nutanix_iqn = s_iqn
+        H.action_hycu_provision_clone = s_prov
+        with H.CRED_LOCK:
+            H.SESSION_CREDS["hycu"] = None
+            H.SESSION_CREDS["prismcentral"] = None
+    check(r["ok"], "récupération avec VG supprimé : %s" % (r.get("error") or "ok"))
+    check(len(prov_calls) == 1 and prov_calls[0]["volumes"][0]["source_vg_uuid"] == VG_OLD
+          and prov_calls[0]["volumes"][0]["vg_name"] == "pvc-orig",
+          "VG absent -> provision HYCU appelée (source = Source UUID, nom = nom du PV)")
+    txt5 = json.dumps(r.get("log", []), ensure_ascii=False)
+    check("restauration automatique depuis HYCU" in txt5,
+          "journal : bascule automatique vers la restauration HYCU signalée")
+
     print("\n== Sauvegarde SANS resources.json : dégradé (volumes seulement), pas de blocage ==")
     ndir = os.path.join(tmp, "_contexts", "dr-site", "sansres", "2026-09-24_10-00-00_000000")
     os.makedirs(ndir)

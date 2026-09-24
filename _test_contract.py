@@ -78,7 +78,7 @@ try:
     idx = read_index()
     c = (idx["volumes"][0] or {}).get("restore_contract") or {}
     check(c.get("vg_uuid") == VG, "contrat : UUID du VG source")
-    check(c.get("hycu_source_uuid") == "hy-" + VG and c.get("vg_name") == "pvc-orig",
+    check(c.get("hycu_uuid") == "hy-" + VG and c.get("vg_name") == "pvc-orig",
           "contrat : identité HYCU (source_uuid + nom du VG)")
     check(c.get("hycu_latest_backup", {}).get("uuid") == "rp-latest",
           "contrat : dernier point de restauration HYCU (le plus récent)")
@@ -111,7 +111,7 @@ try:
     check(r["ok"], "sauvegarde OK malgré l'échec HYCU")
     # vg_uuid vient de l'analyse locale (pas d'appel) ; l'identité HYCU manque.
     c = (idx["volumes"][0] or {}).get("restore_contract") or {}
-    check(c.get("vg_uuid") == VG and "hycu_source_uuid" not in c,
+    check(c.get("vg_uuid") == VG and "hycu_uuid" not in c,
           "contrat dégradé : UUID local présent, identité HYCU absente, sans crash")
 finally:
     with H.CRED_LOCK:

@@ -171,6 +171,11 @@ DEFAULT_CONFIG = {
     # UUID/nom du Volume Group côté HYCU/Nutanix, disque(s), Prism Element, dernier
     # point de restauration HYCU. Requiert HYCU/Prism connectés ; sinon ignoré.
     "backup_collect_restore_contract": True,
+    # Récupération d'une application supprimée : si son Volume Group d'origine n'existe
+    # plus sur le cluster (reclaimPolicy=Delete) mais reste « Protected deleted » dans
+    # HYCU, restaurer/cloner automatiquement le VG via HYCU et découvrir son nouvel UUID
+    # — en un seul clic « Restaurer ». Requiert HYCU + Prism connectés.
+    "recover_restore_deleted_vg": True,
     "config_backup_kinds": list(CONFIG_BACKUP_KINDS_DEFAULT),   # types namespacés exportés
     # False (défaut sûr) = les DONNÉES des Secrets sont MASQUÉES sur disque (structure
     # conservée, valeurs remplacées par « __REDACTED__ »). True = secrets en clair dans
@@ -307,7 +312,7 @@ def save_config(updates):
 
 # Version horodatée de la build (format AAAAMMJJ-HHMM). À incrémenter à chaque
 # changement notable du programme ; affichée dans l'en-tête de l'interface.
-VERSION = "20260925-0450"
+VERSION = "20260925-0520"
 
 # Jeton anti-CSRF généré au démarrage, injecté dans la page et exigé sur les POST.
 CSRF_TOKEN = secrets.token_urlsafe(32)
@@ -5099,6 +5104,18 @@ def _resolve_hycu_vg(source_uuid, vg_name=None):
     return None, None
 
 
+def _vg_exists(uuid):
+    """Le Volume Group existe-t-il encore côté Nutanix ? True/False, ou None si
+    indéterminable (Prism/PE non connecté). Sert à décider, en récupération, s'il faut
+    réutiliser le VG d'origine (existe) ou le restaurer depuis HYCU (supprimé)."""
+    if not uuid or not (SESSION_CREDS.get("prismcentral") or SESSION_CREDS.get("nutanix")):
+        return None
+    try:
+        return bool(action_nutanix_iqn(uuid).get("ok"))
+    except Exception:
+        return None
+
+
 def _await_hycu_job(job_id, timeout_s=600, poll_s=3):
     """Attend la fin d'un job HYCU. Renvoie (ok, dernier_statut, erreur)."""
     if not job_id:
@@ -5389,11 +5406,11 @@ def _collect_restore_contract(ns, volumes):
             contract = {"vg_uuid": vg_uuid}
             vg = by_ext.get(vg_uuid.lower())
             if vg:
-                contract["hycu_source_uuid"] = vg.get("uuid") or vg_uuid
+                contract["hycu_uuid"] = vg.get("uuid") or vg_uuid
                 contract["vg_name"] = vg.get("name") or v.get("pv")
                 # Dernier point de restauration HYCU (pour aligner les lignes de temps).
                 try:
-                    rp = action_hycu_restore_points(contract["hycu_source_uuid"])
+                    rp = action_hycu_restore_points(contract["hycu_uuid"])
                     pts = [p for p in (rp.get("points") or []) if p.get("restorable", True)]
                     if pts:
                         contract["hycu_latest_backup"] = {"uuid": pts[0].get("id"),
@@ -5855,7 +5872,7 @@ def action_dr_backups():
             m = UUID_RE.search(vh)
             if v.get("pvc") and m:
                 vol_refs[v["pvc"]] = m.group(0)
-            hy = ((v.get("restore_contract") or {}).get("hycu_source_uuid")) or ""
+            hy = ((v.get("restore_contract") or {}).get("hycu_uuid")) or ""
             if v.get("pvc") and hy:
                 vol_hycu[v["pvc"]] = hy
             nm = ((v.get("restore_contract") or {}).get("vg_name")) or v.get("pv") or ""
@@ -5955,13 +5972,35 @@ def action_clone_app(payload, log=None):
         if old_pv is None:
             return {"ok": False, "error": "Manifeste du PV introuvable pour « %s »." % pvc_name, "log": []}
         # Récupération : si l'humain n'a rien saisi, on réutilise le VG d'ORIGINE dont
-        # l'UUID est dans la sauvegarde (le PV rebranche sur le volume existant/restauré
-        # à l'identique dans HYCU). Zéro saisie dans le cas courant.
+        # l'UUID (Source UUID Nutanix) est dans la sauvegarde. MAIS si ce VG n'existe plus
+        # sur le cluster (reclaimPolicy=Delete) et qu'il est « Protected deleted » dans
+        # HYCU, on le RESTAURE automatiquement via HYCU et on découvre le nouvel UUID —
+        # en un seul clic. (Prism sert à savoir si le VG existe encore.)
         if recover and not new_ref:
             vh = (analyse_pv(old_pv) or {}).get("old_volume_handle") or ""
             m = UUID_RE.search(vh)
-            if m:
-                new_ref = m.group(0)
+            orig = m.group(0) if m else None
+            if orig:
+                new_ref = orig                       # défaut : réutiliser le VG d'origine
+                if (CONFIG.get("recover_restore_deleted_vg", True) and SESSION_CREDS.get("hycu")
+                        and _vg_exists(orig) is False):
+                    # VG supprimé du cluster mais protégé dans HYCU -> restauration auto.
+                    orig_pv_name = (old_pv.get("metadata") or {}).get("name") or ""
+                    log.append(logentry("Volume d'origine de %s introuvable sur le cluster — "
+                                        "restauration automatique depuis HYCU (« Protected deleted »)."
+                                        % pvc_name, dry=dry, rc=None))
+                    prov = action_hycu_provision_clone({"volumes": [{"pvc": pvc_name,
+                                "source_vg_uuid": orig, "vg_name": orig_pv_name}], "dry": dry})
+                    for l in prov.get("log", []):
+                        log.append(l)
+                    if not prov.get("ok"):
+                        return {"ok": False, "error": "« %s » : le volume d'origine n'existe plus et "
+                                "sa restauration automatique via HYCU a échoué : %s"
+                                % (pvc_name, prov.get("error")), "log": log}
+                    if not dry and prov.get("items"):
+                        disc = (prov["items"][0].get("new_ref") or "").strip()
+                        if disc:
+                            new_ref = disc           # nouvel UUID (Source) du VG restauré
         if not new_ref or not UUID_RE.search(new_ref):
             return {"ok": False, "error": "Référence du VG cloné manquante/invalide pour « %s » "
                     "(UUID du VG, volumeHandle, ou IQN)." % pvc_name, "log": []}
@@ -7342,7 +7381,7 @@ HTML = r"""<!DOCTYPE html>
         <div style="margin-top:10px"><button class="btn ghost" id="drOpenCfg" type="button">Ouvrir les réglages</button></div></div>
       <div id="drForm" style="display:none">
         <div class="warnbox" id="drWarnDr">Mode <b>reprise d'activité</b> : la garde inter-cluster est levée pour CETTE opération. Toutes les sources proviennent de la sauvegarde choisie ; le cluster cible est le <b>cluster actif</b> (<b id="drCluster"></b>). Restaurez d'abord les Volume Groups dans HYCU vers le site cible, puis collez leurs UUID.</div>
-        <div class="note" id="drWarnRec" style="display:none">Ce namespace n'existe plus sur le cluster <b id="drClusterRec"></b> : l'application va être <b>recréée depuis sa sauvegarde</b> (namespace, PV/PVC, workloads, dépendances non masquées), en réutilisant ses volumes d'origine. Dans le cas courant, rien à saisir : vérifiez la sauvegarde et lancez la restauration.</div>
+        <div class="note" id="drWarnRec" style="display:none">Ce namespace n'existe plus sur le cluster <b id="drClusterRec"></b> : l'application va être <b>recréée depuis sa sauvegarde</b> (namespace, PV/PVC, workloads, dépendances non masquées), en réutilisant ses volumes d'origine — ou, s'ils ont été supprimés avec le namespace, en les restaurant automatiquement depuis HYCU (« Protected deleted »). Dans le cas courant, rien à saisir : vérifiez la sauvegarde et lancez la restauration.</div>
         <div class="row" style="margin-top:10px">
           <div><label class="fld">Sauvegarde source (tous clusters / imports S3)</label><select id="drBackupSel"></select></div>
           <div style="flex:none;width:220px"><label class="fld">Namespace cible</label><input type="text" id="drTargetNs" autocomplete="off"></div>
@@ -11927,8 +11966,8 @@ I18N_EN += [
     ("Application supprimée (sauvegardes conservées)", "Deleted application (backups kept)"),
     ("Namespace supprimé du cluster", "Namespace deleted from the cluster"),
     ("Restaurer l'application supprimée « ", "Restore the deleted application « "),
-    ("Ce namespace n'existe plus sur le cluster <b id=\"drClusterRec\"></b> : l'application va être <b>recréée depuis sa sauvegarde</b> (namespace, PV/PVC, workloads, dépendances non masquées), en réutilisant ses volumes d'origine. Dans le cas courant, rien à saisir : vérifiez la sauvegarde et lancez la restauration.",
-     "This namespace no longer exists on cluster <b id=\"drClusterRec\"></b>: the application will be <b>recreated from its backup</b> (namespace, PV/PVC, workloads, non-redacted dependencies), reusing its original volumes. In the common case, nothing to enter: check the backup and start the restore."),
+    ("Ce namespace n'existe plus sur le cluster <b id=\"drClusterRec\"></b> : l'application va être <b>recréée depuis sa sauvegarde</b> (namespace, PV/PVC, workloads, dépendances non masquées), en réutilisant ses volumes d'origine — ou, s'ils ont été supprimés avec le namespace, en les restaurant automatiquement depuis HYCU (« Protected deleted »). Dans le cas courant, rien à saisir : vérifiez la sauvegarde et lancez la restauration.",
+     "This namespace no longer exists on cluster <b id=\"drClusterRec\"></b>: the application will be <b>recreated from its backup</b> (namespace, PV/PVC, workloads, non-redacted dependencies), reusing its original volumes — or, if they were deleted with the namespace, restoring them automatically from HYCU (“Protected deleted”). In the common case, nothing to enter: check the backup and start the restore."),
     ("Restauration d'une application SUPPRIMÉE", "Restore of a DELETED application"),
     ("L'application sera RECRÉÉE sur ce cluster depuis la sauvegarde (namespace, PV/PVC, workloads, dépendances non masquées).",
      "The application will be RECREATED on this cluster from the backup (namespace, PV/PVC, workloads, non-redacted dependencies)."),
@@ -11941,6 +11980,11 @@ I18N_EN += [
     ("Créer les volumes automatiquement via HYCU", "Create the volumes automatically via HYCU"),
     ("Simulation du clone automatique via HYCU (aucun clone réel lancé).",
      "Simulation of the automatic clone via HYCU (no real clone launched)."),
+    ("Volume d'origine de ", "Original volume of "),
+    (" introuvable sur le cluster — restauration automatique depuis HYCU (« Protected deleted »).",
+     " not found on the cluster — automatic restore from HYCU (“Protected deleted”)."),
+    (" : le volume d'origine n'existe plus et sa restauration automatique via HYCU a échoué : ",
+     ": the original volume no longer exists and its automatic restore via HYCU failed: "),
     (" : source HYCU ", ": HYCU source "),
     (" (identité HYCU résolue depuis ", " (HYCU identity resolved from "),
     (", point de restauration ", ", restore point "),

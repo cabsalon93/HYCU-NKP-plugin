@@ -90,7 +90,7 @@ Pour que la restauration soit sans saisie, la **sauvegarde de config** doit êtr
 | `old_volume_handle` / UUID du VG source | Réutiliser (récup.) ou retrouver le VG | ✅ `analysis` | — |
 | Objets du namespace (Deploy, SVC, CM, SA, Secrets masqués…) | Recréer l'app sans lecture live | ✅ `resources.json` | — |
 | **Nom du VG côté Nutanix** (`hycu_vg_name`) | Repli d'appariement par nom (Prism/HYCU) | ❌ | `action_hycu_match(ns)` au moment du backup |
-| **UUID source côté HYCU** (`hycu_source_uuid`/`externalId`) | Lister les points de restauration **même cluster disparu** | ❌ | `action_hycu_match(ns)` |
+| **UUID source côté HYCU** (`hycu_uuid`/`externalId`) | Lister les points de restauration **même cluster disparu** | ❌ | `action_hycu_match(ns)` |
 | **extId du/des disque(s)** au moment du backup | Validation + diagnostic (le disque courant est relu à la restauration) | ❌ | `_clone_vg_disk_uuids(vg_uuid)` |
 | **Identité du Prism Element / cluster Nutanix** (PE uuid) | Cibler le bon Prism en multi-PE | ❌ | `action_nutanix_vg_v4` / Prism |
 | **Système HYCU/Prism** rattaché à ce cluster K8s | Savoir à **quelle** appliance parler en DR | ❌ (implicite = config courante) | Enregistrer l'endpoint/`api_base` utilisé |
@@ -113,7 +113,7 @@ Forme proposée dans `index.json` :
   "restore_contract": {
     "vg_uuid": "<uuid>",
     "vg_name": "pvc-abc…",
-    "hycu_source_uuid": "<uuid>",
+    "hycu_uuid": "<uuid>",
     "disk_extids": ["<extid>", ...],
     "pe_uuid": "<prism-element-uuid>",
     "hycu_latest_backup": { "uuid": "<backupUuid>", "at": "2026-09-25T01:00:00Z" }
@@ -136,7 +136,7 @@ reconstruit le PV. **Saisie humaine : 0** (au plus : choisir la date du point de
 restauration, sinon « la plus récente » par défaut).
 
 **Cas C — Reprise d'activité (autre cluster/site).** Le cluster d'origine n'existe
-plus, mais le **contrat de restauration** (§5) fournit `hycu_source_uuid` → on
+plus, mais le **contrat de restauration** (§5) fournit `hycu_uuid` → on
 liste ses points de restauration sur l'appliance HYCU du **site cible**, on clone
 (en nommant le VG), on découvre l'UUID comme au cas B. **Saisie humaine :** choisir
 le point de restauration (par défaut le plus récent), confirmer le cluster cible.
@@ -178,7 +178,7 @@ liste complète que « pour les experts ».
   masquée. Backend `action_clone_app` mode `recover`, `action_dr_backups.vol_refs`.
 
 - **P1 — Contrat de restauration à la sauvegarde — LIVRÉ (v20260925…).**
-  Bloc `restore_contract` (vg_uuid, vg_name, hycu_source_uuid, disk_extids,
+  Bloc `restore_contract` (vg_uuid, vg_name, hycu_uuid, disk_extids,
   pe_uuid, hycu_latest_backup) + `systems` écrits dans `index.json` au backup,
   **best-effort** (n'échoue jamais le backup, ignoré si HYCU/Prism absents).
   Réglage `backup_collect_restore_contract`. Tests `_test_contract`.
