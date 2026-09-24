@@ -302,7 +302,7 @@ def save_config(updates):
 
 # Version horodatée de la build (format AAAAMMJJ-HHMM). À incrémenter à chaque
 # changement notable du programme ; affichée dans l'en-tête de l'interface.
-VERSION = "20260925-0130"
+VERSION = "20260925-0210"
 
 # Jeton anti-CSRF généré au démarrage, injecté dans la page et exigé sur les POST.
 CSRF_TOKEN = secrets.token_urlsafe(32)
@@ -6577,8 +6577,6 @@ HTML = r"""<!DOCTYPE html>
   /* Anciens éléments de navigation du parcours Restaurer : remplacés par l'assistant */
   .stepper,#rsNextBar{display:none !important}
   .step-no{display:none}
-  .dq{display:inline-flex;align-items:center;justify-content:center;width:17px;height:17px;border:1.5px solid var(--grey);
-      border-radius:50%;font-size:11px;font-weight:700;color:var(--grey);cursor:help;vertical-align:middle}
   /* Superposition : filtre / assistant / déverrouillage au-dessus des modales HYCU,
      confirmation destructive au-dessus de tout. */
   .wiz{z-index:1050} .modal-bg{z-index:1100}
@@ -6773,14 +6771,14 @@ HTML = r"""<!DOCTYPE html>
   <!-- ===================== TABLEAU DE BORD ===================== -->
   <section id="tab-dashboard">
     <div class="dgrid">
-      <div><h2 class="dtitle">Applications <span class="dq" title="Anneau extérieur : namespaces ayant au moins une sauvegarde de configuration (protection). Anneau intérieur : sauvegarde récente, dans l'intervalle de la politique (conformité).">?</span></h2><div class="dcard" id="dbApps"></div></div>
-      <div><h2 class="dtitle">Politique <span class="dq" title="Politique de sauvegarde automatique de la configuration (manifestes PV/PVC et ressources).">?</span></h2><div class="dcard" id="dbPolicy"></div></div>
-      <div><h2 class="dtitle">Sources <span class="dq" title="Systèmes enregistrés via l'engrenage en haut à droite : HYCU, Prism Element, Prism Central.">?</span></h2><div class="dcard" id="dbSources"></div></div>
-      <div><h2 class="dtitle">Cluster <span class="dq" title="Cluster Kubernetes ciblé par kubectl.">?</span></h2><div class="dcard" id="dbCluster"></div></div>
-      <div><h2 class="dtitle">Stockage <span class="dq" title="État du disque qui héberge les sauvegardes de configuration (espace libre, volume occupé, versions).">?</span></h2><div class="dcard" id="dbStorage"></div></div>
-      <div><h2 class="dtitle">Tâches <span class="dq" title="Opérations des 7 derniers jours (sauvegardes, restaurations, clones), d'après le journal d'audit.">?</span></h2><div class="dcard" id="dbJobs"></div></div>
+      <div><h2 class="dtitle">Applications</h2><div class="dcard" id="dbApps"></div></div>
+      <div><h2 class="dtitle">Politique</h2><div class="dcard" id="dbPolicy"></div></div>
+      <div><h2 class="dtitle">Sources</h2><div class="dcard" id="dbSources"></div></div>
+      <div><h2 class="dtitle">Cluster</h2><div class="dcard" id="dbCluster"></div></div>
+      <div><h2 class="dtitle">Stockage</h2><div class="dcard" id="dbStorage"></div></div>
+      <div><h2 class="dtitle">Tâches</h2><div class="dcard" id="dbJobs"></div></div>
       <div><h2 class="dtitle">Dernières tâches</h2><div class="dcard" id="dbLast"></div></div>
-      <div><h2 class="dtitle">Santé des clusters <span class="dq" title="Dernier contrôle de joignabilité de chaque cluster (lecture seule, périodique).">?</span></h2><div class="dcard" id="dbHealth"></div></div>
+      <div><h2 class="dtitle">Santé des clusters</h2><div class="dcard" id="dbHealth"></div></div>
     </div>
   </section>
   <!-- ===================== APPLICATIONS ===================== -->
@@ -9463,7 +9461,7 @@ async function loadDashboard(){
       <span class="dbig" style="margin:0">${on ? "Activée" : "Désactivée"}</span></div>
     <ul class="dlist">
       <li><span class="k">Fréquence</span><span class="v">${on ? "Toutes les "+Math.round(ab.interval_hours||24)+" h" : "—"}</span></li>
-      <li><span class="k">Rétention</span><span class="v">${ab.keep||15} versions</span></li>
+      <li><span class="k">Rétention</span><span class="v">${esc(abRetLabel(ab))}</span></li>
       <li><span class="k">Dernière exécution</span><span class="v">${ab.last_run ? esc(fmtAgo(ab.last_run))+" "+stIc(ab.last_ok?"ok":"ko") : "—"}</span></li>
       <li><span class="k">Prochaine exécution</span><span class="v">${ab.next_due ? esc(new Date(ab.next_due*1000).toLocaleString()) : "—"}</span></li>
     </ul>`;
@@ -10911,15 +10909,6 @@ I18N_EN += [
     ('<h2 class="dtitle">Politique ', '<h2 class="dtitle">Policy '),
     ('<h2 class="dtitle">Tâches ', '<h2 class="dtitle">Jobs '),
     ('<h2 class="dtitle">Dernières tâches</h2>', '<h2 class="dtitle">Recent jobs</h2>'),
-    ("Anneau extérieur : namespaces ayant au moins une sauvegarde de configuration (protection). Anneau intérieur : sauvegarde récente, dans l'intervalle de la politique (conformité).",
-     "Outer ring: namespaces with at least one configuration backup (protection). Inner ring: recent backup, within the policy interval (compliance)."),
-    ("Politique de sauvegarde automatique de la configuration (manifestes PV/PVC et ressources).",
-     "Automatic configuration backup policy (PV/PVC manifests and resources)."),
-    ("Systèmes enregistrés via l'engrenage en haut à droite : HYCU, Prism Element, Prism Central.",
-     "Systems registered via the gear at the top right: HYCU, Prism Element, Prism Central."),
-    ("Cluster Kubernetes ciblé par kubectl.", "Kubernetes cluster targeted by kubectl."),
-    ("Opérations des 7 derniers jours (sauvegardes, restaurations, clones), d'après le journal d'audit.",
-     "Operations over the last 7 days (backups, restores, clones), from the audit log."),
     ('dnums("Protection"', 'dnums("Protection"'),
     ('"Conformité"', '"Compliance"'),
     ('"Connectées"', '"Connected"'),
@@ -11491,12 +11480,8 @@ I18N_EN += [
     ("Historique des tâches (jours ; 0 = illimité)", "Job history (days; 0 = unlimited)"),
     ('">Stockage <', '">Storage <'),
     ('">Santé des clusters <', '">Cluster health <'),
-    ("Dernier contrôle de joignabilité de chaque cluster (lecture seule, périodique).",
-     "Last reachability check of each cluster (read-only, periodic)."),
     ('"Pas encore contrôlé"', '"Not checked yet"'),
     (">Gérer les clusters</a>", ">Manage clusters</a>"),
-    ("État du disque qui héberge les sauvegardes de configuration (espace libre, volume occupé, versions).",
-     "State of the disk hosting the configuration backups (free space, used volume, versions)."),
     ("Dossier absent : ", "Folder missing: "),
     (">disque presque plein<", ">disk almost full<"),
     ('"Disque rempli à "', '"Disk "'),
