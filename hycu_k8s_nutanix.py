@@ -307,7 +307,7 @@ def save_config(updates):
 
 # Version horodatée de la build (format AAAAMMJJ-HHMM). À incrémenter à chaque
 # changement notable du programme ; affichée dans l'en-tête de l'interface.
-VERSION = "20260925-0210"
+VERSION = "20260925-0330"
 
 # Jeton anti-CSRF généré au démarrage, injecté dans la page et exigé sur les POST.
 CSRF_TOKEN = secrets.token_urlsafe(32)
@@ -2581,6 +2581,7 @@ HELP_SECTIONS = [
 <li><b>Restaurez les données</b> : dans HYCU, restaurez/clonez les Volume Groups de l'application vers le site cible, et notez leurs UUID.</li>
 <li><b>Activez la dérogation</b> : ⚙ → Réglages → <b>Autoriser la restauration DR</b> (le temps de l'opération).</li>
 <li><b>Assistant → Restauration DR</b> : choisissez la sauvegarde source (cluster disparu ou import S3), le namespace cible, collez l'UUID de chaque VG restauré, remappez la StorageClass si le site cible en utilise une autre — simulation d'abord, puis réel (re-saisie du cluster cible).</li>
+<li><b>Sans saisie (HYCU connecté)</b> : le bouton <b>« Créer les volumes automatiquement via HYCU »</b> clone les Volume Groups depuis leurs sauvegardes HYCU et inscrit tout seul les nouveaux identifiants — plus aucun UUID à recopier. En simulation, seul le plan est affiché.</li>
 <li><b>Après</b> : vérifiez l'application, re-protégez ses Volume Groups dans HYCU, désactivez la dérogation DR.</li>
 </ol>
 <div class="tip">Tout le reste du temps, laissez « Autoriser la restauration DR » désactivé : la garde inter-cluster/contexte protège contre les restaurations croisées accidentelles. Un Secret masqué à la sauvegarde n'est jamais restauré : re-provisionnez-le depuis sa source.</div>"""),
@@ -5015,6 +5016,142 @@ def action_hycu_job(job_id):
             "progress": progress}
 
 
+# ---- Auto-provisionnement (P2) : cloner un VG via HYCU et DÉCOUVRIR son nouvel UUID,
+#      pour supprimer la saisie manuelle d'UUID lors des restaurations. -----------------
+_JOB_OK = {"OK", "SUCCESS", "SUCCEEDED", "COMPLETED", "DONE", "FINISHED"}
+_JOB_KO = {"ERROR", "FAILED", "ABORTED", "CANCELED", "CANCELLED", "TIMEOUT"}
+
+
+def _discover_vg_uuid_by_name(name):
+    """UUID d'un Volume Group à partir de son NOM (après un clone HYCU qui lui a donné
+    ce nom). Prism d'abord (source de vérité côté Nutanix), repli HYCU. Une ambiguïté
+    (plusieurs VG du même nom) n'est JAMAIS tranchée au hasard. Renvoie (uuid, erreur)."""
+    nl = (name or "").strip().lower()
+    if not nl:
+        return None, "Nom de Volume Group vide."
+    try:
+        res = action_nutanix_vgs(query=name)
+    except Exception as e:
+        res = {"ok": False, "error": str(e)}
+    if res.get("ok"):
+        hits = [v for v in (res.get("vgs") or [])
+                if (v.get("name") or "").strip().lower() == nl and v.get("uuid")]
+        uniq = list(dict.fromkeys(v["uuid"] for v in hits))
+        if len(uniq) == 1:
+            return uniq[0], None
+        if len(uniq) > 1:
+            return None, ("Plusieurs Volume Groups nommés « %s » côté Nutanix : ambiguïté — "
+                          "résolution manuelle requise." % name)
+    # Repli HYCU (le VG cloné peut y apparaître).
+    try:
+        items, herr = _hycu_list_vgs()
+    except Exception as e:
+        items, herr = None, str(e)
+    if not herr:
+        ext = []
+        for v in items or []:
+            if isinstance(v, dict) and (v.get("name") or "").strip().lower() == nl:
+                m = UUID_RE.search(v.get("externalId") or "") or (UUID_RE.search(v.get("uuid") or "") if v.get("uuid") else None)
+                if m:
+                    ext.append(m.group(0))
+        ext = list(dict.fromkeys(ext))
+        if len(ext) == 1:
+            return ext[0], None
+        if len(ext) > 1:
+            return None, "Plusieurs Volume Groups nommés « %s » côté HYCU : ambiguïté." % name
+    return None, "Volume Group « %s » introuvable après le clone (Prism/HYCU)." % name
+
+
+def _await_hycu_job(job_id, timeout_s=600, poll_s=3):
+    """Attend la fin d'un job HYCU. Renvoie (ok, dernier_statut, erreur)."""
+    if not job_id:
+        return False, None, "Identifiant de job HYCU manquant."
+    deadline = time.time() + max(5, int(timeout_s))
+    last = None
+    while time.time() < deadline:
+        j = action_hycu_job(job_id)
+        if not j.get("ok"):
+            return False, last, j.get("error") or "Lecture du job HYCU impossible."
+        st = (j.get("status") or "").strip().upper()
+        last = st or last
+        if st in _JOB_OK:
+            return True, st, None
+        if st in _JOB_KO:
+            return False, st, "Job HYCU terminé en échec (%s)." % st
+        time.sleep(max(1, int(poll_s)))
+    return False, last, "Délai dépassé en attendant le job HYCU %s (dernier statut : %s)." % (job_id, last or "?")
+
+
+def action_hycu_provision_clone(payload):
+    """Auto-provisionnement : pour chaque volume, clone le Volume Group source via HYCU
+    (nom imposé, unique et horodaté), attend le job, puis DÉCOUVRE l'UUID du nouveau VG
+    (Prism, repli HYCU). But : remplir automatiquement les `items` d'une restauration
+    SANS aucune saisie d'UUID par l'humain.
+
+    payload : { volumes:[{pvc, source_vg_uuid, restore_point_id?}], dry, job_timeout_s? }.
+      - dry=True (défaut) : n'appelle PAS HYCU (aucun VG créé) ; renvoie le PLAN.
+      - restore_point_id absent : le point de restauration le PLUS RÉCENT est choisi.
+    Renvoie { ok, dry, items:[{pvc, new_ref}], log:[...], error }.
+    Repli : en cas d'échec/ambiguïté/HYCU indisponible, `ok=False` + message clair —
+    l'appelant garde la saisie manuelle."""
+    dry = bool(payload.get("dry", True))
+    vols = payload.get("volumes") or []
+    if not vols:
+        return {"ok": False, "error": "Aucun volume à provisionner.", "items": [], "log": []}
+    if not dry and not SESSION_CREDS.get("hycu"):
+        return {"ok": False, "error": "Connectez HYCU pour créer les volumes automatiquement "
+                "(sinon, saisissez les UUID manuellement).", "items": [], "log": []}
+    if not dry and not (SESSION_CREDS.get("prismcentral") or SESSION_CREDS.get("nutanix")):
+        return {"ok": False, "error": "Connectez Prism (Element ou Central) : la découverte de "
+                "l'UUID du VG cloné s'y fait.", "items": [], "log": []}
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    timeout_s = int(payload.get("job_timeout_s") or 600)
+    items, log = [], []
+    for i, v in enumerate(vols):
+        pvc = v.get("pvc")
+        src = (v.get("source_vg_uuid") or "").strip()
+        if not pvc or not src or not UUID_RE.search(src):
+            return {"ok": False, "error": "Volume « %s » : UUID du VG source manquant/invalide "
+                    "(re-lancez l'analyse HYCU)." % (pvc or "?"), "items": [], "log": log}
+        # Nom imposé, UNIQUE : garantit une découverte non ambiguë par le nom.
+        new_name = re.sub(r"[^a-zA-Z0-9-]", "-", "hycurestore-%s-%s-%d" % (pvc, ts, i))[:60].strip("-")
+        rp = (v.get("restore_point_id") or "").strip()
+        if not rp:
+            pts = action_hycu_restore_points(src)
+            good = [p for p in (pts.get("points") or []) if p.get("restorable", True)]
+            if not good:
+                return {"ok": False, "error": "Volume « %s » : aucun point de restauration HYCU "
+                        "disponible pour le VG source." % pvc, "items": [], "log": log}
+            rp = good[0].get("id")
+        if dry:
+            log.append(logentry("Plan : HYCU clonera le VG %s (point %s) -> nouveau VG « %s », "
+                                "puis l'UUID sera découvert automatiquement." % (src, rp, new_name),
+                                dry=True, rc=None))
+            items.append({"pvc": pvc, "new_ref": None, "planned_name": new_name})
+            continue
+        # Réel : déclencher le clone HYCU (nom imposé), attendre, découvrir l'UUID.
+        rr = action_hycu_restore({"restore_point_id": rp, "mode": "clone", "new_name": new_name,
+                                  "source_uuid": src, "dry": False})
+        if not rr.get("ok"):
+            return {"ok": False, "error": "Volume « %s » : clone HYCU refusé : %s"
+                    % (pvc, rr.get("error")), "items": items, "log": log}
+        job_id = rr.get("job_id")
+        log.append(logentry("Clone HYCU lancé pour %s (VG source %s, point %s, job %s)"
+                            % (pvc, src, rp, job_id), stdout="Nouveau VG demandé : %s" % new_name))
+        ok, st, jerr = _await_hycu_job(job_id, timeout_s=timeout_s)
+        if not ok:
+            return {"ok": False, "error": "Volume « %s » : %s" % (pvc, jerr), "items": items, "log": log}
+        new_uuid, derr = _discover_vg_uuid_by_name(new_name)
+        if not new_uuid:
+            return {"ok": False, "error": "Volume « %s » : clone HYCU terminé mais %s"
+                    % (pvc, (derr or "UUID introuvable")), "items": items, "log": log}
+        log.append(logentry("UUID du VG cloné découvert automatiquement pour %s" % pvc,
+                            stdout="%s -> %s (VG « %s »)" % (src, new_uuid, new_name)))
+        items.append({"pvc": pvc, "new_ref": new_uuid, "vg_name": new_name})
+    audit("hycu_provision_clone", count=len(items), dry=dry)
+    return {"ok": True, "dry": dry, "items": items, "log": log}
+
+
 # ----- HYCU : protéger réellement les données (assigner politique + sauvegarder) -----
 def action_hycu_policies():
     """Liste les politiques de protection HYCU."""
@@ -6225,6 +6362,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._json(action_hycu_restore(payload))
             if path == "/api/hycu/job":
                 return self._json(action_hycu_job(payload.get("job_id")))
+            if path == "/api/hycu/provision_clone":
+                return self._json(action_hycu_provision_clone(payload))
             if path == "/api/creds/save":
                 return self._json(action_save_credentials(payload))
             if path == "/api/creds/load":
@@ -7153,6 +7292,10 @@ HTML = r"""<!DOCTYPE html>
         </div>
         <label class="fld" id="drVolsLabel">Volumes — collez l'UUID du VG restauré/cloné sur le site cible</label>
         <div id="drVols"></div>
+        <div id="drAutoWrap" style="display:none;margin:8px 0 2px">
+          <button class="btn ghost" id="drAuto" type="button">Créer les volumes automatiquement via HYCU</button>
+          <span class="hint" style="margin-left:8px">HYCU clone les Volume Groups et l'outil récupère les nouveaux identifiants — aucune saisie. En simulation, seul le plan est affiché.</span>
+        </div>
         <div id="drLog" style="margin-top:10px"></div>
         <div id="drErr"></div>
       </div>
@@ -9854,9 +9997,28 @@ function drSyncReuse(){
   $("#drVolsLabel").style.display = (drMode==="recover")? (reuse?"none":"block") : "block";
   if(drMode==="recover") $("#drVolsLabel").textContent="Nouveaux volumes — collez l'identifiant (UUID) fourni par HYCU";
   else $("#drVolsLabel").textContent="Volumes — collez l'UUID du VG restauré/cloné sur le site cible";
+  // Bouton « auto HYCU » : seulement quand la grille est visible ET HYCU + Prism connectés.
+  const autoOk = !reuse && (conn.hycu&&conn.hycu.connected)
+                 && ((conn.prismcentral&&conn.prismcentral.connected)||(conn.nutanix&&conn.nutanix.connected));
+  $("#drAutoWrap").style.display = autoOk? "block":"none";
   rsWizSync();
 }
 $("#drReuse").onchange=drSyncReuse;
+// Auto-provisionnement : HYCU clone les VG et l'outil découvre leurs nouveaux UUID,
+// qu'il inscrit dans la grille (aucune saisie). Simulation = plan seulement.
+$("#drAuto").onclick=async()=>{
+  const b=drSel(); if(!b) return;
+  const refs=(b&&b.vol_refs)||{};
+  const volumes=[...document.querySelectorAll(".drRef")].map(t=>({pvc:t.dataset.pvc, source_vg_uuid:refs[t.dataset.pvc]||""}));
+  if(!volumes.length || volumes.some(v=>!v.source_vg_uuid)){
+    $("#drErr").innerHTML=errBox("UUID du VG source absent de la sauvegarde : automatisation impossible, saisissez les UUID manuellement."); return; }
+  $("#drErr").innerHTML=""; $("#drLog").innerHTML='<div class="hint"><span class="spin"></span>HYCU : création des volumes…</div>';
+  const r=await post("/api/hycu/provision_clone", {volumes, dry:dry()});
+  if(!r.ok){ $("#drErr").innerHTML=errBox(r.error); $("#drLog").innerHTML=renderLog(r.log||[]); return; }
+  if(!r.dry){ (r.items||[]).forEach(it=>{ const el=document.querySelector('.drRef[data-pvc="'+(window.CSS&&CSS.escape?CSS.escape(it.pvc):it.pvc)+'"]'); if(el && it.new_ref) el.value=it.new_ref; }); }
+  $("#drLog").innerHTML=renderLog(r.log||[]);
+  rsWizSync();
+};
 $("#drTargetNs").oninput=()=>rsWizSync();
 async function drRun(){
   const b=drSel(); if(!b) return;
@@ -11704,6 +11866,12 @@ I18N_EN += [
     ("Rien à saisir : l'application est rebranchée sur ses volumes Nutanix d'origine (leurs identifiants sont dans la sauvegarde). Décochez seulement si vous avez restauré les données sur de <b>nouveaux</b> volumes dans HYCU.",
      "Nothing to enter: the application is reconnected to its original Nutanix volumes (their IDs are in the backup). Only untick if you restored the data onto <b>new</b> volumes in HYCU."),
     ("Nouveaux volumes — collez l'identifiant (UUID) fourni par HYCU", "New volumes — paste the ID (UUID) provided by HYCU"),
+    ("Créer les volumes automatiquement via HYCU", "Create the volumes automatically via HYCU"),
+    ("HYCU clone les Volume Groups et l'outil récupère les nouveaux identifiants — aucune saisie. En simulation, seul le plan est affiché.",
+     "HYCU clones the Volume Groups and the tool retrieves the new IDs — nothing to enter. In simulation, only the plan is shown."),
+    ("UUID du VG source absent de la sauvegarde : automatisation impossible, saisissez les UUID manuellement.",
+     "Source VG UUID missing from the backup: automation not possible, enter the UUIDs manually."),
+    ("HYCU : création des volumes…", "HYCU: creating the volumes…"),
     ("UUID du Volume Group (8-4-4-4-12)", "Volume Group UUID (8-4-4-4-12)"),
     ("UUID du VG restauré/cloné sur le site cible (8-4-4-4-12)", "UUID of the VG restored/cloned on the target site (8-4-4-4-12)"),
     (" » (le namespace n'existe plus sur le cluster).", " » (the namespace no longer exists on the cluster)."),
@@ -11737,6 +11905,8 @@ I18N_EN += [
      "<b>Restore the data</b>: in HYCU, restore/clone the application's Volume Groups to the target site, and note their UUIDs."),
     ("<b>Activez la dérogation</b> : ⚙ → Réglages → <b>Autoriser la restauration DR</b> (le temps de l'opération).",
      "<b>Enable the override</b>: ⚙ → Settings → <b>Allow DR restore</b> (for the duration of the operation)."),
+    ("<b>Sans saisie (HYCU connecté)</b> : le bouton <b>« Créer les volumes automatiquement via HYCU »</b> clone les Volume Groups depuis leurs sauvegardes HYCU et inscrit tout seul les nouveaux identifiants — plus aucun UUID à recopier. En simulation, seul le plan est affiché.",
+     "<b>No manual entry (HYCU connected)</b>: the <b>“Create the volumes automatically via HYCU”</b> button clones the Volume Groups from their HYCU backups and fills in the new IDs itself — no UUID to copy anymore. In simulation, only the plan is shown."),
     ("<b>Assistant → Restauration DR</b> : choisissez la sauvegarde source (cluster disparu ou import S3), le namespace cible, collez l'UUID de chaque VG restauré, remappez la StorageClass si le site cible en utilise une autre — simulation d'abord, puis réel (re-saisie du cluster cible).",
      "<b>Wizard → DR restore</b>: pick the source backup (lost cluster or S3 import), the target namespace, paste each restored VG's UUID, remap the StorageClass if the target site uses another one — simulation first, then real (target cluster retyped)."),
     ("<b>Après</b> : vérifiez l'application, re-protégez ses Volume Groups dans HYCU, désactivez la dérogation DR.",

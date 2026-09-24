@@ -177,18 +177,22 @@ liste complète que « pour les experts ».
   case « réutiliser les volumes d'origine » cochée par défaut, grille d'UUID
   masquée. Backend `action_clone_app` mode `recover`, `action_dr_backups.vol_refs`.
 
-- **P1 — Contrat de restauration à la sauvegarde (fondations, faible risque).**
-  Écrire le bloc `restore_contract` + `systems` dans `index.json` au moment du
-  backup, **best-effort** (n'échoue jamais le backup). Tests : un backup avec
-  HYCU/Prism simulés remplit le contrat ; un backup sans connexion reste valide.
-  *Aucune modification du flux de restauration* — on prépare le terrain.
+- **P1 — Contrat de restauration à la sauvegarde — LIVRÉ (v20260925…).**
+  Bloc `restore_contract` (vg_uuid, vg_name, hycu_source_uuid, disk_extids,
+  pe_uuid, hycu_latest_backup) + `systems` écrits dans `index.json` au backup,
+  **best-effort** (n'échoue jamais le backup, ignoré si HYCU/Prism absents).
+  Réglage `backup_collect_restore_contract`. Tests `_test_contract`.
 
-- **P2 — Découverte automatique de l'UUID sur clone (le cœur).** Nouvel étage
-  d'orchestration : `action_hycu_restore` renvoie aussi l'UUID du VG créé
-  (lecture par nom après job) ; `action_clone_app`/DR acceptent un mode
-  « laisser HYCU cloner et découvrir » qui supprime la saisie sur **copie /
-  nouveaux volumes / DR**. Fortement testable avec un faux HYCU + faux Prism
-  (mêmes patrons que `_test_s3.py`/`_test_dr.py`).
+- **P2 — Découverte automatique de l'UUID — LIVRÉ (moteur + endpoint + UI opt-in).**
+  `action_hycu_provision_clone` : clone le VG via HYCU (nom imposé, unique),
+  attend le job (`_await_hycu_job`), puis **découvre l'UUID** du nouveau VG par
+  son nom (`_discover_vg_uuid_by_name` : Prism d'abord, repli HYCU, ambiguïté
+  jamais tranchée au hasard). Endpoint `/api/hycu/provision_clone`. Bouton
+  **« Créer les volumes automatiquement via HYCU »** dans l'assistant (visible
+  si HYCU + Prism connectés) : simulation-first, remplit la grille tout seul,
+  **repli** vers la saisie manuelle sur tout échec. Tests `_test_provision` +
+  parcours navigateur. **À valider sur ton appliance** (cf. §11) avant d'en faire
+  le défaut silencieux — pour l'instant c'est un bouton explicite et sûr.
 
 - **P3 — Alignement des lignes de temps + un seul écran.** Sélecteur unique
   « restaurer à la date… » qui choisit config **et** données ; liste détaillée
