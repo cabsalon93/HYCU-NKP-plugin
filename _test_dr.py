@@ -2,7 +2,6 @@
 """Restauration DR (reprise d'activité) : garde-fou allow_dr_restore, clone
 « depuis la sauvegarde seule » (aucune lecture du cluster d'origine), remap de
 StorageClass, inventaire /api/dr/backups."""
-import datetime
 import json
 import os
 import shutil

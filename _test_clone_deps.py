@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 """Tests du clone des dépendances cross-namespace (Secrets/ConfigMaps/SA/Services)."""
-import json
 import hycu_k8s_nutanix as H
 
 passed = failed = 0
