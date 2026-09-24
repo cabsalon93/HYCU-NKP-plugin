@@ -307,7 +307,7 @@ def save_config(updates):
 
 # Version horodatée de la build (format AAAAMMJJ-HHMM). À incrémenter à chaque
 # changement notable du programme ; affichée dans l'en-tête de l'interface.
-VERSION = "20260925-0420"
+VERSION = "20260925-0450"
 
 # Jeton anti-CSRF généré au démarrage, injecté dans la page et exigé sur les POST.
 CSRF_TOKEN = secrets.token_urlsafe(32)
@@ -5180,10 +5180,13 @@ def action_hycu_provision_clone(payload):
             if resolved:
                 hy_src = resolved
         if dry:
-            log.append(logentry("Plan : HYCU clonera le VG %s (point %s) -> nouveau VG « %s », "
-                                "puis l'UUID sera découvert automatiquement." % (src, rp, new_name),
-                                dry=True, rc=None))
-            items.append({"pvc": pvc, "new_ref": None, "planned_name": new_name})
+            resolved_note = (" (identité HYCU résolue depuis %s)" % src) if hy_src != src else ""
+            detail = "%s : source HYCU %s%s, point de restauration %s, nouveau VG %s" % (
+                pvc, hy_src, resolved_note, rp, new_name)
+            log.append(logentry("Simulation du clone automatique via HYCU (aucun clone réel lancé).",
+                                dry=True, rc=None, stdout=detail))
+            items.append({"pvc": pvc, "new_ref": None, "planned_name": new_name,
+                          "hycu_source": hy_src, "restore_point_id": rp})
             continue
         # Réel : déclencher le clone HYCU (nom imposé), attendre, découvrir l'UUID.
         rr = action_hycu_restore({"restore_point_id": rp, "mode": "clone", "new_name": new_name,
@@ -11936,6 +11939,12 @@ I18N_EN += [
      "Nothing to enter: the application is reconnected to its original Nutanix volumes (their IDs are in the backup). Only untick if you restored the data onto <b>new</b> volumes in HYCU."),
     ("Nouveaux volumes — collez l'identifiant (UUID) fourni par HYCU", "New volumes — paste the ID (UUID) provided by HYCU"),
     ("Créer les volumes automatiquement via HYCU", "Create the volumes automatically via HYCU"),
+    ("Simulation du clone automatique via HYCU (aucun clone réel lancé).",
+     "Simulation of the automatic clone via HYCU (no real clone launched)."),
+    (" : source HYCU ", ": HYCU source "),
+    (" (identité HYCU résolue depuis ", " (HYCU identity resolved from "),
+    (", point de restauration ", ", restore point "),
+    (", nouveau VG ", ", new VG "),
     ("HYCU clone les Volume Groups et l'outil récupère les nouveaux identifiants — aucune saisie. En simulation, seul le plan est affiché.",
      "HYCU clones the Volume Groups and the tool retrieves the new IDs — nothing to enter. In simulation, only the plan is shown."),
     ("UUID du VG source absent de la sauvegarde : automatisation impossible, saisissez les UUID manuellement.",

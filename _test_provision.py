@@ -40,6 +40,28 @@ try:
     check(r["items"][0]["new_ref"] is None and r["items"][0].get("planned_name", "").startswith("hycurestore-data-"),
           "plan : aucun UUID encore, nom de VG cible imposé")
 
+    print("\n== Simulation informative : identité HYCU résolue (VG supprimé), point affiché ==")
+    # Cas réel : sauvegarde ancienne -> on n'a que l'UUID Source (Nutanix) ; HYCU garde le
+    # VG « Protected deleted » avec HYCU UUID != Source UUID.
+    NSRC = "a6a2d63d-52fd-41b2-518f-a119566b744a"   # Source UUID (externalId Nutanix)
+    NHY = "f10d53aa-9f88-43a2-86dc-c762bf39693d"    # HYCU UUID
+    with H.CRED_LOCK:
+        H.SESSION_CREDS["hycu"] = {"access": "a", "secret": "b"}
+    H._hycu_list_vgs = lambda: ([{"uuid": NHY, "name": "pvc-afae3cb2", "externalId": NSRC, "hasBackups": True}], None)
+    H.action_hycu_restore_points = lambda src: ({"ok": True, "points": [
+        {"id": "rp-1", "time": "2026-09-24 04:00", "restorable": True}]} if src == NHY else {"ok": True, "points": []})
+    r = H.action_hycu_provision_clone({"volumes": [{"pvc": "mariadb-pvc", "source_vg_uuid": NSRC,
+                                                    "vg_name": "pvc-afae3cb2"}], "dry": True})
+    check(r["ok"] and r["dry"], "simulation OK sur un VG supprimé (identité résolue)")
+    check(r["items"][0].get("hycu_source") == NHY and r["items"][0].get("restore_point_id") == "rp-1",
+          "plan : identité HYCU résolue depuis l'UUID Source + point de restauration trouvé")
+    with H.CRED_LOCK:
+        H.SESSION_CREDS["hycu"] = None
+    H._hycu_list_vgs = s_list
+    # Restaure le stub « point le plus récent » attendu par la section suivante.
+    H.action_hycu_restore_points = lambda src: {"ok": True, "points": [
+        {"id": "rp-latest", "time": "2026-09-25 01:00", "restorable": True}]}
+
     print("\n== Réel : clone HYCU + attente job + découverte de l'UUID ==")
     with H.CRED_LOCK:
         H.SESSION_CREDS["hycu"] = {"access": "a", "secret": "b"}
