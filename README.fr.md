@@ -174,7 +174,7 @@ browser (`hycu_lang` cookie); French is the default.*
 ## 4. Utilisation — interface HYCU Enterprise Cloud
 
 L'interface reprend le **look et la logique de HYCU Enterprise Cloud** : couleurs
-HYCU, **barre du haut** (logo HYCU, cluster ciblé, ⚙ **Sources**, `?` **À propos**,
+HYCU, **barre du haut** (logo HYCU, **sélecteur du cluster actif**, ⚙ **Sources**, `?` **À propos**,
 EN/FR), **menu latéral** de pages, et chaque opération part d'une **liste
 d'entités** : on sélectionne une ligne, on clique une **action en haut à droite**,
 puis un **assistant** guide l'opération. Un bandeau rappelle en permanence si le
@@ -182,18 +182,82 @@ puis un **assistant** guide l'opération. Un bandeau rappelle en permanence si l
 
 | Page / élément | Rôle |
 |---|---|
-| **Tableau de bord** | Tuiles façon HYCU : *Applications* (anneaux protection / conformité), *Politique* (sauvegarde automatique de la configuration), *Sources* (connectées / configurées), *Cluster* (contexte kubectl), graphique des *Tâches* sur 7 jours et *Dernières tâches*. |
-| **Applications** | Une ligne par namespace autorisé (= application Kubernetes) : politique, **Conformité**, **Protection**, dernière sauvegarde, versions. Actions : **Sauvegarder**, **Restaurer**, **Définir la politique**, **Vérifier** ; l'entonnoir = filtre des namespaces. |
+| **Tableau de bord** | Tuiles façon HYCU : *Applications* (anneaux protection / conformité), *Politique* (sauvegarde automatique de la configuration), *Sources* (connectées / configurées), *Cluster* (cluster actif, workspace, clusters enregistrés), graphique des *Tâches* sur 7 jours et *Dernières tâches*. |
+| **Applications** | Une ligne par namespace autorisé (= application Kubernetes) : politique, **Conformité**, **Protection**, dernière sauvegarde, versions. Actions : **Sauvegarder**, **Restaurer**, **Définir la politique**, **Vérifier** ; l'entonnoir = filtre des namespaces. Bascule **Cluster actif / Tous les clusters** (regroupement workspace NKP → cluster). |
 | **Politiques** | La politique de sauvegarde automatique de la **configuration** (fréquence, rétention, cible) et les **politiques HYCU** (données), en lecture. |
-| **Tâches** | Historique des opérations (sauvegardes, restaurations, clones, protection HYCU) avec compteurs **Succès / Échec / Simulation / En cours**. |
-| **Réglages** | Cluster cible (kubeconfig / contexte) et réglages par client. |
-| **⚙ (en haut à droite)** | **Sources** : enregistrer **HYCU**, **Prism Element**, **Prism Central** et le coffre d'identifiants chiffré (optionnel). |
+| **Tâches** | Historique des opérations (sauvegardes, restaurations, clones, protection HYCU) avec compteurs **Succès / Échec / Simulation / En cours** et le **cluster** de chaque tâche. |
+| **Réglages** | Cluster local (kubeconfig / contexte) et réglages par client. |
+| **Cluster (barre du haut)** | Sélecteur du **cluster actif** : changer de cluster, en ajouter, les gérer (voir ci-dessous). |
+| **⚙ (en haut à droite)** | **Sources** : enregistrer **HYCU**, **Prism Element**, **Prism Central**, vos **clusters Kubernetes** (kubeconfigs, découverte des workspaces NKP) et le coffre d'identifiants chiffré (optionnel). |
 
 Les icônes d'état suivent HYCU : **✓ vert** OK, **✕ rouge** échec / non conforme,
 **? gris** inconnu / jamais sauvegardé. Une application est **protégée** dès
 qu'elle a au moins une sauvegarde de configuration, et **conforme** quand sa
 dernière sauvegarde date de moins que l'intervalle de la politique (24 h si la
 sauvegarde automatique est désactivée).
+
+### Plusieurs clusters (kubeconfigs) & workspaces NKP
+Le **cluster affiché dans la barre du haut est le cluster actif** : toutes les
+pages et toutes les opérations le ciblent. Cliquez dessus pour changer de cluster,
+en ajouter un ou les gérer.
+
+- **Cluster local** — celui de la configuration (`kubeconfig_path` /
+  `kube_context`, ou la résolution par défaut de kubectl) : comportement inchangé,
+  réglé dans **Réglages**.
+- **Ajouter un cluster Kubernetes** (⚙ Sources, ou le menu des clusters) : chargez
+  un fichier **kubeconfig** ou collez-le (YAML ou JSON), choisissez le **contexte**
+  s'il y en a plusieurs, puis **Tester & ajouter** (test de connexion en lecture
+  seule, 10 s max). L'outil **analyse l'authentification** du contexte et vous
+  avertit en cas de :
+  - **plugin exec** (`kubelogin`, `kubectl-oidc_login`…) : la commande doit être
+    installée là où tourne l'outil — elle est absente de l'image conteneur — et une
+    connexion OIDC interactive (navigateur) ne peut pas être pilotée par l'outil ;
+  - **jeton OIDC / JWT** : expiration détectée — avertissement sous 24 h, erreur une
+    fois expiré (les sauvegardes planifiées échoueraient ensuite) ;
+  - **auth-provider** déprécié, **fichiers** locaux de certificat/jeton,
+    `insecure-skip-tls-verify`.
+
+  Pour un usage durable (sauvegarde automatique), préférez un **jeton de
+  ServiceAccount** ou un certificat client.
+- **Les kubeconfigs sont des secrets** : comme les mots de passe, ils restent **en
+  mémoire** le temps de la session navigateur (plus un fichier temporaire privé
+  `0600` — en RAM, `/dev/shm`, si disponible — supprimé au retrait, au verrouillage
+  de session et à l'arrêt). Ils ne sont écrits sur disque que **chiffrés**, dans le
+  coffre, si vous le choisissez : **Enregistrer (chiffrer)** mémorise aussi les
+  clusters ajoutés, **Charger** les restaure.
+- **Sauvegardes séparées par cluster** : `hycu-backups/<namespace>/…` pour le
+  cluster local (disposition inchangée), `hycu-backups/_clusters/<cluster>/<namespace>/…`
+  pour chaque cluster ajouté. Chaque sauvegarde enregistre son cluster, et
+  **restaurer une sauvegarde sur un autre cluster est refusé** (la restauration
+  inter-clusters n'est pas prise en charge).
+- **Garde-fous et audit par cluster** : les confirmations en mode réel nomment le
+  **cluster ciblé** (re-saisie de son nom), `allowed_contexts` accepte aussi les
+  noms de cluster, chaque entrée d'audit enregistre le `cluster`, la page **Tâches**
+  a une colonne *Cluster*, et le **filtre des namespaces est propre à chaque
+  cluster** (`cluster_namespace_filters`).
+- La **sauvegarde automatique** couvre **tous les clusters connus** à chaque
+  passage (un cluster local non configuré est ignoré).
+- **Applications → Tous les clusters** liste les applications de tous les clusters
+  d'un coup, **regroupées par workspace NKP → cluster**. Une action sur la ligne
+  d'un autre cluster bascule d'abord le cluster actif ; **Sauvegarder** fonctionne
+  sur plusieurs clusters en une fois.
+
+**Découverte des workspaces NKP (optionnelle).** NKP organise les clusters en
+**workspaces**, gérés depuis le **cluster de management**. Rendez le cluster de
+management actif, puis ⚙ Sources → **Découvrir les workspaces NKP** : l'outil liste
+les objets `Workspace` et leurs `KommanderCluster` (lecture seule), regroupés par
+workspace. Cochez les clusters, acquittez l'avertissement, puis **Importer la
+sélection** : le kubeconfig de chaque cluster est lu dans son Secret
+(`spec.kubeconfigRef`), testé et enregistré avec son workspace. Un kubeconfig importé
+reposant sur un **plugin exec** est **refusé** (l'outil exécuterait une commande
+décrite dans le Secret).
+
+> ⚠️ La découverte exige des **droits élevés** sur le cluster de management
+> (lecture des Workspaces, des KommanderClusters et des **Secrets** kubeconfig des
+> namespaces de workspace), et les kubeconfigs importés donnent généralement un
+> accès **administrateur** aux clusters. Ne l'utilisez que si c'est compatible avec
+> votre politique de sécurité ; sinon ajoutez chaque cluster avec un kubeconfig
+> dédié et restreint.
 
 ### Sauvegarder (Applications → Sauvegarder)
 Sélectionnez une ou plusieurs applications → **Sauvegarder**. L'outil exporte et
@@ -279,13 +343,19 @@ Running ; plafond ~10 min — recliquez pour arrêter).
 - Le serveur **n'écoute que sur `127.0.0.1`** (jamais exposé au réseau).
 - Protection **anti-CSRF / anti-DNS-rebinding** : vérification des en-têtes `Host`
   et `Origin`/`Referer`, et **jeton anti-CSRF** exigé sur chaque action.
-- **Dry-run par défaut** ; confirmation du contexte avant toute action réelle.
+- **Dry-run par défaut** ; confirmation du cluster/contexte ciblé avant toute action réelle.
 - **Identifiants liés à la session navigateur** : les identifiants HYCU/Nutanix sont
   liés à **une session de navigateur** (cookie de session `hycu_sess`). Ouvrir la page
   depuis un navigateur relancé, un autre navigateur ou une fenêtre privée **verrouille
   les connexions** — identifiants effacés de la mémoire, la phrase secrète du coffre
   (ou les mots de passe) sont redemandés. Un simple rechargement (F5) dans le même
-  navigateur conserve la session.
+  navigateur conserve la session. Les **kubeconfigs des clusters ajoutés** suivent la
+  même règle (effacés à une nouvelle session navigateur, restaurés en déverrouillant
+  le coffre).
+- **Isolation des clusters** : chaque requête désigne son cluster ; un cluster
+  inconnu n'exécute **aucune commande** (jamais de repli silencieux sur le cluster
+  local), les sauvegardes sont rangées par cluster et une sauvegarde ne peut être
+  restaurée que sur le cluster dont elle provient.
 - **Journal d'audit** append-only : `hycu-backups/audit.log` (horodaté : namespace,
   volumes, mode, dry/réel, résultat).
 - **Lecture des sauvegardes bornée** : par défaut, seuls les chemins **sous
@@ -307,8 +377,9 @@ la page **Réglages** de l'interface. Toutes les clés sont optionnelles.
 | Clé | Défaut | Rôle |
 |---|---|---|
 | `kubectl_path` | `"kubectl"` | Binaire kubectl. Ex. `"microk8s kubectl"`, `"k3s kubectl"`, ou chemin complet. |
-| `allowed_contexts` | `[]` | Liste blanche de contextes kubectl. `[]` = tous. En mode réel, un contexte hors liste est **refusé**. |
-| `namespace_filter` | `[]` | Liste blanche de namespaces. `[]` = tous. |
+| `allowed_contexts` | `[]` | Liste blanche de contextes kubectl (ou de noms de clusters ajoutés dans ⚙ Sources). `[]` = tous. En mode réel, un contexte hors liste est **refusé**. |
+| `namespace_filter` | `[]` | Liste blanche de namespaces du cluster **local**. `[]` = tous. |
+| `cluster_namespace_filters` | `{}` | Listes blanches de namespaces des clusters **ajoutés dans ⚙ Sources**, par nom de cluster : `{"prod-paris": ["shop"]}`. Tenu à jour par l'éditeur de filtre. |
 | `wait_timeout` | `120` | Attente max (s) d'une suppression / d'un passage `Bound` / de l'arrêt des pods. |
 | `subprocess_margin` | `30` | Marge (s) du timeout subprocess au-dessus de `wait_timeout` (pour ne pas tuer `kubectl wait` avant son verdict). |
 | `clone_name_suffix` | `"0000"` | Convention HYCU pour le nom du PV cloné (suggestion pré-remplie, modifiable). |
@@ -335,8 +406,9 @@ la page **Réglages** de l'interface. Toutes les clés sont optionnelles.
 | `prismcentral_api_base` | `/api/nutanix/v3` | Base de l'API Prism Central v3. |
 | `prismcentral_verify_tls` | `false` | Vérifier le certificat TLS Prism Central. |
 
-> Les **identifiants** HYCU/Nutanix ne sont **jamais** dans la config : ils sont saisis
-> dans **⚙ Sources** et gardés en mémoire le temps de la session uniquement.
+> Les **identifiants** HYCU/Nutanix et les **kubeconfigs** des clusters ajoutés ne
+> sont **jamais** dans la config : ils sont saisis dans **⚙ Sources** et gardés en
+> mémoire le temps de la session uniquement (ou dans le coffre chiffré).
 
 ### Exemple — un client « microk8s », 2 namespaces, cluster de prod verrouillé
 ```json
@@ -372,6 +444,11 @@ vrai cluster** :
    **abort → relance** (vérifier que l'app revient à son nombre de réplicas
    d'origine, pas à 0), et un PVC bloqué en `Terminating`.
 6. `kubectl wait --for=jsonpath` nécessite **kubectl ≥ 1.23**.
+7. **Découverte des workspaces NKP** : les ressources utilisées
+   (`workspaces.kommander.mesosphere.io`, `kommanderclusters.kommander.mesosphere.io`,
+   `spec.kubeconfigRef`, clé de Secret `value` ou `kubeconfig`) suivent la
+   documentation NKP — à valider sur votre version de NKP, avec le RBAC que vous
+   comptez accorder.
 
 ## 8. Dépannage
 
@@ -384,6 +461,10 @@ vrai cluster** :
 | « Jeton anti-CSRF invalide » | Rechargez la page (le jeton est régénéré à chaque démarrage). |
 | Les connexions redemandent le déverrouillage | Comportement attendu : une nouvelle session navigateur (navigateur relancé, fenêtre privée) verrouille les identifiants — re-saisissez la phrase secrète du coffre. |
 | Séquence « interrompue » | Lire l'étape en cause dans le log, corriger, **relancer** (réplicas mémorisés). |
+| « Cluster « x » inconnu » | Le cluster actif a été retiré, ou une nouvelle session navigateur a effacé les clusters ajoutés : déverrouillez le coffre (ils reviennent) ou choisissez un autre cluster dans la barre du haut. |
+| Avertissement « plugin exec » / « jeton expiré » sur un cluster | Le kubeconfig dépend d'une commande de connexion externe ou d'un jeton à courte durée : régénérez-le, ou utilisez un jeton de ServiceAccount (voir §4, *Plusieurs clusters*). |
+| « Cette sauvegarde provient du cluster « x »… » | La restauration inter-clusters est refusée : sélectionnez le cluster d'origine de la sauvegarde dans la barre du haut. |
+| Découverte NKP : « ne semble pas être un cluster de management NKP » | Le cluster actif n'est pas le cluster de management, ou votre RBAC ne permet pas de lire les Workspaces/KommanderClusters. |
 
 ## 9. Sources HYCU / Nutanix (⚙ en haut à droite)
 

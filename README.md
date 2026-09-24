@@ -179,7 +179,7 @@ défaut.*
 ## 4. Using the tool — HYCU Enterprise Cloud interface
 
 The interface follows the **HYCU Enterprise Cloud** look and workflow: HYCU
-colours, a **top bar** (HYCU logo, target cluster, ⚙ **Sources**, `?` **About**,
+colours, a **top bar** (HYCU logo, **active cluster selector**, ⚙ **Sources**, `?` **About**,
 EN/FR), a **left menu** of pages, and every operation starts from an **entity
 list**: select a row, click an **action at the top right**, and a **wizard**
 guides you. A slim banner always shows whether **simulation mode** (default) or
@@ -187,17 +187,73 @@ guides you. A slim banner always shows whether **simulation mode** (default) or
 
 | Page / element | What it does |
 |---|---|
-| **Dashboard** | HYCU-style tiles: *Applications* (protection / compliance rings), *Policy* (automatic configuration backup), *Sources* (connected / configured), *Cluster* (kubectl context), 7-day *Jobs* chart and *Recent jobs*. |
-| **Applications** | One row per allowed namespace (= Kubernetes application): policy, **Compliance**, **Protection**, last backup, versions. Actions: **Back up**, **Restore**, **Set Policy**, **Verify**; funnel icon = namespace filter. |
+| **Dashboard** | HYCU-style tiles: *Applications* (protection / compliance rings), *Policy* (automatic configuration backup), *Sources* (connected / configured), *Cluster* (active cluster, workspace, registered clusters), 7-day *Jobs* chart and *Recent jobs*. |
+| **Applications** | One row per allowed namespace (= Kubernetes application): policy, **Compliance**, **Protection**, last backup, versions. Actions: **Back up**, **Restore**, **Set Policy**, **Verify**; funnel icon = namespace filter. **Active cluster / All clusters** toggle (grouped by NKP workspace → cluster). |
 | **Policies** | The automatic **configuration** backup policy (frequency, retention, target) and the **HYCU policies** (data), read-only. |
-| **Jobs** | History of operations (backups, restores, clones, HYCU protection) with **Success / Failed / Simulation / In progress** counters. |
-| **Settings** | Target cluster (kubeconfig / context) and per-customer settings. |
-| **⚙ (top right)** | **Sources**: register **HYCU**, **Prism Element**, **Prism Central** and the optional encrypted credentials vault. |
+| **Jobs** | History of operations (backups, restores, clones, HYCU protection) with **Success / Failed / Simulation / In progress** counters and the **cluster** of each job. |
+| **Settings** | Local cluster (kubeconfig / context) and per-customer settings. |
+| **Cluster (top bar)** | **Active cluster** selector: switch cluster, add one, manage them (see below). |
+| **⚙ (top right)** | **Sources**: register **HYCU**, **Prism Element**, **Prism Central**, your **Kubernetes clusters** (kubeconfigs, NKP workspace discovery) and the optional encrypted credentials vault. |
 
 Status icons follow HYCU: **green ✓** OK, **red ✕** failed / not compliant,
 **grey ?** unknown / never backed up. An application is **protected** once it has
 at least one configuration backup, and **compliant** when its latest backup is
 within the policy interval (24 h when the automatic backup is disabled).
+
+### Multiple clusters (kubeconfigs) & NKP workspaces
+The **cluster shown in the top bar is the active cluster**: every page and every
+operation targets it. Click it to switch cluster, add one, or manage them.
+
+- **Local cluster** — the one from the configuration (`kubeconfig_path` /
+  `kube_context`, or kubectl's default resolution): unchanged behaviour, set in
+  **Settings**.
+- **Add a Kubernetes cluster** (⚙ Sources, or the cluster menu): load a
+  **kubeconfig** file or paste it (YAML or JSON), pick the **context** if it has
+  several, then **Test & add** (read-only connection test, 10 s max). The tool
+  **analyses the authentication** of the context and warns you about:
+  - an **exec plugin** (`kubelogin`, `kubectl-oidc_login`…): the command must be
+    installed where the tool runs — it is absent from the container image — and an
+    interactive OIDC browser login cannot be driven by the tool;
+  - an **OIDC / JWT token**: expiry detected — warning under 24 h, error once
+    expired (scheduled backups would then fail);
+  - a deprecated **auth-provider**, local certificate/token **files**,
+    `insecure-skip-tls-verify`.
+
+  For long-lived use (automatic backup), prefer a **ServiceAccount token** or a
+  client certificate.
+- **Kubeconfigs are secrets**: like passwords, they stay **in memory** for the
+  browser session (plus a private `0600` temporary file — in RAM, `/dev/shm`, when
+  available — deleted on removal, session lock and shutdown). They are written to
+  disk only **encrypted**, in the vault, if you choose to: **Save (encrypt)** also
+  stores the added clusters and **Load** brings them back.
+- **Backups separated per cluster**: `hycu-backups/<namespace>/…` for the local
+  cluster (unchanged layout), `hycu-backups/_clusters/<cluster>/<namespace>/…` for
+  each added cluster. Every backup records its cluster, and **restoring a backup
+  onto another cluster is refused** (cross-cluster restore is not supported).
+- **Safeguards and audit per cluster**: real-mode confirmations name the **target
+  cluster** (retype its name), `allowed_contexts` also accepts cluster names, every
+  audit entry records the `cluster`, the **Jobs** page has a *Cluster* column, and
+  the **namespace filter is kept per cluster** (`cluster_namespace_filters`).
+- The **automatic backup** covers **all known clusters** at each run (an
+  unconfigured local cluster is skipped).
+- **Applications → All clusters** lists the applications of every cluster at once,
+  **grouped by NKP workspace → cluster**. An action on a row of another cluster
+  switches the active cluster first; **Back up** works across clusters in one go.
+
+**NKP workspace discovery (optional).** NKP organises clusters into
+**workspaces**, managed from the **management cluster**. Make the management
+cluster active, then ⚙ Sources → **Discover NKP workspaces**: the tool lists the
+`Workspace` objects and their `KommanderCluster`s (read-only), grouped by
+workspace. Tick the clusters, acknowledge the warning, then **Import selection**:
+each cluster's kubeconfig is read from its Secret (`spec.kubeconfigRef`), tested and
+registered with its workspace. An imported kubeconfig relying on an **exec plugin**
+is **refused** (it would make the tool run a command described in the Secret).
+
+> ⚠️ Discovery requires **elevated rights** on the management cluster (read
+> Workspaces, KommanderClusters and the kubeconfig **Secrets** of the workspace
+> namespaces), and the imported kubeconfigs usually grant **admin** access to the
+> clusters. Use it only if this fits your security policy; otherwise add each
+> cluster with a dedicated, restricted kubeconfig.
 
 ### Back up (Applications → Back up)
 Select one or several applications → **Back up**. The tool exports and cleans
@@ -278,13 +334,17 @@ refreshes every ~3 s until the state is stable (all PVCs Bound, pods Running;
 - The server **only listens on `127.0.0.1`** (never exposed to the network).
 - **Anti-CSRF / anti-DNS-rebinding** protection: `Host` and `Origin`/`Referer`
   header checks, and an **anti-CSRF token** required on every action.
-- **Dry-run by default**; context confirmation before any real action.
+- **Dry-run by default**; confirmation of the target cluster/context before any real action.
 - **Browser-session-bound credentials**: HYCU/Nutanix credentials are tied to
   **one browser session** (`hycu_sess` session cookie). Opening the page from a
   restarted browser, another browser, or a private window **locks the
   connections** — credentials are wiped from memory and the vault master
   passphrase (or the passwords) must be entered again. A simple reload (F5) in
-  the same browser keeps the session.
+  the same browser keeps the session. **Kubeconfigs of added clusters** follow the
+  same rule (wiped at a new browser session, restored by unlocking the vault).
+- **Cluster isolation**: each request names its cluster; an unknown cluster runs
+  **no command** (never a silent fallback to the local cluster), backups are stored
+  per cluster and a backup can only be restored onto the cluster it comes from.
 - Append-only **audit log**: `hycu-backups/audit.log` (timestamped: namespace,
   volumes, mode, dry/real, result).
 - **Bounded backup reads**: by default, only paths **under `hycu-backups/`** are
@@ -305,8 +365,9 @@ Copy `hycu_config.example.json` → `hycu_config.json`. Also editable via the
 | Key | Default | Role |
 |---|---|---|
 | `kubectl_path` | `"kubectl"` | kubectl binary. E.g. `"microk8s kubectl"`, `"k3s kubectl"`, or full path. |
-| `allowed_contexts` | `[]` | Whitelist of kubectl contexts. `[]` = all. In real mode, a context outside the list is **refused**. |
-| `namespace_filter` | `[]` | Whitelist of namespaces. `[]` = all. |
+| `allowed_contexts` | `[]` | Whitelist of kubectl contexts (or names of clusters added in ⚙ Sources). `[]` = all. In real mode, a context outside the list is **refused**. |
+| `namespace_filter` | `[]` | Whitelist of namespaces of the **local** cluster. `[]` = all. |
+| `cluster_namespace_filters` | `{}` | Namespace whitelists of the clusters **added in ⚙ Sources**, by cluster name: `{"prod-paris": ["shop"]}`. Maintained by the filter editor. |
 | `wait_timeout` | `120` | Max wait (s) for a deletion / a `Bound` transition / pod shutdown. |
 | `subprocess_margin` | `30` | Margin (s) of the subprocess timeout above `wait_timeout` (so `kubectl wait` is not killed before its verdict). |
 | `clone_name_suffix` | `"0000"` | HYCU convention for the cloned PV name (pre-filled suggestion, editable). |
@@ -333,8 +394,9 @@ Copy `hycu_config.example.json` → `hycu_config.json`. Also editable via the
 | `prismcentral_api_base` | `/api/nutanix/v3` | Prism Central v3 API base. |
 | `prismcentral_verify_tls` | `false` | Verify the Prism Central TLS certificate. |
 
-> HYCU/Nutanix **credentials** are **never** in the config: they are entered in
-> **⚙ Sources** and kept in memory for the session only.
+> HYCU/Nutanix **credentials** and the **kubeconfigs** of added clusters are
+> **never** in the config: they are entered in **⚙ Sources** and kept in memory for
+> the session only (or in the encrypted vault).
 
 ### Example — a “microk8s” customer, 2 namespaces, locked-down prod cluster
 ```json
@@ -373,6 +435,10 @@ cluster**:
    **abort → relaunch** (verify the app comes back to its original replica
    count, not 0), and a PVC stuck in `Terminating`.
 6. `kubectl wait --for=jsonpath` requires **kubectl ≥ 1.23**.
+7. **NKP workspace discovery**: the resources used (`workspaces.kommander.mesosphere.io`,
+   `kommanderclusters.kommander.mesosphere.io`, `spec.kubeconfigRef`, Secret key
+   `value` or `kubeconfig`) follow the NKP documentation — validate on your NKP
+   version, with the RBAC you intend to grant.
 
 ## 8. Troubleshooting
 
@@ -385,6 +451,10 @@ cluster**:
 | “Invalid anti-CSRF token” | Reload the page (the token is regenerated at each startup). |
 | Connections ask to be unlocked again | Expected: a new browser session (restarted browser, private window) locks the credentials — enter the vault passphrase again. |
 | “Interrupted” sequence | Read the failing step in the log, fix, **relaunch** (replicas remembered). |
+| “Cluster « x » unknown” | The active cluster was removed, or a new browser session wiped the added clusters: unlock the vault (they come back) or pick another cluster in the top bar. |
+| Warning “exec plugin” / “token expired” on a cluster | The kubeconfig relies on an external login command or a short-lived token: regenerate it, or use a ServiceAccount token (see §4, *Multiple clusters*). |
+| “This backup comes from cluster « x »…” | Cross-cluster restore is refused: select the backup's source cluster in the top bar. |
+| NKP discovery: “does not look like an NKP management cluster” | The active cluster is not the management cluster, or your RBAC cannot read Workspaces/KommanderClusters. |
 
 ## 9. HYCU / Nutanix sources (⚙ at the top right)
 

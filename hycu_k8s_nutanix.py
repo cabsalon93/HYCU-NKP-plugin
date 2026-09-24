@@ -33,6 +33,9 @@ PRÉREQUIS
   - Python 3.7 ou plus (aucune librairie externe à installer).
   - kubectl installé et configuré sur le contexte du bon cluster.
     L'outil utilise le contexte courant : vérifiez-le dans l'en-tête de la page.
+    D'autres clusters peuvent être ajoutés depuis l'interface (⚙ Sources : kubeconfig
+    importé, ou découverte des workspaces NKP) ; le cluster ACTIF se choisit dans
+    la barre du haut et les sauvegardes sont rangées par cluster.
 
 LANCEMENT
   python3 hycu_k8s_nutanix.py
@@ -73,6 +76,9 @@ import secrets
 import datetime
 import threading
 import time
+import atexit
+import tempfile
+import concurrent.futures
 import webbrowser
 import urllib.parse
 import urllib.request
@@ -104,6 +110,9 @@ DEFAULT_CONFIG = {
     "backup_root": os.path.join(os.getcwd(), "hycu-backups"),
     "allowed_contexts": [],         # [] = tout contexte (mais confirmation demandée)
     "namespace_filter": [],         # [] = tous les namespaces ; sinon liste blanche
+    # Filtres de namespaces des clusters AJOUTÉS depuis l'interface (⚙ Sources) :
+    # { "<nom du cluster>": ["ns1", "ns2"] }. Le cluster local utilise namespace_filter.
+    "cluster_namespace_filters": {},
     "wait_timeout": 120,            # secondes : attente max d'une suppression / Bound
     "subprocess_margin": 30,        # marge subprocess au-dessus de kubectl wait
     "clone_name_suffix": "0000",    # convention HYCU pour le nom du PV cloné
@@ -237,7 +246,7 @@ def save_config(updates):
 
 # Version horodatée de la build (format AAAAMMJJ-HHMM). À incrémenter à chaque
 # changement notable du programme ; affichée dans l'en-tête de l'interface.
-VERSION = "20260924-1200"
+VERSION = "20260924-1800"
 
 # Jeton anti-CSRF généré au démarrage, injecté dans la page et exigé sur les POST.
 CSRF_TOKEN = secrets.token_urlsafe(32)
@@ -292,6 +301,11 @@ def audit(event, **fields):
     try:
         os.makedirs(CONFIG["backup_root"], exist_ok=True)
         rec = {"ts": datetime.datetime.now().isoformat(), "event": event}
+        if "cluster" not in fields:             # cluster ciblé (multi-cluster)
+            try:
+                rec["cluster"] = _cluster_label()
+            except Exception:
+                pass
         rec.update(fields)
         with open(os.path.join(CONFIG["backup_root"], "audit.log"), "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -358,6 +372,7 @@ def _run_async(fn, payload):
     op_id immédiatement. Le client interroge /api/op_status pour la progression."""
     op_id = secrets.token_hex(8)
     shared = []
+    cid = _current_cid()            # l'opération reste sur le cluster de la requête
     with OP_LOCK:
         # purge : ne garder qu'un historique borné d'opérations terminées
         done_ids = [k for k, v in OPERATIONS.items() if v["done"]]
@@ -367,7 +382,8 @@ def _run_async(fn, payload):
 
     def worker():
         try:
-            res = fn(payload, log=shared)
+            with use_cluster(cid):
+                res = fn(payload, log=shared)
         except Exception as e:  # filet : ne jamais laisser un thread mourir sans verdict
             res = {"ok": False, "error": "Erreur interne : %s" % e, "log": shared}
         with OP_LOCK:
@@ -397,7 +413,13 @@ def run(cmd, dry=False, label=None, timeout=None):
     Si dry=True, ne lance rien et renvoie la commande qui aurait été exécutée.
     Le timeout subprocess est volontairement supérieur au timeout 'kubectl wait'
     pour ne pas tuer la commande avant son propre verdict."""
-    pretty = " ".join(cmd)
+    if cmd and cmd[0] == _NO_CLUSTER:
+        # Cluster actif inconnu (retiré / session verrouillée) : on n'exécute RIEN, et
+        # surtout on ne se rabat jamais silencieusement sur le cluster local.
+        return {"ok": False, "dry": bool(dry), "cmd": "", "stdout": "", "rc": -1,
+                "stderr": _NO_CLUSTER_MSG % (cmd[1] if len(cmd) > 1 else "?"),
+                "label": label or "kubectl"}
+    pretty = " ".join(_redact_cmd(cmd))
     if dry:
         return {"ok": True, "dry": True, "cmd": pretty, "stdout": "", "stderr": "",
                 "rc": None, "label": label or pretty}
@@ -420,18 +442,553 @@ def run(cmd, dry=False, label=None, timeout=None):
                 "stderr": str(e), "label": label or pretty}
 
 
+# ------------------------------------------------------------------------------
+# Multi-cluster : kubeconfigs chargés depuis l'interface (⚙ Sources)
+#
+# Le cluster « local » est celui de la configuration (kubeconfig_path / kube_context,
+# ou la résolution kubectl par défaut) : comportement historique inchangé. Des
+# clusters SUPPLÉMENTAIRES peuvent être ajoutés depuis l'interface (kubeconfig collé
+# ou importé, ou découvert depuis un cluster de management NKP). Leur kubeconfig est
+# un SECRET : gardé en mémoire + dans un fichier temporaire 0600 (dossier 0700, en
+# RAM /dev/shm si disponible), effacé au retrait, au verrouillage de session et à
+# l'arrêt. Il n'est persisté que dans le coffre chiffré, sur demande.
+#
+# Routage : chaque requête HTTP porte l'en-tête « X-HYCU-Cluster » (cluster actif
+# choisi dans la barre du haut) ; il est posé dans un contexte PAR THREAD, lu par
+# _kubectl_base(). Les opérations longues (_run_async) héritent du cluster de la
+# requête qui les a lancées. Un cluster inconnu n'exécute RIEN (pas de repli local).
+# ------------------------------------------------------------------------------
+LOCAL_CID = "local"
+CLUSTERS = {}                       # cid -> {id, name, context, server, kc_path, kubeconfig, auth…}
+CLUSTERS_LOCK = threading.Lock()
+_CL_TL = threading.local()
+_KC_DIR = {"path": None}
+_NO_CLUSTER = "__HYCU_NO_CLUSTER__"
+_NO_CLUSTER_MSG = ("Cluster « %s » inconnu (retiré, ou session verrouillée) : sélectionnez un cluster "
+                   "dans la barre du haut. Aucune commande n'a été exécutée.")
+KUBECONFIG_MAX_BYTES = 1024 * 1024
+_LOCAL_CTX = {"name": None, "at": 0.0}
+
+
+def _current_cid():
+    return getattr(_CL_TL, "cid", None) or LOCAL_CID
+
+
+@contextlib.contextmanager
+def use_cluster(cid, req_timeout=None):
+    """Exécute le bloc sur le cluster `cid` (thread courant uniquement)."""
+    prev = (getattr(_CL_TL, "cid", None), getattr(_CL_TL, "req_timeout", None))
+    _CL_TL.cid = cid or LOCAL_CID
+    _CL_TL.req_timeout = req_timeout
+    try:
+        yield
+    finally:
+        _CL_TL.cid, _CL_TL.req_timeout = prev
+
+
+def _get_cluster(cid):
+    with CLUSTERS_LOCK:
+        c = CLUSTERS.get(cid)
+        return dict(c) if c else None
+
+
+def _cluster_ids():
+    """Clusters connus : le local d'abord, puis les clusters ajoutés (ordre d'ajout)."""
+    with CLUSTERS_LOCK:
+        return [LOCAL_CID] + list(CLUSTERS.keys())
+
+
+def _local_context_name(max_age=15.0):
+    """Nom du contexte du cluster local (mis en cache quelques secondes)."""
+    now = time.time()
+    if _LOCAL_CTX["at"] and now - _LOCAL_CTX["at"] < max_age:
+        return _LOCAL_CTX["name"]
+    sel = (CONFIG.get("kube_context") or "").strip()
+    name = sel
+    if not sel:
+        with use_cluster(LOCAL_CID):
+            r = kubectl(["config", "current-context"])
+        name = r["stdout"].strip() if (r["ok"] and r["stdout"]) else None
+    _LOCAL_CTX.update({"name": name, "at": now})
+    return name
+
+
+def _cluster_label(cid=None):
+    """Nom lisible d'un cluster (journal d'audit, confirmations, tâches)."""
+    cid = cid or _current_cid()
+    if cid == LOCAL_CID:
+        return _local_context_name() or "local"
+    c = _get_cluster(cid)
+    return c["name"] if c else cid
+
+
+def _cluster_root(root):
+    """Dossier de sauvegarde PROPRE au cluster actif, sous `root`. Le cluster local
+    garde la disposition historique <root>/<ns>/<horodatage> (aucune migration) ;
+    les clusters ajoutés vont sous <root>/_clusters/<id>/<ns>/<horodatage>. « _clusters »
+    ne peut pas entrer en collision avec un namespace (le « _ » est interdit par K8s)."""
+    cid = _current_cid()
+    if cid == LOCAL_CID:
+        return root
+    return os.path.join(root, "_clusters", cid)
+
+
+def _ns_filter():
+    """Filtre de namespaces du cluster actif ([] = tous)."""
+    cid = _current_cid()
+    if cid == LOCAL_CID:
+        return list(CONFIG.get("namespace_filter") or [])
+    c = _get_cluster(cid)
+    flts = CONFIG.get("cluster_namespace_filters") or {}
+    return list(flts.get(c["name"]) or []) if (c and isinstance(flts, dict)) else []
+
+
+def _save_ns_filter(flt):
+    cid = _current_cid()
+    if cid == LOCAL_CID:
+        return save_config({"namespace_filter": flt})
+    c = _get_cluster(cid)
+    if not c:
+        return False, "Cluster inconnu."
+    flts = dict(CONFIG.get("cluster_namespace_filters") or {})
+    if flt:
+        flts[c["name"]] = flt
+    else:
+        flts.pop(c["name"], None)
+    return save_config({"cluster_namespace_filters": flts})
+
+
+def _kc_dir():
+    """Dossier privé (0700) des kubeconfigs temporaires ; en RAM (/dev/shm) si possible."""
+    if _KC_DIR["path"] and os.path.isdir(_KC_DIR["path"]):
+        return _KC_DIR["path"]
+    parent = "/dev/shm" if (os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK)) else None
+    d = tempfile.mkdtemp(prefix="hycu-kc-", dir=parent)
+    try:
+        os.chmod(d, 0o700)
+    except OSError:
+        pass
+    _KC_DIR["path"] = d
+    return d
+
+
+def _write_kc_file(text):
+    fd, path = tempfile.mkstemp(prefix="kc-", suffix=".json", dir=_kc_dir())
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
+    return path
+
+
+def _rm_quiet(path):
+    try:
+        if path:
+            os.remove(path)
+    except OSError:
+        pass
+
+
+@atexit.register
+def _cleanup_kc_dir():
+    d = _KC_DIR.get("path")
+    if d:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def _redact_cmd(cmd):
+    """Masque le chemin du kubeconfig temporaire d'un cluster ajouté dans les logs."""
+    d = _KC_DIR.get("path")
+    if not d:
+        return cmd
+    return ["<kubeconfig>" if (isinstance(a, str) and a.startswith(d)) else a for a in cmd]
+
+
 def _kubectl_base():
     """Binaire kubectl (« kubectl », « microk8s kubectl »…) + ciblage explicite du
-    cluster : --kubeconfig et --context sont ajoutés à TOUTES les commandes si
-    configurés, pour viser le bon cluster sans dépendre du contexte courant."""
+    cluster ACTIF : --kubeconfig et --context sont ajoutés à TOUTES les commandes,
+    pour viser le bon cluster sans dépendre du contexte courant."""
     base = CONFIG["kubectl_path"].split()
-    kc = (CONFIG.get("kubeconfig_path") or "").strip()
-    if kc:
-        base += ["--kubeconfig", kc]
-    ctx = (CONFIG.get("kube_context") or "").strip()
-    if ctx:
-        base += ["--context", ctx]
+    cid = _current_cid()
+    if cid == LOCAL_CID:
+        kc = (CONFIG.get("kubeconfig_path") or "").strip()
+        if kc:
+            base += ["--kubeconfig", kc]
+        ctx = (CONFIG.get("kube_context") or "").strip()
+        if ctx:
+            base += ["--context", ctx]
+    else:
+        c = _get_cluster(cid)
+        if not c:
+            return [_NO_CLUSTER, cid]
+        base += ["--kubeconfig", c["kc_path"], "--context", c["context"]]
+    rt = getattr(_CL_TL, "req_timeout", None)
+    if rt:
+        base.append("--request-timeout=%ds" % int(rt))
     return base
+
+
+# --- Analyse d'un kubeconfig (sans parseur YAML : `kubectl config view -o json`) ---
+def _b64url_json(seg):
+    try:
+        pad = "=" * (-len(seg) % 4)
+        return json.loads(base64.urlsafe_b64decode(seg + pad).decode("utf-8"))
+    except Exception:
+        return None
+
+
+def _kc_auth_info(user, cluster, now=None):
+    """Type d'authentification d'une entrée « user » + avertissements utiles.
+    level : ok | warn | error. Ne renvoie jamais de secret."""
+    now = time.time() if now is None else now
+    user, cluster = user or {}, cluster or {}
+    warnings, level, typ, exp = [], "ok", "unknown", None
+
+    def warn(msg, lvl="warn"):
+        nonlocal level
+        warnings.append(msg)
+        if lvl == "error" or level == "ok":
+            level = lvl
+    if user.get("exec"):
+        cmd = (user["exec"] or {}).get("command") or "?"
+        typ = "exec"
+        warn("Authentification par plugin exec (« %s ») : cette commande doit être installée là où "
+             "tourne l'outil (absente de l'image conteneur par défaut) ; elle peut aussi ouvrir un "
+             "navigateur (OIDC) que l'outil ne peut pas piloter." % os.path.basename(str(cmd)))
+    elif user.get("auth-provider"):
+        typ = "auth-provider"
+        warn("Authentification « auth-provider » (%s) : mécanisme déprécié, jeton OIDC à durée de vie "
+             "courte — prévoyez un jeton de ServiceAccount pour un usage durable."
+             % ((user["auth-provider"] or {}).get("name") or "oidc"))
+    elif user.get("token") or user.get("tokenFile"):
+        typ = "token"
+        if user.get("tokenFile"):
+            warn("Le jeton est lu depuis un fichier local (%s) : il doit exister là où tourne l'outil."
+                 % user.get("tokenFile"))
+        parts = str(user.get("token") or "").split(".")
+        claims = _b64url_json(parts[1]) if len(parts) == 3 else None
+        if isinstance(claims, dict) and claims.get("exp"):
+            try:
+                exp = float(claims["exp"])
+            except (TypeError, ValueError):
+                exp = None
+            if exp and exp <= now:
+                warn("Le jeton a EXPIRÉ (%s) : régénérez le kubeconfig."
+                     % datetime.datetime.fromtimestamp(exp).strftime("%Y-%m-%d %H:%M"), "error")
+            elif exp and exp - now < 24 * 3600:
+                warn("Le jeton expire dans moins de 24 h (%s) : les sauvegardes planifiées échoueront ensuite."
+                     % datetime.datetime.fromtimestamp(exp).strftime("%Y-%m-%d %H:%M"))
+    elif user.get("client-certificate-data") or user.get("client-certificate"):
+        typ = "client-certificate"
+        if user.get("client-certificate") and not user.get("client-certificate-data"):
+            warn("Le certificat client est un fichier local (%s) : il doit exister là où tourne l'outil."
+                 % user.get("client-certificate"))
+    elif user.get("username"):
+        typ = "basic"
+        warn("Authentification par identifiant/mot de passe (basic) : désactivée sur la plupart des clusters récents.")
+    else:
+        warn("Aucune information d'authentification reconnue pour ce contexte.")
+    if cluster.get("insecure-skip-tls-verify"):
+        warn("Vérification TLS du serveur DÉSACTIVÉE (insecure-skip-tls-verify).")
+    if cluster.get("certificate-authority") and not cluster.get("certificate-authority-data"):
+        warn("L'autorité de certification est un fichier local (%s) : il doit exister là où tourne l'outil."
+             % cluster.get("certificate-authority"))
+    return {"type": typ, "warnings": warnings, "level": level, "expires": exp}
+
+
+def _kc_view(path):
+    """Kubeconfig -> dict JSON via kubectl (résout aussi le format YAML). (data, err)."""
+    r = run(CONFIG["kubectl_path"].split() + ["--kubeconfig", path, "config", "view", "--raw", "-o", "json"],
+            timeout=30)
+    if not r["ok"]:
+        return None, (r["stderr"] or "kubectl config view a échoué").replace(path, "<kubeconfig>")
+    try:
+        return json.loads(r["stdout"] or "{}"), None
+    except ValueError as e:
+        return None, "Kubeconfig illisible : %s" % e
+
+
+def _kc_contexts(view):
+    """[{name, cluster, user, server, auth}] + contexte courant, depuis `config view`."""
+    by = lambda key: {e.get("name"): (e.get(key[:-1]) or {}) for e in (view.get(key) or [])}
+    clusters, users = by("clusters"), by("users")
+    out = []
+    for e in view.get("contexts") or []:
+        ctx = e.get("context") or {}
+        cl = clusters.get(ctx.get("cluster")) or {}
+        out.append({"name": e.get("name"), "cluster": ctx.get("cluster"), "user": ctx.get("user"),
+                    "namespace": ctx.get("namespace") or "", "server": cl.get("server") or "",
+                    "auth": _kc_auth_info(users.get(ctx.get("user")), cl)})
+    return out, view.get("current-context") or ""
+
+
+def _load_kubeconfig_text(text):
+    """Écrit le kubeconfig dans un fichier privé et l'analyse.
+    Renvoie (path, contexts, current, err) — path supprimé en cas d'erreur."""
+    if not isinstance(text, str) or not text.strip():
+        return None, [], "", "Kubeconfig vide."
+    if len(text.encode("utf-8")) > KUBECONFIG_MAX_BYTES:
+        return None, [], "", "Kubeconfig trop volumineux (1 Mo max)."
+    path = _write_kc_file(text)
+    view, err = _kc_view(path)
+    if err:
+        _rm_quiet(path)
+        return None, [], "", "Kubeconfig invalide : %s" % err
+    ctxs, cur = _kc_contexts(view)
+    if not ctxs:
+        _rm_quiet(path)
+        return None, [], "", "Aucun contexte dans ce kubeconfig."
+    return path, ctxs, cur, None
+
+
+def _cluster_slug(name):
+    return re.sub(r"[^a-z0-9._-]+", "-", (name or "").strip().lower()).strip("-._")[:63]
+
+
+def action_clusters_inspect(payload):
+    """Analyse un kubeconfig SANS l'enregistrer : contextes, serveur, type d'auth."""
+    path, ctxs, cur, err = _load_kubeconfig_text(payload.get("kubeconfig"))
+    _rm_quiet(path)
+    if err:
+        return _err(err)
+    return _ok(contexts=ctxs, current=cur or ctxs[0]["name"])
+
+
+def _test_cluster(path, context):
+    """Test de connectivité (lecture seule, 10 s max). Renvoie (ok, avertissement|erreur)."""
+    r = run(CONFIG["kubectl_path"].split() + ["--kubeconfig", path, "--context", context,
+            "--request-timeout=10s", "get", "ns", "-o", "name"], timeout=25)
+    if r["ok"]:
+        return True, None
+    msg = (r["stderr"] or "").replace(path, "<kubeconfig>")
+    if "forbidden" in msg.lower():
+        return True, ("Connexion établie, mais la liste des namespaces est refusée (RBAC) : l'outil "
+                      "ne verra que les namespaces explicitement autorisés.")
+    return False, msg or "Cluster injoignable."
+
+
+def _register_cluster(name, text, context=None, workspace="", source="upload", nkp_ref="",
+                      management="", test=True, allow_exec=True):
+    """Enregistre un cluster supplémentaire. Renvoie _ok(cluster=…) ou _err(...).
+    allow_exec=False : refuse un contexte authentifié par plugin « exec » (kubectl
+    exécuterait alors une commande arbitraire décrite DANS le kubeconfig — inacceptable
+    pour un kubeconfig qui ne vient pas directement de l'opérateur, ex. Secret NKP)."""
+    name = (name or "").strip()
+    cid = _cluster_slug(name)
+    if not name or not cid or len(name) > 63:
+        return _err("Nom de cluster invalide (1 à 63 caractères, lettres/chiffres/-/./_).")
+    if cid == LOCAL_CID or name == (_local_context_name() or ""):
+        return _err("Ce nom est réservé au cluster local : choisissez-en un autre.")
+    with CLUSTERS_LOCK:
+        if cid in CLUSTERS or any(c["name"] == name for c in CLUSTERS.values()):
+            return _err("Un cluster nommé « %s » est déjà enregistré." % name)
+    path, ctxs, cur, err = _load_kubeconfig_text(text)
+    if err:
+        return _err(err)
+    names = [c["name"] for c in ctxs]
+    context = (context or "").strip() or (cur if cur in names else "") or (names[0] if len(names) == 1 else "")
+    if not context:
+        _rm_quiet(path)
+        return _err("Ce kubeconfig contient plusieurs contextes : choisissez-en un.",
+                    need_context=True, contexts=ctxs)
+    if context not in names:
+        _rm_quiet(path)
+        return _err("Contexte « %s » introuvable dans ce kubeconfig." % context, contexts=ctxs)
+    info = next(c for c in ctxs if c["name"] == context)
+    if not allow_exec and info["auth"].get("type") == "exec":
+        _rm_quiet(path)
+        return _err("Kubeconfig refusé : authentification par plugin exec (commande externe) non "
+                    "autorisée pour un kubeconfig importé automatiquement.")
+    note = None
+    if test:
+        ok, note = _test_cluster(path, context)
+        if not ok:
+            _rm_quiet(path)
+            return _err("Connexion au cluster impossible : %s" % note)
+    entry = {"id": cid, "name": name, "context": context, "server": info["server"],
+             "kc_path": path, "kubeconfig": text, "auth": info["auth"], "user": info["user"],
+             "workspace": workspace or "", "source": source, "nkp_ref": nkp_ref or "",
+             "management": management or "", "added": time.time(), "note": note}
+    with CLUSTERS_LOCK:
+        if cid in CLUSTERS:                     # course : ajouté entre-temps
+            _rm_quiet(path)
+            return _err("Un cluster nommé « %s » est déjà enregistré." % name)
+        CLUSTERS[cid] = entry
+    return _ok(cluster=_cluster_public(entry))
+
+
+def _cluster_public(c):
+    """Vue publique d'un cluster (jamais le kubeconfig ni le chemin du fichier)."""
+    auth = dict(c.get("auth") or {})
+    if auth.get("expires"):                     # ré-évaluer l'expiration à chaque lecture
+        exp = auth["expires"]
+        if exp <= time.time() and auth.get("level") != "error":
+            auth["level"] = "error"
+            auth["warnings"] = list(auth.get("warnings") or []) + ["Le jeton a EXPIRÉ : régénérez le kubeconfig."]
+    return {"id": c["id"], "name": c["name"], "context": c["context"], "server": c["server"],
+            "auth": auth, "workspace": c.get("workspace") or "", "source": c.get("source") or "upload",
+            "nkp_ref": c.get("nkp_ref") or "", "management": c.get("management") or "",
+            "warning": c.get("note")}
+
+
+def action_clusters():
+    """Liste des clusters : le local (configuration) + les clusters ajoutés."""
+    local_ctx = _local_context_name()
+    out = [{"id": LOCAL_CID, "name": local_ctx or "local", "context": local_ctx or "",
+            "server": "", "local": True, "configured": bool(local_ctx),
+            "kubeconfig_path": (CONFIG.get("kubeconfig_path") or "").strip(),
+            "auth": None, "workspace": "", "source": "config"}]
+    with CLUSTERS_LOCK:
+        extra = [_cluster_public(c) for c in CLUSTERS.values()]
+    return _ok(clusters=out + extra, active=_current_cid())
+
+
+def action_clusters_add(payload):
+    r = _register_cluster(payload.get("name"), payload.get("kubeconfig"), payload.get("context"),
+                          workspace=(payload.get("workspace") or "").strip())
+    if r.get("ok"):
+        audit("cluster_add", cluster=r["cluster"]["name"], context=r["cluster"]["context"],
+              server=r["cluster"]["server"], auth=r["cluster"]["auth"].get("type"))
+    return r
+
+
+def _unregister_cluster(cid):
+    with CLUSTERS_LOCK:
+        c = CLUSTERS.pop(cid, None)
+    if c:
+        _rm_quiet(c.get("kc_path"))
+    return c
+
+
+def action_clusters_remove(payload):
+    cid = payload.get("id") or ""
+    if cid == LOCAL_CID:
+        return _err("Le cluster local (configuration) ne peut pas être retiré ici : voir Réglages.")
+    c = _unregister_cluster(cid)
+    if not c:
+        return _err("Cluster inconnu.")
+    audit("cluster_remove", cluster=c["name"])
+    return _ok(removed=c["name"])
+
+
+def _wipe_clusters():
+    """Oublie tous les clusters ajoutés (verrouillage de session). Renvoie leurs noms."""
+    with CLUSTERS_LOCK:
+        gone = list(CLUSTERS.values())
+        CLUSTERS.clear()
+    for c in gone:
+        _rm_quiet(c.get("kc_path"))
+    return [c["name"] for c in gone]
+
+
+# --- Découverte NKP (optionnelle) depuis le cluster de MANAGEMENT ---
+# NKP (Kommander) : Workspace (cluster-scoped, workspaces.kommander.mesosphere.io) ->
+# un namespace par workspace (status.namespaceRef.name) -> KommanderCluster
+# (kommander.mesosphere.io, namespacé dans le namespace du workspace) dont
+# spec.kubeconfigRef.name désigne le Secret contenant le kubeconfig du cluster.
+NKP_WS_RES = "workspaces.kommander.mesosphere.io"
+NKP_KC_RES = "kommanderclusters.kommander.mesosphere.io"
+NKP_DISPLAY_ANN = "kommander.mesosphere.io/display-name"
+
+
+def action_nkp_discover():
+    """Liste les workspaces NKP et leurs clusters, vus depuis le cluster ACTIF (qui
+    doit être le cluster de management). Lecture seule, n'enregistre rien."""
+    wsd, err = kubectl_json(["get", NKP_WS_RES])
+    if err:
+        return _err("Le cluster actif ne semble pas être un cluster de management NKP (ressource "
+                    "Workspace introuvable ou accès refusé) : %s" % err)
+    ns2ws, workspaces = {}, []
+    for w in wsd.get("items") or []:
+        md = w.get("metadata") or {}
+        name = md.get("name") or ""
+        disp = (md.get("annotations") or {}).get(NKP_DISPLAY_ANN) or name
+        wns = (((w.get("status") or {}).get("namespaceRef") or {}).get("name")
+               or (w.get("spec") or {}).get("namespaceName") or name)
+        ns2ws[wns] = disp
+        workspaces.append({"name": name, "display": disp, "namespace": wns, "clusters": 0})
+    kcd, err = kubectl_json(["get", NKP_KC_RES, "-A"])
+    if err:
+        return _err("Liste des clusters NKP (KommanderCluster) indisponible : %s" % err)
+    with CLUSTERS_LOCK:
+        known = {c.get("nkp_ref"): c["name"] for c in CLUSTERS.values() if c.get("nkp_ref")}
+    clusters = []
+    for k in kcd.get("items") or []:
+        md = k.get("metadata") or {}
+        ns, name = md.get("namespace") or "", md.get("name") or ""
+        ref = ((k.get("spec") or {}).get("kubeconfigRef") or {}).get("name") or ""
+        host = (name == "host-cluster") or (not ref and ns == "kommander")
+        st = k.get("status") or {}
+        ws = ns2ws.get(ns) or ns
+        for w in workspaces:
+            if w["namespace"] == ns:
+                w["clusters"] += 1
+        clusters.append({"name": name, "namespace": ns, "workspace": ws,
+                         "secret": ref or ("%s-kubeconfig" % name),
+                         "phase": st.get("phase") or "", "host": bool(host),
+                         "registered": known.get("%s/%s" % (ns, name))})
+    clusters.sort(key=lambda c: (c["workspace"].lower(), c["name"].lower()))
+    return _ok(workspaces=workspaces, clusters=clusters, management=_cluster_label())
+
+
+def _kubeconfig_from_secret(sec):
+    """Texte du kubeconfig contenu dans un Secret (clés usuelles, sinon heuristique)."""
+    data = sec.get("data") or {}
+    keys = [k for k in ("value", "kubeconfig", "admin.conf", "config") if k in data] + sorted(data)
+    for k in keys:
+        try:
+            txt = base64.b64decode(data[k]).decode("utf-8")
+        except Exception:
+            continue
+        if "clusters" in txt and "contexts" in txt:
+            return txt
+    return None
+
+
+def action_nkp_import(payload):
+    """Importe des clusters NKP découverts : lit le Secret kubeconfig de chacun (sur
+    le cluster de management ACTIF), l'enregistre et le teste. Opt-in explicite :
+    exige payload.ack=True (lecture de Secrets = droits élevés sur le management)."""
+    if not payload.get("ack"):
+        return _err("Confirmez d'abord l'avertissement sur les privilèges requis.")
+    mgmt = _cluster_label()
+    results = []
+    for it in payload.get("items") or []:
+        ns, name = (it.get("namespace") or "").strip(), (it.get("name") or "").strip()
+        secret = (it.get("secret") or "").strip() or ("%s-kubeconfig" % name)
+        label = "%s/%s" % (ns, name)
+        if not all(K8S_NAME_RE.match(x or "") for x in (ns, name, secret)):
+            results.append({"cluster": label, "ok": False, "error": "Nom invalide."})
+            continue
+        sec, err = kubectl_json(["get", "secret", secret, "-n", ns])
+        if err:
+            results.append({"cluster": label, "ok": False,
+                            "error": "Secret « %s » illisible : %s" % (secret, err)})
+            continue
+        text = _kubeconfig_from_secret(sec)
+        if not text:
+            results.append({"cluster": label, "ok": False,
+                            "error": "Aucun kubeconfig trouvé dans le Secret « %s »." % secret})
+            continue
+        ws = (it.get("workspace") or "").strip()
+        cname = name
+        with CLUSTERS_LOCK:
+            taken = {c["name"] for c in CLUSTERS.values()}
+        if cname in taken and ws:
+            cname = "%s-%s" % (name, _cluster_slug(ws))
+        r = _register_cluster(cname, text, None, workspace=ws, source="nkp", nkp_ref=label,
+                              management=mgmt, test=bool(payload.get("test", True)), allow_exec=False)
+        if r.get("ok"):
+            audit("nkp_import", cluster=cname, workspace=ws, management=mgmt, secret=secret)
+            results.append({"cluster": label, "ok": True, "name": cname, "warning": r["cluster"].get("warning"),
+                            "auth": r["cluster"]["auth"]})
+        else:
+            results.append({"cluster": label, "ok": False, "error": r.get("error")})
+    n = sum(1 for r in results if r["ok"])
+    return {"ok": n > 0 or not results, "error": None if n or not results else "Aucun cluster importé.",
+            "results": results, "imported": n}
 
 
 def kubectl(args, dry=False, label=None, timeout=None):
@@ -745,7 +1302,7 @@ def build_new_pv(old_pv, new_ref, new_name, mode):
 # ------------------------------------------------------------------------------
 def backup_dir(ns, root=None):
     ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")  # microsec anti-collision
-    d = os.path.join(root or CONFIG["backup_root"], ns, ts)
+    d = os.path.join(_cluster_root(root or CONFIG["backup_root"]), ns, ts)
     os.makedirs(d, exist_ok=True)
     return d
 
@@ -792,7 +1349,7 @@ def list_backups(ns, root=None):
     """Liste les sauvegardes d'un namespace sous backup_root, ou sous un dossier
     personnalisé `root` (chemin contenant <namespace>/<horodatage>/index.json)."""
     root = os.path.expanduser(root.strip()) if (root and root.strip()) else CONFIG["backup_root"]
-    base = os.path.join(root, ns)
+    base = os.path.join(_cluster_root(root), ns)
     if not os.path.isdir(base):
         return []
     out = []
@@ -839,6 +1396,23 @@ def action_contexts(kubeconfig=None):
 
 def action_context():
     allowed = CONFIG.get("allowed_contexts") or []
+    cid = _current_cid()
+    if cid != LOCAL_CID:
+        # Cluster ajouté depuis l'interface : « contexte » affiché/confirmé = nom du
+        # cluster ; autorisé si son nom OU son contexte kubeconfig est dans allowed_contexts.
+        c = _get_cluster(cid)
+        base = {"allowed": allowed, "require_confirm": bool(CONFIG.get("require_context_confirm")),
+                "cluster_id": cid}
+        if not c:
+            return {**base, "context": None, "error": _NO_CLUSTER_MSG % cid, "context_ok": False,
+                    "kubectl_ok": False, "kubectl_hint": "no_cluster", "selected_context": "",
+                    "cluster_name": None}
+        pub = _cluster_public(c)
+        return {**base, "context": c["name"], "error": None,
+                "context_ok": (not allowed) or (c["name"] in allowed) or (c["context"] in allowed),
+                "kubectl_ok": True, "kubectl_hint": None, "selected_context": c["context"],
+                "cluster_name": c["name"], "kube_context": c["context"], "server": c["server"],
+                "workspace": pub["workspace"], "auth": pub["auth"]}
     selected = (CONFIG.get("kube_context") or "").strip()
     if selected:
         # Contexte choisi explicitement : on vérifie qu'il existe dans le kubeconfig.
@@ -855,7 +1429,8 @@ def action_context():
         err = None if r["ok"] else r["stderr"]
         kubectl_ok = ctx is not None
         hint = None if kubectl_ok else _kubectl_hint(err)
-    return {"context": ctx, "error": err,
+    _LOCAL_CTX.update({"name": ctx, "at": time.time()})
+    return {"context": ctx, "error": err, "cluster_id": LOCAL_CID, "cluster_name": ctx or "local",
             "allowed": allowed,
             "context_ok": (not allowed) or (ctx in allowed),
             "kubectl_ok": kubectl_ok, "kubectl_hint": hint,
@@ -864,7 +1439,7 @@ def action_context():
 
 
 def _namespace_allowed(ns):
-    flt = CONFIG.get("namespace_filter") or []
+    flt = _ns_filter()
     return (not flt) or (ns in flt)
 
 
@@ -874,10 +1449,10 @@ def _allow_namespace(ns, log=None):
     Un namespace CRÉÉ PAR L'OUTIL (clone d'application vers un nouveau namespace)
     doit rester utilisable ensuite : sans cet ajout, Vérifier/Restaurer/Sauvegarder
     refuseraient le namespace fraîchement créé (« Namespace non autorisé »)."""
-    flt = CONFIG.get("namespace_filter") or []
+    flt = _ns_filter()
     if not flt or ns in flt:
         return
-    save_config({"namespace_filter": flt + [ns]})
+    _save_ns_filter(flt + [ns])
     audit("namespace_filter_auto_add", namespace=ns)
     if log is not None:
         log.append(logentry("Namespace « %s » ajouté aux namespaces autorisés" % ns, ok=True,
@@ -889,7 +1464,7 @@ def action_namespaces():
     if err:
         return {"ok": False, "namespaces": [], "error": err}
     names = sorted(i["metadata"]["name"] for i in data.get("items", []))
-    flt = CONFIG.get("namespace_filter") or []
+    flt = _ns_filter()
     if flt:
         names = [n for n in names if n in flt]
     return {"ok": True, "namespaces": names, "error": None}
@@ -899,7 +1474,7 @@ def action_ns_filter():
     """Liste TOUTES les namespaces du cluster (non filtrées) + le filtre courant,
     pour l'éditeur de filtre."""
     data, err = kubectl_json(["get", "ns"])
-    flt = CONFIG.get("namespace_filter") or []
+    flt = _ns_filter()
     if err:
         return {"ok": False, "error": err, "all": [], "filter": flt}
     names = sorted(i["metadata"]["name"] for i in data.get("items", []))
@@ -912,7 +1487,7 @@ def action_set_ns_filter(payload):
     if not isinstance(flt, list):
         flt = []
     flt = sorted({str(x).strip() for x in flt if str(x).strip()})
-    save_config({"namespace_filter": flt})
+    _save_ns_filter(flt)
     audit("ns_filter_set", count=len(flt), filter=flt)
     return {"ok": True, "filter": flt}
 
@@ -954,7 +1529,8 @@ def action_backup(ns, dest=None):
 
     d = backup_dir(ns, root)
     index = {"namespace": ns, "created": datetime.datetime.now().isoformat(),
-             "context": action_context().get("context"), "volumes": []}
+             "context": action_context().get("context"),
+             "cluster": _cluster_label(), "cluster_id": _current_cid(), "volumes": []}
     files = []
     for pvc in items:
         name = pvc["metadata"]["name"]
@@ -1025,7 +1601,7 @@ def action_backup_all(dest=None):
     audit("backup_all", namespaces=len(namespaces), backed_up=backed_up, volumes=vol_total, root=root)
     return {"ok": True, "error": None, "results": results, "root": root,
             "namespaces": len(namespaces), "backed_up": backed_up, "volumes": vol_total,
-            "filtered": bool(CONFIG.get("namespace_filter"))}
+            "filtered": bool(_ns_filter())}
 
 
 # ------------------------------------------------------------------------------
@@ -1099,26 +1675,49 @@ def _auto_backup_run(now=None, runner=None):
     """Une exécution de sauvegarde auto (scheduler ou tests). Enregistre le résultat
     puis applique la rétention (auto_backup_keep versions par namespace)."""
     now = time.time() if now is None else now
-    runner = runner or action_backup_all
+    dest = CONFIG.get("auto_backup_dest") or None
     AUTO_BACKUP["running"] = True
     try:
-        r = runner(CONFIG.get("auto_backup_dest") or None)
-        ok = bool(r.get("ok"))
-        summary = ("%d namespace(s) sauvegardé(s), %d volume(s)" % (r.get("backed_up", 0), r.get("volumes", 0))
-                   if ok else (r.get("error") or "échec"))
-        if ok and r.get("root"):
-            removed = 0
-            for res in r.get("results") or []:
-                if res.get("ok") and res.get("ns"):
-                    removed += _prune_backups(r["root"], res["ns"], CONFIG.get("auto_backup_keep", 15))
-            if removed:
-                summary += " ; %d ancienne(s) version(s) supprimée(s)" % removed
+        if runner is not None:                  # tests : cluster courant uniquement
+            parts = [(None,) + _auto_backup_one(runner, dest)]
+        else:
+            parts = []
+            cids = _cluster_ids()
+            for cid in cids:
+                with use_cluster(cid):
+                    # Cluster local non configuré (outil utilisé uniquement avec des
+                    # clusters ajoutés) : ignoré sans le compter comme un échec.
+                    if cid == LOCAL_CID and len(cids) > 1 and not action_context().get("kubectl_ok"):
+                        continue
+                    parts.append((_cluster_label(cid),) + _auto_backup_one(action_backup_all, dest))
+        ok = bool(parts) and all(p[1] for p in parts)
+        if len(parts) <= 1:
+            summary = parts[0][2] if parts else "aucun cluster disponible"
+        else:
+            summary = " | ".join("%s : %s" % (p[0], p[2]) for p in parts)
         AUTO_BACKUP.update({"last_run": now, "last_ok": ok, "last_summary": summary})
         _save_auto_backup_state()
-        audit("auto_backup", ok=ok, summary=summary)
+        audit("auto_backup", ok=ok, summary=summary,
+              **({"cluster": "*"} if len(parts) > 1 else {}))
         return ok
     finally:
         AUTO_BACKUP["running"] = False
+
+
+def _auto_backup_one(runner, dest):
+    """Sauvegarde auto + rétention sur le cluster ACTIF. Renvoie (ok, résumé)."""
+    r = runner(dest)
+    ok = bool(r.get("ok"))
+    summary = ("%d namespace(s) sauvegardé(s), %d volume(s)" % (r.get("backed_up", 0), r.get("volumes", 0))
+               if ok else (r.get("error") or "échec"))
+    if ok and r.get("root"):
+        removed = 0
+        for res in r.get("results") or []:
+            if res.get("ok") and res.get("ns"):
+                removed += _prune_backups(r["root"], res["ns"], CONFIG.get("auto_backup_keep", 15))
+        if removed:
+            summary += " ; %d ancienne(s) version(s) supprimée(s)" % removed
+    return ok, summary
 
 
 def _auto_backup_loop():
@@ -1179,6 +1778,10 @@ def action_metrics_text():
            "Horodatage Unix de la dernière sauvegarde automatique (0 si jamais).", typ="counter")
     metric("hycu_auto_backup_last_success", 1 if AUTO_BACKUP.get("last_ok") else 0,
            "1 si la dernière sauvegarde automatique a réussi.")
+    with CLUSTERS_LOCK:
+        n_extra = len(CLUSTERS)
+    metric("hycu_clusters_registered", 1 + n_extra,
+           "Clusters Kubernetes connus (local + ajoutés depuis l'interface).")
     # État des connexions (par système) — un seul bloc HELP/TYPE, plusieurs lignes.
     out.append("# HELP hycu_connected 1 si le système externe est connecté (session en cours).\n"
                "# TYPE hycu_connected gauge\n")
@@ -1240,6 +1843,39 @@ def action_applications():
                      "compliant": bool(last and (now - last) <= fresh),
                      "volumes": len(((latest or {}).get("index") or {}).get("volumes") or []) if latest else None})
     return {"ok": bool(info.get("ok")), "error": info.get("error"), "apps": apps,
+            "filtered": bool(_ns_filter()),
+            "freshness_hours": round(fresh / 3600.0, 1),
+            "policy": {"enabled": bool(CONFIG.get("auto_backup_enabled")),
+                       "interval_hours": _auto_backup_interval_s() / 3600.0}}
+
+
+def action_applications_all():
+    """Applications de TOUS les clusters connus (en parallèle, 15 s max par requête
+    kubectl pour qu'un cluster injoignable ne bloque pas la page), étiquetées par
+    cluster et workspace NKP — pour la vue groupée workspace -> cluster -> namespace."""
+    cids = _cluster_ids()
+
+    def one(cid):
+        with use_cluster(cid, req_timeout=15):
+            c = _get_cluster(cid) if cid != LOCAL_CID else None
+            meta = {"cluster_id": cid, "cluster": _cluster_label(cid),
+                    "workspace": (c or {}).get("workspace") or ""}
+            if cid == LOCAL_CID and not action_context().get("kubectl_ok"):
+                return dict(meta, ok=False, skipped=True, error="Cluster local non configuré.", apps=[])
+            try:
+                r = action_applications()
+            except Exception as e:  # un cluster en erreur ne doit pas masquer les autres
+                r = {"ok": False, "error": str(e), "apps": []}
+            apps = [dict(a, **meta) for a in (r.get("apps") or [])]
+            return dict(meta, ok=bool(r.get("ok")), error=r.get("error"), apps=apps)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(cids))) as ex:
+        per = list(ex.map(one, cids))
+    apps = [a for p in per for a in p["apps"]]
+    fresh = _backup_freshness_s()
+    return {"ok": any(p["ok"] for p in per), "error": None, "apps": apps,
+            "clusters": [{k: p.get(k) for k in ("cluster_id", "cluster", "workspace", "ok", "error", "skipped")}
+                         for p in per],
             "freshness_hours": round(fresh / 3600.0, 1),
             "policy": {"enabled": bool(CONFIG.get("auto_backup_enabled")),
                        "interval_hours": _auto_backup_interval_s() / 3600.0}}
@@ -1297,6 +1933,7 @@ def action_jobs(limit=200):
                      "namespace": rec.get("namespace") or rec.get("target_namespace") or "",
                      "target_namespace": rec.get("target_namespace") or "",
                      "detail": rec.get("summary") or rec.get("mode") or "",
+                     "cluster": rec.get("cluster") or "",
                      "volumes": rec.get("count") if ev == "backup" else None})
     jobs.reverse()
     counts = {"success": 0, "failed": 0, "simulation": 0}
@@ -1332,7 +1969,7 @@ def _scan_workloads(ns):
 
 
 def _replica_state_path(ns):
-    return os.path.join(CONFIG["backup_root"], ns, "_replica_state.json")
+    return os.path.join(_cluster_root(CONFIG["backup_root"]), ns, "_replica_state.json")
 
 
 def _load_replica_state(ns):
@@ -1354,7 +1991,7 @@ def _save_replica_state(ns, desired_map):
 
 # --- Transaction de restauration (reprise idempotente après interruption) ---
 def _txn_path(ns):
-    return os.path.join(CONFIG["backup_root"], ns, "_restore_txn.json")
+    return os.path.join(_cluster_root(CONFIG["backup_root"]), ns, "_restore_txn.json")
 
 
 def _load_txn(ns):
@@ -1551,6 +2188,27 @@ def _wait_pvc_bound(name, ns, log):
 # ------------------------------------------------------------------------------
 # Récupération du PV de référence (sauvegarde ou live)
 # ------------------------------------------------------------------------------
+def _backup_cluster_error(backup_path, backup_root=None):
+    """Garde anti-confusion MULTI-CLUSTER : une sauvegarde ne peut servir qu'au cluster
+    sur lequel elle a été prise (les manifestes PV référencent des Volume Groups et
+    un driver CSI propres à ce cluster). Les sauvegardes antérieures au multi-cluster
+    (sans « cluster_id ») sont rattachées au cluster local. Renvoie un message ou None."""
+    bp = _safe_backup_path(backup_path, backup_root)
+    if not bp:
+        return None
+    try:
+        with open(os.path.join(bp, "index.json"), encoding="utf-8") as f:
+            idx = json.load(f)
+    except (OSError, ValueError):
+        return None
+    src = idx.get("cluster_id") or LOCAL_CID
+    if src == _current_cid():
+        return None
+    return ("Cette sauvegarde provient du cluster « %s », alors que le cluster actif est « %s ». "
+            "La restauration inter-clusters n'est pas prise en charge : sélectionnez le cluster "
+            "d'origine dans la barre du haut." % (idx.get("cluster") or src, _cluster_label()))
+
+
 def _load_old_pv(ns, pvc_name, backup_path, backup_root=None):
     """Renvoie (old_pv, pv_name) depuis la sauvegarde si fournie, sinon en live."""
     bp = _safe_backup_path(backup_path, backup_root)
@@ -1672,6 +2330,9 @@ def action_prepare_restore(payload):
     mode = payload.get("mode", "clone")
     backup_path = payload.get("backup_path")
     backup_root = payload.get("backup_root")
+    xerr = _backup_cluster_error(backup_path, backup_root)
+    if xerr:
+        return {"ok": False, "error": xerr, "results": []}
     items = payload.get("items")
     if not items:  # compat : ancien format mono-PVC
         items = [{"pvc": payload.get("pvc"),
@@ -2012,6 +2673,7 @@ def action_get_config():
 
 def action_set_config(payload):
     ok, err = save_config(payload.get("config") or {})
+    _LOCAL_CTX["at"] = 0.0          # contexte local peut-être changé : relire
     return {"ok": ok, "error": err, "config": CONFIG}
 
 
@@ -2258,8 +2920,10 @@ def check_ui_session(cookie_header):
         for k in SESSION_CREDS:
             SESSION_CREDS[k] = None
         new_id = UI_SESSION["id"]
-    if locked:
-        audit("creds_locked", reason="new_browser_session", systems=sorted(locked))
+    # Les kubeconfigs ajoutés depuis l'interface sont des identifiants : même règle.
+    gone = _wipe_clusters()
+    if locked or gone:
+        audit("creds_locked", reason="new_browser_session", systems=sorted(locked), clusters=gone)
     return "hycu_sess=%s; Path=/; HttpOnly; SameSite=Strict" % new_id
 
 
@@ -2333,8 +2997,17 @@ def action_save_credentials(payload):
         return {"ok": False, "error": "Choisissez une phrase secrète d'au moins 8 caractères."}
     with CRED_LOCK:
         creds = {k: v for k, v in SESSION_CREDS.items() if v}
-    if not creds:
+    # Clusters Kubernetes ajoutés depuis l'interface : leur kubeconfig est un secret,
+    # conservé uniquement ici (chiffré), jamais dans hycu_config.json.
+    with CLUSTERS_LOCK:
+        clusters = [{k: c.get(k) for k in ("name", "kubeconfig", "context", "workspace",
+                                           "source", "nkp_ref", "management")}
+                    for c in CLUSTERS.values()]
+    if not creds and not clusters:
         return {"ok": False, "error": "Connectez-vous d'abord à au moins un système."}
+    names = sorted(creds.keys())
+    if clusters:
+        creds = dict(creds, _clusters=clusters)
     try:
         blob = encrypt_secret(json.dumps(creds).encode("utf-8"), pw)
         with open(SECRETS_PATH, "w", encoding="utf-8") as f:
@@ -2346,8 +3019,8 @@ def action_save_credentials(payload):
     except Exception as e:
         return {"ok": False, "error": "Écriture du coffre impossible : %s" % e}
     save_config({"remember_credentials": True})
-    audit("creds_saved", systems=list(creds.keys()))
-    return {"ok": True, "saved": sorted(creds.keys())}
+    audit("creds_saved", systems=names, clusters=[c["name"] for c in clusters])
+    return {"ok": True, "saved": names, "clusters": [c["name"] for c in clusters]}
 
 
 def action_load_credentials(payload):
@@ -2373,8 +3046,25 @@ def action_load_credentials(payload):
             if k in SESSION_CREDS and isinstance(v, dict):
                 SESSION_CREDS[k] = v
                 loaded.append(k)
-    audit("creds_loaded", systems=loaded)
-    return {"ok": True, "loaded": sorted(loaded)}
+    # Clusters mémorisés : réenregistrés SANS test réseau (chargement rapide) ; un
+    # cluster déjà présent (même nom) est laissé tel quel.
+    cl_ok, cl_err = [], []
+    for c in creds.get("_clusters") or []:
+        if not isinstance(c, dict):
+            continue
+        with CLUSTERS_LOCK:
+            present = any(x["name"] == c.get("name") for x in CLUSTERS.values())
+        if present:
+            cl_ok.append(c.get("name"))
+            continue
+        r = _register_cluster(c.get("name"), c.get("kubeconfig"), c.get("context"),
+                              workspace=c.get("workspace") or "", source=c.get("source") or "upload",
+                              nkp_ref=c.get("nkp_ref") or "", management=c.get("management") or "",
+                              test=False, allow_exec=(c.get("source") or "upload") != "nkp")
+        (cl_ok if r.get("ok") else cl_err).append(c.get("name") if r.get("ok")
+                                                  else "%s (%s)" % (c.get("name"), r.get("error")))
+    audit("creds_loaded", systems=loaded, clusters=cl_ok)
+    return {"ok": True, "loaded": sorted(loaded), "clusters": cl_ok, "cluster_errors": cl_err}
 
 
 def action_forget_credentials():
@@ -3348,6 +4038,9 @@ def action_clone_app(payload, log=None):
         return {"ok": False, "error": "Nom de namespace cible invalide : '%s'." % target_ns, "log": []}
     if not items:
         return {"ok": False, "error": "Aucun volume sélectionné.", "log": []}
+    xerr = _backup_cluster_error(backup_path, backup_root)
+    if xerr:
+        return {"ok": False, "error": xerr, "log": []}
     # Garde contexte (mode réel) : appliquer des manifestes (PV/PVC/workloads/Secrets)
     # sur le cluster courant exige un contexte autorisé/reconfirmé, comme la restauration.
     if not dry:
@@ -3653,7 +4346,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return False
         return True
 
+    def _req_cluster(self, qs=None):
+        """Cluster ciblé par la requête : en-tête X-HYCU-Cluster (ou ?cluster= pour les
+        liens de téléchargement). Absent = cluster local (compatibilité)."""
+        cid = (self.headers.get("X-HYCU-Cluster") or (qs or {}).get("cluster") or "").strip()
+        return cid[:80] or LOCAL_CID
+
     def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        qs = {k: v[0] for k, v in urllib.parse.parse_qs(parsed.query).items()}
+        with use_cluster(self._req_cluster(qs)):
+            return self._do_GET()
+
+    def do_POST(self):
+        with use_cluster(self._req_cluster()):
+            return self._do_POST()
+
+    def _do_GET(self):
         if not self._origin_ok():
             return self._send(403, "Forbidden", "text/plain")
         parsed = urllib.parse.urlparse(self.path)
@@ -3692,7 +4401,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if path == "/api/auto_backup":
                 return self._json(action_auto_backup_status())
             if path == "/api/applications":
+                if qs.get("scope") == "all":
+                    return self._json(action_applications_all())
                 return self._json(action_applications())
+            if path == "/api/clusters":
+                return self._json(action_clusters())
+            if path == "/api/nkp/discover":
+                return self._json(action_nkp_discover())
             if path == "/api/jobs":
                 return self._json(action_jobs())
             if path == "/api/op_status":
@@ -3714,7 +4429,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._json({"error": "Erreur interne."}, 500)
         return self._json({"error": "not found"}, 404)
 
-    def do_POST(self):
+    def _do_POST(self):
         if not self._origin_ok(require_origin=True):
             return self._send(403, "Forbidden", "text/plain")
         if self.headers.get("X-CSRF-Token") != CSRF_TOKEN:
@@ -3759,6 +4474,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._json(action_forget_credentials())
             if path == "/api/ns_filter":
                 return self._json(action_set_ns_filter(payload))
+            if path == "/api/clusters/inspect":
+                return self._json(action_clusters_inspect(payload))
+            if path == "/api/clusters/add":
+                return self._json(action_clusters_add(payload))
+            if path == "/api/clusters/remove":
+                return self._json(action_clusters_remove(payload))
+            if path == "/api/nkp/import":
+                return self._json(action_nkp_import(payload))
             if path == "/api/hycu/protect":
                 return self._json(action_hycu_protect(payload))
             if path == "/api/orchestrate/inplace":
@@ -4036,6 +4759,32 @@ HTML = r"""<!DOCTYPE html>
   table.ht .cb{width:36px;text-align:center}
   table.ht .ctr{text-align:center}
   .tempty{padding:26px;text-align:center;color:var(--muted);font-size:14px}
+  /* ---------- Multi-cluster : sélecteur (barre du haut), groupes, Sources ---------- */
+  .tb-link .caret{opacity:.8}
+  .clmenu{position:fixed;top:58px;z-index:90;background:#fff;border-radius:6px;min-width:290px;max-width:400px;
+          box-shadow:0 6px 24px rgba(42,46,68,.18);padding:6px 0;display:none;max-height:70vh;overflow:auto}
+  .clmenu .cli{display:flex;align-items:center;gap:10px;padding:9px 14px;cursor:pointer;font-size:14px;color:var(--strong)}
+  .clmenu .cli:hover{background:var(--purple-t)}
+  .clmenu .cli.on{font-weight:700}
+  .clmenu .cli .ws{color:var(--muted);font-size:12px;margin-left:auto;padding-left:12px;white-space:nowrap;font-weight:400}
+  .clmenu .chk{width:16px;flex:none;color:var(--purple);display:flex}
+  .clmenu .msep{height:1px;background:var(--line);margin:6px 0}
+  .clmenu .act{color:var(--top)}
+  table.ht .mc{display:none}
+  table.ht.multi .mc{display:table-cell}
+  table.ht tr.grp td{background:#F6F7FB;color:var(--title);font-size:12.5px;font-weight:700;padding:7px 12px}
+  table.ht tbody tr.grp:hover td{background:#F6F7FB}
+  table.ht tr.grp .gs{color:var(--grey);margin:0 7px;font-weight:400}
+  table.ht tr.grp .ge{color:var(--red);font-weight:400;margin-left:10px}
+  table.ht tr.srcsec td{background:#F6F7FB;color:var(--title);font-size:11.5px;font-weight:700;text-transform:uppercase;
+               letter-spacing:.4px;padding:7px 12px}
+  table.ht tbody tr.srcsec:hover td{background:#F6F7FB}
+  .srctools{display:flex;gap:22px;margin:0 0 10px;flex-wrap:wrap}
+  .tag{display:inline-block;font-size:11px;font-weight:700;color:var(--top);border:1px solid var(--rule);border-radius:3px;
+       padding:0 6px;margin-left:8px;vertical-align:middle}
+  textarea.kc{width:100%;min-height:120px;font-family:ui-monospace,Consolas,monospace;font-size:12px;box-sizing:border-box;
+       border:1px solid var(--rule);border-radius:4px;padding:8px 10px;color:var(--strong);resize:vertical}
+  ul.wl{margin:6px 0 0;padding-left:18px;font-size:13px;color:var(--text)}
   /* Icônes d'état HYCU : pastille pleine, symbole blanc */
   .st,.ic.ok,.ic.ko,.ic.sim{display:inline-flex;width:18px;height:18px;border-radius:50%;flex:none;
       color:transparent !important;font-size:0 !important;vertical-align:middle;
@@ -4196,7 +4945,8 @@ HTML = r"""<!DOCTYPE html>
   #mRestore #rsInplaceRunWrap{border-top:none !important;padding-top:0 !important}
   #rsWizMode.sim{background:var(--purple-t);color:var(--top)} #rsWizMode.live{background:#FCE9E8;color:var(--red)}
   /* Sources : une fiche de connexion à la fois (choisie dans le tableau) */
-  #tab-connect > .card{border:1px solid var(--rule);box-shadow:none}
+  #tab-connect > .card{border:1px solid var(--rule);box-shadow:none;padding:14px 18px 16px;border-radius:4px}
+  #tab-connect > .card > h3{display:flex;margin-bottom:8px;font-size:16px}
   #srcBody tr.clk td:first-child{font-weight:500;color:var(--strong)}
 
   @media(max-width:1100px){.dgrid{grid-template-columns:repeat(2,minmax(0,1fr))}}
@@ -4332,12 +5082,13 @@ HTML = r"""<!DOCTYPE html>
   <a class="tb-brand" id="tbHome" href="#" title="Tableau de bord">__LOGO__<span class="tb-word">HYCU<sup>®</sup></span><span class="tb-prod">Kubernetes · Nutanix</span></a>
   <div class="tb-right">
     <span id="hdrConn" class="hdrconn" title="État des sources — cliquer pour ouvrir les Sources"></span>
-    <button class="tb-link" id="ctxLink" type="button" title="Cluster Kubernetes ciblé (contexte kubectl) — cliquer pour le changer"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="16" height="6.5" rx="1.3"/><rect x="4" y="13.5" width="16" height="6.5" rx="1.3"/><path d="M7.6 7.25h.01M7.6 16.75h.01"/></svg><u id="ctx">…</u><span id="ctxWarn"></span></button>
-    <button class="tb-ico" id="srcBtn" type="button" title="Sources (HYCU, Prism Central, Prism Element)"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></button>
+    <button class="tb-link" id="ctxLink" type="button" title="Cluster Kubernetes actif — cliquer pour en choisir un autre"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="16" height="6.5" rx="1.3"/><rect x="4" y="13.5" width="16" height="6.5" rx="1.3"/><path d="M7.6 7.25h.01M7.6 16.75h.01"/></svg><u id="ctx">…</u><span id="ctxWarn"></span><svg class="caret" width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M2.5 4.5l3.5 3.5 3.5-3.5" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round"/></svg></button>
+    <button class="tb-ico" id="srcBtn" type="button" title="Sources (HYCU, Prism Central, Prism Element, clusters Kubernetes)"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></button>
     <button class="tb-ico" id="aboutBtn" type="button" title="À propos de cet outil"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9.4"/><path d="M9.6 9.4a2.5 2.5 0 0 1 4.9.8c0 1.7-2.5 2.1-2.5 3.8"/><circle cx="12" cy="17.1" r=".7" fill="currentColor" stroke="none"/></svg></button>
     <button id="langBtn" class="tb-lang" type="button" title="Afficher l'interface en anglais">EN</button>
   </div>
 </header>
+<div id="clMenu" class="clmenu" role="menu"></div>
 
 <div class="shell">
 <nav class="sidebar" role="tablist" aria-label="Sections de l'outil">
@@ -4381,13 +5132,14 @@ HTML = r"""<!DOCTYPE html>
         <button class="pact" id="actVerify" type="button" disabled><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="8.6"/><path d="M8.3 12.2l2.5 2.5 5-5.3"/></svg><span>Vérifier</span></button>
       </div></div>
     <div class="tcard">
-      <div class="tbar"><input type="text" id="appsSearch" placeholder="Rechercher" autocomplete="off">
+      <div class="tbar"><div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap"><input type="text" id="appsSearch" placeholder="Rechercher" autocomplete="off">
+        <div class="seg" id="appsScope" style="display:none"><button class="on" type="button" data-scope="one">Cluster actif</button><button type="button" data-scope="all">Tous les clusters</button></div></div>
         <div style="display:flex;align-items:center;gap:14px"><span class="tinfo" id="appsInfo"></span>
           <button class="pact nsEdit" type="button" title="Filtrer la liste des namespaces"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5h16l-6.2 7.4V19l-3.6-1.8v-4.8z"/></svg></button></div></div>
-      <table class="ht"><thead><tr><th class="cb"><input type="checkbox" id="appsAll" title="Tout sélectionner"></th>
-        <th>Nom</th><th>Type</th><th>Politique</th><th class="ctr">Conformité</th><th class="ctr">Protection</th>
+      <table class="ht" id="appsTable"><thead><tr><th class="cb"><input type="checkbox" id="appsAll" title="Tout sélectionner"></th>
+        <th>Nom</th><th class="mc">Workspace</th><th class="mc">Cluster</th><th>Type</th><th>Politique</th><th class="ctr">Conformité</th><th class="ctr">Protection</th>
         <th>Dernière sauvegarde</th><th class="ctr">Versions</th></tr></thead>
-        <tbody id="appsBody"><tr><td colspan="8" class="tempty"><span class="spin"></span></td></tr></tbody></table>
+        <tbody id="appsBody"><tr><td colspan="10" class="tempty"><span class="spin"></span></td></tr></tbody></table>
     </div>
   </section>
   <!-- ===================== POLITIQUES ===================== -->
@@ -4432,8 +5184,8 @@ HTML = r"""<!DOCTYPE html>
     <div class="tcard" style="margin-bottom:16px;padding:14px 16px"><div class="jcounts" id="jobsCounts" style="margin-top:0"></div></div>
     <div class="tcard">
       <div class="tbar"><input type="text" id="jobsSearch" placeholder="Rechercher" autocomplete="off"><span class="tinfo" id="jobsInfo"></span></div>
-      <table class="ht"><thead><tr><th>Tâche</th><th>Application</th><th>Détail</th><th>Démarrée</th><th class="ctr">État</th></tr></thead>
-        <tbody id="jobsBody"><tr><td colspan="5" class="tempty"><span class="spin"></span></td></tr></tbody></table>
+      <table class="ht"><thead><tr><th>Tâche</th><th>Application</th><th>Cluster</th><th>Détail</th><th>Démarrée</th><th class="ctr">État</th></tr></thead>
+        <tbody id="jobsBody"><tr><td colspan="6" class="tempty"><span class="spin"></span></td></tr></tbody></table>
     </div>
   </section>
 
@@ -4458,9 +5210,10 @@ HTML = r"""<!DOCTYPE html>
   <section id="tab-settings" style="display:none">
     <div class="pagehead"><h1 class="ptitle">Réglages</h1></div>
     <div class="card">
-      <h3><span class="step-no">⎈</span>Cluster cible (contexte kubectl)</h3>
+      <h3><span class="step-no">⎈</span>Cluster local (contexte kubectl)</h3>
       <p class="sub">Choisissez explicitement le cluster, au lieu de suivre le contexte courant.
-        L'outil ajoute <code>--context</code> (et <code>--kubeconfig</code>) à chaque commande kubectl.</p>
+        L'outil ajoute <code>--context</code> (et <code>--kubeconfig</code>) à chaque commande kubectl.
+        Les clusters <b>supplémentaires</b> (kubeconfig importé, workspaces NKP) se gèrent depuis <b>⚙ Sources</b>.</p>
       <label class="fld">Fichier kubeconfig (vide = défaut ~/.kube/config)</label>
       <input type="text" id="cfgKubeconfig" placeholder="%USERPROFILE%\.kube\config">
       <div class="row" style="margin-top:6px">
@@ -4480,8 +5233,8 @@ HTML = r"""<!DOCTYPE html>
         <div><label class="fld">Préfixe volumeHandle (vide = auto)</label><input type="text" id="cfgVhPrefix" placeholder="auto-détecté"></div>
       </div>
       <div class="row">
-        <div><label class="fld">Contextes autorisés (séparés par des virgules ; vide = tous)</label><input type="text" id="cfgCtx" placeholder="prod-cluster, dr-cluster"></div>
-        <div><label class="fld">Namespaces autorisés (vide = tous)</label><input type="text" id="cfgNs" placeholder="wordpress, bo-dev"></div>
+        <div><label class="fld">Contextes / clusters autorisés (séparés par des virgules ; vide = tous)</label><input type="text" id="cfgCtx" placeholder="prod-cluster, dr-cluster"></div>
+        <div><label class="fld">Namespaces autorisés — cluster local (vide = tous)</label><input type="text" id="cfgNs" placeholder="wordpress, bo-dev"></div>
       </div>
       <div class="row">
         <div><label class="fld">Timeout d'attente (s)</label><input type="text" id="cfgWait" placeholder="120"></div>
@@ -4667,13 +5420,17 @@ HTML = r"""<!DOCTYPE html>
   <div class="hmodal" style="max-width:860px">
     <div class="hm-head"><h2 id="mSourcesTitle">Sources</h2><div class="hm-ico"><button type="button" data-close="mSources" title="Fermer">✕</button></div></div>
     <div class="hm-body">
-      <p class="hint" style="margin:0 0 12px">Enregistrez ici les systèmes utilisés par l'outil. Les identifiants restent en mémoire le temps de la session (ou dans le coffre chiffré si vous le choisissez).</p>
+      <p class="hint" style="margin:0 0 12px">Enregistrez ici les systèmes utilisés par l'outil — HYCU, Nutanix et vos clusters Kubernetes. Les identifiants et kubeconfigs restent en mémoire le temps de la session (ou dans le coffre chiffré si vous le choisissez).</p>
+      <div class="srctools">
+        <button class="pact" id="clAddBtn" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="16" height="6.5" rx="1.3"/><rect x="4" y="13.5" width="10" height="6.5" rx="1.3"/><path d="M18.5 14.5v5M16 17h5"/></svg><span>Ajouter un cluster Kubernetes</span></button>
+        <button class="pact" id="nkpBtn" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3.5" y="3.5" width="7" height="7" rx="1.2"/><rect x="13.5" y="3.5" width="7" height="7" rx="1.2"/><rect x="3.5" y="13.5" width="7" height="7" rx="1.2"/><circle cx="16.6" cy="16.6" r="3"/><path d="M18.8 18.8l2 2"/></svg><span>Découvrir les workspaces NKP</span></button>
+      </div>
       <div class="tcard" style="box-shadow:none;border:1px solid var(--rule);margin-bottom:14px">
-        <table class="ht"><thead><tr><th>Nom</th><th>Type</th><th>URL</th><th class="ctr">État</th></tr></thead><tbody id="srcBody"></tbody></table>
+        <table class="ht"><thead><tr><th>Nom</th><th>Type</th><th>URL / serveur</th><th class="ctr">État</th></tr></thead><tbody id="srcBody"></tbody></table>
       </div>
   <!-- ===================== CONNEXIONS ===================== -->
   <section id="tab-connect">
-    <div class="card">
+    <div class="card" data-card="hycu">
       <h3><span class="step-no">H</span>HYCU — connexion</h3>
       <p class="sub">Pour lister les points de restauration et orchestrer le clone/restore d'un Volume Group
         depuis l'assistant de restauration (<b>Applications → Restaurer</b>). Les identifiants restent <b>en mémoire</b> le temps de la session — jamais écrits sur disque.</p>
@@ -4701,7 +5458,7 @@ HTML = r"""<!DOCTYPE html>
       <div id="hyErr"></div>
     </div>
 
-    <div class="card">
+    <div class="card" data-card="nutanix">
       <h3><span class="step-no">N</span>Nutanix Prism Element — connexion</h3>
       <p class="sub">Récupère automatiquement la référence (UUID) du Volume Group cloné (lecture seule, API v2)
         dans l'assistant de restauration. Identifiants en mémoire de session uniquement.</p>
@@ -4720,7 +5477,7 @@ HTML = r"""<!DOCTYPE html>
       <div id="ntErr"></div>
     </div>
 
-    <div class="card">
+    <div class="card" data-card="prismcentral">
       <h3><span class="step-no">PC</span>Nutanix Prism Central — connexion</h3>
       <p class="sub">Alternative multi-cluster (API v3). Sert aussi à récupérer la référence (UUID) du Volume Group
         cloné si vous n'utilisez pas Prism Element. Identifiants en mémoire de session uniquement.</p>
@@ -4739,9 +5496,9 @@ HTML = r"""<!DOCTYPE html>
       <div id="pcErr"></div>
     </div>
 
-    <div class="card">
+    <div class="card" data-card="vault">
       <h3><span class="step-no">🔒</span>Mémoriser les connexions (chiffré)</h3>
-      <p class="sub">Option : enregistrer les identifiants saisis ci-dessus dans un coffre <b>chiffré</b>
+      <p class="sub">Option : enregistrer les identifiants saisis (et les kubeconfigs des clusters ajoutés) dans un coffre <b>chiffré</b>
         (<code>hycu_secrets.enc</code>), protégé par une <b>phrase secrète maîtresse</b> — jamais stockée.
         Par défaut, rien n'est écrit (RAM seulement), le choix le plus sûr.</p>
       <label class="fld">Phrase secrète (≥ 8 caractères)</label>
@@ -4755,6 +5512,53 @@ HTML = r"""<!DOCTYPE html>
       <div class="hint" style="margin-top:8px">MD5 n'étant pas réversible, le coffre utilise un chiffrement
         par phrase secrète (PBKDF2-HMAC-SHA256 + scellé d'intégrité).</div>
       <div id="vaultErr"></div>
+    </div>
+
+    <div class="card" data-card="cluster-add">
+      <h3><span class="step-no">K</span>Ajouter un cluster Kubernetes</h3>
+      <p class="sub">Chargez le <b>kubeconfig</b> du cluster (fichier ou copier-coller). Comme un mot de passe, il reste
+        <b>en mémoire</b> le temps de la session, et n'est écrit sur disque que <b>chiffré</b> si vous utilisez le coffre.
+        Les sauvegardes de chaque cluster sont rangées séparément.</p>
+      <div class="row">
+        <div><label class="fld">Nom du cluster</label><input type="text" id="clName" placeholder="prod-paris" autocomplete="off"></div>
+        <div><label class="fld">Fichier kubeconfig</label><input type="file" id="clFile"></div>
+      </div>
+      <label class="fld">…ou collez son contenu (YAML ou JSON)</label>
+      <textarea id="clKc" class="kc" spellcheck="false" autocomplete="off" placeholder="apiVersion: v1&#10;kind: Config&#10;clusters: …"></textarea>
+      <div id="clCtxWrap" style="display:none"><label class="fld">Contexte</label><select id="clCtx"></select><div id="clCtxInfo"></div></div>
+      <div style="margin-top:12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <button class="btn" id="clAdd" type="button">Tester &amp; ajouter</button>
+        <span class="hint" style="margin:0">Test de connexion en lecture seule (liste des namespaces, 10 s max).</span>
+      </div>
+      <div id="clErr"></div>
+    </div>
+
+    <div class="card" data-card="cluster">
+      <h3><span class="step-no">K</span><span id="clDTitle">Cluster</span></h3>
+      <div id="clDBody"></div>
+      <div style="margin-top:12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <button class="btn" id="clUse" type="button">Définir comme cluster actif</button>
+        <button class="btn ghost" id="clLocalCfg" type="button">Ouvrir les réglages</button>
+        <button class="btn danger" id="clRemove" type="button">Retirer</button>
+      </div>
+      <div id="clDErr"></div>
+    </div>
+
+    <div class="card" data-card="nkp">
+      <h3><span class="step-no">W</span>Découverte des workspaces NKP (optionnel)</h3>
+      <p class="sub">Depuis le <b>cluster de management</b> NKP, liste les <b>workspaces</b> et leurs clusters, puis importe
+        leurs kubeconfigs. Cluster interrogé : <b id="nkpMgmt">—</b> (le cluster actif — choisissez le cluster de management
+        dans la barre du haut).</p>
+      <div class="warnbox">⚠ <b>Droits élevés requis</b> sur le cluster de management : lecture des Workspaces, des
+        KommanderClusters et des <b>Secrets</b> kubeconfig des namespaces de workspace. Les kubeconfigs importés donnent
+        souvent un accès <b>administrateur</b> aux clusters : ils restent en mémoire (coffre chiffré en option), jamais en clair sur disque.</div>
+      <div style="margin-top:12px"><button class="btn" id="nkpDiscover" type="button">Découvrir</button></div>
+      <div id="nkpOut"></div>
+      <div id="nkpImportWrap" style="display:none;margin-top:10px">
+        <label class="fld"><input type="checkbox" id="nkpAck" style="width:auto"> J'ai compris : importer les kubeconfigs des clusters cochés</label>
+        <button class="btn" id="nkpImport" type="button" disabled>Importer la sélection</button>
+      </div>
+      <div id="nkpRes"></div>
     </div>
   </section>
 
@@ -4777,9 +5581,12 @@ function badge(phase){
   return `<span class="badge ${c}">${phase||"—"}</span>`;
 }
 function esc(s){return (s==null?"":String(s)).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
-async function get(u){const r=await fetch(u);return r.json();}
-async function post(u,b){const r=await fetch(u,{method:"POST",
-  headers:{"Content-Type":"application/json","X-CSRF-Token":CSRF},
+// Cluster Kubernetes ACTIF : chaque requête le désigne (en-tête X-HYCU-Cluster) ;
+// le serveur route kubectl vers ce cluster. « local » = cluster de la configuration.
+let ACTIVE_CID="local", CLUSTERS=[{id:"local", name:"local", local:true}];
+async function get(u, cid){const r=await fetch(u,{headers:{"X-HYCU-Cluster":cid||ACTIVE_CID}});return r.json();}
+async function post(u,b,cid){const r=await fetch(u,{method:"POST",
+  headers:{"Content-Type":"application/json","X-CSRF-Token":CSRF,"X-HYCU-Cluster":cid||ACTIVE_CID},
   body:JSON.stringify(b)});return r.json();}
 
 // Erreurs actionnables : reconnaît les causes courantes (HYCU/Nutanix/kubectl/HTTP)
@@ -4974,10 +5781,9 @@ async function runOp(url, body, onProgress){
 
 // Init : contexte + namespaces + config
 async function initApp(){
+  await loadClusters();
   ctxInfo = await get("/api/context");
-  $("#ctx").textContent = ctxInfo.context || "indisponible";
-  $("#ctxWarn").innerHTML = (ctxInfo.context && ctxInfo.allowed && ctxInfo.allowed.length && !ctxInfo.context_ok)
-    ? ' <span class="bad">⚠ hors liste autorisée</span>' : '';
+  renderCtx();
   renderKubeBanner();
   const n=await get("/api/namespaces");
   const opts = (n.namespaces||[]).map(x=>`<option>${esc(x)}</option>`).join("");
@@ -4991,6 +5797,7 @@ async function initApp(){
   onPageShown(curPage);                       // (re)charge les données de la page affichée
 }
 (async()=>{
+  ACTIVE_CID = prefs().cluster || "local";
   const cfg = await get("/api/config");
   ctxInfo = await get("/api/context");      // utilisé comme suggestion par l'assistant
   if(cfg && cfg.exists===false){ startWizard(); }
@@ -5015,8 +5822,11 @@ $("#unlockGo").onclick=async()=>{
     setTimeout(()=>$("#unlockPass").focus(),30); return; }
   const names={hycu:"HYCU", nutanix:"Prism Element", prismcentral:"Prism Central"};
   const lst=(r.loaded||[]).map(s=>names[s]||s).join(", ");
-  $("#unlockErr").innerHTML=`<div class="note">Connexions rechargées : ${esc(lst||"aucune")}.</div>`;
+  const cls=(r.clusters||[]).join(", ");
+  $("#unlockErr").innerHTML=`<div class="note">Connexions rechargées : ${esc(lst||"aucune")}.`+
+    (cls?`<br>Clusters Kubernetes rechargés : ${esc(cls)}.`:"")+`</div>`;
   await loadConnStatus();
+  await afterVaultLoad();
   setTimeout(()=>{ $("#unlock").style.display="none"; $("#unlockErr").innerHTML=""; }, 900);
 };
 
@@ -5137,7 +5947,7 @@ $("#wizNext").onclick=async()=>{
 // où le serveur ne peut pas écrire sur le disque du client).
 function dlBackupLink(dir, root, label){
   if(!dir) return "";
-  const u="/api/backup/download?path="+encodeURIComponent(dir)+(root?("&root="+encodeURIComponent(root)):"");
+  const u="/api/backup/download?path="+encodeURIComponent(dir)+(root?("&root="+encodeURIComponent(root)):"")+"&cluster="+encodeURIComponent(ACTIVE_CID);
   return `<a class="btn ghost" href="${u}" download style="padding:2px 8px;font-size:12px;text-decoration:none;margin-left:6px">⬇ ${esc(label||'Télécharger (.zip)')}</a>`;
 }
 // ----- Sauvegarde automatique de la configuration (onglet 1) -----
@@ -5319,7 +6129,7 @@ async function applyBackupSelection(){
     state.backup_path=b.path;
     pvcs=((b.index||{}).volumes||[]).map(v=>({name:v.pvc,pv:v.pv,phase:"sauvegardé"}));
     src=customRoot?"sauvegarde (dossier perso)":(i==="0"?"dernière sauvegarde":"sauvegarde choisie");
-    const _dl=$("#rsBackupDl"); if(_dl){ _dl.href="/api/backup/download?path="+encodeURIComponent(b.path)+(customRoot?("&root="+encodeURIComponent(customRoot)):""); _dl.style.display="inline"; }
+    const _dl=$("#rsBackupDl"); if(_dl){ _dl.href="/api/backup/download?path="+encodeURIComponent(b.path)+(customRoot?("&root="+encodeURIComponent(customRoot)):"")+"&cluster="+encodeURIComponent(ACTIVE_CID); _dl.style.display="inline"; }
   }else{
     state.backup_path=null;   // aucune sauvegarde -> repli live (vide si namespace détruit)
     const _dl=$("#rsBackupDl"); if(_dl) _dl.style.display="none";
@@ -5596,7 +6406,7 @@ $("#rsInplaceRun").onclick=async()=>{
     const needCtx = ctxInfo.require_confirm ? (ctxInfo.context||"") : null;
     const res = await confirmDanger({title:"Restauration SUR PLACE RÉELLE", requireText:needCtx, lines:[
        "Namespace : <b>"+esc((rsHyMatch?rsHyMatch.ns:$("#rsNs").value)||"?")+"</b>",
-       "Contexte kubectl : <b>"+esc(ctxInfo.context||"?")+"</b>",
+       "Cluster ciblé : <b>"+esc(ctxInfo.context||"?")+"</b>",
        "L'application sera <b>ARRÊTÉE</b>, les volumes restaurés <b>in-place</b> dans HYCU (données écrasées par le point choisi), puis l'application <b>REDÉMARRÉE</b>."]});
     if(!res) return;
     if(typeof res==="string") confirmedCtx=res;
@@ -5737,7 +6547,7 @@ $("#rsGo").onclick=async()=>{
       const needCtx = ctxInfo.require_confirm ? (ctxInfo.context||"") : null;
       const res = await confirmDanger({title:"Clone d'application RÉEL", requireText:needCtx, lines:[
          "Une <b>COPIE</b> de l'application sera créée"+(state.cloneNsMode==="same"?" dans le <b>même namespace</b> (avec suffixe)":" dans le namespace cible <b>"+esc($("#rsCloneTargetNs").value||"?")+"</b>")+".",
-         "Contexte kubectl : <b>"+esc(ctxInfo.context||"?")+"</b>",
+         "Cluster ciblé : <b>"+esc(ctxInfo.context||"?")+"</b>",
          "L'application d'origine n'est <b>PAS</b> modifiée ni arrêtée."]});
       if(!res) return;
       if(typeof res==="string") confirmedCtxCA=res;
@@ -5771,7 +6581,7 @@ $("#rsGo").onclick=async()=>{
     const needCtx = ctxInfo.require_confirm ? (ctxInfo.context||"") : null;
     const res = await confirmDanger({title:"Restauration RÉELLE", requireText:needCtx, lines:[
       "Namespace : <b>"+esc($("#rsNs").value||"?")+"</b>",
-      "Contexte kubectl : <b>"+esc(ctxInfo.context||"?")+"</b>",
+      "Cluster ciblé : <b>"+esc(ctxInfo.context||"?")+"</b>",
       "L'application sera <b>arrêtée</b>, les anciens PVC/PV <b>supprimés</b> puis recréés sur le(s) Volume Group(s) restauré(s)."]});
     if(!res) return;
     if(typeof res==="string") confirmedCtx=res;
@@ -5968,15 +6778,18 @@ async function vaultAction(url, needPass){
 }
 $("#vaultSave").onclick=async()=>{
   const r=await vaultAction("/api/creds/save", true);
-  $("#vaultErr").innerHTML = r.ok? `<div class="note">Connexions chiffrées : ${esc((r.saved||[]).join(', '))}.</div>`
+  $("#vaultErr").innerHTML = r.ok? `<div class="note">Connexions chiffrées : ${esc((r.saved||[]).join(', ')||"—")}.`+
+      ((r.clusters||[]).length?`<br>Clusters Kubernetes chiffrés : ${esc(r.clusters.join(', '))}.`:"")+`</div>`
                                  : errBox(r.error);
   await loadConnStatus();
 };
 $("#vaultLoad").onclick=async()=>{
   const r=await vaultAction("/api/creds/load", true);
-  $("#vaultErr").innerHTML = r.ok? `<div class="note">Connexions chargées : ${esc((r.loaded||[]).join(', '))}.</div>`
+  $("#vaultErr").innerHTML = r.ok? `<div class="note">Connexions chargées : ${esc((r.loaded||[]).join(', ')||"—")}.`+
+      ((r.clusters||[]).length?`<br>Clusters Kubernetes chargés : ${esc(r.clusters.join(', '))}.`:"")+`</div>`
                                  : errBox(r.error);
   await loadConnStatus();
+  if(r.ok) await afterVaultLoad();
 };
 $("#vaultForget").onclick=async()=>{
   if(!confirm("Supprimer le coffre chiffré du disque ?")) return;
@@ -6170,7 +6983,7 @@ bindGo();
 
 // ----- Barre du haut / barre latérale -----
 $("#srcBtn").onclick=()=>openSources();
-$("#ctxLink").onclick=()=>switchTab("settings");
+$("#ctxLink").onclick=e=>{ e.stopPropagation(); toggleClMenu(); };
 $("#tbHome").onclick=e=>{ e.preventDefault(); switchTab("dashboard"); };
 $("#sbCol").onclick=()=>{ const m=!document.body.classList.contains("sb-min");
   document.body.classList.toggle("sb-min",m); savePref("sbMin",m); };
@@ -6221,16 +7034,36 @@ function onPageShown(tab){
 }
 
 // ============================ Applications ============================
-let apps=[], appsSel=new Set(), appsFresh=24, appsPolicy={};
+let apps=[], appsSel=new Set(), appsFresh=24, appsPolicy={}, appsScope="one", appsClErr=[];
+// Clé de sélection = cluster|namespace (vue « Tous les clusters » : un même nom de
+// namespace peut exister sur plusieurs clusters).
+const appKey=a=>(a.cluster_id||ACTIVE_CID)+"|"+a.name;
+function updateScopeSeg(){
+  const multi=CLUSTERS.length>1;
+  $("#appsScope").style.display = multi ? "" : "none";
+  if(!multi) appsScope="one";
+  else if(prefs().appsScope==="all") appsScope="all";
+  document.querySelectorAll("#appsScope button").forEach(b=>b.classList.toggle("on", b.dataset.scope===appsScope));
+}
+document.querySelectorAll("#appsScope button").forEach(b=>b.onclick=()=>{
+  appsScope=b.dataset.scope; savePref("appsScope", appsScope); appsSel.clear();
+  document.querySelectorAll("#appsScope button").forEach(x=>x.classList.toggle("on", x===b));
+  loadApps();
+});
 async function loadApps(){
   $("#appsRefresh").classList.add("busy");
-  const r=await get("/api/applications");
+  const all = appsScope==="all";
+  const r=await get(all ? "/api/applications?scope=all" : "/api/applications");
   $("#appsRefresh").classList.remove("busy");
-  apps=r.apps||[]; appsFresh=r.freshness_hours||24; appsPolicy=r.policy||{};
-  const names=new Set(apps.map(a=>a.name));
-  [...appsSel].forEach(n=>{ if(!names.has(n)) appsSel.delete(n); });
+  apps=(r.apps||[]).map(a=>all ? a : Object.assign({}, a, {cluster_id:ACTIVE_CID}));
+  appsFresh=r.freshness_hours||24; appsPolicy=r.policy||{};
+  appsClErr = all ? (r.clusters||[]).filter(c=>!c.ok && !c.skipped) : [];
+  if(all) apps.sort((x,y)=>(x.workspace||"").localeCompare(y.workspace||"") || (x.cluster||"").localeCompare(y.cluster||"") || x.name.localeCompare(y.name));
+  const keys=new Set(apps.map(appKey));
+  [...appsSel].forEach(k=>{ if(!keys.has(k)) appsSel.delete(k); });
+  $("#appsTable").classList.toggle("multi", all);
   if(!r.ok && !apps.length){
-    $("#appsBody").innerHTML=`<tr><td colspan="8">${errBox(r.error||"kubectl ?")}</td></tr>`;
+    $("#appsBody").innerHTML=`<tr><td colspan="10">${errBox(r.error||"kubectl ?")}</td></tr>`;
     updateAppActs(); return r;
   }
   renderApps(); return r;
@@ -6240,82 +7073,106 @@ function appPolicyLabel(){
 }
 function appsVisible(){
   const q=($("#appsSearch").value||"").trim().toLowerCase();
-  return apps.filter(a=>!q || a.name.toLowerCase().includes(q));
+  return apps.filter(a=>!q || a.name.toLowerCase().includes(q) || (a.cluster||"").toLowerCase().includes(q)
+                           || (a.workspace||"").toLowerCase().includes(q));
 }
 function renderApps(){
-  const rows=appsVisible();
+  const rows=appsVisible(), all=appsScope==="all";
   $("#appsInfo").textContent=rows.length+" application(s)";
+  let h="";
+  appsClErr.forEach(c=>{ h+=`<tr class="grp"><td colspan="10">${c.workspace?esc(c.workspace)+'<span class="gs">›</span>':""}${esc(c.cluster)}`+
+                             `<span class="ge">${stIc("ko")} ${esc(c.error||"injoignable")}</span></td></tr>`; });
   if(!rows.length){
-    $("#appsBody").innerHTML=`<tr><td colspan="8" class="tempty">${apps.length
+    h+=`<tr><td colspan="10" class="tempty">${apps.length
       ? "Aucune application ne correspond à la recherche."
       : "Aucun namespace à afficher — vérifiez le contexte kubectl ou le filtre des namespaces."}</td></tr>`;
   } else {
-    $("#appsBody").innerHTML=rows.map(a=>{
-      const sel=appsSel.has(a.name);
+    let grp=null;
+    h+=rows.map(a=>{
+      let g="";
+      const gk=(a.workspace||"")+"|"+(a.cluster_id||"");
+      if(all && gk!==grp){ grp=gk;
+        g=`<tr class="grp"><td colspan="10">${a.workspace?esc(a.workspace)+'<span class="gs">›</span>':""}${esc(a.cluster||"")}`+
+          `${a.cluster_id===ACTIVE_CID?'<span class="tag">ACTIF</span>':''}</td></tr>`; }
+      const k=appKey(a), sel=appsSel.has(k);
       const comp = a.compliant ? stIc("ok","Sauvegarde de configuration récente")
                  : (a.protected ? stIc("ko","Dernière sauvegarde plus ancienne que "+appsFresh+" h")
                                 : stIc("na","Jamais sauvegardée"));
       const prot = a.protected ? stIc("ok", a.backups+" sauvegarde(s) de configuration")
                                : stIc("na","Aucune sauvegarde de configuration");
       const last = a.last_backup ? esc(fmtAgo(a.last_backup)) : '<span style="color:var(--muted)">Jamais</span>';
-      return `<tr class="clk${sel?' sel':''}" data-ns="${esc(a.name)}">
+      return g+`<tr class="clk${sel?' sel':''}" data-k="${esc(k)}">
         <td class="cb"><input type="checkbox" tabindex="-1" ${sel?"checked":""}></td>
         <td style="color:var(--strong);font-weight:500">${esc(a.name)}</td>
+        <td class="mc">${esc(a.workspace||"—")}</td><td class="mc">${esc(a.cluster||"")}</td>
         <td>Application Kubernetes</td><td>${esc(appPolicyLabel())}</td>
         <td class="ctr">${comp}</td><td class="ctr">${prot}</td><td>${last}</td>
         <td class="ctr">${a.backups||0}</td></tr>`;
     }).join("");
-    document.querySelectorAll("#appsBody tr.clk").forEach(tr=>tr.onclick=()=>{
-      const n=tr.dataset.ns; appsSel.has(n) ? appsSel.delete(n) : appsSel.add(n); renderApps(); });
   }
-  $("#appsAll").checked = rows.length>0 && rows.every(a=>appsSel.has(a.name));
+  $("#appsBody").innerHTML=h;
+  document.querySelectorAll("#appsBody tr.clk").forEach(tr=>tr.onclick=()=>{
+    const k=tr.dataset.k; appsSel.has(k) ? appsSel.delete(k) : appsSel.add(k); renderApps(); });
+  $("#appsAll").checked = rows.length>0 && rows.every(a=>appsSel.has(appKey(a)));
   updateAppActs();
 }
-function selApps(){ return apps.map(a=>a.name).filter(n=>appsSel.has(n)); }
+function selAppObjs(){ return apps.filter(a=>appsSel.has(appKey(a))); }
+function selApps(){ return selAppObjs().map(a=>a.name); }
 function updateAppActs(){
-  const n=selApps().length;
+  const n=selAppObjs().length;
   $("#actBackup").disabled = !n;
   ["#actRestore","#actPolicy","#actVerify"].forEach(id=>$(id).disabled = n!==1);
 }
+// Opération sur UNE application d'un autre cluster (vue « Tous les clusters ») : on
+// bascule d'abord le cluster actif, pour que confirmations et garde-fous le désignent.
+async function ensureCluster(a){ if(a && a.cluster_id && a.cluster_id!==ACTIVE_CID) await setActiveCluster(a.cluster_id); }
 $("#appsSearch").oninput=renderApps;
 $("#appsAll").onchange=()=>{ const on=$("#appsAll").checked;
-  appsVisible().forEach(a=>on ? appsSel.add(a.name) : appsSel.delete(a.name)); renderApps(); };
+  appsVisible().forEach(a=>on ? appsSel.add(appKey(a)) : appsSel.delete(appKey(a))); renderApps(); };
 $("#appsRefresh").onclick=()=>loadApps();
-$("#actBackup").onclick=()=>openBackupModal(selApps());
-$("#actRestore").onclick=()=>openRestoreModal(selApps()[0]);
-$("#actPolicy").onclick=()=>openPolicyModal(selApps()[0]);
-$("#actVerify").onclick=()=>gotoVerify(selApps()[0], false);
+$("#actBackup").onclick=async()=>{
+  const objs=selAppObjs();
+  const cids=[...new Set(objs.map(a=>a.cluster_id))];
+  if(cids.length===1) await ensureCluster(objs[0]);
+  openBackupModal(objs.map(a=>a.name), objs);
+};
+$("#actRestore").onclick=async()=>{ const a=selAppObjs()[0]; await ensureCluster(a); openRestoreModal(a.name); };
+$("#actPolicy").onclick=async()=>{ const a=selAppObjs()[0]; await ensureCluster(a); openPolicyModal(a.name); };
+$("#actVerify").onclick=async()=>{ const a=selAppObjs()[0]; await ensureCluster(a); gotoVerify(a.name, false); };
 
 // ============================ Modale Sauvegarde ============================
 // Actions principales dans le pied de modale (comme HYCU) : on y DÉPLACE les boutons
 // existants — leurs gestionnaires d'événements suivent l'élément.
 $("#mBackupFoot").append($("#bkRunAll"), $("#bkRun"));
-let bkSel=[];
-function openBackupModal(list){
+let bkSel=[], bkObjs=[];
+function openBackupModal(list, objs){
   bkSel=(list||[]).filter(Boolean);
-  const multi=bkSel.length>1;
+  bkObjs=(objs && objs.length===bkSel.length) ? objs : bkSel.map(n=>({name:n, cluster_id:ACTIVE_CID}));
+  const multi=bkSel.length>1, multiCl=new Set(bkObjs.map(o=>o.cluster_id)).size>1;
   $("#bkOut").innerHTML="";
   $("#bkNsRow").style.display = multi ? "none" : "";
   $("#bkSelInfo").style.display = multi ? "" : "none";
   $("#bkRun").style.display = multi ? "none" : "";
   $("#bkRunAll").style.display = multi ? "none" : "";
   $("#bkRunSel").style.display = multi ? "" : "none";
-  if(multi){ $("#bkSelList").textContent=bkSel.join(", ");
+  if(multi){ $("#bkSelList").textContent=bkObjs.map(o=>multiCl ? o.name+" ("+(o.cluster||o.cluster_id)+")" : o.name).join(", ");
              $("#bkRunSel").textContent="Sauvegarder la sélection ("+bkSel.length+")"; }
   else if(bkSel[0]){ state.ns=bkSel[0]; applyGlobalNs(); }
   openModal("mBackup");
 }
 $("#bkRunSel").onclick=async()=>{
   const b=$("#bkRunSel"), dest=$("#bkDest").value.trim(); b.disabled=true;
+  const multiCl=new Set(bkObjs.map(o=>o.cluster_id)).size>1;
   let lines="", ok=0;
-  for(const ns of bkSel){
-    $("#bkOut").innerHTML=`<div class="hint"><span class="spin"></span>${esc(ns)}…</div><ul class="dlist">${lines}</ul>`;
-    const r=await post("/api/backup",{ns, dest});
+  for(const o of bkObjs){
+    const lbl=multiCl ? o.name+" ("+(o.cluster||o.cluster_id)+")" : o.name;
+    $("#bkOut").innerHTML=`<div class="hint"><span class="spin"></span>${esc(lbl)}…</div><ul class="dlist">${lines}</ul>`;
+    const r=await post("/api/backup",{ns:o.name, dest}, o.cluster_id);
     if(r.ok) ok++;
-    lines+=`<li><span class="k" style="display:flex;gap:10px;align-items:center">${stIc(r.ok?"ok":"ko")}${esc(ns)}</span>`+
+    lines+=`<li><span class="k" style="display:flex;gap:10px;align-items:center">${stIc(r.ok?"ok":"ko")}${esc(lbl)}</span>`+
            `<span class="v" style="font-weight:400">${r.ok ? r.count+" volume(s)" : esc(r.error||"")}</span></li>`;
   }
-  $("#bkOut").innerHTML=`<div class="note">${ok}/${bkSel.length} namespace(s) sauvegardé(s).</div><ul class="dlist" style="margin-top:8px">${lines}</ul>`;
+  $("#bkOut").innerHTML=`<div class="note">${ok}/${bkObjs.length} namespace(s) sauvegardé(s).</div><ul class="dlist" style="margin-top:8px">${lines}</ul>`;
   b.disabled=false;
 };
 
@@ -6333,10 +7190,27 @@ const SRC=[{key:"hycu", name:"HYCU", type:"Sauvegarde & restauration (API REST)"
            {key:"nutanix", name:"Prism Element", type:"Nutanix — Volume Groups (API v2)"},
            {key:"prismcentral", name:"Prism Central", type:"Nutanix — multi-cluster (API v3/v4)"},
            {key:"vault", name:"Coffre d'identifiants", type:"Mémorisation chiffrée (optionnel)"}];
-let srcIdx=0;
+let srcSel="hycu";
+const CHK_SVG='<svg width="14" height="14" viewBox="0 0 18 18" aria-hidden="true"><path d="M4.5 9.4l3 3 6-6.4" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+function clById(id){ return CLUSTERS.find(c=>c.id===id); }
+function clType(c){
+  if(c.local) return "Kubernetes — configuration locale";
+  if(c.source==="nkp") return "Kubernetes — NKP"+(c.workspace?" (workspace "+c.workspace+")":"");
+  return "Kubernetes — kubeconfig importé";
+}
+function clStatusIc(c){
+  if(c.local) return c.configured ? stIc("ok","Contexte : "+(c.context||"")) : stIc("na","Non configuré");
+  const a=c.auth||{}, w=(a.warnings||[]).concat(c.warning?[c.warning]:[]).join(" ");
+  if(a.level==="error") return stIc("ko", w);
+  if(a.level==="warn" || c.warning) return stIc("wn", w);
+  return stIc("ok","Authentification : "+(a.type||"?"));
+}
 function renderSourcesTable(){
   const body=$("#srcBody"); if(!body) return;
-  body.innerHTML=SRC.map((s,i)=>{
+  const row=(key, name, type, url, st)=>`<tr class="clk${key===srcSel?' sel':''}" data-key="${esc(key)}"><td>${name}</td><td>${esc(type)}</td>`+
+           `<td><code>${esc(url||"—")}</code></td><td class="ctr">${st}</td></tr>`;
+  let h=`<tr class="srcsec"><td colspan="4">HYCU &amp; Nutanix</td></tr>`;
+  h+=SRC.map(s=>{
     let url="—", st;
     if(s.key==="vault"){
       st = (conn.vault && conn.vault.present) ? stIc("ok","Coffre présent") : stIc("na","Aucun coffre");
@@ -6344,18 +7218,210 @@ function renderSourcesTable(){
       const x=conn[s.key]||{}; url=x.url||"—";
       st = x.connected ? stIc("ok","Connecté") : (x.configured ? stIc("wn","Configuré, non connecté") : stIc("na","Non configuré"));
     }
-    return `<tr class="clk${i===srcIdx?' sel':''}" data-i="${i}"><td>${esc(s.name)}</td><td>${esc(s.type)}</td>`+
-           `<td><code>${esc(url)}</code></td><td class="ctr">${st}</td></tr>`;
+    return row(s.key, esc(s.name), s.type, url, st);
   }).join("");
-  body.querySelectorAll("tr").forEach(tr=>tr.onclick=()=>{ srcIdx=+tr.dataset.i; showSourceCard(); renderSourcesTable(); });
+  h+=`<tr class="srcsec"><td colspan="4">Clusters Kubernetes</td></tr>`;
+  h+=CLUSTERS.map(c=>row("cluster:"+c.id, esc(c.name)+(c.id===ACTIVE_CID?'<span class="tag">ACTIF</span>':''),
+        clType(c), c.local ? (c.kubeconfig_path||"kubeconfig par défaut") : c.server, clStatusIc(c))).join("");
+  body.innerHTML=h;
+  body.querySelectorAll("tr.clk").forEach(tr=>tr.onclick=()=>{ srcSel=tr.dataset.key; showSourceCard(); renderSourcesTable(); });
 }
 function showSourceCard(){
-  [...document.querySelectorAll("#tab-connect > .card")].forEach((c,i)=>c.style.display = i===srcIdx ? "" : "none");
+  const card = srcSel.indexOf("cluster:")===0 ? "cluster" : srcSel;
+  document.querySelectorAll("#tab-connect > .card").forEach(c=>c.style.display = c.dataset.card===card ? "" : "none");
+  if(card==="cluster") renderClusterCard(srcSel.slice(8));
+  if(card==="nkp") $("#nkpMgmt").textContent = ctxInfo.context || "—";
 }
 function openSources(i){
-  if(typeof i==="number") srcIdx=i;
+  if(typeof i==="number") srcSel=SRC[i].key;
+  else if(typeof i==="string") srcSel=i;
   renderSourcesTable(); showSourceCard(); openModal("mSources");
 }
+$("#clAddBtn").onclick=()=>openSources("cluster-add");
+$("#nkpBtn").onclick=()=>openSources("nkp");
+
+// ----- Clusters Kubernetes : liste, sélecteur de la barre du haut, cluster actif -----
+async function loadClusters(){
+  const r=await get("/api/clusters","local");
+  if(r && r.ok) CLUSTERS=r.clusters||CLUSTERS;
+  if(!clById(ACTIVE_CID)) ACTIVE_CID="local";      // cluster retiré / session verrouillée
+  renderClMenu(); renderSourcesTable(); updateScopeSeg();
+  return CLUSTERS;
+}
+function renderCtx(){
+  $("#ctx").textContent = ctxInfo.context || "indisponible";
+  $("#ctxWarn").innerHTML = (ctxInfo.context && ctxInfo.allowed && ctxInfo.allowed.length && !ctxInfo.context_ok)
+    ? ' <span class="bad">⚠ hors liste autorisée</span>'
+    : ((ctxInfo.auth && ctxInfo.auth.level==="error") ? ' <span class="bad">⚠ jeton expiré</span>' : '');
+  $("#ctxLink").title = "Cluster Kubernetes actif"+(ctxInfo.workspace?(" — workspace "+ctxInfo.workspace):"")+" — cliquer pour en choisir un autre";
+}
+function renderClMenu(){
+  const m=$("#clMenu");
+  m.innerHTML=CLUSTERS.map(c=>`<div class="cli${c.id===ACTIVE_CID?' on':''}" data-cid="${esc(c.id)}" role="menuitem">`+
+      `<span class="chk">${c.id===ACTIVE_CID?CHK_SVG:''}</span><span>${esc(c.name)}</span>`+
+      `<span class="ws">${esc(c.local ? "configuration locale" : (c.workspace || "kubeconfig importé"))}</span></div>`).join("")+
+    `<div class="msep"></div><div class="cli act" data-act="add" role="menuitem"><span class="chk"></span>Ajouter un cluster Kubernetes…</div>`+
+    `<div class="cli act" data-act="manage" role="menuitem"><span class="chk"></span>Gérer les clusters…</div>`;
+  m.querySelectorAll(".cli").forEach(el=>el.onclick=async e=>{
+    e.stopPropagation(); m.style.display="none";
+    if(el.dataset.act==="add") return openSources("cluster-add");
+    if(el.dataset.act==="manage") return openSources("cluster:"+ACTIVE_CID);
+    if(el.dataset.cid!==ACTIVE_CID) await setActiveCluster(el.dataset.cid);
+  });
+}
+function toggleClMenu(){
+  const m=$("#clMenu");
+  if(m.style.display==="block"){ m.style.display="none"; return; }
+  renderClMenu();
+  const r=$("#ctxLink").getBoundingClientRect();
+  m.style.right=Math.max(8, window.innerWidth-r.right-10)+"px";
+  m.style.display="block";
+}
+document.addEventListener("click",()=>{ $("#clMenu").style.display="none"; });
+async function setActiveCluster(cid){
+  if(!clById(cid)) return;
+  ACTIVE_CID=cid; savePref("cluster", cid);
+  ["mBackup","mPolicy","mRestore"].forEach(closeModal);
+  if(appsScope!=="all") appsSel.clear();
+  state.ns=null;
+  ctxInfo=await get("/api/context");
+  renderCtx(); renderKubeBanner(); renderClMenu(); renderSourcesTable();
+  if($("#mSources").style.display!=="none") showSourceCard();
+  await refreshNamespaces();
+  onPageShown(curPage);
+}
+// Coffre déverrouillé : les clusters mémorisés reviennent -> reprendre le cluster préféré.
+async function afterVaultLoad(){
+  await loadClusters();
+  const p=prefs().cluster;
+  if(p && p!==ACTIVE_CID && clById(p)) await setActiveCluster(p);
+}
+function renderClusterCard(cid){
+  const c=clById(cid); $("#clDErr").innerHTML="";
+  if(!c){ $("#clDTitle").textContent="Cluster"; $("#clDBody").innerHTML='<div class="hint">Cluster introuvable.</div>'; return; }
+  $("#clDTitle").textContent=c.name;
+  const li=(k,v)=>`<li><span class="k">${k}</span><span class="v">${v}</span></li>`;
+  let h='<ul class="dlist">';
+  h+=li("Type", esc(clType(c)));
+  if(c.local){
+    h+=li("Contexte kubectl", c.context?`<code>${esc(c.context)}</code>`:"—");
+    h+=li("Kubeconfig", `<code>${esc(c.kubeconfig_path||"kubeconfig par défaut")}</code>`);
+  } else {
+    h+=li("Contexte kubectl", `<code>${esc(c.context)}</code>`);
+    h+=li("Serveur API", `<code>${esc(c.server||"—")}</code>`);
+    if(c.workspace) h+=li("Workspace NKP", esc(c.workspace));
+    if(c.management) h+=li("Cluster de management", esc(c.management));
+    h+=li("Authentification", esc((c.auth||{}).type||"?")+" "+clStatusIc(c));
+  }
+  h+=li("Sauvegardes", c.local ? "<code>hycu-backups/&lt;namespace&gt;/</code>" : `<code>hycu-backups/_clusters/${esc(c.id)}/&lt;namespace&gt;/</code>`);
+  h+='</ul>';
+  const w=((c.auth||{}).warnings||[]).concat(c.warning?[c.warning]:[]);
+  if(w.length) h+=`<div class="warnbox" style="margin-top:10px">⚠ ${w.map(esc).join("<br>")}</div>`;
+  if(c.local && !c.configured) h+=`<div class="warnbox" style="margin-top:10px">Aucun contexte kubectl local : ajoutez un cluster avec son kubeconfig, ou configurez kubectl (Réglages).</div>`;
+  $("#clDBody").innerHTML=h;
+  $("#clUse").disabled = c.id===ACTIVE_CID;
+  $("#clUse").textContent = c.id===ACTIVE_CID ? "Cluster actif" : "Définir comme cluster actif";
+  $("#clRemove").style.display = c.local ? "none" : "";
+  $("#clLocalCfg").style.display = c.local ? "" : "none";
+  $("#clUse").onclick=()=>setActiveCluster(c.id);
+  $("#clLocalCfg").onclick=()=>{ closeModal("mSources"); switchTab("settings"); };
+  $("#clRemove").onclick=async()=>{
+    if(!confirm("Retirer le cluster « "+c.name+" » ? Son kubeconfig est oublié ; ses sauvegardes restent sur disque.")) return;
+    const r=await post("/api/clusters/remove",{id:c.id},"local");
+    if(!r.ok){ $("#clDErr").innerHTML=errBox(r.error); return; }
+    const wasActive = c.id===ACTIVE_CID;
+    await loadClusters();
+    srcSel="cluster:"+(wasActive?"local":ACTIVE_CID);
+    if(wasActive) await setActiveCluster("local");
+    showSourceCard(); renderSourcesTable();
+  };
+}
+
+// ----- Ajout d'un cluster (kubeconfig fichier / collé) -----
+let clInspectT=null, clCtxs=[];
+function clCtxInfo(){
+  const c=clCtxs.find(x=>x.name===$("#clCtx").value); if(!c){ $("#clCtxInfo").innerHTML=""; return; }
+  const a=c.auth||{};
+  $("#clCtxInfo").innerHTML=`<ul class="dlist" style="margin-top:8px"><li><span class="k">Serveur API</span><span class="v"><code>${esc(c.server||"—")}</code></span></li>`+
+    `<li><span class="k">Authentification</span><span class="v">${esc(a.type||"?")} ${a.level==="error"?stIc("ko"):a.level==="warn"?stIc("wn"):stIc("ok")}</span></li></ul>`+
+    ((a.warnings||[]).length?`<div class="warnbox" style="margin-top:8px">⚠ ${a.warnings.map(esc).join("<br>")}</div>`:"");
+  if(!$("#clName").value.trim() || $("#clName").dataset.auto==="1"){
+    $("#clName").value=(c.cluster||c.name||"").replace(/[^A-Za-z0-9._-]+/g,"-").slice(0,63); $("#clName").dataset.auto="1"; }
+}
+async function clInspect(){
+  const kc=$("#clKc").value; $("#clErr").innerHTML="";
+  if(!kc.trim()){ $("#clCtxWrap").style.display="none"; clCtxs=[]; return; }
+  const r=await post("/api/clusters/inspect",{kubeconfig:kc},"local");
+  if(!r.ok){ $("#clCtxWrap").style.display="none"; clCtxs=[]; $("#clErr").innerHTML=errBox(r.error); return; }
+  clCtxs=r.contexts||[];
+  $("#clCtx").innerHTML=clCtxs.map(c=>`<option value="${esc(c.name)}">${esc(c.name)}</option>`).join("");
+  $("#clCtx").value=r.current||(clCtxs[0]||{}).name||"";
+  $("#clCtxWrap").style.display="block"; clCtxInfo();
+}
+$("#clKc").oninput=()=>{ clearTimeout(clInspectT); clInspectT=setTimeout(clInspect, 500); };
+$("#clCtx").onchange=clCtxInfo;
+$("#clName").oninput=()=>{ $("#clName").dataset.auto=""; };
+$("#clFile").onchange=()=>{
+  const f=$("#clFile").files[0]; if(!f) return;
+  if(f.size>1024*1024){ $("#clErr").innerHTML=errBox("Kubeconfig trop volumineux (1 Mo max)."); return; }
+  const rd=new FileReader(); rd.onload=()=>{ $("#clKc").value=rd.result; $("#clFile").value=""; clInspect(); }; rd.readAsText(f);
+};
+$("#clAdd").onclick=async()=>{
+  const b=$("#clAdd"); $("#clErr").innerHTML="";
+  if(!$("#clKc").value.trim()){ $("#clErr").innerHTML=errBox("Chargez ou collez d'abord un kubeconfig."); return; }
+  b.disabled=true; b.innerHTML='<span class="spin"></span>Test de connexion…';
+  const r=await post("/api/clusters/add",{name:$("#clName").value.trim(), kubeconfig:$("#clKc").value,
+                                          context:$("#clCtx").value||""},"local");
+  b.disabled=false; b.textContent="Tester & ajouter";
+  if(!r.ok){ $("#clErr").innerHTML=errBox(r.error); if(r.need_context) clInspect(); return; }
+  $("#clKc").value=""; $("#clName").value=""; $("#clName").dataset.auto=""; $("#clCtxWrap").style.display="none"; clCtxs=[];
+  await loadClusters();
+  srcSel="cluster:"+r.cluster.id; renderSourcesTable(); showSourceCard();
+  $("#clDErr").innerHTML=`<div class="note">Cluster ajouté. Choisissez « Définir comme cluster actif » pour l'utiliser, ou sélectionnez-le dans la barre du haut.</div>`;
+};
+
+// ----- Découverte NKP (workspaces -> clusters) depuis le cluster de management actif -----
+let nkpData=null;
+function nkpSync(){
+  const n=document.querySelectorAll(".nkpChk:checked").length;
+  $("#nkpImport").disabled = !(n && $("#nkpAck").checked);
+  $("#nkpImport").textContent = n ? "Importer la sélection ("+n+")" : "Importer la sélection";
+}
+$("#nkpAck").onchange=nkpSync;
+$("#nkpDiscover").onclick=()=>nkpLoad(false);
+async function nkpLoad(keepRes){
+  const b=$("#nkpDiscover"); if(!keepRes) $("#nkpRes").innerHTML=""; $("#nkpImportWrap").style.display="none";
+  b.disabled=true; $("#nkpOut").innerHTML='<div class="hint"><span class="spin"></span>Lecture des workspaces…</div>';
+  const r=await get("/api/nkp/discover"); b.disabled=false; nkpData=r;
+  if(!r.ok){ $("#nkpOut").innerHTML=errBox(r.error); return; }
+  const cl=r.clusters||[];
+  if(!cl.length){ $("#nkpOut").innerHTML='<div class="hint">Aucun cluster trouvé dans les workspaces.</div>'; return; }
+  let h=`<div class="tcard" style="box-shadow:none;border:1px solid var(--rule);margin-top:12px"><table class="ht"><thead><tr><th class="cb"></th><th>Cluster</th><th>Phase</th><th>État</th></tr></thead><tbody>`, ws=null;
+  cl.forEach((c,i)=>{
+    if(c.workspace!==ws){ ws=c.workspace; h+=`<tr class="grp"><td colspan="4">Workspace <span class="gs">›</span>${esc(ws)}</td></tr>`; }
+    const dis=c.host||!!c.registered;
+    const st=c.host ? "Cluster de management (actif)" : (c.registered ? "Déjà importé ("+c.registered+")" : "—");
+    h+=`<tr><td class="cb"><input type="checkbox" class="nkpChk" data-i="${i}" ${dis?"disabled":""}></td>`+
+       `<td style="color:var(--strong)">${esc(c.name)}</td><td>${esc(c.phase||"—")}</td><td>${esc(st)}</td></tr>`;
+  });
+  $("#nkpOut").innerHTML=h+"</tbody></table></div>";
+  document.querySelectorAll(".nkpChk").forEach(x=>x.onchange=nkpSync);
+  $("#nkpImportWrap").style.display="block"; $("#nkpAck").checked=false; nkpSync();
+}
+$("#nkpImport").onclick=async()=>{
+  const items=[...document.querySelectorAll(".nkpChk:checked")].map(x=>nkpData.clusters[+x.dataset.i])
+    .map(c=>({namespace:c.namespace, name:c.name, secret:c.secret, workspace:c.workspace}));
+  if(!items.length) return;
+  const b=$("#nkpImport"); b.disabled=true; b.innerHTML='<span class="spin"></span>Import…';
+  const r=await post("/api/nkp/import",{ack:$("#nkpAck").checked, items});
+  nkpSync();
+  const res=r.results||[];
+  $("#nkpRes").innerHTML=(r.error&&!res.length?errBox(r.error):"")+(res.length?`<ul class="dlist" style="margin-top:10px">`+res.map(x=>
+    `<li><span class="k" style="display:flex;gap:10px;align-items:center">${stIc(x.ok?"ok":"ko")}${esc(x.cluster)}</span>`+
+    `<span class="v" style="font-weight:400">${x.ok ? "Importé sous « "+esc(x.name)+" »"+(x.warning?" — "+esc(x.warning):"") : esc(x.error||"")}</span></li>`).join("")+"</ul>":"");
+  await loadClusters();
+  if(r.imported) await nkpLoad(true);
+};
 
 // ============================ Politiques ============================
 async function loadPolicies(){
@@ -6415,12 +7481,13 @@ function renderJobs(){
   $("#jobsCounts").innerHTML=jobCounts(r);
   const q=($("#jobsSearch").value||"").trim().toLowerCase();
   const rows=(r.jobs||[]).filter(j=>!q || (JOB_LBL[j.event]||j.event).toLowerCase().includes(q)
-                                        || (j.namespace||"").toLowerCase().includes(q));
+                                        || (j.namespace||"").toLowerCase().includes(q)
+                                        || (j.cluster||"").toLowerCase().includes(q));
   $("#jobsInfo").textContent=rows.length+" tâche(s)";
   $("#jobsBody").innerHTML = rows.length ? rows.map(j=>{ const d=jobRowData(j);
-      return `<tr><td style="color:var(--strong)">${esc(d.lbl)}</td><td>${d.app}</td><td>${esc(d.det)}</td>`+
+      return `<tr><td style="color:var(--strong)">${esc(d.lbl)}</td><td>${d.app}</td><td>${esc(j.cluster==="*"?"Tous":(j.cluster||"—"))}</td><td>${esc(d.det)}</td>`+
              `<td>${esc(fmtTs(j.ts))}</td><td class="ctr">${stIc(d.st[0], d.st[1])}</td></tr>`; }).join("")
-    : `<tr><td colspan="5" class="tempty">Aucune tâche enregistrée pour l'instant.</td></tr>`;
+    : `<tr><td colspan="6" class="tempty">Aucune tâche enregistrée pour l'instant.</td></tr>`;
 }
 $("#jobsSearch").oninput=renderJobs;
 $("#jobsRefresh").onclick=()=>loadJobs();
@@ -6464,13 +7531,15 @@ async function loadDashboard(){
   $("#dbSources").innerHTML=donutSVG(Math.round(100*nConn/3), Math.round(100*nConf/3))+
     dnums("Connectées", nConn+"/3", "Configurées", nConf+"/3");
   $("#dbSources").style.cursor="pointer"; $("#dbSources").onclick=()=>openSources();
+  $("#dbCluster").style.cursor="pointer"; $("#dbCluster").onclick=()=>openSources("cluster:"+ACTIVE_CID);
 
   $("#dbCluster").innerHTML=`<div class="dbig" style="font-size:21px;word-break:break-all">${esc(ctxInfo.context||"—")}</div>
-    <div class="hint" style="margin:0 0 8px">Contexte kubectl</div>
+    <div class="hint" style="margin:0 0 8px">${ctxInfo.workspace ? "Workspace "+esc(ctxInfo.workspace) : "Cluster actif"}</div>
     <ul class="dlist">
       <li><span class="k">kubectl</span><span class="v">${ctxInfo.kubectl_ok ? stIc("ok","Opérationnel") : stIc("ko","Indisponible")}</span></li>
+      <li><span class="k">Clusters enregistrés</span><span class="v">${CLUSTERS.length}</span></li>
       <li><span class="k">Applications (namespaces)</span><span class="v">${n}</span></li>
-      <li><span class="k">Filtre des namespaces</span><span class="v">${($("#cfgNs").value||"").trim() ? "Actif" : "Aucun"}</span></li>
+      <li><span class="k">Filtre des namespaces</span><span class="v">${a.filtered ? "Actif" : "Aucun"}</span></li>
       <li><span class="k">Mode</span><span class="v">${dry() ? "Simulation" : '<span class="ko">Réel</span>'}</span></li>
     </ul>`;
 
@@ -6479,7 +7548,8 @@ async function loadDashboard(){
   $("#dbLast").innerHTML = last.length
     ? `<ul class="dlist">`+last.map(x=>{ const d=jobRowData(x);
         return `<li><span class="k" style="display:flex;align-items:center;gap:10px">${stIc(d.st[0], d.st[1])}<span>${esc(d.lbl)}`+
-               `${x.namespace ? ' <span style="color:var(--muted)">· '+d.app+'</span>' : ''}</span></span>`+
+               `${x.namespace ? ' <span style="color:var(--muted)">· '+d.app+'</span>' : ''}`+
+               `${(x.cluster && CLUSTERS.length>1) ? ' <span style="color:var(--muted)">· '+esc(x.cluster==="*"?"Tous":x.cluster)+'</span>' : ''}</span></span>`+
                `<span class="v" style="font-weight:400;color:var(--muted)">${esc(fmtTs(x.ts))}</span></li>`; }).join("")+
       `</ul><div style="margin-top:8px"><a href="#" class="lnk" data-go="jobs">Voir toutes les tâches</a></div>`
     : `<div class="tempty">Aucune tâche enregistrée pour l'instant.</div>`;
@@ -7750,6 +8820,162 @@ I18N_EN += [
     ('"Configuré, non connecté"', '"Configured, not connected"'),
     ('"Non configuré"', '"Not configured"'),
 ]
+
+# --- Multi-cluster (kubeconfigs ajoutés depuis l'interface) + découverte NKP ---
+I18N_EN += [
+    # Barre du haut / menu des clusters
+    ("Cluster Kubernetes actif — cliquer pour en choisir un autre", "Active Kubernetes cluster — click to choose another one"),
+    ('"Cluster Kubernetes actif"+', '"Active Kubernetes cluster"+'),
+    ('" — cliquer pour en choisir un autre"', '" — click to choose another one"'),
+    ("Sources (HYCU, Prism Central, Prism Element, clusters Kubernetes)",
+     "Sources (HYCU, Prism Central, Prism Element, Kubernetes clusters)"),
+    ("⚠ jeton expiré", "⚠ token expired"),
+    ('"configuration locale"', '"local configuration"'),
+    ('"kubeconfig importé"', '"imported kubeconfig"'),
+    ("Gérer les clusters…", "Manage clusters…"),
+    ("Ajouter un cluster Kubernetes", "Add a Kubernetes cluster"),
+    ("Découvrir les workspaces NKP", "Discover NKP workspaces"),
+    # Sources
+    ("Enregistrez ici les systèmes utilisés par l'outil — HYCU, Nutanix et vos clusters Kubernetes. Les identifiants et kubeconfigs restent en mémoire le temps de la session (ou dans le coffre chiffré si vous le choisissez).",
+     "Register here the systems used by the tool — HYCU, Nutanix and your Kubernetes clusters. Credentials and kubeconfigs stay in memory for the session (or in the encrypted vault if you choose so)."),
+    ("<th>URL / serveur</th>", "<th>URL / server</th>"),
+    (">Clusters Kubernetes<", ">Kubernetes clusters<"),
+    ("Kubernetes — configuration locale", "Kubernetes — local configuration"),
+    ("Kubernetes — kubeconfig importé", "Kubernetes — imported kubeconfig"),
+    ('"kubeconfig par défaut"', '"default kubeconfig"'),
+    ('class="tag">ACTIF<', 'class="tag">ACTIVE<'),
+    ('"Contexte : "+', '"Context: "+'),
+    ('"Authentification : "+', '"Authentication: "+'),
+    ("Option : enregistrer les identifiants saisis (et les kubeconfigs des clusters ajoutés) dans un coffre <b>chiffré</b>",
+     "Optional: store the credentials entered (and the kubeconfigs of added clusters) in an <b>encrypted</b> vault"),
+    ("Clusters Kubernetes rechargés : ", "Kubernetes clusters reloaded: "),
+    ("Clusters Kubernetes chiffrés : ", "Kubernetes clusters encrypted: "),
+    ("Clusters Kubernetes chargés : ", "Kubernetes clusters loaded: "),
+    # Fiche d'ajout
+    ("Chargez le <b>kubeconfig</b> du cluster (fichier ou copier-coller). Comme un mot de passe, il reste",
+     "Load the cluster <b>kubeconfig</b> (file or copy-paste). Like a password, it stays"),
+    ("<b>en mémoire</b> le temps de la session, et n'est écrit sur disque que <b>chiffré</b> si vous utilisez le coffre.",
+     "<b>in memory</b> for the session, and is only written to disk <b>encrypted</b> if you use the vault."),
+    ("Les sauvegardes de chaque cluster sont rangées séparément.", "Each cluster's backups are stored separately."),
+    ('<label class="fld">Nom du cluster</label>', '<label class="fld">Cluster name</label>'),
+    ('<label class="fld">Fichier kubeconfig</label>', '<label class="fld">Kubeconfig file</label>'),
+    ("…ou collez son contenu (YAML ou JSON)", "…or paste its content (YAML or JSON)"),
+    ('<label class="fld">Contexte</label><select id="clCtx">', '<label class="fld">Context</label><select id="clCtx">'),
+    ('id="clAdd" type="button">Tester &amp; ajouter<', 'id="clAdd" type="button">Test &amp; add<'),
+    ('"Tester & ajouter"', '"Test & add"'),
+    ("Test de connexion en lecture seule (liste des namespaces, 10 s max).", "Read-only connection test (namespace list, 10 s max)."),
+    ("Test de connexion…", "Testing connection…"),
+    ("Chargez ou collez d'abord un kubeconfig.", "Load or paste a kubeconfig first."),
+    ("Cluster ajouté. Choisissez « Définir comme cluster actif » pour l'utiliser, ou sélectionnez-le dans la barre du haut.",
+     "Cluster added. Choose “Set as active cluster” to use it, or select it in the top bar."),
+    # Fiche d'un cluster
+    ("Définir comme cluster actif", "Set as active cluster"),
+    ('"Cluster actif"', '"Active cluster"'),
+    ('data-scope="one">Cluster actif<', 'data-scope="one">Active cluster<'),
+    ("Tous les clusters", "All clusters"),
+    ('==="*"?"Tous":', '==="*"?"All":'),
+    ('id="clLocalCfg" type="button">Ouvrir les réglages<', 'id="clLocalCfg" type="button">Open settings<'),
+    ('id="clRemove" type="button">Retirer<', 'id="clRemove" type="button">Remove<'),
+    ('"Cluster introuvable."', '"Cluster not found."'),
+    ('li("Contexte kubectl"', 'li("kubectl context"'),
+    ('li("Serveur API"', 'li("API server"'),
+    ('li("Workspace NKP"', 'li("NKP workspace"'),
+    ('li("Cluster de management"', 'li("Management cluster"'),
+    ('li("Sauvegardes"', 'li("Backups"'),
+    ("Serveur API", "API server"),
+    ("Aucun contexte kubectl local : ajoutez un cluster avec son kubeconfig, ou configurez kubectl (Réglages).",
+     "No local kubectl context: add a cluster with its kubeconfig, or configure kubectl (Settings)."),
+    ('"Retirer le cluster « "', '"Remove cluster « "'),
+    ('" » ? Son kubeconfig est oublié ; ses sauvegardes restent sur disque."',
+     '" »? Its kubeconfig is forgotten; its backups stay on disk."'),
+    # Découverte NKP
+    ("Découverte des workspaces NKP (optionnel)", "NKP workspace discovery (optional)"),
+    ("Depuis le <b>cluster de management</b> NKP, liste les <b>workspaces</b> et leurs clusters, puis importe",
+     "From the NKP <b>management cluster</b>, lists the <b>workspaces</b> and their clusters, then imports"),
+    ("leurs kubeconfigs. Cluster interrogé : ", "their kubeconfigs. Queried cluster: "),
+    ("(le cluster actif — choisissez le cluster de management", "(the active cluster — choose the management cluster"),
+    ("dans la barre du haut).", "in the top bar)."),
+    ("<b>Droits élevés requis</b> sur le cluster de management : lecture des Workspaces, des",
+     "<b>Elevated rights required</b> on the management cluster: read access to Workspaces,"),
+    ("KommanderClusters et des <b>Secrets</b> kubeconfig des namespaces de workspace. Les kubeconfigs importés donnent",
+     "KommanderClusters and kubeconfig <b>Secrets</b> in workspace namespaces. Imported kubeconfigs often grant"),
+    ("souvent un accès <b>administrateur</b> aux clusters : ils restent en mémoire (coffre chiffré en option), jamais en clair sur disque.",
+     "<b>administrator</b> access to the clusters: they stay in memory (optional encrypted vault), never in clear text on disk."),
+    ('id="nkpDiscover" type="button">Découvrir<', 'id="nkpDiscover" type="button">Discover<'),
+    ("J'ai compris : importer les kubeconfigs des clusters cochés", "I understand: import the kubeconfigs of the checked clusters"),
+    ("Importer la sélection", "Import selection"),
+    ("Lecture des workspaces…", "Reading workspaces…"),
+    ("Aucun cluster trouvé dans les workspaces.", "No cluster found in the workspaces."),
+    ("Cluster de management (actif)", "Management cluster (active)"),
+    ('"Déjà importé ("', '"Already imported ("'),
+    ('"Importé sous « "', '"Imported as « "'),
+    # Pages : Applications, tableau de bord, confirmations, réglages
+    ("Clusters enregistrés", "Registered clusters"),
+    ('"Cluster ciblé : <b>"', '"Target cluster: <b>"'),
+    ("Cluster local (contexte kubectl)", "Local cluster (kubectl context)"),
+    ("Les clusters <b>supplémentaires</b> (kubeconfig importé, workspaces NKP) se gèrent depuis <b>⚙ Sources</b>.",
+     "<b>Additional</b> clusters (imported kubeconfig, NKP workspaces) are managed from <b>⚙ Sources</b>."),
+    ("Contextes / clusters autorisés (séparés par des virgules ; vide = tous)", "Allowed contexts / clusters (comma-separated; empty = all)"),
+    ("Namespaces autorisés — cluster local (vide = tous)", "Allowed namespaces — local cluster (empty = all)"),
+    # Messages du serveur
+    (" inconnu (retiré, ou session verrouillée) : sélectionnez un cluster dans la barre du haut. Aucune commande n'a été exécutée.",
+     " unknown (removed, or session locked): select a cluster in the top bar. No command was executed."),
+    ("Authentification par plugin exec (« ", "Exec plugin authentication (« "),
+    (" ») : cette commande doit être installée là où tourne l'outil (absente de l'image conteneur par défaut) ; elle peut aussi ouvrir un navigateur (OIDC) que l'outil ne peut pas piloter.",
+     " »): this command must be installed where the tool runs (absent from the default container image); it may also open a browser (OIDC) that the tool cannot drive."),
+    ("Authentification « auth-provider » (", "« auth-provider » authentication ("),
+    (") : mécanisme déprécié, jeton OIDC à durée de vie courte — prévoyez un jeton de ServiceAccount pour un usage durable.",
+     "): deprecated mechanism, short-lived OIDC token — use a ServiceAccount token for long-term use."),
+    ("Le jeton est lu depuis un fichier local (", "The token is read from a local file ("),
+    (") : il doit exister là où tourne l'outil.", "): it must exist where the tool runs."),
+    ("Le jeton a EXPIRÉ : régénérez le kubeconfig.", "The token has EXPIRED: regenerate the kubeconfig."),
+    ("Le jeton a EXPIRÉ (", "The token has EXPIRED ("),
+    (") : régénérez le kubeconfig.", "): regenerate the kubeconfig."),
+    ("Le jeton expire dans moins de 24 h (", "The token expires in less than 24 h ("),
+    (") : les sauvegardes planifiées échoueront ensuite.", "): scheduled backups will fail afterwards."),
+    ("Le certificat client est un fichier local (", "The client certificate is a local file ("),
+    ("Authentification par identifiant/mot de passe (basic) : désactivée sur la plupart des clusters récents.",
+     "Username/password (basic) authentication: disabled on most recent clusters."),
+    ("Aucune information d'authentification reconnue pour ce contexte.", "No recognized authentication information for this context."),
+    ("Vérification TLS du serveur DÉSACTIVÉE (insecure-skip-tls-verify).", "Server TLS verification DISABLED (insecure-skip-tls-verify)."),
+    ("L'autorité de certification est un fichier local (", "The certificate authority is a local file ("),
+    ("Kubeconfig vide.", "Empty kubeconfig."),
+    ("Kubeconfig trop volumineux (1 Mo max).", "Kubeconfig too large (1 MB max)."),
+    ("Kubeconfig invalide : ", "Invalid kubeconfig: "),
+    ("Kubeconfig illisible : ", "Unreadable kubeconfig: "),
+    ("kubectl config view a échoué", "kubectl config view failed"),
+    ("Aucun contexte dans ce kubeconfig.", "No context in this kubeconfig."),
+    ("Connexion établie, mais la liste des namespaces est refusée (RBAC) : l'outil ne verra que les namespaces explicitement autorisés.",
+     "Connected, but listing namespaces is forbidden (RBAC): the tool will only see explicitly allowed namespaces."),
+    ("Cluster injoignable.", "Cluster unreachable."),
+    ("Nom de cluster invalide (1 à 63 caractères, lettres/chiffres/-/./_).", "Invalid cluster name (1 to 63 characters, letters/digits/-/./_)."),
+    ("Ce nom est réservé au cluster local : choisissez-en un autre.", "This name is reserved for the local cluster: choose another one."),
+    ("Un cluster nommé « ", "A cluster named « "),
+    (" » est déjà enregistré.", " » is already registered."),
+    ("Ce kubeconfig contient plusieurs contextes : choisissez-en un.", "This kubeconfig contains several contexts: choose one."),
+    (" » introuvable dans ce kubeconfig.", " » not found in this kubeconfig."),
+    ("Connexion au cluster impossible : ", "Cannot connect to the cluster: "),
+    ("Le cluster local (configuration) ne peut pas être retiré ici : voir Réglages.",
+     "The local cluster (configuration) cannot be removed here: see Settings."),
+    ("Cluster inconnu.", "Unknown cluster."),
+    ("Le cluster actif ne semble pas être un cluster de management NKP (ressource Workspace introuvable ou accès refusé) : ",
+     "The active cluster does not look like an NKP management cluster (Workspace resource not found or access denied): "),
+    ("Liste des clusters NKP (KommanderCluster) indisponible : ", "NKP cluster list (KommanderCluster) unavailable: "),
+    ("Confirmez d'abord l'avertissement sur les privilèges requis.", "First acknowledge the warning about required privileges."),
+    ("Nom invalide.", "Invalid name."),
+    (" » illisible : ", " » unreadable: "),
+    ("Aucun kubeconfig trouvé dans le Secret « ", "No kubeconfig found in Secret « "),
+    ("Aucun cluster importé.", "No cluster imported."),
+    ("Kubeconfig refusé : authentification par plugin exec (commande externe) non autorisée pour un kubeconfig importé automatiquement.",
+     "Kubeconfig refused: exec plugin authentication (external command) is not allowed for an automatically imported kubeconfig."),
+    ("Cette sauvegarde provient du cluster « ", "This backup comes from cluster « "),
+    (" », alors que le cluster actif est « ", " », while the active cluster is « "),
+    (" ». La restauration inter-clusters n'est pas prise en charge : sélectionnez le cluster d'origine dans la barre du haut.",
+     " ». Cross-cluster restore is not supported: select the source cluster in the top bar."),
+    ("Cluster local non configuré.", "Local cluster not configured."),
+    ("aucun cluster disponible", "no cluster available"),
+]
+
 
 _I18N_SORTED = None          # (fr, en) triés du plus long au plus court
 _HTML_EN = None              # cache de la page traduite

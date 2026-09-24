@@ -1,5 +1,5 @@
 {
-  "_aide": "Copiez ce fichier en 'hycu_config.json' (à côté du programme) puis adaptez les valeurs. TOUTES les clés sont optionnelles : une clé absente prend sa valeur par défaut, une clé inconnue (comme celle-ci) est ignorée. Détail de chaque clé : voir README.md §6. Les identifiants HYCU/Nutanix ne sont JAMAIS ici (saisis dans l'onglet Connexions, gardés en RAM).",
+  "_aide": "Copiez ce fichier en 'hycu_config.json' (à côté du programme) puis adaptez les valeurs. TOUTES les clés sont optionnelles : une clé absente prend sa valeur par défaut, une clé inconnue (comme celle-ci) est ignorée. Détail de chaque clé : voir README.md §6. Les identifiants HYCU/Nutanix et les kubeconfigs des clusters ajoutés ne sont JAMAIS ici (saisis dans ⚙ Sources, gardés en RAM ou dans le coffre chiffré).",
 
   "_section_kubectl": "— Accès au cluster —",
   "kubectl_path": "kubectl",
@@ -7,6 +7,7 @@
   "kubeconfig_path": "",
   "allowed_contexts": [],
   "namespace_filter": [],
+  "cluster_namespace_filters": {},
 
   "_section_serveur": "— Serveur local & stockage —",
   "host": "127.0.0.1",
