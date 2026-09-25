@@ -170,12 +170,14 @@ try:
     check(here.get("atelier") is True and here.get("boutique") is False,
           "restorable_here : vrai pour la sauvegarde d'ici, faux pour l'étrangère")
 
-    saved_ns_fn = H.action_namespaces
+    saved_ns_fn, saved_wl_fn = H.action_namespaces, H._list_namespace_workloads
     H.action_namespaces = lambda: {"ok": True, "namespaces": ["autre-ns"]}
+    H._list_namespace_workloads = lambda names: ({}, {}, None)   # (lecture des workloads : hors sujet DR)
     try:
         apps = {a["name"]: a for a in H.action_applications()["apps"]}
     finally:
         H.action_namespaces = saved_ns_fn
+        H._list_namespace_workloads = saved_wl_fn
     check("atelier" in apps and apps["atelier"]["missing"] and apps["atelier"]["protected"]
           and apps["atelier"]["backups"] >= 1,
           "namespace détruit : toujours listé (missing=true, sauvegardes comptées)")

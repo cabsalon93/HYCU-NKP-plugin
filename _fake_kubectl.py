@@ -72,6 +72,7 @@ def main(argv):
     ns = None
     if "-n" in args:
         ns = args[args.index("-n") + 1]
+    all_ns = "-A" in args or "--all-namespaces" in args
     as_name = "name" in args and "-o" in args and args[args.index("-o") + 1] == "name"
     kind = args[1]
     target = args[2] if len(args) > 2 and not args[2].startswith("-") else None
@@ -83,13 +84,29 @@ def main(argv):
             print(json.dumps({"items": items}))
         return 0
 
+    def by_ns(table):
+        """Objets d'un namespace, ou de TOUS (-A) avec metadata.namespace renseigné."""
+        table = table or {}
+        if all_ns:
+            res = []
+            for n, lst in table.items():
+                for o in lst:
+                    o = json.loads(json.dumps(o))
+                    o.setdefault("metadata", {}).setdefault("namespace", n)
+                    res.append(o)
+            return res
+        return list(table.get(ns, []))
+
     if kind in ("ns", "namespace", "namespaces"):
         if data.get("forbidden_ns"):
             print('Error from server (Forbidden): namespaces is forbidden', file=sys.stderr)
             return 1
         return out([{"metadata": {"name": n}} for n in data.get("namespaces", [])])
     if kind == "pvc":
-        return out((data.get("pvcs") or {}).get(ns, []))
+        return out(by_ns(data.get("pvcs")))
+    if "," in kind or kind in ("deployments", "statefulsets", "daemonsets", "cronjobs"):
+        # workloads : { "<ns>": [objets avec kind] } — vide si absent des données
+        return out(by_ns(data.get("workloads")))
     if kind == "pv" and target:
         pv = (data.get("pvs") or {}).get(target)
         if not pv:

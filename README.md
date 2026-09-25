@@ -189,7 +189,7 @@ guides you. A slim banner always shows whether **simulation mode** (default) or
 | Page / element | What it does |
 |---|---|
 | **Dashboard** | HYCU-style tiles: *Applications* (protection / compliance rings), *Policy* (automatic backup), *Sources*, *Cluster*, *Storage* (disk space of the backup folder, used volume, quota, saturation alert), 7-day *Jobs* chart and *Recent jobs*. |
-| **Applications** | One row per allowed namespace (= Kubernetes application): policy, **Compliance**, **Protection**, last backup, versions. Actions: **Back up**, **Restore**, **Set Policy**, **Verify**; funnel icon = namespace filter. **Active cluster / All clusters** toggle (grouped by NKP workspace → cluster). A namespace **deleted** from the cluster stays listed as long as its backups exist (“Deleted — restorable” badge): **Restore** opens the recovery from the backup. |
+| **Applications** | One row per **application** — a namespace can hold several: workloads (Deployments, StatefulSets, DaemonSets, CronJobs) are grouped by the `app.kubernetes.io/instance`, `app.kubernetes.io/name` or `app` label (otherwise the workload name). Columns: namespace, **Type** (**Stateful** = mounts volumes, **Stateless** = configuration only, *volumes without workload*, *empty*), policy, **Compliance**, **Protection** (namespace backups; an application volume missing from the latest backup is flagged), last backup, versions. Actions: **Back up** (per namespace: two applications of the same namespace = one backup), **Restore** (targets the application: volumes preselected if stateful, configuration objects pre-ticked if stateless), **Set Policy**, **Verify**; funnel icon = namespace filter. **Active cluster / All clusters** toggle (grouped by NKP workspace → cluster). A namespace **deleted** from the cluster stays listed as long as its backups exist (“Deleted — restorable” badge): **Restore** opens the recovery from the backup. |
 | **Policies** | The automatic **configuration** backup policy (frequency, retention, target) and the **HYCU policies** (data), read-only. |
 | **Jobs** | History of operations (backups, restores, clones, HYCU protection) with **Success / Failed / Simulation / In progress** counters and the **cluster** of each job. **HTML report** (standalone compliance report: applications, RPO, cluster health) and **CSV** (Excel) buttons. |
 | **Cluster (top bar)** | **Active cluster** selector: switch cluster, add one, manage them (see below). |
@@ -273,7 +273,9 @@ cleanup described in the HYCU procedure).
   stays PV/PVC-centric. Disable with `config_backup_full: false`.
 - **Back up all (filtered)**: backs up in one go **all namespaces allowed** by
   the filter, or **all** namespaces of the cluster if no filter. A namespace
-  without PVCs is **skipped** (not an error).
+  with no PVC **and no workload** is **skipped** (not an error). A **stateless**
+  namespace (workloads without volume) is backed up: its `resources.json` snapshot is
+  enough to restore its applications (`apps` index: applications, workloads, PVCs, type).
 - **Partial backup**: if a bound PV could not be read (API unavailable, RBAC),
   the backup is kept with an `index.partial` marker and the error list, the
   operation is reported as failed and **no older version is pruned** (an
@@ -315,6 +317,11 @@ Select **one** application → **Restore**. As in HYCU's *Application Restore*:
      **diff preview** (live → backup) before any `apply`. Volumes and data are
      untouched; a Secret **redacted** at backup time is never restored (it would
      overwrite the real secret).
+     **Stateless application**: **Restore** on its row opens this path directly
+     with **its** objects pre-ticked (workloads, Services, referenced
+     ConfigMaps/Secrets) — the “Only the application's objects” box hides the rest
+     of the namespace. A **deleted** stateless namespace can be recovered too
+     (workloads + dependencies recreated from the snapshot, no volume).
 2. **Options**: target application and cluster, **configuration backup** to
    rebuild from (most recent by default), **volumes** (all pre-selected) and one
    **HYCU restore point** per volume (**most recent pre-selected**). Generated

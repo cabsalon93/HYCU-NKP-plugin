@@ -316,7 +316,7 @@ def save_config(updates):
 
 # Version horodatée de la build (format AAAAMMJJ-HHMM). À incrémenter à chaque
 # changement notable du programme ; affichée dans l'en-tête de l'interface.
-VERSION = "20260925-0930"
+VERSION = "20260925-1130"
 
 # Jeton anti-CSRF généré au démarrage, injecté dans la page et exigé sur les POST.
 CSRF_TOKEN = secrets.token_urlsafe(32)
@@ -1315,7 +1315,7 @@ def _backup_namespace_resources(ns, d):
     with open(os.path.join(d, "resources.json"), "w", encoding="utf-8") as f:
         json.dump({"namespace": ns, "kinds": kinds, "secret_data_included": include_secret,
                    "items": out}, f, indent=2)
-    return len(out), skipped
+    return len(out), skipped, out
 
 
 # ------------------------------------------------------------------------------
@@ -1862,8 +1862,11 @@ def action_backup(ns, dest=None, protect=None):
     if err:
         return {"ok": False, "error": err}
     items = pvc_data.get("items", [])
-    if not items:
-        return {"ok": False, "error": "Aucun PVC trouvé dans le namespace '%s'." % ns}
+    # Namespace sans PVC : sauvegardable quand même (application STATELESS — sa
+    # configuration se restaure depuis l'instantané resources.json), à condition que
+    # l'instantané soit activé et qu'il contienne au moins un workload (voir plus bas).
+    if not items and not CONFIG.get("config_backup_full", True):
+        return {"ok": False, "skipped": True, "error": "Aucun PVC trouvé dans le namespace '%s'." % ns}
 
     d = backup_dir(ns, root)
     index = {"namespace": ns, "created": datetime.datetime.now().isoformat(),
@@ -1904,13 +1907,31 @@ def action_backup(ns, dest=None, protect=None):
     # Instantané de configuration ÉTENDUE (Deployments, Services, Secrets…) — lecture
     # seule, additif, n'échoue jamais la sauvegarde PV/PVC (voir _backup_namespace_resources).
     resources_count = None
+    res_items = []
     if CONFIG.get("config_backup_full", True):
         try:
-            resources_count, _skipped = _backup_namespace_resources(ns, d)
+            resources_count, _skipped, res_items = _backup_namespace_resources(ns, d)
             index["resources_count"] = resources_count
             files.append("resources.json")
         except Exception as e:
             print("Sauvegarde de config étendue (%s) ignorée : %s" % (ns, e))
+    # Applications du namespace (workloads regroupés, PVC montés, stateful/stateless) :
+    # mémorisées dans l'index pour cibler la restauration — y compris quand le
+    # namespace n'existera plus (récupération).
+    try:
+        index["apps"] = [{k: a[k] for k in ("name", "workloads", "pvcs", "type", "unassigned", "whole_ns") if a.get(k)}
+                         for a in _apps_from_workloads(ns, res_items, [p["metadata"]["name"] for p in items])]
+    except Exception as e:
+        print("Applications de %s non indexées : %s" % (ns, e))
+    if not items and not any(o.get("kind") in APP_WORKLOAD_KINDS for o in res_items):
+        # Ni PVC ni workload : rien à protéger (namespace vide ou purement système).
+        shutil.rmtree(d, ignore_errors=True)
+        try:
+            os.rmdir(os.path.dirname(d))          # dossier du namespace, s'il est resté vide
+        except OSError:
+            pass
+        return {"ok": False, "skipped": True,
+                "error": "Aucun PVC ni workload dans le namespace '%s' : rien à sauvegarder." % ns}
 
     # Contrat de restauration (best-effort) : de quoi restaurer plus tard SANS saisie
     # d'UUID (nom/UUID du VG côté HYCU, disques, Prism Element, dernier point HYCU).
@@ -1983,7 +2004,7 @@ def action_backup_all(dest=None):
                             "pruned": int(b.get("pruned") or 0)})
         else:
             err = b.get("error") or ""
-            results.append({"ns": ns, "ok": False, "skipped": "Aucun PVC" in err,
+            results.append({"ns": ns, "ok": False, "skipped": bool(b.get("skipped")) or "Aucun PVC" in err,
                             "count": 0, "error": err})
     audit("backup_all", namespaces=len(namespaces), backed_up=backed_up, volumes=vol_total, root=root)
     return {"ok": True, "error": None, "results": results, "root": root,
@@ -2310,15 +2331,218 @@ def _backup_epoch(b):
         return None
 
 
+# ------------------------------------------------------------------------------
+# Applications DANS les namespaces. Un namespace peut héberger plusieurs
+# applications (ex. « wordpress » + un outil de supervision). Une application = le
+# groupe de workloads portant la même étiquette d'application
+# (app.kubernetes.io/instance > app.kubernetes.io/name > app ; sinon le nom du
+# workload). Elle est STATEFUL si l'un de ses workloads monte un PVC (volumes
+# persistentVolumeClaim, ou volumeClaimTemplates d'un StatefulSet), STATELESS sinon.
+# Les SAUVEGARDES restent par namespace (une seule « recette » cohérente) ; l'application
+# sert à CIBLER la restauration : volumes présélectionnés (stateful), objets de
+# configuration filtrés (stateless). La récupération d'un namespace supprimé et la
+# DR restent au niveau du namespace (elles recréent tout).
+# ------------------------------------------------------------------------------
+APP_WORKLOAD_KINDS = ("Deployment", "StatefulSet", "DaemonSet", "CronJob")
+APP_LABEL_KEYS = ("app.kubernetes.io/instance", "app.kubernetes.io/name", "app")
+APP_UNASSIGNED = "volumes sans workload"     # pseudo-application : PVC qu'aucun workload ne monte
+
+
+def _app_key_of(obj):
+    """Nom d'application d'un objet : première étiquette d'application présente,
+    sinon le nom de l'objet (workload sans étiquette = application à lui seul)."""
+    labels = (obj.get("metadata") or {}).get("labels") or {}
+    for k in APP_LABEL_KEYS:
+        if labels.get(k):
+            return str(labels[k])
+    return (obj.get("metadata") or {}).get("name") or "?"
+
+
+def _workload_pod_spec(w):
+    spec = w.get("spec") or {}
+    if (w.get("kind") or "") == "CronJob":
+        spec = (spec.get("jobTemplate") or {}).get("spec") or {}
+    return ((spec.get("template") or {}).get("spec")) or {}
+
+
+def _workload_pvcs(w, pvc_names=None):
+    """PVC montés par un workload : volumes persistentVolumeClaim + volumeClaimTemplates
+    d'un StatefulSet (PVC nommés <template>-<sts>-<n> : ceux qui existent si la liste
+    des PVC du namespace est connue, sinon un par réplica)."""
+    out = []
+    for v in (_workload_pod_spec(w).get("volumes") or []):
+        c = (v.get("persistentVolumeClaim") or {}).get("claimName")
+        if c and c not in out:
+            out.append(c)
+    if (w.get("kind") or "") == "StatefulSet":
+        spec = w.get("spec") or {}
+        name = (w.get("metadata") or {}).get("name") or ""
+        try:
+            n = int(spec.get("replicas") if spec.get("replicas") is not None else 1)
+        except (TypeError, ValueError):
+            n = 1
+        for t in (spec.get("volumeClaimTemplates") or []):
+            tn = (t.get("metadata") or {}).get("name")
+            if not tn:
+                continue
+            if pvc_names is not None:
+                rx = re.compile(r"^%s-%s-\d+$" % (re.escape(tn), re.escape(name)))
+                found = [p for p in pvc_names if rx.match(p)]
+            else:
+                found = ["%s-%s-%d" % (tn, name, i) for i in range(max(n, 1))]
+            for c in found:
+                if c not in out:
+                    out.append(c)
+    return out
+
+
+def _apps_from_workloads(ns, workloads, pvc_names=None):
+    """Regroupe les workloads d'un namespace en applications :
+    [{name, namespace, workloads:[{kind,name,replicas}], pvcs:[...], type}] triées par
+    nom. type = stateful | stateless | empty. Les objets DÉRIVÉS (Job d'un CronJob,
+    ReplicaSet…) sont ignorés. Les PVC qu'aucun workload ne monte forment la
+    pseudo-application « volumes sans workload » (restaurables comme stockage) ; un
+    namespace sans workload ni PVC est une application « vide » portant son nom."""
+    pvc_names = list(pvc_names or [])
+    groups = {}
+    for w in workloads or []:
+        kind = w.get("kind") or ""
+        if kind not in APP_WORKLOAD_KINDS:
+            continue
+        owners = {o.get("kind") for o in ((w.get("metadata") or {}).get("ownerReferences") or [])}
+        if owners & (set(APP_WORKLOAD_KINDS) | {"Job", "ReplicaSet"}):
+            continue
+        key = _app_key_of(w)
+        g = groups.setdefault(key, {"name": key, "namespace": ns, "workloads": [], "pvcs": []})
+        spec = w.get("spec") or {}
+        g["workloads"].append({"kind": kind, "name": (w.get("metadata") or {}).get("name") or "?",
+                               "replicas": spec.get("replicas") if kind in ("Deployment", "StatefulSet") else None})
+        for c in _workload_pvcs(w, pvc_names if pvc_names else None):
+            if c not in g["pvcs"]:
+                g["pvcs"].append(c)
+    apps = sorted(groups.values(), key=lambda a: a["name"].lower())
+    for a in apps:
+        a["type"] = "stateful" if a["pvcs"] else "stateless"
+    claimed = {c for a in apps for c in a["pvcs"]}
+    orphans = [c for c in pvc_names if c not in claimed]
+    if orphans and apps:
+        apps.append({"name": APP_UNASSIGNED, "namespace": ns, "workloads": [], "pvcs": orphans,
+                     "type": "stateful", "unassigned": True})
+    elif not apps:
+        apps.append({"name": ns, "namespace": ns, "workloads": [], "pvcs": orphans,
+                     "type": "stateful" if orphans else "empty", "whole_ns": True})
+    return apps
+
+
+def _list_namespace_workloads(namespaces):
+    """({ns: [workloads]}, {ns: [noms de PVC]}, erreur) pour les namespaces donnés.
+    Deux appels kubectl cluster-wide (-A) quand les droits le permettent, sinon repli
+    par namespace. Jamais bloquant : sans données, un namespace est présenté comme une
+    application unique (comme avant)."""
+    kinds = "deployments,statefulsets,daemonsets,cronjobs"
+    wl, pvcs, err_out = {}, {}, None
+    wanted = set(namespaces)
+
+    def fill(store, args, key=None):
+        data, err = kubectl_json(args)
+        if err or not data:
+            return err or "réponse vide"
+        for it in data.get("items") or []:
+            n = (it.get("metadata") or {}).get("namespace") or key
+            if n in wanted:
+                store.setdefault(n, []).append(it)
+        return None
+
+    for store, what in ((wl, kinds), (pvcs, "pvc")):
+        err = fill(store, ["get", what, "-A"])
+        if err:
+            if _kubectl_hint(err) != "other":
+                return wl, pvcs, err              # kubectl absent / sans contexte : inutile d'insister
+            err_out = err
+            for ns in namespaces:
+                e2 = fill(store, ["get", what, "-n", ns], key=ns)
+                if not e2:
+                    err_out = None
+                store.setdefault(ns, store.get(ns, []))
+        else:
+            for ns in namespaces:
+                store.setdefault(ns, [])
+    pvc_names = {ns: [(p.get("metadata") or {}).get("name") for p in lst if (p.get("metadata") or {}).get("name")]
+                 for ns, lst in pvcs.items()}
+    return wl, pvc_names, err_out
+
+
+def _apps_from_backup_index(ns, idx):
+    """Applications mémorisées dans l'index d'une sauvegarde (clé `apps`, écrite à la
+    sauvegarde) — utilisées quand le namespace n'existe plus sur le cluster."""
+    apps = (idx or {}).get("apps") or []
+    out = []
+    for a in apps:
+        if not isinstance(a, dict) or not a.get("name"):
+            continue
+        out.append({"name": a["name"], "namespace": ns, "workloads": list(a.get("workloads") or []),
+                    "pvcs": list(a.get("pvcs") or []), "type": a.get("type") or ("stateful" if a.get("pvcs") else "stateless"),
+                    "unassigned": bool(a.get("unassigned")), "whole_ns": bool(a.get("whole_ns"))})
+    return out
+
+
+def _app_object_indexes(items, app):
+    """Indices des objets d'un instantané resources.json appartenant à l'application
+    `app` : objets portant son étiquette d'application, ses workloads, les Secrets /
+    ConfigMaps / ServiceAccount qu'ils référencent, et les Services dont le sélecteur
+    cible ses pods. Sert à présélectionner la restauration d'objets d'UNE application
+    (stateless) sans toucher aux autres applications du namespace."""
+    if not app:
+        return set(range(len(items or [])))
+    wls = [o for o in (items or []) if (o.get("kind") or "") in APP_WORKLOAD_KINDS and _app_key_of(o) == app]
+    secrets, cms, sas, pod_labels = set(), set(), set(), []
+    for w in wls:
+        r = _referenced_objects(w if (w.get("kind") or "") != "CronJob"
+                                else {"spec": {"template": {"spec": _workload_pod_spec(w)}}})
+        secrets |= r["secrets"]
+        cms |= r["configmaps"]
+        if r["serviceaccount"]:
+            sas.add(r["serviceaccount"])
+        spec = w.get("spec") or {}
+        if (w.get("kind") or "") == "CronJob":
+            spec = (spec.get("jobTemplate") or {}).get("spec") or {}
+        lbls = (((spec.get("template") or {}).get("metadata") or {}).get("labels")) or {}
+        if lbls:
+            pod_labels.append(lbls)
+    sel = set()
+    for i, o in enumerate(items or []):
+        kind = o.get("kind") or ""
+        meta = o.get("metadata") or {}
+        name = meta.get("name") or ""
+        labels = meta.get("labels") or {}
+        if any(str(labels.get(k)) == app for k in APP_LABEL_KEYS if labels.get(k)):
+            sel.add(i)
+        elif kind in APP_WORKLOAD_KINDS and _app_key_of(o) == app:
+            sel.add(i)
+        elif kind == "Secret" and name in secrets:
+            sel.add(i)
+        elif kind == "ConfigMap" and name in cms:
+            sel.add(i)
+        elif kind == "ServiceAccount" and name in sas:
+            sel.add(i)
+        elif kind == "Service":
+            s = (o.get("spec") or {}).get("selector") or {}
+            if s and any(all(pl.get(k) == v for k, v in s.items()) for pl in pod_labels):
+                sel.add(i)
+    return sel
+
+
 def action_applications():
-    """Namespaces autorisés vus comme des « applications » Kubernetes, avec leur
-    état de protection de configuration. Lecture seule : 1 appel kubectl (liste des
-    namespaces), le reste vient des sauvegardes sur disque (dossier par défaut +
-    dossier de la sauvegarde automatique s'il diffère).
+    """Applications des namespaces autorisés (une ligne par APPLICATION, plusieurs
+    par namespace possibles — voir _apps_from_workloads), avec l'état de protection
+    de configuration du namespace. Lecture seule : liste des namespaces + workloads
+    et PVC (2 appels cluster-wide), le reste vient des sauvegardes sur disque
+    (dossier par défaut + dossier de la sauvegarde automatique s'il diffère).
 
     Un namespace SUPPRIMÉ du cluster mais dont des sauvegardes existent reste
-    listé (`missing: true`) : c'est précisément l'application qu'il faut pouvoir
-    RESTAURER — la détruire ne doit jamais la faire disparaître de l'écran."""
+    listé (`missing: true`, applications lues dans sa dernière sauvegarde) : c'est
+    précisément l'application qu'il faut pouvoir RESTAURER — la détruire ne doit
+    jamais la faire disparaître de l'écran."""
     info = action_namespaces()
     names = list(info.get("namespaces") or [])
     live = set(names)
@@ -2348,6 +2572,12 @@ def action_applications():
                     except OSError:
                         pass
     now, fresh = time.time(), _backup_freshness_s()
+    # Workloads + PVC des namespaces VIVANTS (pour découper chaque namespace en
+    # applications). Sans droits / sans kubectl : un namespace = une application.
+    wl_by_ns, pvc_by_ns, wl_err = ({}, {}, None)
+    live_names = [n for n in names if n in live]
+    if live_names and info.get("ok"):
+        wl_by_ns, pvc_by_ns, wl_err = _list_namespace_workloads(live_names)
     apps = []
     for ns in names:
         bks = []
@@ -2359,12 +2589,36 @@ def action_applications():
         stamps = [t for t in (_backup_epoch(b) for b in bks) if t]
         last = max(stamps) if stamps else None
         latest = max(bks, key=lambda b: _backup_epoch(b) or 0) if bks else None
-        apps.append({"name": ns, "backups": len(bks), "last_backup": last,
-                     "protected": bool(bks),
-                     "missing": ns not in live,
-                     "compliant": bool(last and (now - last) <= fresh),
-                     "volumes": len(((latest or {}).get("index") or {}).get("volumes") or []) if latest else None})
+        lidx = ((latest or {}).get("index") or {}) if latest else {}
+        backed_pvcs = {v.get("pvc") for v in (lidx.get("volumes") or []) if v.get("pvc")}
+        missing = ns not in live
+        if not missing and ns in wl_by_ns:
+            ns_apps = _apps_from_workloads(ns, wl_by_ns.get(ns) or [], pvc_by_ns.get(ns) or [])
+        elif missing:
+            ns_apps = _apps_from_backup_index(ns, lidx) or \
+                [{"name": ns, "namespace": ns, "workloads": [], "pvcs": sorted(backed_pvcs),
+                  "type": "stateful" if backed_pvcs else ("stateless" if lidx.get("resources_count") else "empty"),
+                  "whole_ns": True}]
+        else:
+            ns_apps = [{"name": ns, "namespace": ns, "workloads": [], "pvcs": [], "type": "unknown", "whole_ns": True}]
+        base = {"namespace": ns, "backups": len(bks), "last_backup": last, "protected": bool(bks),
+                "missing": missing, "compliant": bool(last and (now - last) <= fresh),
+                "ns_apps": len(ns_apps)}
+        for a in ns_apps:
+            row = dict(base, name=a["name"], type=a["type"], workloads=a.get("workloads") or [],
+                       pvcs=a.get("pvcs") or [], unassigned=bool(a.get("unassigned")),
+                       whole_ns=bool(a.get("whole_ns")))
+            if a.get("whole_ns") or a["type"] == "unknown":
+                row["volumes"] = len(lidx.get("volumes") or []) if latest else None
+                row["unbacked_pvcs"] = []
+            else:
+                row["volumes"] = len(a.get("pvcs") or [])
+                # Volumes de l'application ABSENTS de la dernière sauvegarde du namespace
+                # (PVC créé après) : la protection de cette application est incomplète.
+                row["unbacked_pvcs"] = [p for p in (a.get("pvcs") or []) if p not in backed_pvcs] if latest else list(a.get("pvcs") or [])
+            apps.append(row)
     return {"ok": bool(info.get("ok")), "error": info.get("error"), "apps": apps,
+            "workloads_error": wl_err,
             "filtered": bool(_ns_filter()),
             "freshness_hours": round(fresh / 3600.0, 1),
             "policy": {"enabled": bool(CONFIG.get("auto_backup_enabled")),
@@ -2491,18 +2745,19 @@ def action_report_data():
 def report_csv(d):
     """CSV « applications » (une ligne par namespace x cluster) — pour Excel."""
     out = io.StringIO()
-    out.write("cluster;workspace;application;protegee;conforme;versions;"
+    out.write("cluster;workspace;namespace;application;type;protegee;conforme;versions;"
               "derniere_sauvegarde;volumes;politique_h;dernier_export_s3\n")
     itv = round((d["apps"].get("policy") or {}).get("interval_hours") or 24, 1)
     for a in d["apps"].get("apps") or []:
         last = (datetime.datetime.fromtimestamp(a["last_backup"]).isoformat(timespec="seconds")
                 if a.get("last_backup") else "")
-        out.write("%s;%s;%s;%s;%s;%s;%s;%s;%s;%s\n" % (
-            a.get("cluster") or "", a.get("workspace") or "", a["name"],
+        ns = a.get("namespace") or a["name"]
+        out.write("%s;%s;%s;%s;%s;%s;%s;%s;%s;%s;%s;%s\n" % (
+            a.get("cluster") or "", a.get("workspace") or "", ns, a["name"], a.get("type") or "",
             "oui" if a.get("protected") else "non", "oui" if a.get("compliant") else "NON",
             a.get("backups") or 0, last,
             a.get("volumes") if a.get("volumes") is not None else "", itv,
-            (d.get("s3_exports") or {}).get(a["name"]) or ""))
+            (d.get("s3_exports") or {}).get(ns) or ""))
     return out.getvalue()
 
 
@@ -2517,13 +2772,15 @@ def report_html(d):
     ago = lambda ts: (datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M") if ts else "jamais")
     ic = lambda ok: ('<span class="ok">✓</span>' if ok else '<span class="ko">✕</span>')
     exp = d.get("s3_exports") or {}
+    typ = {"stateful": "Stateful", "stateless": "Stateless", "empty": "Vide"}
     rows = "".join(
-        "<tr><td>%s</td><td>%s</td><td><b>%s</b></td><td class=c>%s</td><td class=c>%s</td>"
+        "<tr><td>%s</td><td>%s</td><td>%s</td><td><b>%s</b></td><td>%s</td><td class=c>%s</td><td class=c>%s</td>"
         "<td class=c>%s</td><td>%s</td><td>%s</td></tr>" % (
-            esc_(a.get("cluster")), esc_(a.get("workspace") or "—"), esc_(a["name"]),
+            esc_(a.get("cluster")), esc_(a.get("workspace") or "—"), esc_(a.get("namespace") or a["name"]),
+            esc_(a["name"]), esc_(typ.get(a.get("type"), "—")),   # « Vide » traduit via la paire >Vide<
             ic(a.get("protected")), ic(a.get("compliant")), a.get("backups") or 0,
             esc_(ago(a.get("last_backup"))),
-            esc_((exp.get(a["name"]) or "—")[:16].replace("T", " "))) for a in apps)
+            esc_((exp.get(a.get("namespace") or a["name"]) or "—")[:16].replace("T", " "))) for a in apps)
     hrows = "".join("<tr><td>%s</td><td class=c>%s</td><td>%s</td></tr>"
                     % (esc_(cid), ic(h.get("ok")), esc_(h.get("error") or "joignable"))
                     for cid, h in sorted((d.get("health") or {}).items()))
@@ -2551,7 +2808,7 @@ footer{margin-top:26px;color:#6B7089;font-size:11px}</style></head><body>
 <span class=kpi><b>%s</b>sauvegarde automatique</span>
 <span class=kpi><b>%d / %d / %d</b>tâches ok / échec / simulation</span></div>
 <h2>Applications (protection de la configuration)</h2>
-<table><tr><th>Cluster</th><th>Workspace</th><th>Application</th><th>Protégée</th>
+<table><tr><th>Cluster</th><th>Workspace</th><th>Namespace</th><th>Application</th><th>Type</th><th>Protégée</th>
 <th>Conforme</th><th>Versions</th><th>Dernière sauvegarde</th><th>Dernier export S3</th></tr>%s</table>
 <h2>Santé des clusters</h2>
 <table><tr><th>Cluster</th><th>Joignable</th><th>Détail</th></tr>%s</table>
@@ -2563,7 +2820,7 @@ automatique %s, intervalle %s h, rétention %s.</footer></body></html>""" % (
         esc_(d["generated"]), esc_(d["version"]), n, prot, n, comp, n,
         "activée" if ab.get("enabled") else "désactivée",
         jc.get("success", 0), jc.get("failed", 0), jc.get("simulation", 0),
-        rows or "<tr><td colspan=8>aucune application</td></tr>",
+        rows or "<tr><td colspan=10>aucune application</td></tr>",
         hrows or "<tr><td colspan=3>aucun contrôle encore exécuté</td></tr>",
         jrows or "<tr><td colspan=5>aucune tâche</td></tr>", esc_(s3txt),
         "activée" if ab.get("enabled") else "désactivée",
@@ -2590,7 +2847,7 @@ HELP_SECTIONS = [
 <ul>
 <li><b>Barre du haut</b> : pastilles d'état HYCU/PE/PC · <b>cluster actif</b> (cliquez pour changer de cluster ou en ajouter) · ⚙ <b>Sources / Réglages</b> · <b>?</b> Aide / À propos · <b>EN/FR</b>.</li>
 <li><b>Tableau de bord</b> : anneaux protection/conformité, politique, sources, cluster, activité des tâches.</li>
-<li><b>Applications</b> : une ligne par namespace. Sélectionnez, puis agissez en haut à droite : <b>Sauvegarder · Restaurer · Définir la politique · Vérifier</b>. Bascule <b>Cluster actif / Tous les clusters</b> (regroupés par workspace NKP).</li>
+<li><b>Applications</b> : une ligne par <b>application</b> (un namespace peut en contenir plusieurs : les workloads sont regroupés par étiquette <code>app.kubernetes.io/instance</code>, <code>app.kubernetes.io/name</code> ou <code>app</code>), avec son namespace et son <b>type</b> : <b>Stateful</b> (monte des volumes) ou <b>Stateless</b> (configuration seule). Sélectionnez, puis agissez en haut à droite : <b>Sauvegarder · Restaurer · Définir la politique · Vérifier</b>. La sauvegarde reste <b>par namespace</b> (une seule recette cohérente) ; Restaurer cible l'application choisie. Bascule <b>Cluster actif / Tous les clusters</b> (regroupés par workspace NKP).</li>
 <li><b>Politiques</b> : sauvegarde automatique de la configuration (fréquence, rétention) + politiques HYCU.</li>
 <li><b>Tâches</b> : historique (succès/échec/simulation), cluster de chaque tâche, boutons <b>Rapport HTML/CSV</b>.</li>
 <li><b>Le bandeau Simulation</b> : tant qu'il est activé, AUCUNE commande destructive n'est exécutée — l'outil montre ce qu'il ferait. Désactivez-le seulement au moment d'agir.</li>
@@ -2606,7 +2863,7 @@ HELP_SECTIONS = [
     ("sauvegarde", "Sauvegarder", """
 <ul>
 <li><b>Applications → Sauvegarder</b> : exporte et nettoie les manifestes <b>PV/PVC</b> (la « recette » du restore) + un <b>instantané des autres objets</b> (Deployments, Services, ConfigMaps, Secrets <i>masqués</i>…) dans <code>resources.json</code>.</li>
-<li><b>Sauvegarder tous (filtrés)</b> : tous les namespaces autorisés d'un coup ; un namespace sans PVC est ignoré.</li>
+<li><b>Sauvegarder tous (filtrés)</b> : tous les namespaces autorisés d'un coup ; un namespace sans PVC <b>ni workload</b> est ignoré. Un namespace <b>stateless</b> (workloads sans volume) est sauvegardé : son instantané suffit à le restaurer.</li>
 <li>Dossier par défaut : <code>hycu-backups/</code> — <b>copiez-le hors du cluster</b> (téléchargement .zip dans l'assistant de restauration, ou export S3 automatique, voir plus bas).</li>
 <li>Le filtre des namespaces (entonnoir) et le <b>sélecteur d'étiquettes</b> (Réglages) bornent ce que l'outil voit et touche.</li>
 </ul>"""),
@@ -2629,6 +2886,7 @@ HELP_SECTIONS = [
 <li><b>Restaurer le stockage vers de nouveaux volumes</b> : de nouveaux Volume Groups sont clonés, l'application y est rattachée ; les volumes d'origine sont conservés.</li>
 <li><b>Restaurer des objets de configuration</b> : ré-applique des objets choisis depuis l'instantané d'une sauvegarde, avec <b>aperçu des différences</b> avant tout apply. Ne touche ni aux volumes ni aux données.</li>
 </ol>
+<div class="tip"><b>Application stateless (sans volume) ?</b> Cliquez <b>Restaurer</b> sur sa ligne : l'assistant ouvre directement le parcours <b>objets de configuration</b> avec <b>ses</b> objets précochés (workloads, Services, ConfigMaps/Secrets référencés) — les autres applications du namespace ne sont pas touchées. Pour une application <b>stateful</b>, seuls <b>ses</b> volumes sont présélectionnés dans les parcours de stockage.</div>
 <div class="tip">Déroulé conseillé : lancez d'abord en <b>simulation</b> (plan affiché, aucun effet), relisez le récapitulatif, puis désactivez la simulation et relancez. En mode réel, l'outil demande de <b>retaper le nom du cluster</b>. Après une restauration réelle, la <b>Vérification</b> s'ouvre automatiquement (PVC Bound, pods Running).</div>
 <div class="tip">Si une étape échoue, la séquence <b>s'arrête</b> et l'application reste arrêtée (jamais redémarrée sur des volumes incohérents). Corrigez puis <b>relancez</b> : la reprise est idempotente et les réplicas d'origine sont mémorisés.</div>
 <div class="tip"><b>Application supprimée du cluster ?</b> Tant que ses sauvegardes existent, elle reste listée dans <b>Applications</b> avec le badge « Supprimée — restaurable ». Cliquez <b>Restaurer</b> : le parcours de récupération recrée tout (namespace, PV/PVC, workloads, dépendances non masquées) depuis la sauvegarde choisie, en <b>réutilisant les volumes d'origine</b> — rien à saisir. Si un Volume Group a été supprimé avec le namespace mais reste « Protected deleted » dans HYCU, il est <b>restauré automatiquement</b> (HYCU connecté). Décochez « réutiliser » seulement si vous avez restauré les données sur de nouveaux volumes. Aucune dérogation DR n'est requise : la récupération reste sur le même cluster/contexte.</div>"""),
@@ -3329,13 +3587,21 @@ def action_objects_list(payload):
                                         allow_dr=dr)
     if err:
         return _err(err)
+    # Ciblage d'UNE application du namespace (stateless : c'est SA restauration) :
+    # `in_app` marque les objets qui lui appartiennent (étiquette, workloads,
+    # dépendances référencées, Services qui la ciblent) — présélectionnés côté UI.
+    app = (payload.get("app") or "").strip()
+    in_app = _app_object_indexes(items, app) if app else None
     out = []
     for i, obj in enumerate(items):
         k = _obj_key(obj)
-        out.append({"i": i, "kind": k["kind"], "name": k["name"],
-                    "redacted": _obj_is_redacted(obj)})
-    out.sort(key=lambda x: (x["kind"], x["name"]))
-    return _ok(items=out, count=len(out))
+        row = {"i": i, "kind": k["kind"], "name": k["name"], "redacted": _obj_is_redacted(obj)}
+        if in_app is not None:
+            row["in_app"] = i in in_app
+        out.append(row)
+    out.sort(key=lambda x: (not x.get("in_app", True), x["kind"], x["name"]))
+    return _ok(items=out, count=len(out), app=app or None,
+               app_count=(len(in_app) if in_app is not None else None))
 
 
 def _obj_diff_one(ns, obj):
@@ -6144,6 +6410,10 @@ def action_dr_backups():
                     "vol_names": vol_names,
                     "resources_count": idx.get("resources_count"),
                     "has_resources": os.path.isfile(os.path.join(dirpath, "resources.json")),
+                    # Sauvegarde STATELESS : aucun volume, mais des workloads à recréer.
+                    "stateless": (not (idx.get("volumes") or [])
+                                  and any((a.get("type") == "stateless") for a in (idx.get("apps") or []))),
+                    "apps": [a.get("name") for a in (idx.get("apps") or []) if a.get("name")],
                     "imported": rel.split(os.sep)[0] == "_imports"})
     out.sort(key=lambda b: b.get("created") or "", reverse=True)
     return _ok(backups=out, allowed=bool(CONFIG.get("allow_dr_restore")))
@@ -6209,18 +6479,27 @@ def action_clone_app(payload, log=None):
         return {"ok": False, "error": "Un suffixe est requis pour cloner dans le même namespace.", "log": []}
     if not K8S_NAME_RE.match(target_ns):
         return {"ok": False, "error": "Nom de namespace cible invalide : '%s'." % target_ns, "log": []}
-    if not items:
+    # Sans volume : seule une récupération/DR d'une sauvegarde STATELESS (namespace sans
+    # PVC, workloads dans l'instantané) a un sens — vérifié plus bas, une fois l'instantané lu.
+    if not items and not from_backup:
         return {"ok": False, "error": "Aucun volume sélectionné.", "log": []}
     xerr = _backup_cluster_error(backup_path, backup_root, allow_dr=dr)
     if xerr:
         return {"ok": False, "error": xerr, "log": []}
     bitems = None
+    stateless = False
     if from_backup:
         # resources.json ABSENT ne bloque PAS : on restaure les volumes (PV/PVC) et on
         # avertit que workloads/dépendances ne seront pas recréés (sauvegarde ancienne).
         bitems, berr = _load_backup_resources(backup_path, backup_root, allow_dr=dr, missing_ok=True)
         if berr:
             return {"ok": False, "error": "Restauration DR : %s" % berr, "log": []}
+        if not items:
+            stateless = any((o.get("kind") or "") in APP_WORKLOAD_KINDS for o in (bitems or []))
+            if not stateless:
+                return {"ok": False, "log": [], "error":
+                        "Aucun volume sélectionné et aucun workload dans l'instantané de cette "
+                        "sauvegarde : rien à recréer."}
     # Remap optionnel de la StorageClass (site DR : classes souvent différentes).
     dr_sc = (payload.get("dr_storageclass") or "").strip()
     if dr_sc and not K8S_NAME_RE.match(dr_sc):
@@ -6331,8 +6610,18 @@ def action_clone_app(payload, log=None):
                          "new_pv_name": clone_pv_name, "new_pvc_name": new_pvc_name,
                          "orig_pv_name": orig_pv_name})
 
-    workloads = (_workloads_from_items(bitems, [it["pvc"] for it in items]) if from_backup
-                 else _find_workloads_using_pvcs(ns, [it["pvc"] for it in items]))
+    if stateless:
+        # Récupération STATELESS : tous les workloads de l'instantané qui ne montent
+        # aucun PVC (le namespace n'en avait pas) — recréés avec leurs dépendances.
+        workloads = [json.loads(json.dumps(o)) for o in (bitems or [])
+                     if (o.get("kind") or "") in APP_WORKLOAD_KINDS and not _workload_pvcs(o, [])
+                     and not ({x.get("kind") for x in ((o.get("metadata") or {}).get("ownerReferences") or [])}
+                              & (set(APP_WORKLOAD_KINDS) | {"Job", "ReplicaSet"}))]
+        warnings.append("Sauvegarde sans volume (application stateless) : seuls les workloads et "
+                        "leurs dépendances sont recréés depuis l'instantané.")
+    else:
+        workloads = (_workloads_from_items(bitems, [it["pvc"] for it in items]) if from_backup
+                     else _find_workloads_using_pvcs(ns, [it["pvc"] for it in items]))
     if from_backup and not dr:
         warnings.append("Récupération « depuis la sauvegarde seule » : workloads et dépendances "
                         "proviennent de la sauvegarde « %s » (le namespace n'existe plus sur le "
@@ -7505,9 +7794,9 @@ HTML = r"""<!DOCTYPE html>
         <div style="display:flex;align-items:center;gap:14px"><span class="tinfo" id="appsInfo"></span>
           <button class="pact nsEdit" type="button" title="Filtrer la liste des namespaces"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5h16l-6.2 7.4V19l-3.6-1.8v-4.8z"/></svg></button></div></div>
       <table class="ht" id="appsTable"><thead><tr><th class="cb"><input type="checkbox" id="appsAll" title="Tout sélectionner"></th>
-        <th>Nom</th><th class="mc">Workspace</th><th class="mc">Cluster</th><th>Type</th><th>Politique</th><th class="ctr">Conformité</th><th class="ctr">Protection</th>
+        <th>Nom</th><th>Namespace</th><th class="mc">Workspace</th><th class="mc">Cluster</th><th>Type</th><th>Politique</th><th class="ctr">Conformité</th><th class="ctr">Protection</th>
         <th>Dernière sauvegarde</th><th class="ctr">Versions</th></tr></thead>
-        <tbody id="appsBody"><tr><td colspan="10" class="tempty"><span class="spin"></span></td></tr></tbody></table>
+        <tbody id="appsBody"><tr><td colspan="11" class="tempty"><span class="spin"></span></td></tr></tbody></table>
     </div>
   </section>
   <!-- ===================== POLITIQUES ===================== -->
@@ -7708,6 +7997,7 @@ HTML = r"""<!DOCTYPE html>
       <span class="st" data-st="3">3 · Lancer</span>
     </div>
     <div id="rsPgType">
+      <div class="note" id="rsAppNote" style="display:none;margin-bottom:10px"></div>
       <div class="opt" data-kind="cloneapp"><svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="4" y="27" width="16" height="16" rx="2"/><circle cx="35.5" cy="35" r="8.5"/><path d="M27.5 12.5a8.3 8.3 0 1 1 3 6.3"/><path d="M27 6.8v5.4h5.4"/></svg><div><b>Restaurer toute l'application (copie)</b><span>Restaure le stockage et les objets de l'application (workloads, dépendances) dans le même namespace (suffixe) ou dans un autre. L'original n'est pas modifié.</span></div></div>
       <div class="opt" data-kind="inplace"><svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="19" cy="10.5" rx="12" ry="4.5"/><path d="M7 10.5v25c0 2.5 5.4 4.5 12 4.5"/><path d="M31 10.5v10"/><path d="M7 23c0 2.5 5.4 4.5 12 4.5"/><path d="M27.3 36.3a8.2 8.2 0 1 0 2.4-5.8"/><path d="M27 26.6v4.9h4.9"/></svg><div><b>Restaurer le stockage sur place</b><span>Restaure les données dans les volumes d'origine. L'application est arrêtée puis redémarrée.</span></div></div>
       <div class="opt" data-kind="reattach"><svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="16" cy="10.5" rx="11" ry="4.3"/><path d="M5 10.5v25c0 2.4 4.9 4.3 11 4.3s11-1.9 11-4.3v-25"/><path d="M5 23c0 2.4 4.9 4.3 11 4.3s11-1.9 11-4.3"/><path d="M32 23.5h11M38.5 18.5l5 5-5 5"/></svg><div><b>Restaurer le stockage vers de nouveaux volumes</b><span>Restaure vers de nouveaux Volume Groups et y rattache l'application. Les volumes d'origine sont conservés.</span></div></div>
@@ -7752,7 +8042,8 @@ HTML = r"""<!DOCTYPE html>
         <div><label class="fld" style="margin-top:0">Sauvegarde (instantané de config)</label><select id="objBackupSel"></select></div>
       </div>
       <div id="objPick">
-        <label class="fld">Objets à restaurer <span class="hint" id="objInfo"></span></label>
+        <label class="fld" style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">Objets à restaurer <span class="hint" id="objInfo"></span>
+          <span id="objOnlyAppWrap" style="display:none;font-weight:400;margin-left:auto"><input type="checkbox" id="objOnlyApp" checked style="width:auto"> Seulement les objets de l'application</span></label>
         <div class="tcard" style="box-shadow:none;border:1px solid var(--rule)">
           <table class="ht"><thead><tr><th class="cb"><input type="checkbox" id="objAll"></th><th>Type</th><th>Nom</th><th>Note</th></tr></thead>
           <tbody id="objBody"></tbody></table></div>
@@ -8069,7 +8360,7 @@ HTML = r"""<!DOCTYPE html>
 const $ = s => document.querySelector(s);
 const CSRF = document.querySelector('meta[name=csrf-token]').content;
 const dry = () => $("#dry").checked;
-let state = {selected:{}, mode:"clone", cloneSub:"reattach", cloneNsMode:"same", backup_path:null, backup_root:null, preview:null, ns:null};
+let state = {selected:{}, mode:"clone", cloneSub:"reattach", cloneNsMode:"same", backup_path:null, backup_root:null, preview:null, ns:null, app:null};
 let ctxInfo = {};
 function isCloneApp(){ return state.mode==="clone" && state.cloneSub==="cloneapp"; }
 
@@ -8648,6 +8939,7 @@ let loadPvcsSeq=0;     // jeton anti-course : un fetch dépassé (autre namespac
 async function loadPvcs(){
   const sel=$("#rsNs"); if(!sel.value) return;
   const ns=sel.value; state.ns=ns; state.pvcNs=ns; rsHyMatch=null; rsInplaceSel={};
+  if(state.app && state.app.ns!==ns){ state.app=null; $("#rsWizApp").innerHTML=rsAppLabel(); }   // autre namespace choisi : plus d'application ciblée
   const seq=++loadPvcsSeq;
   const customRoot = $("#rsCustomDir").checked ? $("#rsBackupRoot").value.trim() : "";
   state.backup_root = customRoot || null;
@@ -8693,8 +8985,15 @@ function renderRsPvcs(pvcs, src){
   document.querySelectorAll(".rsChk").forEach(c=>c.onchange=rebuildVolCfgs);
   $("#rsConfig").style.display="none"; $("#rsPlan").style.display="none"; setRsStep(1);
   // Assistant de restauration : comme dans HYCU, TOUS les volumes de l'application
-  // sont présélectionnés (l'opérateur peut en décocher).
-  if(rsAutoCheck && pvcs.length){ document.querySelectorAll(".rsChk").forEach(c=>c.checked=true); rebuildVolCfgs(); }
+  // sont présélectionnés (l'opérateur peut en décocher). Application ciblée (page
+  // Applications) : seuls SES volumes le sont — les autres applications du namespace
+  // ne sont pas touchées par défaut.
+  if(rsAutoCheck && pvcs.length){
+    const only = state.app && state.app.pvcs && state.app.pvcs.length ? new Set(state.app.pvcs) : null;
+    document.querySelectorAll(".rsChk").forEach(c=>c.checked = !only || only.has(c.dataset.pvc));
+    if(only && ![...document.querySelectorAll(".rsChk")].some(c=>c.checked)) document.querySelectorAll(".rsChk").forEach(c=>c.checked=true);
+    rebuildVolCfgs();
+  }
   updateNextBar();
 }
 // Horodatage epoch en secondes (≈ `date -u +%s`) : sert de suffixe UNIQUE à chaque clone,
@@ -9668,7 +9967,17 @@ function onPageShown(tab){
 let apps=[], appsSel=new Set(), appsFresh=24, appsPolicy={}, appsScope="one", appsClErr=[];
 // Clé de sélection = cluster|namespace (vue « Tous les clusters » : un même nom de
 // namespace peut exister sur plusieurs clusters).
-const appKey=a=>(a.cluster_id||ACTIVE_CID)+"|"+a.name;
+// Clé d'une ligne : cluster | namespace | application (plusieurs applications par namespace).
+const appKey=a=>(a.cluster_id||ACTIVE_CID)+"|"+(a.namespace||a.name)+"|"+a.name;
+const appNs=a=>a.namespace||a.name;
+// Libellé du type d'application (stateful = monte des volumes ; stateless = configuration seule).
+function appTypeCell(a){
+  if(a.missing) return '<span class="badge b-lost">Supprimée — restaurable</span>'+(a.type==="stateless"?' <span class="hint">stateless</span>':"");
+  if(a.type==="stateful") return '<span class="badge b-bound">Stateful</span> <span class="hint">'+(a.volumes||0)+' volume(s)</span>'+(a.unassigned?' <span class="hint">· sans workload</span>':"");
+  if(a.type==="stateless") return '<span class="badge b-pending">Stateless</span> <span class="hint">'+((a.workloads||[]).length)+' workload(s)</span>';
+  if(a.type==="empty") return '<span class="badge b-na">Vide</span>';
+  return '<span class="badge b-na">Namespace</span>';
+}
 function updateScopeSeg(){
   const multi=CLUSTERS.length>1;
   $("#appsScope").style.display = multi ? "" : "none";
@@ -9689,12 +9998,12 @@ async function loadApps(){
   apps=(r.apps||[]).map(a=>all ? a : Object.assign({}, a, {cluster_id:ACTIVE_CID}));
   appsFresh=r.freshness_hours||24; appsPolicy=r.policy||{};
   appsClErr = all ? (r.clusters||[]).filter(c=>!c.ok && !c.skipped) : [];
-  if(all) apps.sort((x,y)=>(x.workspace||"").localeCompare(y.workspace||"") || (x.cluster||"").localeCompare(y.cluster||"") || x.name.localeCompare(y.name));
+  if(all) apps.sort((x,y)=>(x.workspace||"").localeCompare(y.workspace||"") || (x.cluster||"").localeCompare(y.cluster||"") || appNs(x).localeCompare(appNs(y)) || x.name.localeCompare(y.name));
   const keys=new Set(apps.map(appKey));
   [...appsSel].forEach(k=>{ if(!keys.has(k)) appsSel.delete(k); });
   $("#appsTable").classList.toggle("multi", all);
   if(!r.ok && !apps.length){
-    $("#appsBody").innerHTML=`<tr><td colspan="10">${errBox(r.error||"kubectl ?")}</td></tr>`;
+    $("#appsBody").innerHTML=`<tr><td colspan="11">${errBox(r.error||"kubectl ?")}</td></tr>`;
     updateAppActs(); return r;
   }
   renderApps(); return r;
@@ -9704,17 +10013,18 @@ function appPolicyLabel(){
 }
 function appsVisible(){
   const q=($("#appsSearch").value||"").trim().toLowerCase();
-  return apps.filter(a=>!q || a.name.toLowerCase().includes(q) || (a.cluster||"").toLowerCase().includes(q)
-                           || (a.workspace||"").toLowerCase().includes(q));
+  return apps.filter(a=>!q || a.name.toLowerCase().includes(q) || appNs(a).toLowerCase().includes(q)
+                           || (a.cluster||"").toLowerCase().includes(q) || (a.workspace||"").toLowerCase().includes(q));
 }
 function renderApps(){
   const rows=appsVisible(), all=appsScope==="all";
-  $("#appsInfo").textContent=rows.length+" application(s)";
+  const nNs=new Set(rows.map(a=>(a.cluster_id||"")+"|"+appNs(a))).size;
+  $("#appsInfo").textContent=rows.length+" application(s) · "+nNs+" namespace(s)";
   let h="";
-  appsClErr.forEach(c=>{ h+=`<tr class="grp"><td colspan="10">${c.workspace?esc(c.workspace)+'<span class="gs">›</span>':""}${esc(c.cluster)}`+
+  appsClErr.forEach(c=>{ h+=`<tr class="grp"><td colspan="11">${c.workspace?esc(c.workspace)+'<span class="gs">›</span>':""}${esc(c.cluster)}`+
                              `<span class="ge">${stIc("ko")} ${esc(c.error||"injoignable")}</span></td></tr>`; });
   if(!rows.length){
-    h+=`<tr><td colspan="10" class="tempty">${apps.length
+    h+=`<tr><td colspan="11" class="tempty">${apps.length
       ? "Aucune application ne correspond à la recherche."
       : "Aucun namespace à afficher — vérifiez le contexte kubectl ou le filtre des namespaces."}</td></tr>`;
   } else {
@@ -9723,22 +10033,27 @@ function renderApps(){
       let g="";
       const gk=(a.workspace||"")+"|"+(a.cluster_id||"");
       if(all && gk!==grp){ grp=gk;
-        g=`<tr class="grp"><td colspan="10">${a.workspace?esc(a.workspace)+'<span class="gs">›</span>':""}${esc(a.cluster||"")}`+
+        g=`<tr class="grp"><td colspan="11">${a.workspace?esc(a.workspace)+'<span class="gs">›</span>':""}${esc(a.cluster||"")}`+
           `${a.cluster_id===ACTIVE_CID?'<span class="tag">ACTIF</span>':''}</td></tr>`; }
       const k=appKey(a), sel=appsSel.has(k);
       const comp = a.missing ? stIc("na","Namespace supprimé du cluster")
                  : a.compliant ? stIc("ok","Sauvegarde de configuration récente")
                  : (a.protected ? stIc("ko","Dernière sauvegarde plus ancienne que "+appsFresh+" h")
                                 : stIc("na","Jamais sauvegardée"));
-      const prot = a.protected ? stIc("ok", a.backups+" sauvegarde(s) de configuration")
-                               : stIc("na","Aucune sauvegarde de configuration");
+      // Protection = sauvegardes du NAMESPACE ; un volume de l'application absent de la
+      // dernière sauvegarde (PVC créé depuis) rend sa protection incomplète.
+      const unb=(a.unbacked_pvcs||[]);
+      const prot = !a.protected ? stIc("na","Aucune sauvegarde de configuration")
+                 : (unb.length && !a.missing) ? stIc("wn", "Volume(s) absent(s) de la dernière sauvegarde : "+unb.join(", ")+" — relancez une sauvegarde")
+                 : stIc("ok", a.backups+" sauvegarde(s) de configuration du namespace");
       const last = a.last_backup ? esc(fmtAgo(a.last_backup)) : '<span style="color:var(--muted)">Jamais</span>';
-      const nameCell = esc(a.name)+(a.missing?' <span class="badge b-lost">Supprimée — restaurable</span>':'');
+      const nameCell = (a.unassigned ? '<i>'+esc(a.name)+'</i>' : esc(a.name))
+        + (a.whole_ns && !a.missing && a.type!=="empty" ? ' <span class="hint">(namespace entier)</span>' : '');
       return g+`<tr class="clk${sel?' sel':''}" data-k="${esc(k)}"${a.missing?' style="opacity:.75"':''}>
         <td class="cb"><input type="checkbox" tabindex="-1" ${sel?"checked":""}></td>
-        <td style="color:var(--strong);font-weight:500">${nameCell}</td>
+        <td style="color:var(--strong);font-weight:500">${nameCell}</td><td>${esc(appNs(a))}</td>
         <td class="mc">${esc(a.workspace||"—")}</td><td class="mc">${esc(a.cluster||"")}</td>
-        <td>${a.missing?"Application supprimée (sauvegardes conservées)":"Application Kubernetes"}</td><td>${esc(appPolicyLabel())}</td>
+        <td>${appTypeCell(a)}</td><td>${esc(appPolicyLabel())}</td>
         <td class="ctr">${comp}</td><td class="ctr">${prot}</td><td>${last}</td>
         <td class="ctr">${a.backups||0}</td></tr>`;
     }).join("");
@@ -9750,12 +10065,22 @@ function renderApps(){
   updateAppActs();
 }
 function selAppObjs(){ return apps.filter(a=>appsSel.has(appKey(a))); }
-function selApps(){ return selAppObjs().map(a=>a.name); }
+// Namespaces distincts de la sélection (la sauvegarde est par namespace : deux
+// applications du même namespace = une seule sauvegarde).
+function selNsObjs(){
+  const seen=new Set(), out=[];
+  selAppObjs().forEach(a=>{ const k=(a.cluster_id||ACTIVE_CID)+"|"+appNs(a); if(seen.has(k)) return; seen.add(k);
+    out.push({name:appNs(a), cluster_id:a.cluster_id, cluster:a.cluster, workspace:a.workspace, missing:a.missing}); });
+  return out;
+}
+function selApps(){ return selNsObjs().map(a=>a.name); }
 function updateAppActs(){
-  const objs=selAppObjs(), n=objs.length, anyMissing=objs.some(a=>a.missing);
-  $("#actBackup").disabled = !n || anyMissing;
+  const objs=selAppObjs(), n=objs.length, anyMissing=objs.some(a=>a.missing), anyEmpty=objs.some(a=>a.type==="empty");
+  $("#actBackup").disabled = !n || anyMissing || anyEmpty;
   ["#actPolicy","#actVerify"].forEach(id=>$(id).disabled = n!==1 || anyMissing);
-  $("#actRestore").disabled = n!==1;           // restaurer une app SUPPRIMÉE est le cas clé
+  // Restaurer : une seule ligne ; un namespace vide reste restaurable s'il a des sauvegardes
+  // (application supprimée mais namespace conservé) — restaurer une app SUPPRIMÉE est le cas clé.
+  $("#actRestore").disabled = n!==1 || (anyEmpty && !objs[0].protected);
 }
 // Opération sur UNE application d'un autre cluster (vue « Tous les clusters ») : on
 // bascule d'abord le cluster actif, pour que confirmations et garde-fous le désignent.
@@ -9765,16 +10090,16 @@ $("#appsAll").onchange=()=>{ const on=$("#appsAll").checked;
   appsVisible().forEach(a=>on ? appsSel.add(appKey(a)) : appsSel.delete(appKey(a))); renderApps(); };
 $("#appsRefresh").onclick=()=>loadApps();
 $("#actBackup").onclick=async()=>{
-  const objs=selAppObjs();
+  const objs=selNsObjs();
   const cids=[...new Set(objs.map(a=>a.cluster_id))];
   if(cids.length===1) await ensureCluster(objs[0]);
   openBackupModal(objs.map(a=>a.name), objs);
 };
 $("#actRestore").onclick=async()=>{ const a=selAppObjs()[0]; await ensureCluster(a);
-  if(a.missing) return openRecoverModal(a.name);
-  openRestoreModal(a.name); };
-$("#actPolicy").onclick=async()=>{ const a=selAppObjs()[0]; await ensureCluster(a); openPolicyModal(a.name); };
-$("#actVerify").onclick=async()=>{ const a=selAppObjs()[0]; await ensureCluster(a); gotoVerify(a.name, false); };
+  if(a.missing) return openRecoverModal(appNs(a));
+  openRestoreModal(appNs(a), a); };
+$("#actPolicy").onclick=async()=>{ const a=selAppObjs()[0]; await ensureCluster(a); openPolicyModal(appNs(a)); };
+$("#actVerify").onclick=async()=>{ const a=selAppObjs()[0]; await ensureCluster(a); gotoVerify(appNs(a), false); };
 
 // ============================ Modale Sauvegarde ============================
 // Actions principales dans le pied de modale (comme HYCU) : on y DÉPLACE les boutons
@@ -10204,7 +10529,8 @@ async function loadDashboard(){
     <ul class="dlist">
       <li><span class="k">kubectl</span><span class="v">${ctxInfo.kubectl_ok ? stIc("ok","Opérationnel") : stIc("ko","Indisponible")}</span></li>
       <li><span class="k">Clusters enregistrés</span><span class="v">${CLUSTERS.length}</span></li>
-      <li><span class="k">Applications (namespaces)</span><span class="v">${n}</span></li>
+      <li><span class="k">Applications</span><span class="v">${n}</span></li>
+      <li><span class="k">Namespaces</span><span class="v">${new Set(alive.map(x=>x.namespace||x.name)).size}</span></li>
       <li><span class="k">Filtre des namespaces</span><span class="v">${a.filtered ? "Actif" : "Aucun"}</span></li>
       <li><span class="k">Mode</span><span class="v">${dry() ? "Simulation" : '<span class="ko">Réel</span>'}</span></li>
     </ul>`;
@@ -10302,16 +10628,34 @@ function rsShowPage(p){
   const b=$("#mRestore .hm-body"); if(b) b.scrollTop=0;
   rsWizSync();
 }
-function openRestoreModal(ns){
+// Libellé « namespace › application » de l'assistant (application ciblée, ou namespace entier).
+function rsAppLabel(){
+  const a=state.app;
+  if(!a || a.whole_ns) return esc(state.ns||"—");
+  return esc(state.ns||"—")+' <span class="sep">›</span> '+esc(a.name)+
+    (a.type==="stateless" ? ' <span class="badge b-pending">Stateless</span>' : a.type==="stateful" ? ' <span class="badge b-bound">Stateful</span>' : "");
+}
+function openRestoreModal(ns, app){
   ns = ns || state.ns || $("#rsNs").value; if(!ns) return;
   state.ns=ns; applyGlobalNs();
+  // Application ciblée (page Applications) : {name, type, pvcs, whole_ns}. Sans
+  // application (namespace entier), l'assistant se comporte comme avant.
+  state.app = (app && app.name && !app.whole_ns) ? {ns:ns, name:app.name, type:app.type, pvcs:app.pvcs||[], unassigned:!!app.unassigned} : null;
   rsWizKind=rsKindFromState(); rsSyncOpts();
-  $("#rsWizApp").textContent=ns;
+  $("#rsWizApp").innerHTML=rsAppLabel();
   $("#rsWizCluster").innerHTML=`<b>${esc(ctxInfo.context||"—")}</b>`;
   ["#rsLog","#rsInplaceLog","#rsErr"].forEach(id=>$(id).innerHTML="");
   if($("#rsCustomDir").checked) $("#rsAdvWrap").open=true;
-  rsShowPage("type");
+  const note=$("#rsAppNote");
+  if(note){
+    note.style.display = state.app ? "block" : "none";
+    note.innerHTML = !state.app ? "" : state.app.type==="stateless"
+      ? `Application <b>${esc(state.app.name)}</b> : <b>stateless</b> (aucun volume). Sa restauration = ré-appliquer ses objets de configuration (workloads, Services, ConfigMaps…) depuis l'instantané d'une sauvegarde — parcours <b>« objets de configuration »</b>, présélectionné.`
+      : `Application <b>${esc(state.app.name)}</b> : <b>stateful</b> — ses volumes (${esc(state.app.pvcs.join(", ")||"—")}) seront présélectionnés ; les autres volumes du namespace restent décochés.`;
+  }
   openModal("mRestore");
+  if(state.app && state.app.type==="stateless"){ rsWizKind="objects"; rsSyncOpts(); rsShowPage("type"); return objOpen(); }
+  rsShowPage("type");
 }
 async function rsToForm(){
   if(!rsWizKind) return;
@@ -10339,10 +10683,12 @@ function rsWizSync(){
     const n=document.querySelectorAll(".drRef").length;
     const filled=[...document.querySelectorAll(".drRef")].filter(t=>t.value.trim()).length;
     // Réutilisation des volumes d'origine : aucun UUID requis (le serveur les déduit
-    // de la sauvegarde). Sinon, tous les volumes doivent avoir une référence.
+    // de la sauvegarde). Sinon, tous les volumes doivent avoir une référence. Une
+    // sauvegarde STATELESS (aucun volume, workloads dans l'instantané) se restaure sans volume.
     const needRefs = !drRecoverReuse();
+    const b=drSel(), noVol = !n && !!(b && b.stateless);
     lbl=dry()? "Restaurer (simulation)" : "Restaurer (réel)";
-    dis=!drAllowed || !n || (needRefs && filled<n) || drBusy || !$("#drTargetNs").value.trim();
+    dis=!drAllowed || (!n && !noVol) || (needRefs && filled<n) || drBusy || !$("#drTargetNs").value.trim();
     act=drRun;
   }
   else if(rsWizPage==="objects"){
@@ -10388,7 +10734,8 @@ var drAllowed=false, drBusy=false, drBackups=[], drMode="dr", drRecoverNs=null;
 // mêmes mécanismes que la page DR (sources depuis la sauvegarde seule), mais SANS
 // la dérogation allow_dr_restore (le serveur vérifie que la sauvegarde est d'ici).
 function openRecoverModal(ns){
-  state.ns=ns;
+  state.ns=ns; state.app=null;         // la récupération recrée tout le namespace
+  const note=$("#rsAppNote"); if(note){ note.style.display="none"; note.innerHTML=""; }
   rsWizKind="recover"; rsSyncOpts();   // kind dédié : « Retour » puis « Suivant » ne devient jamais une DR
   ["#rsLog","#rsInplaceLog","#rsErr"].forEach(id=>{ const e=$(id); if(e) e.innerHTML=""; });
   openModal("mRestore");
@@ -10449,7 +10796,8 @@ function drRenderVols(){
      <input type="text" class="drRef" data-pvc="${esc(v)}" spellcheck="false" autocomplete="off"
        value="${drMode==="recover"&&refs[v]?esc(refs[v]):""}"
        placeholder="${esc(drMode==="recover"?"UUID du Volume Group (8-4-4-4-12)":"UUID du VG restauré/cloné sur le site cible (8-4-4-4-12)")}"></div>`).join("")
-    : '<div class="hint">Aucun volume dans cette sauvegarde.</div>';
+    : (b && b.stateless ? '<div class="note">Sauvegarde <b>stateless</b> (aucun volume) : les workloads'+((b.apps||[]).length?' ('+esc((b.apps||[]).join(", "))+')':'')+' et leurs dépendances seront recréés depuis l\'instantané.</div>'
+                        : '<div class="hint">Aucun volume dans cette sauvegarde.</div>');
   document.querySelectorAll(".drRef").forEach(t=>t.oninput=rsWizSync);
   drSyncReuse();
 }
@@ -10530,10 +10878,11 @@ async function drRun(){
 // ----- Restauration guidée des OBJETS de configuration (resources.json) -----
 var objItems=[], objPhase="pick", objBusy=false, objBackups=[];
 function objBody_(){ return {namespace:$("#rsNs").value||state.ns,
-  backup_path:($("#objBackupSel").value||null), backup_root:state.backup_root||null}; }
+  backup_path:($("#objBackupSel").value||null), backup_root:state.backup_root||null,
+  app:(state.app && !state.app.unassigned) ? state.app.name : null}; }
 async function objOpen(){
   objPhase="pick"; objBusy=true; objItems=[];
-  $("#objApp").textContent=state.ns||$("#rsNs").value||"—";
+  $("#objApp").innerHTML=rsAppLabel();
   $("#objErr").innerHTML=""; $("#objLog").innerHTML=""; $("#objDiffWrap").style.display="none";
   $("#objPick").style.display="block";
   $("#objBody").innerHTML='<tr><td colspan="4" class="tempty"><span class="spin"></span></td></tr>';
@@ -10557,20 +10906,31 @@ async function objLoadList(){
   objBusy=false;
   if(!r.ok){ $("#objBody").innerHTML=""; $("#objErr").innerHTML=errBox(r.error); objItems=[]; rsWizSync(); return; }
   objItems=r.items||[];
-  $("#objInfo").textContent="("+objItems.length+" objet(s) dans l'instantané)";
-  $("#objBody").innerHTML=objItems.length? objItems.map(o=>`<tr class="clk${o.redacted?'':' '}" data-i="${o.i}">
-     <td class="cb"><input type="checkbox" class="objChk" data-i="${o.i}" ${o.redacted?"disabled":""}></td>
+  // Application ciblée : ses objets sont marqués (in_app) et PRÉCOCHÉS ; les objets des
+  // autres applications du namespace sont masqués par défaut (case « seulement… »).
+  const appOn = !!(r.app);
+  $("#objOnlyAppWrap").style.display = appOn ? "" : "none";
+  $("#objInfo").textContent="("+objItems.length+" objet(s) dans l'instantané"+(appOn?(" · "+(r.app_count||0)+" de l'application « "+r.app+" »"):"")+")";
+  $("#objBody").innerHTML=objItems.length? objItems.map(o=>`<tr class="clk${o.redacted?'':' '}${appOn&&!o.in_app?' objOther':''}" data-i="${o.i}">
+     <td class="cb"><input type="checkbox" class="objChk" data-i="${o.i}" ${o.redacted?"disabled":""} ${appOn&&o.in_app&&!o.redacted?"checked":""}></td>
      <td>${esc(o.kind)}</td><td style="color:var(--strong);font-weight:500">${esc(o.name)}</td>
-     <td>${o.redacted?'<span class="badge b-pending">Secret masqué — non restaurable</span>':""}</td></tr>`).join("")
+     <td>${o.redacted?'<span class="badge b-pending">Secret masqué — non restaurable</span>':(appOn&&!o.in_app?'<span class="hint">autre application / partagé</span>':"")}</td></tr>`).join("")
     : '<tr><td colspan="4" class="tempty">Instantané vide.</td></tr>';
   document.querySelectorAll("#objBody tr.clk").forEach(tr=>tr.onclick=e=>{
     if(e.target.classList.contains("objChk")) return rsWizSync();
     const c=tr.querySelector(".objChk"); if(c && !c.disabled){ c.checked=!c.checked; rsWizSync(); } });
   document.querySelectorAll(".objChk").forEach(c=>c.onchange=rsWizSync);
-  $("#objAll").checked=false; rsWizSync();
+  $("#objAll").checked=false; objSyncOnlyApp(); rsWizSync();
 }
+function objSyncOnlyApp(){
+  const only = $("#objOnlyAppWrap").style.display!=="none" && $("#objOnlyApp").checked;
+  document.querySelectorAll("#objBody tr.objOther").forEach(tr=>{ tr.style.display = only ? "none" : "";
+    if(only){ const c=tr.querySelector(".objChk"); if(c) c.checked=false; } });
+}
+$("#objOnlyApp").onchange=()=>{ objSyncOnlyApp(); rsWizSync(); };
 $("#objAll").onchange=()=>{ const on=$("#objAll").checked;
-  document.querySelectorAll(".objChk:not([disabled])").forEach(c=>c.checked=on); rsWizSync(); };
+  document.querySelectorAll("#objBody tr").forEach(tr=>{ if(tr.style.display==="none") return;
+    const c=tr.querySelector(".objChk:not([disabled])"); if(c) c.checked=on; }); rsWizSync(); };
 function objSelIdx(){ return [...document.querySelectorAll(".objChk:checked")].map(c=>+c.dataset.i); }
 async function objToDiff(){
   objBusy=true; rsWizSync();
@@ -12163,6 +12523,37 @@ I18N_EN += [
     # ---- Applications supprimées mais sauvegardées (récupération même cluster) ----
     ("Supprimée — restaurable", "Deleted — restorable"),
     ("Application supprimée (sauvegardes conservées)", "Deleted application (backups kept)"),
+    # Applications dans les namespaces (stateful / stateless)
+    ("volumes sans workload", "volumes without workload"),
+    ('<h2 class="dtitle">Tâches</h2>', '<h2 class="dtitle">Jobs</h2>'),
+    ("Aucun PVC ni workload dans le namespace '", "No PVC nor workload in namespace '"),
+    ("' : rien à sauvegarder.", "': nothing to back up."),
+    ("Aucun volume sélectionné et aucun workload dans l'instantané de cette sauvegarde : rien à recréer.",
+     "No volume selected and no workload in this backup's snapshot: nothing to recreate."),
+    ("Sauvegarde sans volume (application stateless) : seuls les workloads et leurs dépendances sont recréés depuis l'instantané.",
+     "Backup without volume (stateless application): only the workloads and their dependencies are recreated from the snapshot."),
+    ("<b>Applications</b> : une ligne par <b>application</b> (un namespace peut en contenir plusieurs : les workloads sont regroupés par étiquette <code>app.kubernetes.io/instance</code>, <code>app.kubernetes.io/name</code> ou <code>app</code>), avec son namespace et son <b>type</b> : <b>Stateful</b> (monte des volumes) ou <b>Stateless</b> (configuration seule). Sélectionnez, puis agissez en haut à droite : <b>Sauvegarder · Restaurer · Définir la politique · Vérifier</b>. La sauvegarde reste <b>par namespace</b> (une seule recette cohérente) ; Restaurer cible l'application choisie. Bascule <b>Cluster actif / Tous les clusters</b> (regroupés par workspace NKP).",
+     "<b>Applications</b>: one row per <b>application</b> (a namespace can hold several: workloads are grouped by the <code>app.kubernetes.io/instance</code>, <code>app.kubernetes.io/name</code> or <code>app</code> label), with its namespace and its <b>type</b>: <b>Stateful</b> (mounts volumes) or <b>Stateless</b> (configuration only). Select, then act at the top right: <b>Back up · Restore · Set Policy · Verify</b>. Backups stay <b>per namespace</b> (one consistent recipe); Restore targets the chosen application. <b>Active cluster / All clusters</b> toggle (grouped by NKP workspace)."),
+    ("<b>Sauvegarder tous (filtrés)</b> : tous les namespaces autorisés d'un coup ; un namespace sans PVC <b>ni workload</b> est ignoré. Un namespace <b>stateless</b> (workloads sans volume) est sauvegardé : son instantané suffit à le restaurer.",
+     "<b>Back up all (filtered)</b>: every allowed namespace at once; a namespace with no PVC <b>and no workload</b> is skipped. A <b>stateless</b> namespace (workloads without volume) is backed up: its snapshot is enough to restore it."),
+    ("<div class=\"tip\"><b>Application stateless (sans volume) ?</b> Cliquez <b>Restaurer</b> sur sa ligne : l'assistant ouvre directement le parcours <b>objets de configuration</b> avec <b>ses</b> objets précochés (workloads, Services, ConfigMaps/Secrets référencés) — les autres applications du namespace ne sont pas touchées. Pour une application <b>stateful</b>, seuls <b>ses</b> volumes sont présélectionnés dans les parcours de stockage.</div>",
+     "<div class=\"tip\"><b>Stateless application (no volume)?</b> Click <b>Restore</b> on its row: the wizard opens the <b>configuration objects</b> path directly with <b>its</b> objects pre-ticked (workloads, Services, referenced ConfigMaps/Secrets) — the other applications of the namespace are left untouched. For a <b>stateful</b> application, only <b>its</b> volumes are preselected in the storage paths.</div>"),
+    ("Volume(s) absent(s) de la dernière sauvegarde : ", "Volume(s) missing from the latest backup: "),
+    (" — relancez une sauvegarde", " — run a backup again"),
+    (" sauvegarde(s) de configuration du namespace", " configuration backup(s) of the namespace"),
+    ("(namespace entier)", "(whole namespace)"),
+    ("· sans workload", "· no workload"),
+    (">Vide<", ">Empty<"),
+    ("</b> : <b>stateless</b> (aucun volume). Sa restauration = ré-appliquer ses objets de configuration (workloads, Services, ConfigMaps…) depuis l'instantané d'une sauvegarde — parcours <b>« objets de configuration »</b>, présélectionné.",
+     "</b>: <b>stateless</b> (no volume). Restoring it = re-applying its configuration objects (workloads, Services, ConfigMaps…) from a backup snapshot — the <b>“configuration objects”</b> path, preselected."),
+    ("</b> : <b>stateful</b> — ses volumes (", "</b>: <b>stateful</b> — its volumes ("),
+    (") seront présélectionnés ; les autres volumes du namespace restent décochés.",
+     ") will be preselected; the other volumes of the namespace stay unticked."),
+    (" Seulement les objets de l'application", " Only the application's objects"),
+    (" de l'application « ", " of the application « "),
+    ("autre application / partagé", "other application / shared"),
+    ("Sauvegarde <b>stateless</b> (aucun volume) : les workloads", "<b>Stateless</b> backup (no volume): the workloads"),
+    (" et leurs dépendances seront recréés depuis l'instantané.", " and their dependencies will be recreated from the snapshot."),
     ("Namespace supprimé du cluster", "Namespace deleted from the cluster"),
     ("Restaurer l'application supprimée « ", "Restore the deleted application « "),
     ("Ce namespace n'existe plus sur le cluster <b id=\"drClusterRec\"></b> : l'application va être <b>recréée depuis sa sauvegarde</b> (namespace, PV/PVC, workloads, dépendances non masquées), en réutilisant ses volumes d'origine — ou, s'ils ont été supprimés avec le namespace, en les restaurant automatiquement depuis HYCU (« Protected deleted »). Dans le cas courant, rien à saisir : vérifiez la sauvegarde et lancez la restauration.",

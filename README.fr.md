@@ -183,7 +183,7 @@ puis un **assistant** guide l'opération. Un bandeau rappelle en permanence si l
 | Page / élément | Rôle |
 |---|---|
 | **Tableau de bord** | Tuiles façon HYCU : *Applications* (anneaux protection / conformité), *Politique* (sauvegarde automatique), *Sources*, *Cluster*, *Stockage* (espace disque du dossier des sauvegardes, volume occupé, quota, alerte de saturation), graphique des *Tâches* sur 7 jours et *Dernières tâches*. |
-| **Applications** | Une ligne par namespace autorisé (= application Kubernetes) : politique, **Conformité**, **Protection**, dernière sauvegarde, versions. Actions : **Sauvegarder**, **Restaurer**, **Définir la politique**, **Vérifier** ; l'entonnoir = filtre des namespaces. Bascule **Cluster actif / Tous les clusters** (regroupement workspace NKP → cluster). Un namespace **supprimé** du cluster reste listé tant que ses sauvegardes existent (badge « Supprimée — restaurable ») : **Restaurer** ouvre la récupération depuis la sauvegarde. |
+| **Applications** | Une ligne par **application** — un namespace peut en contenir plusieurs : les workloads (Deployments, StatefulSets, DaemonSets, CronJobs) sont regroupés par étiquette `app.kubernetes.io/instance`, `app.kubernetes.io/name` ou `app` (sinon le nom du workload). Colonnes : namespace, **Type** (**Stateful** = monte des volumes, **Stateless** = configuration seule, *volumes sans workload*, *vide*), politique, **Conformité**, **Protection** (sauvegardes du namespace ; un volume de l'application absent de la dernière sauvegarde est signalé), dernière sauvegarde, versions. Actions : **Sauvegarder** (par namespace : deux applications du même namespace = une sauvegarde), **Restaurer** (cible l'application : volumes présélectionnés si stateful, objets de configuration précochés si stateless), **Définir la politique**, **Vérifier** ; l'entonnoir = filtre des namespaces. Bascule **Cluster actif / Tous les clusters** (regroupement workspace NKP → cluster). Un namespace **supprimé** du cluster reste listé tant que ses sauvegardes existent (badge « Supprimée — restaurable ») : **Restaurer** ouvre la récupération depuis la sauvegarde. |
 | **Politiques** | La politique de sauvegarde automatique de la **configuration** (fréquence, rétention, cible) et les **politiques HYCU** (données), en lecture. |
 | **Tâches** | Historique des opérations (sauvegardes, restaurations, clones, protection HYCU) avec compteurs **Succès / Échec / Simulation / En cours** et le **cluster** de chaque tâche. Boutons **Rapport HTML** (rapport de conformité autonome : applications, RPO, santé des clusters) et **CSV** (Excel). |
 | **Cluster (barre du haut)** | Sélecteur du **cluster actif** : changer de cluster, en ajouter, les gérer (voir ci-dessous). |
@@ -277,7 +277,9 @@ manuel des manifestes décrit dans la procédure HYCU).
   automatique reste centrée PV/PVC. Désactivable via `config_backup_full: false`.
 - **Sauvegarder tous (filtrés)** : sauvegarde en une fois **tous les namespaces
   autorisés** par le filtre, ou **tous** les namespaces du cluster si aucun filtre.
-  Un namespace sans PVC est **ignoré** (pas une erreur).
+  Un namespace sans PVC **ni workload** est **ignoré** (pas une erreur). Un namespace
+  **stateless** (workloads sans volume) est sauvegardé : son instantané `resources.json`
+  suffit à restaurer ses applications (index `apps` : applications, workloads, PVC, type).
 - **Sauvegarde partielle** : si un PV lié n'a pas pu être lu (API indisponible,
   droits), la sauvegarde est conservée avec un marqueur `index.partial` et la
   liste des erreurs, l'opération est signalée en échec et **aucune ancienne
@@ -323,6 +325,11 @@ HYCU :
      d'une sauvegarde, avec **aperçu des différences** (live → sauvegarde) avant
      tout `apply`. Ne touche ni aux volumes ni aux données ; un Secret **masqué**
      à la sauvegarde n'est jamais restauré (il écraserait le vrai secret).
+     **Application stateless** : **Restaurer** sur sa ligne ouvre directement ce
+     parcours avec **ses** objets précochés (workloads, Services, ConfigMaps/Secrets
+     référencés) — case « Seulement les objets de l'application » pour masquer le
+     reste du namespace. Un namespace stateless **supprimé** se récupère aussi
+     (workloads + dépendances recréés depuis l'instantané, sans volume).
 2. **Options** : application et cluster cibles, **sauvegarde de configuration** à
    partir de laquelle reconstruire (la plus récente par défaut), **volumes** (tous
    présélectionnés) et un **point de restauration HYCU** par volume (**le plus

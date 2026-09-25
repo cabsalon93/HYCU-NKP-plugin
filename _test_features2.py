@@ -114,8 +114,8 @@ try:
           and "enabled (encrypted)" in en, "rapport traduit en anglais")
     csv = H.report_csv(fake)
     lines = csv.strip().splitlines()
-    check(len(lines) == 3 and lines[1].startswith("prod;Team A;wordpress;oui;oui;12;"),
-          "CSV : une ligne par application")
+    check(len(lines) == 3 and lines[1].startswith("prod;Team A;wordpress;wordpress;;oui;oui;12;"),
+          "CSV : une ligne par application (namespace, application, type)")
 
     print("\n== Chiffrement des exports (HV2B) ==")
     blob = H.encrypt_bytes(b"donnees-zip" * 100, "phrase!")

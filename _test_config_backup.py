@@ -58,7 +58,7 @@ try:
             return None, "error: the server doesn't have a resource type \"ingress\""  # RBAC/absent
         return {"items": []}, None
     H.kubectl_json = fake
-    n, skipped = H._backup_namespace_resources("wordpress", tmp)
+    n, skipped, _items = H._backup_namespace_resources("wordpress", tmp)
     check(n == 2, "2 objets exportés (Deployment + Secret)")
     check(skipped == ["ingress"], "type en erreur IGNORÉ (pas d'échec)")
     saved = json.load(open(os.path.join(tmp, "resources.json"), encoding="utf-8"))
