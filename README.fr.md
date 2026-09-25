@@ -55,7 +55,10 @@ configuration** (Applications → Sauvegarder) fournit le « squelette » PV/PVC
 
 - Un **kubeconfig** avec des droits RBAC suffisants sur le cluster cible :
   `get/list/delete` sur `pv`, `pvc`, `pods` ; `get/patch/scale` sur
-  `deployments`/`statefulsets` ; `patch` sur `pv`/`pvc` (déblocage des finalizers).
+  `deployments`/`statefulsets` ; `patch` sur `pv`/`pvc` (déblocage des finalizers) ;
+  `list` **cluster-wide** sur `deployments`, `statefulsets`, `daemonsets`, `cronjobs`
+  et `pvc` (page Applications : 2 appels pour tout le cluster ; sans ce droit, repli
+  par namespace borné par `apps_fallback_max`).
 - **kubectl ≥ 1.23** (l'outil utilise `kubectl wait --for=jsonpath`).
 - Côté HYCU/Nutanix : le Volume Group restauré/cloné doit exister et sa **référence**
   (UUID) être connue — **automatique** avec les connecteurs HYCU/Prism (⚙
@@ -280,6 +283,12 @@ manuel des manifestes décrit dans la procédure HYCU).
   Un namespace sans PVC **ni workload** est **ignoré** (pas une erreur). Un namespace
   **stateless** (workloads sans volume) est sauvegardé : son instantané `resources.json`
   suffit à restaurer ses applications (index `apps` : applications, workloads, PVC, type).
+- **Catalogue** : chaque dossier de cluster/contexte porte un `_catalog.json`
+  (résumé par namespace et par version : horodatage, volumes, identités des VG,
+  applications, taille). C'est une **base dérivée**, reconstruite automatiquement
+  si elle manque ou se corrompt ; la restauration lit toujours `index.json` et les
+  manifestes, jamais le catalogue. Il évite de relire des milliers d'`index.json`
+  à chaque affichage (page Applications, tableau de bord, inventaire DR, quota).
 - **Sauvegarde partielle** : si un PV lié n'a pas pu être lu (API indisponible,
   droits), la sauvegarde est conservée avec un marqueur `index.partial` et la
   liste des erreurs, l'opération est signalée en échec et **aucune ancienne
@@ -431,6 +440,10 @@ la page **Réglages** de l'interface. Toutes les clés sont optionnelles.
 | `auto_backup_keep_daily` / `_weekly` / `_monthly` | `7` / `4` / `12` | Fenêtres GFS (jours / semaines ISO / mois). La sauvegarde la plus récente est toujours conservée. |
 | `namespace_label_selector` | `""` | Sélecteur d'étiquettes appliqué à la liste des namespaces (tous clusters), ex. `hycu.io/backup=true` : les équipes s'incluent via leurs manifestes (GitOps). Vide = inactif. |
 | `audit_retention_days` | `31` | Rétention du journal d'audit / historique des Tâches (compaction quotidienne atomique). `0` = illimité. |
+| `apps_fallback_max` | `50` | Grands clusters : si la liste **cluster-wide** des workloads/PVC est refusée (RBAC), l'outil retombe sur un appel par namespace **jusqu'à** ce nombre ; au-delà il renonce (une ligne par namespace) et signale qu'un droit de liste cluster-wide est requis. |
+| `apps_cache_ttl_s` | `45` | Cache de l'inventaire Applications (page, tableau de bord, rapport) en secondes ; un seul calcul à la fois par cluster. Vidé après toute écriture ; **Actualiser** force le recalcul. `0` = désactivé. |
+| `backup_parallel` | `4` | Namespaces sauvegardés en parallèle lors d'un passage « tous les namespaces » (manuel ou automatique). |
+| `backup_pv_prefetch_min` | `20` | À partir de ce nombre de namespaces, les PV (cluster-scoped) sont lus **une fois** par passage au lieu d'un appel par volume. |
 | `storage_min_free_mb` | `500` | **Plancher d'espace libre** : toute sauvegarde est refusée (erreur claire, auditée) si le disque est en dessous — jamais de disque saturé par l'outil. `0` = désactivé. |
 | `storage_quota_gb` | `0` | **Quota global** du dossier de sauvegardes : au-delà, les plus anciennes sont purgées (la plus récente de chaque application×cluster et la sauvegarde d'une restauration en cours sont toujours gardées). `0` = illimité. |
 | `config_backup_full` | `true` | Capturer aussi les ressources non-PV/PVC du namespace (Deployments, Services, Secrets…) dans `resources.json`. |

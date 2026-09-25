@@ -56,7 +56,10 @@ shows the whole sequence without executing anything.
 
 - A **kubeconfig** with sufficient RBAC rights on the target cluster:
   `get/list/delete` on `pv`, `pvc`, `pods`; `get/patch/scale` on
-  `deployments`/`statefulsets`; `patch` on `pv`/`pvc` (finalizer unblocking).
+  `deployments`/`statefulsets`; `patch` on `pv`/`pvc` (finalizer unblocking);
+  **cluster-wide** `list` on `deployments`, `statefulsets`, `daemonsets`, `cronjobs`
+  and `pvc` (Applications page: 2 calls for the whole cluster; without it, a
+  per-namespace fallback bounded by `apps_fallback_max`).
 - **kubectl ≥ 1.23** (the tool uses `kubectl wait --for=jsonpath`).
 - On the HYCU/Nutanix side: the restored/cloned Volume Group must exist and its
   **reference** (UUID) be known — **automatic** with the HYCU/Prism connectors
@@ -276,6 +279,12 @@ cleanup described in the HYCU procedure).
   with no PVC **and no workload** is **skipped** (not an error). A **stateless**
   namespace (workloads without volume) is backed up: its `resources.json` snapshot is
   enough to restore its applications (`apps` index: applications, workloads, PVCs, type).
+- **Catalog**: each cluster/context folder carries a `_catalog.json` (summary per
+  namespace and version: timestamp, volumes, VG identities, applications, size).
+  It is a **derived database**, rebuilt automatically when missing or corrupt;
+  restores always read `index.json` and the manifests, never the catalog. It
+  avoids re-reading thousands of `index.json` files on every display
+  (Applications page, dashboard, DR inventory, quota).
 - **Partial backup**: if a bound PV could not be read (API unavailable, RBAC),
   the backup is kept with an `index.partial` marker and the error list, the
   operation is reported as failed and **no older version is pruned** (an
@@ -418,6 +427,10 @@ Copy `hycu_config.example.json` → `hycu_config.json`. Also editable via the
 | `auto_backup_keep_daily` / `_weekly` / `_monthly` | `7` / `4` / `12` | GFS windows (days / ISO weeks / months). The most recent backup is always kept. |
 | `namespace_label_selector` | `""` | Label selector applied to the namespace list (all clusters), e.g. `hycu.io/backup=true`: app teams opt in through their manifests (GitOps). Empty = inactive. |
 | `audit_retention_days` | `31` | Audit log / Jobs history retention (atomic daily compaction). `0` = unlimited. |
+| `apps_fallback_max` | `50` | Large clusters: if the **cluster-wide** list of workloads/PVCs is refused (RBAC), the tool falls back to one call per namespace **up to** this count; beyond it gives up (one row per namespace) and reports that a cluster-wide list permission is required. |
+| `apps_cache_ttl_s` | `45` | Applications inventory cache (page, dashboard, report) in seconds; one computation at a time per cluster. Cleared after any write; **Refresh** forces a recompute. `0` = disabled. |
+| `backup_parallel` | `4` | Namespaces backed up in parallel during an “all namespaces” pass (manual or automatic). |
+| `backup_pv_prefetch_min` | `20` | From this number of namespaces, PVs (cluster-scoped) are read **once** per pass instead of one call per volume. |
 | `storage_min_free_mb` | `500` | **Free-space floor**: every backup is refused (clear, audited error) when the disk is below it — the tool never fills the disk. `0` = disabled. |
 | `storage_quota_gb` | `0` | **Global quota** of the backup folder: above it, the oldest backups are pruned (the most recent of each application×cluster and the backup of an in-progress restore are always kept). `0` = unlimited. |
 | `config_backup_full` | `true` | Also capture the namespace's non-PV/PVC resources (Deployments, Services, Secrets…) into `resources.json`. |

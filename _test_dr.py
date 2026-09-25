@@ -172,7 +172,7 @@ try:
 
     saved_ns_fn, saved_wl_fn = H.action_namespaces, H._list_namespace_workloads
     H.action_namespaces = lambda: {"ok": True, "namespaces": ["autre-ns"]}
-    H._list_namespace_workloads = lambda names: ({}, {}, None)   # (lecture des workloads : hors sujet DR)
+    H._list_namespace_workloads = lambda names, full=False: ({}, {}, None)   # (lecture des workloads : hors sujet DR)
     try:
         apps = {a["name"]: a for a in H.action_applications()["apps"]}
     finally:

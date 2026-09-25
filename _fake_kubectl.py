@@ -77,9 +77,32 @@ def main(argv):
     kind = args[1]
     target = args[2] if len(args) > 2 and not args[2].startswith("-") else None
 
+    jsonpath = None
+    if "-o" in args and args[args.index("-o") + 1].startswith("jsonpath="):
+        jsonpath = args[args.index("-o") + 1][len("jsonpath="):]
+
+    def light_line(o):
+        """Émule les DEUX gabarits jsonpath de l'outil (workloads / PVC)."""
+        m, s = o.get("metadata") or {}, o.get("spec") or {}
+        if "volumeClaimTemplates" not in jsonpath:
+            return "%s\t%s" % (m.get("namespace", ""), m.get("name", ""))
+        lb = m.get("labels") or {}
+        tpl = ((s.get("template") or {}).get("spec") or {})
+        ctpl = ((((s.get("jobTemplate") or {}).get("spec") or {}).get("template") or {}).get("spec") or {})
+        claims = lambda ps: " ".join((v.get("persistentVolumeClaim") or {}).get("claimName", "") for v in (ps.get("volumes") or []) if v.get("persistentVolumeClaim"))
+        return "\t".join([m.get("namespace", ""), o.get("kind", ""), m.get("name", ""),
+                          lb.get("app.kubernetes.io/instance", ""), lb.get("app.kubernetes.io/name", ""), lb.get("app", ""),
+                          str(s.get("replicas", "")) if s.get("replicas") is not None else "",
+                          " ".join(x.get("kind", "") for x in (m.get("ownerReferences") or [])),
+                          claims(tpl), claims(ctpl),
+                          " ".join((t.get("metadata") or {}).get("name", "") for t in (s.get("volumeClaimTemplates") or []))])
+
     def out(items):
         if as_name:
             print("\n".join("%s/%s" % (kind, i["metadata"]["name"]) for i in items))
+        elif jsonpath is not None:
+            # comme kubectl : un objet UNIQUE n'est pas enveloppé dans une liste (.items absent -> vide)
+            print("\n".join(light_line(i) for i in items) if len(items) != 1 else "")
         else:
             print(json.dumps({"items": items}))
         return 0

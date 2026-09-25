@@ -120,7 +120,7 @@ try:
               apps_idx=[{"name": "legacy", "type": "stateful", "pvcs": ["d"], "workloads": [{"kind": "Deployment", "name": "legacy"}]},
                         {"name": "sidecar", "type": "stateless", "pvcs": [], "workloads": [{"kind": "Deployment", "name": "sidecar"}]}])
     H.action_namespaces = lambda: {"ok": True, "namespaces": ["shop", "void"]}
-    H._list_namespace_workloads = lambda names: ({"shop": items, "void": []}, {"shop": pvcs, "void": []}, None)
+    H._list_namespace_workloads = lambda names, full=False: ({"shop": items, "void": []}, {"shop": pvcs, "void": []}, None)
     r = H.action_applications()
     rows = {(a["namespace"], a["name"]): a for a in r["apps"]}
     check(r["ok"] and set(rows) == {("shop", "wp"), ("shop", "redis"), ("shop", "nolabel"), ("shop", H.APP_UNASSIGNED),
@@ -135,7 +135,7 @@ try:
     check(rows[("gone", "legacy")]["missing"] and rows[("gone", "sidecar")]["missing"]
           and rows[("gone", "sidecar")]["type"] == "stateless", "namespace supprimé : applications lues dans sa sauvegarde")
     check(rows[("void", "void")]["type"] == "empty" and not rows[("void", "void")]["protected"], "namespace vide : ligne « vide », non protégé")
-    H._list_namespace_workloads = lambda names: ({}, {}, "forbidden")
+    H._list_namespace_workloads = lambda names, full=False: ({}, {}, "forbidden")
     r2 = H.action_applications()
     check({a["name"] for a in r2["apps"] if a["namespace"] == "shop"} == {"shop"} and r2["workloads_error"] == "forbidden",
           "sans droits sur les workloads : repli une ligne par namespace + erreur exposée")
@@ -146,7 +146,7 @@ try:
         calls.append(args)
         if args[:2] == ["get", "pvc"]:
             return {"items": []}, None
-        if args[:2] == ["get", "deployment"]:
+        if args[0] == "get" and args[1].split(",")[0] == "deployment":   # appel groupé ou type par type
             return {"items": [wl("Deployment", "api", {"app": "api"})]}, None
         return {"items": []}, None
     H.kubectl_json = kj_stateless
@@ -203,7 +203,7 @@ try:
     check(not rr["ok"] and "Aucun volume" in rr["error"], "clone ordinaire sans volume : toujours refusé")
 
     print("\n== Clone d'une application STATELESS depuis le cluster (simulation) ==")
-    H._list_namespace_workloads = lambda names: ({"shop": items}, {"shop": pvcs}, None)
+    H._list_namespace_workloads = lambda names, full=False: ({"shop": items}, {"shop": pvcs}, None)
     applied.clear()
     H._apply_manifest = capture
     try:

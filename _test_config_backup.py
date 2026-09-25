@@ -48,6 +48,8 @@ try:
     H.CONFIG["config_backup_include_secret_data"] = False
     def fake(args):
         kind = args[1]
+        if "," in kind:   # appel groupé : kubectl échoue dès qu'un type est inconnu -> repli type par type
+            return None, "error: the server doesn't have a resource type \"ingress\""
         if kind == "deployment":
             return {"items": [{"kind": "Deployment", "metadata": {"name": "web", "uid": "u"},
                                "status": {"x": 1}, "spec": {}}]}, None

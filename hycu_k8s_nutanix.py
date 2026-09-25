@@ -191,6 +191,11 @@ DEFAULT_CONFIG = {
     "auto_backup_interval_hours": 24,
     "auto_backup_dest": "",         # vide = backup_root ; sinon dossier commun dédié
     "auto_backup_keep": 15,         # rétention « compteur » : versions conservées par namespace
+    # Grands clusters (centaines / milliers de namespaces) :
+    "apps_fallback_max": 50,        # repli « 1 appel par namespace » (liste cluster-wide refusée) : au-delà, on renonce
+    "apps_cache_ttl_s": 45,         # cache de l'inventaire Applications (tableau de bord + page), secondes
+    "backup_parallel": 4,           # namespaces sauvegardés en parallèle lors d'un passage « tous »
+    "backup_pv_prefetch_min": 20,   # à partir de N namespaces, les PV sont lus UNE fois par passage
     # Rétention : "count" = garder N versions (auto_backup_keep) ; "gfs" = grand-père/
     # père/fils — garder la plus récente de chaque JOUR sur D jours, de chaque SEMAINE
     # sur W semaines, de chaque MOIS sur M mois (comme les produits de sauvegarde
@@ -316,7 +321,7 @@ def save_config(updates):
 
 # Version horodatée de la build (format AAAAMMJJ-HHMM). À incrémenter à chaque
 # changement notable du programme ; affichée dans l'en-tête de l'interface.
-VERSION = "20260925-1300"
+VERSION = "20260925-1500"
 
 # Jeton anti-CSRF généré au démarrage, injecté dans la page et exigé sur les POST.
 CSRF_TOKEN = secrets.token_urlsafe(32)
@@ -514,6 +519,7 @@ def _run_async(fn, payload):
         with OP_LOCK:
             OPERATIONS[op_id]["result"] = res
             OPERATIONS[op_id]["done"] = True
+        _apps_cache_clear()                      # l'opération a pu créer/modifier des applications
 
     threading.Thread(target=worker, daemon=True).start()
     return {"ok": True, "op_id": op_id}
@@ -1302,16 +1308,27 @@ def _backup_namespace_resources(ns, d):
     kinds = CONFIG.get("config_backup_kinds") or CONFIG_BACKUP_KINDS_DEFAULT
     include_secret = bool(CONFIG.get("config_backup_include_secret_data"))
     out, skipped = [], []
-    for kind in kinds:
-        data, err = kubectl_json(["get", kind, "-n", ns])
-        if err or not data:
-            skipped.append(kind)
-            continue
-        for item in data.get("items", []):
+
+    def take(data):
+        for item in (data or {}).get("items", []):
             try:
                 out.append(_clean_resource(json.loads(json.dumps(item)), include_secret))
             except Exception:
                 pass
+
+    # UN seul appel pour tous les types (15 fois moins d'appels kubectl par namespace) ;
+    # kubectl échoue (rc 1) dès qu'un type est inconnu ou refusé -> repli type par type,
+    # qui IGNORE les types en erreur comme avant.
+    data, err = kubectl_json(["get", ",".join(kinds), "-n", ns]) if len(kinds) > 1 else (None, "un seul type")
+    if not err and data:
+        take(data)
+    else:
+        for kind in kinds:
+            data, err = kubectl_json(["get", kind, "-n", ns])
+            if err or not data:
+                skipped.append(kind)
+                continue
+            take(data)
     with open(os.path.join(d, "resources.json"), "w", encoding="utf-8") as f:
         json.dump({"namespace": ns, "kinds": kinds, "secret_data_included": include_secret,
                    "items": out}, f, indent=2)
@@ -1522,20 +1539,14 @@ def _storage_floor_error(root):
 
 def _all_backup_dirs(root):
     """Tous les dossiers de sauvegarde sous `root` (index.json présent), tous
-    namespaces et clusters confondus : [(chemin, epoch, taille, ns_clé)]."""
+    namespaces et clusters confondus : [(chemin, epoch, taille, ns_clé)] — depuis le
+    catalogue (un index illisible n'y figure pas : jamais purgé d'office)."""
     out = []
-    for dirpath, dirs, fnames in os.walk(root):
-        if "index.json" in fnames:
-            dirs[:] = []                        # ne pas descendre dans la sauvegarde
-            try:
-                with open(os.path.join(dirpath, "index.json"), encoding="utf-8") as f:
-                    idx = json.load(f)
-            except (OSError, ValueError):
-                continue                         # illisible : jamais purgé d'office
-            b = {"path": dirpath, "index": idx}
-            size, _n = _dir_size(dirpath)
-            key = "%s|%s" % (idx.get("cluster_id") or "local", idx.get("namespace") or os.path.basename(os.path.dirname(dirpath)))
-            out.append((dirpath, _backup_epoch(b) or 0, size, key))
+    for base in _catalog_bases(root):
+        for ns, vs in _catalog_all(base).items():
+            for v in vs:
+                key = "%s|%s" % (v.get("cluster_id") or "local", v.get("namespace") or ns)
+                out.append((_catalog_backup_path(base, ns, v), v.get("epoch") or 0, v.get("size") or 0, key))
     return out
 
 
@@ -1583,6 +1594,7 @@ def enforce_storage_quota(root=None):
             shutil.rmtree(path)
             removed += 1
             freed += size
+            _catalog_forget_path(path)
         except OSError as e:
             print("Quota de stockage : suppression impossible de %s : %s" % (path, e))
     if removed:
@@ -1668,6 +1680,219 @@ def list_backups(ns, root=None):
                 out.append(b)
         out.sort(key=lambda b: b["timestamp"], reverse=True)
     return out
+
+
+# ------------------------------------------------------------------------------
+# CATALOGUE des sauvegardes — « base » en fichier plat JSON, DÉRIVÉE et reconstructible.
+# Pourquoi : à 1 000 namespaces × 15 versions, relire 15 000 index.json à chaque
+# affichage (page Applications, tableau de bord toutes les 30 s, inventaire DR, quota,
+# tuile Stockage) coûte des secondes à des minutes. Le catalogue (<base>/_catalog.json ;
+# une base = un dossier de cluster/contexte, la disposition historique ou un dossier
+# d'import S3) mémorise, par namespace et par version, le RÉSUMÉ consommé par ces écrans
+# (horodatage, volumes, identités des VG, applications, taille…).
+# Il n'est JAMAIS la source de vérité d'une restauration : celle-ci lit toujours
+# index.json et les manifestes (list_backups, _safe_backup_path, _backup_cluster_error).
+# Invalidation : date de modification + nombre d'entrées du dossier du namespace, et
+# OUBLI EXPLICITE après chaque écriture de l'outil (sauvegarde, rétention, quota, import
+# S3). Un catalogue supprimé ou corrompu est simplement reconstruit au prochain accès.
+# ------------------------------------------------------------------------------
+CATALOG_FILE = "_catalog.json"
+CATALOG_VERSION = 1
+_CATALOG_LOCK = threading.RLock()
+_CATALOGS = {}            # base (chemin absolu) -> {"ns": {ns: {"key", "versions", "pending"}}, "dirty"}
+
+
+def _catalog_summary(path, idx):
+    """Résumé d'UNE version (index.json déjà lu) : uniquement les champs consommés par
+    l'inventaire, la page Applications, la DR et le quota — jamais les manifestes."""
+    vols, vol_refs, vol_hycu, vol_names = [], {}, {}, {}
+    for v in (idx.get("volumes") or []):
+        pvc = v.get("pvc")
+        if not pvc:
+            continue
+        vols.append(pvc)
+        m = UUID_RE.search(((v.get("analysis") or {}).get("old_volume_handle")) or "")
+        if m:
+            vol_refs[pvc] = m.group(0)
+        hy = ((v.get("restore_contract") or {}).get("hycu_uuid")) or ""
+        if hy:
+            vol_hycu[pvc] = hy
+        nm = ((v.get("restore_contract") or {}).get("vg_name")) or v.get("pv") or ""
+        if nm:
+            vol_names[pvc] = nm
+    size, files = _dir_size(path)
+    return {"ts": os.path.basename(path), "created": idx.get("created") or "",
+            "epoch": _backup_epoch({"path": path, "index": idx}) or 0,
+            "namespace": idx.get("namespace") or "", "context": idx.get("context") or "",
+            "cluster": idx.get("cluster") or "", "cluster_id": idx.get("cluster_id") or "",
+            "volumes": vols, "vol_refs": vol_refs, "vol_hycu": vol_hycu, "vol_names": vol_names,
+            "resources_count": idx.get("resources_count"),
+            "has_resources": os.path.isfile(os.path.join(path, "resources.json")),
+            "partial": bool(idx.get("partial")), "apps": idx.get("apps") or [],
+            "size": size, "files": files}
+
+
+def _catalog_load(base):
+    base = os.path.abspath(base)
+    with _CATALOG_LOCK:
+        cat = _CATALOGS.get(base)
+        if cat is None:
+            cat = {"ns": {}, "dirty": False}
+            try:
+                with open(os.path.join(base, CATALOG_FILE), encoding="utf-8") as f:
+                    doc = json.load(f)
+                if isinstance(doc, dict) and doc.get("v") == CATALOG_VERSION and isinstance(doc.get("ns"), dict):
+                    cat["ns"] = doc["ns"]
+            except (OSError, ValueError):
+                pass                              # absent / corrompu : reconstruit
+            _CATALOGS[base] = cat
+        return cat
+
+
+def _catalog_save(base):
+    """Écriture atomique du catalogue s'il a changé (jamais bloquant)."""
+    base = os.path.abspath(base)
+    with _CATALOG_LOCK:
+        cat = _CATALOGS.get(base)
+        if not cat or not cat["dirty"]:
+            return
+        cat["dirty"] = False
+        if not os.path.isdir(base):
+            return
+        tmp = os.path.join(base, CATALOG_FILE + ".tmp")
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"v": CATALOG_VERSION, "ns": cat["ns"]}, f)
+            os.replace(tmp, os.path.join(base, CATALOG_FILE))
+        except OSError as e:
+            print("Catalogue des sauvegardes non écrit (%s) : %s" % (base, e))
+
+
+def _catalog_forget(base, ns=None):
+    """Oubli explicite (après une écriture de l'outil) : le namespace — ou toute la
+    base — sera rescanné au prochain accès."""
+    if not base:
+        return
+    base = os.path.abspath(base)
+    with _CATALOG_LOCK:
+        cat = _CATALOGS.get(base)
+        if not cat:
+            return
+        if ns is None:
+            cat["ns"].clear()
+        else:
+            cat["ns"].pop(ns, None)
+        cat["dirty"] = True
+    _catalog_save(base)
+
+
+def _catalog_forget_path(backup_dir):
+    """Oubli depuis le chemin d'UNE sauvegarde (<base>/<ns>/<horodatage>)."""
+    try:
+        nsdir = os.path.dirname(os.path.abspath(backup_dir))
+        _catalog_forget(os.path.dirname(nsdir), os.path.basename(nsdir))
+    except Exception:
+        pass
+
+
+def _catalog_ns(base, ns, save=True):
+    """Résumés des versions de `ns` sous `base` (<base>/<ns>/<horodatage>/index.json),
+    plus récentes d'abord. Réutilise le catalogue si le dossier du namespace n'a pas
+    changé ; sinon ne relit que les versions nouvelles. Les dossiers vus SANS index.json
+    (sauvegarde en cours d'écriture) sont revérifiés à chaque appel."""
+    base = os.path.abspath(base)
+    nsdir = os.path.join(base, ns)
+    try:
+        st = os.stat(nsdir)
+        names = os.listdir(nsdir)
+    except OSError:
+        with _CATALOG_LOCK:
+            cat = _catalog_load(base)
+            if ns in cat["ns"]:
+                cat["ns"].pop(ns, None)
+                cat["dirty"] = True
+        if save:
+            _catalog_save(base)
+        return []
+    key = [st.st_mtime_ns, len(names)]
+    with _CATALOG_LOCK:
+        cat = _catalog_load(base)
+        ent = cat["ns"].get(ns)
+        if ent and ent.get("key") == key and not any(
+                os.path.isfile(os.path.join(nsdir, t, "index.json")) for t in (ent.get("pending") or [])):
+            return list(ent.get("versions") or [])
+        old = {v["ts"]: v for v in ((ent or {}).get("versions") or []) if v.get("ts")}
+        versions, pending = [], []
+        for ts in names:
+            p = os.path.join(nsdir, ts)
+            prev = old.get(ts)
+            if prev is not None:
+                versions.append(prev)
+                continue
+            ip = os.path.join(p, "index.json")
+            if not os.path.isfile(ip):
+                if os.path.isdir(p):
+                    pending.append(ts)
+                continue
+            try:
+                with open(ip, encoding="utf-8") as f:
+                    idx = json.load(f)
+            except (OSError, ValueError):
+                continue
+            versions.append(_catalog_summary(p, idx))
+        versions.sort(key=lambda v: v["ts"], reverse=True)
+        cat["ns"][ns] = {"key": key, "versions": versions, "pending": pending}
+        cat["dirty"] = True
+    if save:
+        _catalog_save(base)
+    return list(versions)
+
+
+def _catalog_all(base):
+    """{ns: [versions]} pour toute une base : un listdir + un stat par namespace, seuls
+    les namespaces modifiés sont rescannés ; le catalogue est écrit une fois."""
+    base = os.path.abspath(base)
+    out = {}
+    if not os.path.isdir(base):
+        return out
+    try:
+        entries = sorted(os.listdir(base))
+    except OSError:
+        return out
+    for ns in entries:
+        if ns.startswith("_") or not K8S_NAME_RE.match(ns):
+            continue
+        vs = _catalog_ns(base, ns, save=False)
+        if vs:
+            out[ns] = vs
+    with _CATALOG_LOCK:
+        cat = _catalog_load(base)
+        for gone in [n for n in cat["ns"] if n not in entries]:
+            cat["ns"].pop(gone, None)
+            cat["dirty"] = True
+    _catalog_save(base)
+    return out
+
+
+def _catalog_bases(root):
+    """Toutes les bases sous `root` : disposition historique (<root>/<ns>), puis
+    _contexts/*, _clusters/* et _imports/*."""
+    root = os.path.abspath(root)
+    bases = [root]
+    for sub in ("_contexts", "_clusters", "_imports"):
+        d = os.path.join(root, sub)
+        try:
+            for n in sorted(os.listdir(d)):
+                p = os.path.join(d, n)
+                if os.path.isdir(p):
+                    bases.append(p)
+        except OSError:
+            pass
+    return bases
+
+
+def _catalog_backup_path(base, ns, v):
+    return os.path.join(os.path.abspath(base), ns, v["ts"])
 
 
 # ------------------------------------------------------------------------------
@@ -1835,11 +2060,14 @@ def action_pvcs(ns):
     return {"ok": True, "pvcs": pvcs, "error": None}
 
 
-def action_backup(ns, dest=None, protect=None):
+def action_backup(ns, dest=None, protect=None, pv_cache=None, defer_quota=False):
     """Exporte + nettoie tous les PV/PVC du namespace (étapes 1-3 du document).
     `dest` (optionnel) = dossier de destination choisi par l'utilisateur (vide = défaut).
     `protect` = chemins de sauvegarde à ne jamais purger par la rétention (ex. la
-    sauvegarde SOURCE d'une restauration en cours)."""
+    sauvegarde SOURCE d'une restauration en cours).
+    `pv_cache` = {nom: manifeste PV} lu UNE fois par passage (sauvegarde de tous les
+    namespaces) ; un PV absent du cache est relu individuellement. `defer_quota` : le
+    quota global est appliqué par l'appelant en fin de passage (pas par namespace)."""
     if not _namespace_allowed(ns):
         return {"ok": False, "error": "Namespace '%s' non autorisé par la configuration." % ns}
     root, derr = _resolve_backup_dest(dest)
@@ -1884,7 +2112,10 @@ def action_backup(ns, dest=None, protect=None):
         files.append(os.path.basename(pvc_path))
         entry = {"pvc": name, "pv": pv_name, "pvc_file": os.path.basename(pvc_path)}
         if pv_name:
-            pv_data, perr = kubectl_json(["get", "pv", pv_name])
+            if pv_cache is not None and pv_name in pv_cache:
+                pv_data, perr = pv_cache[pv_name], None
+            else:
+                pv_data, perr = kubectl_json(["get", "pv", pv_name])
             if pv_data and not perr:
                 clean_v = clean_pv(json.loads(json.dumps(pv_data)))
                 pv_path = os.path.join(d, "pv_%s.json" % pv_name)
@@ -1950,6 +2181,7 @@ def action_backup(ns, dest=None, protect=None):
     with open(idx_tmp, "w", encoding="utf-8") as f:
         json.dump(index, f, indent=2)
     os.replace(idx_tmp, os.path.join(d, "index.json"))
+    _catalog_forget_path(d)                   # le catalogue rescanne ce namespace
 
     if pv_errors:
         audit("backup", namespace=ns, dir=d, count=len(items), resources=resources_count,
@@ -1964,7 +2196,8 @@ def action_backup(ns, dest=None, protect=None):
     pruned = 0
     try:
         pruned = _prune_backups(root, ns, CONFIG.get("auto_backup_keep", 15), protect=protect)
-        enforce_storage_quota(root)
+        if not defer_quota:
+            enforce_storage_quota(root)
     except Exception as e:
         print("Garde-fou stockage après sauvegarde : %s" % e)
     return _s3_after_backup(
@@ -1987,25 +2220,54 @@ def action_backup_all(dest=None):
     root, derr = _resolve_backup_dest(dest)        # valide la destination une seule fois
     if derr:
         return {"ok": False, "error": derr, "results": []}
-    results, backed_up, vol_total = [], 0, 0
-    for ns in namespaces:
-        # Namespace avec une restauration interrompue (transaction en cours) : son état
-        # est à moitié restauré — le sauvegarder polluerait « la sauvegarde la plus
-        # récente » proposée ensuite. Ignoré (repassera une fois la reprise terminée).
-        if _load_txn(ns):
-            results.append({"ns": ns, "ok": False, "skipped": True, "count": 0,
-                            "error": "Restauration en cours (transaction) : sauvegarde différée."})
-            continue
-        b = action_backup(ns, root)
-        if b.get("ok"):
-            backed_up += 1
-            vol_total += b.get("count", 0)
-            results.append({"ns": ns, "ok": True, "count": b.get("count", 0), "dir": b.get("dir"),
-                            "pruned": int(b.get("pruned") or 0)})
-        else:
+    # Grands clusters : les PV sont cluster-scoped -> lus UNE fois pour tout le passage
+    # (au lieu d'un appel par volume) ; échec -> lecture individuelle comme avant.
+    pv_cache = None
+    try:
+        prefetch_min = int(CONFIG.get("backup_pv_prefetch_min", 20))
+    except (TypeError, ValueError):
+        prefetch_min = 20
+    if len(namespaces) >= max(prefetch_min, 1):
+        pvs, perr = kubectl_json(["get", "pv"])
+        if not perr and pvs:
+            pv_cache = {(p.get("metadata") or {}).get("name"): p for p in (pvs.get("items") or [])
+                        if (p.get("metadata") or {}).get("name")}
+    try:
+        workers = max(1, int(CONFIG.get("backup_parallel", 4)))
+    except (TypeError, ValueError):
+        workers = 4
+    cid, rto = _current_cid(), getattr(_CL_TL, "req_timeout", None)
+
+    def one(ns):
+        with use_cluster(cid, req_timeout=rto):          # threads : cluster de l'appelant
+            # Namespace avec une restauration interrompue (transaction en cours) : son état
+            # est à moitié restauré — le sauvegarder polluerait « la sauvegarde la plus
+            # récente » proposée ensuite. Ignoré (repassera une fois la reprise terminée).
+            if _load_txn(ns):
+                return {"ns": ns, "ok": False, "skipped": True, "count": 0,
+                        "error": "Restauration en cours (transaction) : sauvegarde différée."}
+            try:
+                b = action_backup(ns, root, pv_cache=pv_cache, defer_quota=True)
+            except Exception as e:                      # un namespace en erreur n'arrête pas le passage
+                b = {"ok": False, "error": "Erreur interne : %s" % e}
+            if b.get("ok"):
+                return {"ns": ns, "ok": True, "count": b.get("count", 0), "dir": b.get("dir"),
+                        "pruned": int(b.get("pruned") or 0)}
             err = b.get("error") or ""
-            results.append({"ns": ns, "ok": False, "skipped": bool(b.get("skipped")) or "Aucun PVC" in err,
-                            "count": 0, "error": err})
+            return {"ns": ns, "ok": False, "skipped": bool(b.get("skipped")) or "Aucun PVC" in err,
+                    "count": 0, "error": err}
+
+    if workers > 1 and len(namespaces) > 1:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(workers, len(namespaces))) as ex:
+            results = list(ex.map(one, namespaces))     # ordre des namespaces conservé
+    else:
+        results = [one(ns) for ns in namespaces]
+    backed_up = sum(1 for r in results if r["ok"])
+    vol_total = sum(r["count"] for r in results if r["ok"])
+    try:
+        enforce_storage_quota(root)                     # une fois par passage, pas par namespace
+    except Exception as e:
+        print("Quota de stockage en fin de passage : %s" % e)
     audit("backup_all", namespaces=len(namespaces), backed_up=backed_up, volumes=vol_total, root=root)
     return {"ok": True, "error": None, "results": results, "root": root,
             "namespaces": len(namespaces), "backed_up": backed_up, "volumes": vol_total,
@@ -2129,6 +2391,7 @@ def _prune_backups(root, ns, keep, protect=None):
         try:
             shutil.rmtree(b["path"])
             removed += 1
+            _catalog_forget_path(b["path"])
         except OSError as e:
             print("Rétention sauvegarde auto : suppression impossible de %s : %s" % (b["path"], e))
     if removed:
@@ -2169,6 +2432,7 @@ def _auto_backup_run(now=None, runner=None):
             summary = " | ".join("%s : %s" % (p[0], p[2]) for p in parts)
         AUTO_BACKUP.update({"last_run": now, "last_ok": ok, "last_summary": summary})
         _save_auto_backup_state()
+        _apps_cache_clear()
         audit("auto_backup", ok=ok, summary=summary,
               **({"cluster": "*"} if len(parts) > 1 else {}))
         return ok
@@ -2434,33 +2698,123 @@ def _apps_from_workloads(ns, workloads, pvc_names=None):
     return apps
 
 
-def _list_namespace_workloads(namespaces):
+APP_WORKLOAD_RESOURCES = "deployments,statefulsets,daemonsets,cronjobs"
+# Extraction LÉGÈRE des workloads (inventaire) : kubectl ne renvoie que les champs
+# utiles (une ligne par objet, tabulations) au lieu du JSON complet — à 1 000
+# namespaces, le JSON complet pèse des dizaines de Mo et dépasse la mémoire du pod.
+_WL_LIGHT_TPL = ("{range .items[*]}{.metadata.namespace}{'\\t'}{.kind}{'\\t'}{.metadata.name}{'\\t'}"
+                 "{.metadata.labels.app\\.kubernetes\\.io/instance}{'\\t'}{.metadata.labels.app\\.kubernetes\\.io/name}{'\\t'}"
+                 "{.metadata.labels.app}{'\\t'}{.spec.replicas}{'\\t'}{.metadata.ownerReferences[*].kind}{'\\t'}"
+                 "{.spec.template.spec.volumes[*].persistentVolumeClaim.claimName}{'\\t'}"
+                 "{.spec.jobTemplate.spec.template.spec.volumes[*].persistentVolumeClaim.claimName}{'\\t'}"
+                 "{.spec.volumeClaimTemplates[*].metadata.name}{'\\n'}{end}").replace("'", '"')
+_PVC_LIGHT_TPL = '{range .items[*]}{.metadata.namespace}{"\\t"}{.metadata.name}{"\\n"}{end}'
+
+
+def _wl_from_light_line(line):
+    """Objet workload SYNTHÉTIQUE (mêmes chemins que le JSON kubectl, champs utiles
+    seulement) depuis une ligne de _WL_LIGHT_TPL — consommé par _apps_from_workloads."""
+    f = line.split("\t")
+    if len(f) < 11 or not f[1] or not f[2]:
+        return None
+    labels = {}
+    for key, val in (("app.kubernetes.io/instance", f[3]), ("app.kubernetes.io/name", f[4]), ("app", f[5])):
+        if val:
+            labels[key] = val
+    claims = [c for c in (f[8] + " " + f[9]).split() if c]
+    obj = {"kind": f[1], "metadata": {"namespace": f[0], "name": f[2], "labels": labels,
+                                      "ownerReferences": [{"kind": k} for k in f[7].split() if k]},
+           "spec": {"template": {"spec": {"volumes": [{"persistentVolumeClaim": {"claimName": c}} for c in claims]}},
+                    "volumeClaimTemplates": [{"metadata": {"name": t}} for t in f[10].split() if t]}}
+    if f[6].strip():
+        try:
+            obj["spec"]["replicas"] = int(f[6])
+        except ValueError:
+            pass
+    return obj
+
+
+def _kubectl_light(args, tpl):
+    """kubectl … -o jsonpath=<tpl> -> (lignes, erreur). kubectl n'enveloppe pas UN
+    objet unique dans une liste (.items absent -> sortie vide) : dans ce cas on
+    relit en JSON (un seul objet : négligeable)."""
+    r = run(_kubectl_base() + args + ["-o", "jsonpath=" + tpl], dry=False)
+    if not r["ok"]:
+        return None, r["stderr"]
+    lines = [l for l in (r["stdout"] or "").splitlines() if l.strip()]
+    if lines:
+        return lines, None
+    data, err = kubectl_json(args)
+    if err:
+        return None, err
+    items = (data or {}).get("items")
+    if items is None and (data or {}).get("kind"):
+        items = [data]
+    return ("__json__", items or []), None
+
+
+def _list_namespace_workloads(namespaces, full=False):
     """({ns: [workloads]}, {ns: [noms de PVC]}, erreur) pour les namespaces donnés.
-    Deux appels kubectl cluster-wide (-A) quand les droits le permettent, sinon repli
-    par namespace. Jamais bloquant : sans données, un namespace est présenté comme une
-    application unique (comme avant)."""
-    kinds = "deployments,statefulsets,daemonsets,cronjobs"
+    `full=False` (inventaire) : extraction légère (jsonpath) -> objets synthétiques ne
+    portant que les champs utiles au regroupement ; `full=True` (clone d'une application
+    stateless) : JSON complet, réservé à UN namespace. Deux appels cluster-wide (-A)
+    quand les droits le permettent ; sinon repli par namespace, BORNÉ (au-delà de
+    `apps_fallback_max` namespaces, on renonce et on signale : un droit de liste
+    cluster-wide est requis). Jamais bloquant : sans données, un namespace est
+    présenté comme une application unique."""
     wl, pvcs, err_out = {}, {}, None
     wanted = set(namespaces)
 
-    def fill(store, args, key=None):
-        data, err = kubectl_json(args)
-        if err or not data:
-            return err or "réponse vide"
-        for it in data.get("items") or []:
-            n = (it.get("metadata") or {}).get("namespace") or key
-            if n in wanted:
-                store.setdefault(n, []).append(it)
+    def add(store, it, key):
+        n = (it.get("metadata") or {}).get("namespace") or key
+        if n in wanted:
+            store.setdefault(n, []).append(it)
+
+    def fill(store, what, args, key=None):
+        if full:
+            data, err = kubectl_json(args)
+            if err or not data:
+                return err or "réponse vide"
+            for it in data.get("items") or []:
+                add(store, it, key)
+            return None
+        res, err = _kubectl_light(args, _WL_LIGHT_TPL if what == APP_WORKLOAD_RESOURCES else _PVC_LIGHT_TPL)
+        if err:
+            return err
+        if isinstance(res, tuple):                      # relecture JSON (objet unique)
+            for it in res[1]:
+                if what == APP_WORKLOAD_RESOURCES:
+                    add(store, it, key)
+                else:
+                    add(store, {"metadata": {"namespace": (it.get("metadata") or {}).get("namespace"),
+                                             "name": (it.get("metadata") or {}).get("name")}}, key)
+            return None
+        for line in res:
+            if what == APP_WORKLOAD_RESOURCES:
+                obj = _wl_from_light_line(line)
+                if obj:
+                    add(store, obj, key)
+            else:
+                f = line.split("\t")
+                if len(f) >= 2 and f[1]:
+                    add(store, {"metadata": {"namespace": f[0], "name": f[1]}}, key)
         return None
 
-    for store, what in ((wl, kinds), (pvcs, "pvc")):
-        err = fill(store, ["get", what, "-A"])
+    try:
+        fb_max = int(CONFIG.get("apps_fallback_max", 50))
+    except (TypeError, ValueError):
+        fb_max = 50
+    for store, what in ((wl, APP_WORKLOAD_RESOURCES), (pvcs, "pvc")):
+        err = fill(store, what, ["get", what, "-A"])
         if err:
             if _kubectl_hint(err) != "other":
                 return wl, pvcs, err              # kubectl absent / sans contexte : inutile d'insister
+            if len(namespaces) > fb_max:
+                return {}, {}, ("%s (liste cluster-wide refusée ; repli par namespace non tenté au-delà de %d "
+                                "namespaces — accordez un droit de liste cluster-wide)" % (err, fb_max))
             err_out = err
             for ns in namespaces:
-                e2 = fill(store, ["get", what, "-n", ns], key=ns)
+                e2 = fill(store, what, ["get", what, "-n", ns], key=ns)
                 if not e2:
                     err_out = None
                 store.setdefault(ns, store.get(ns, []))
@@ -2550,27 +2904,30 @@ def action_applications():
     ab_dest = (CONFIG.get("auto_backup_dest") or "").strip()
     if ab_dest and os.path.abspath(os.path.expanduser(ab_dest)) != os.path.abspath(CONFIG["backup_root"]):
         roots.append(ab_dest)
-    # namespaces présents UNIQUEMENT dans les sauvegardes (cluster/contexte ACTIF) :
-    # dossiers du cluster + ancienne disposition locale (list_backups filtre par contexte).
+    # Sauvegardes du cluster/contexte ACTIF depuis le CATALOGUE (aucune lecture
+    # d'index.json) : dossier du cluster + ancienne disposition locale (versions du
+    # contexte courant, ou sans contexte — même règle que list_backups).
+    cats = []
+    for root in roots:
+        base = os.path.abspath(os.path.expanduser(root)) if root else CONFIG["backup_root"]
+        croot = _cluster_root(base)
+        cats.append(_catalog_all(croot))
+        if _current_cid() == LOCAL_CID and croot != base:
+            ctx = _local_context_name() or ""
+            legacy = _catalog_all(base)
+            cats.append({ns: [v for v in vs if (v.get("context") or "") in ("", ctx)] for ns, vs in legacy.items()})
+    # namespaces présents UNIQUEMENT dans les sauvegardes
     flt = _ns_filter()
     if info.get("ok"):
         seen = set(names)
-        for root in roots:
-            base = os.path.abspath(os.path.expanduser(root)) if root else CONFIG["backup_root"]
-            for d in {_cluster_root(base), (base if _current_cid() == LOCAL_CID else None)}:
-                if not d or not os.path.isdir(d):
+        for c in cats:
+            for ns in sorted(c):
+                if ns in seen or not c[ns]:
                     continue
-                for ns in sorted(os.listdir(d)):
-                    if ns in seen or ns.startswith("_") or not K8S_NAME_RE.match(ns):
-                        continue
-                    if flt and ns not in flt:
-                        continue                 # filtre par noms (le sélecteur d'étiquettes ne
-                    seen.add(ns)                 # peut pas être vérifié sur un ns disparu)
-                    try:
-                        if list_backups(ns, root):
-                            names.append(ns)
-                    except OSError:
-                        pass
+                if flt and ns not in flt:
+                    continue                     # filtre par noms (le sélecteur d'étiquettes ne
+                seen.add(ns)                     # peut pas être vérifié sur un ns disparu)
+                names.append(ns)
     now, fresh = time.time(), _backup_freshness_s()
     # Workloads + PVC des namespaces VIVANTS (pour découper chaque namespace en
     # applications). Sans droits / sans kubectl : un namespace = une application.
@@ -2580,17 +2937,14 @@ def action_applications():
         wl_by_ns, pvc_by_ns, wl_err = _list_namespace_workloads(live_names)
     apps = []
     for ns in names:
-        bks = []
-        for root in roots:
-            try:
-                bks.extend(list_backups(ns, root))
-            except OSError:
-                pass
-        stamps = [t for t in (_backup_epoch(b) for b in bks) if t]
+        bks = [v for c in cats for v in c.get(ns, [])]
+        stamps = [v.get("epoch") for v in bks if v.get("epoch")]
         last = max(stamps) if stamps else None
-        latest = max(bks, key=lambda b: _backup_epoch(b) or 0) if bks else None
-        lidx = ((latest or {}).get("index") or {}) if latest else {}
-        backed_pvcs = {v.get("pvc") for v in (lidx.get("volumes") or []) if v.get("pvc")}
+        latest = max(bks, key=lambda v: v.get("epoch") or 0) if bks else None
+        # `lidx` : résumé de la dernière sauvegarde (mêmes clés que l'index pour ce qui est utilisé)
+        lidx = {"volumes": [{"pvc": p} for p in (latest.get("volumes") or [])],
+                "apps": latest.get("apps") or [], "resources_count": latest.get("resources_count")} if latest else {}
+        backed_pvcs = set((latest or {}).get("volumes") or [])
         missing = ns not in live
         if not missing and ns in wl_by_ns:
             ns_apps = _apps_from_workloads(ns, wl_by_ns.get(ns) or [], pvc_by_ns.get(ns) or [])
@@ -2625,7 +2979,46 @@ def action_applications():
                        "interval_hours": _auto_backup_interval_s() / 3600.0}}
 
 
-def action_applications_all():
+# Cache de l'inventaire Applications (par cluster) : le tableau de bord (toutes les
+# 30 s), la page Applications et le rapport partagent le même résultat pendant
+# `apps_cache_ttl_s` secondes ; un seul calcul à la fois par cluster (les appels
+# concurrents attendent le résultat au lieu de relancer kubectl). Vidé après toute
+# écriture (POST) et à la fin d'une opération asynchrone ou d'un passage de sauvegarde ;
+# le bouton Actualiser force un recalcul (?fresh=1).
+_APPS_CACHE = {}
+_APPS_CACHE_LOCK = threading.Lock()
+_APPS_INFLIGHT = {}
+
+
+def _apps_cache_clear():
+    with _APPS_CACHE_LOCK:
+        _APPS_CACHE.clear()
+
+
+def action_applications_cached(fresh=False):
+    cid = _current_cid()
+    try:
+        ttl = float(CONFIG.get("apps_cache_ttl_s", 45))
+    except (TypeError, ValueError):
+        ttl = 45.0
+    with _APPS_CACHE_LOCK:
+        e = _APPS_CACHE.get(cid)
+        if e and not fresh and ttl > 0 and time.time() - e[0] < ttl:
+            return dict(e[1], cached_age=round(time.time() - e[0], 1))
+        lk = _APPS_INFLIGHT.setdefault(cid, threading.Lock())
+    with lk:                                     # single-flight par cluster
+        with _APPS_CACHE_LOCK:
+            e = _APPS_CACHE.get(cid)
+            if e and not fresh and ttl > 0 and time.time() - e[0] < ttl:
+                return dict(e[1], cached_age=round(time.time() - e[0], 1))
+        r = action_applications()
+        if r.get("ok") or r.get("apps"):
+            with _APPS_CACHE_LOCK:
+                _APPS_CACHE[cid] = (time.time(), r)
+        return r
+
+
+def action_applications_all(fresh=False):
     """Applications de TOUS les clusters connus (en parallèle, 15 s max par requête
     kubectl pour qu'un cluster injoignable ne bloque pas la page), étiquetées par
     cluster et workspace NKP — pour la vue groupée workspace -> cluster -> namespace."""
@@ -2639,7 +3032,7 @@ def action_applications_all():
             if cid == LOCAL_CID and not action_context().get("kubectl_ok"):
                 return dict(meta, ok=False, skipped=True, error="Cluster local non configuré.", apps=[])
             try:
-                r = action_applications()
+                r = action_applications_cached(fresh=fresh)
             except Exception as e:  # un cluster en erreur ne doit pas masquer les autres
                 r = {"ok": False, "error": str(e), "apps": []}
             apps = [dict(a, **meta) for a in (r.get("apps") or [])]
@@ -2694,19 +3087,20 @@ def action_storage():
                 warn = warn or pct >= 90.0
             except OSError as e:
                 entry["error"] = str(e)
-            size, files = _dir_size(root)
-            entry.update(backups_bytes=size, files=files)
+            # Volume occupé, fichiers et nombre de versions : depuis le catalogue (aucun
+            # parcours de l'arbre : la tuile est rafraîchie toutes les 30 s).
+            size = files = n = 0
+            for base in _catalog_bases(root):
+                for _ns, vs in _catalog_all(base).items():
+                    for v in vs:
+                        size += v.get("size") or 0
+                        files += v.get("files") or 0
+                        n += 1
             try:
                 entry["audit_bytes"] = os.path.getsize(os.path.join(root, "audit.log"))
             except OSError:
                 entry["audit_bytes"] = 0
-            # nombre de versions de sauvegarde (dossiers avec index.json) sous ce root
-            n = 0
-            for dirpath, dirs, fnames in os.walk(root):
-                if "index.json" in fnames:
-                    n += 1
-                    dirs[:] = []                # ne pas descendre dans une sauvegarde
-            entry["backups_count"] = n
+            entry.update(backups_bytes=size + entry["audit_bytes"], files=files, backups_count=n)
         out.append(entry)
     try:
         quota_b = float(CONFIG.get("storage_quota_gb") or 0) * 1024 ** 3
@@ -2866,6 +3260,7 @@ HELP_SECTIONS = [
 <li><b>Sauvegarder tous (filtrés)</b> : tous les namespaces autorisés d'un coup ; un namespace sans PVC <b>ni workload</b> est ignoré. Un namespace <b>stateless</b> (workloads sans volume) est sauvegardé : son instantané suffit à le restaurer.</li>
 <li>Dossier par défaut : <code>hycu-backups/</code> — <b>copiez-le hors du cluster</b> (téléchargement .zip dans l'assistant de restauration, ou export S3 automatique, voir plus bas).</li>
 <li>Le filtre des namespaces (entonnoir) et le <b>sélecteur d'étiquettes</b> (Réglages) bornent ce que l'outil voit et touche.</li>
+<li><b>Grands clusters</b> : chaque dossier de sauvegardes porte un catalogue <code>_catalog.json</code> (résumé dérivé, reconstruit s'il manque — la restauration lit toujours <code>index.json</code>), l'inventaire est mis en cache quelques dizaines de secondes (<b>Actualiser</b> force le recalcul), la page est paginée par 100 et un passage « tous les namespaces » lit les PV une fois et travaille en parallèle. Réglages : <code>apps_fallback_max</code>, <code>apps_cache_ttl_s</code>, <code>backup_parallel</code>.</li>
 </ul>"""),
     ("politiques", "Sauvegarde automatique & rétention", """
 <ul>
@@ -4521,6 +4916,7 @@ def action_s3_import(payload):
             results.append({"key": label, "ok": False, "error": err})
             continue
         imported += 1
+        _catalog_forget_path(dest)
         results.append({"key": label, "ok": True, "files": n, "path": dest})
         audit("s3_import", key=key, namespace=nsname, files=n, path=dest)
     return {"ok": imported > 0 or not results, "results": results, "imported": imported,
@@ -6373,50 +6769,38 @@ def action_dr_backups():
     DR. Lecture seule ; le champ `allowed` reflète le réglage allow_dr_restore."""
     root = CONFIG["backup_root"]
     out = []
-    for dirpath, dirs, fnames in os.walk(root):
-        if "index.json" not in fnames:
-            continue
-        dirs[:] = []
-        try:
-            with open(os.path.join(dirpath, "index.json"), encoding="utf-8") as f:
-                idx = json.load(f)
-        except (OSError, ValueError):
-            continue
-        rel = os.path.relpath(dirpath, root)
-        restorable = _backup_cluster_error(dirpath) is None
-        # UUID du Volume Group d'ORIGINE de chaque volume (dans la sauvegarde) : permet
-        # à l'assistant de PRÉ-REMPLIR le champ en récupération (aucune saisie manuelle).
-        vol_refs = {}
-        vol_hycu = {}       # identité HYCU du VG (contrat P1) : source des points de restauration
-        vol_names = {}      # nom du VG (contrat, sinon nom du PV) : indice de résolution HYCU
-        for v in (idx.get("volumes") or []):
-            vh = ((v.get("analysis") or {}).get("old_volume_handle")) or ""
-            m = UUID_RE.search(vh)
-            if v.get("pvc") and m:
-                vol_refs[v["pvc"]] = m.group(0)
-            hy = ((v.get("restore_contract") or {}).get("hycu_uuid")) or ""
-            if v.get("pvc") and hy:
-                vol_hycu[v["pvc"]] = hy
-            nm = ((v.get("restore_contract") or {}).get("vg_name")) or v.get("pv") or ""
-            if v.get("pvc") and nm:
-                vol_names[v["pvc"]] = nm
-        out.append({"path": dirpath, "restorable_here": restorable,
-                    "namespace": idx.get("namespace") or "",
-                    "timestamp": os.path.basename(dirpath), "created": idx.get("created") or "",
-                    "cluster": idx.get("cluster") or idx.get("cluster_id") or "local",
-                    "cluster_id": idx.get("cluster_id") or "local",
-                    "context": idx.get("context") or "",
-                    "volumes": [v.get("pvc") for v in (idx.get("volumes") or [])],
-                    "vol_refs": vol_refs,
-                    "vol_hycu": vol_hycu,
-                    "vol_names": vol_names,
-                    "resources_count": idx.get("resources_count"),
-                    "has_resources": os.path.isfile(os.path.join(dirpath, "resources.json")),
-                    # Sauvegarde STATELESS : aucun volume, mais des workloads à recréer.
-                    "stateless": (not (idx.get("volumes") or [])
-                                  and any((a.get("type") == "stateless") for a in (idx.get("apps") or []))),
-                    "apps": [a.get("name") for a in (idx.get("apps") or []) if a.get("name")],
-                    "imported": rel.split(os.sep)[0] == "_imports"})
+    # « Restaurable ici » = même règle que _backup_cluster_error (cluster d'origine et,
+    # pour le cluster local, même contexte kubectl), évaluée sur le résumé du catalogue
+    # — le serveur la re-vérifie sur l'index réel au moment de restaurer.
+    cur_cid = _current_cid()
+    cur_ctx = (_local_context_name() or "").strip() if cur_cid == LOCAL_CID else ""
+    for base in _catalog_bases(root):
+        imported = os.path.relpath(base, root).split(os.sep)[0] == "_imports"
+        for ns, vs in _catalog_all(base).items():
+            for v in vs:
+                src = v.get("cluster_id") or LOCAL_CID
+                bctx = (v.get("context") or "").strip()
+                restorable = (src == cur_cid) and not (src == LOCAL_CID and bctx and cur_ctx and bctx != cur_ctx)
+                # vol_refs : UUID du Volume Group d'ORIGINE de chaque volume — l'assistant
+                # PRÉ-REMPLIT le champ en récupération (aucune saisie manuelle) ; vol_hycu :
+                # identité HYCU (contrat P1) ; vol_names : nom du VG (contrat, sinon PV).
+                out.append({"path": _catalog_backup_path(base, ns, v), "restorable_here": restorable,
+                            "namespace": v.get("namespace") or ns,
+                            "timestamp": v["ts"], "created": v.get("created") or "",
+                            "cluster": v.get("cluster") or v.get("cluster_id") or "local",
+                            "cluster_id": v.get("cluster_id") or "local",
+                            "context": v.get("context") or "",
+                            "volumes": list(v.get("volumes") or []),
+                            "vol_refs": dict(v.get("vol_refs") or {}),
+                            "vol_hycu": dict(v.get("vol_hycu") or {}),
+                            "vol_names": dict(v.get("vol_names") or {}),
+                            "resources_count": v.get("resources_count"),
+                            "has_resources": bool(v.get("has_resources")),
+                            # Sauvegarde STATELESS : aucun volume, mais des workloads à recréer.
+                            "stateless": (not (v.get("volumes") or [])
+                                          and any((a.get("type") == "stateless") for a in (v.get("apps") or []))),
+                            "apps": [a.get("name") for a in (v.get("apps") or []) if a.get("name")],
+                            "imported": imported})
     out.sort(key=lambda b: b.get("created") or "", reverse=True)
     return _ok(backups=out, allowed=bool(CONFIG.get("allow_dr_restore")))
 
@@ -6508,7 +6892,7 @@ def action_clone_app(payload, log=None):
     elif not items:
         # Clone STATELESS depuis le cluster : les workloads de l'application, qui ne
         # doivent monter aucun PVC (sinon : sélectionner ses volumes, clone stateful).
-        wl_map, pvc_map, werr = _list_namespace_workloads([ns])
+        wl_map, pvc_map, werr = _list_namespace_workloads([ns], full=True)   # manifestes COMPLETS : ils sont copiés
         if werr and not wl_map.get(ns):
             return {"ok": False, "error": "Lecture des workloads de « %s » impossible : %s" % (ns, werr), "log": []}
         for w in wl_map.get(ns) or []:
@@ -7005,6 +7389,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._do_GET()
 
     def do_POST(self):
+        _apps_cache_clear()                      # toute écriture invalide l'inventaire
         with use_cluster(self._req_cluster()):
             return self._do_POST()
 
@@ -7056,9 +7441,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if path == "/api/auto_backup":
                 return self._json(action_auto_backup_status())
             if path == "/api/applications":
+                fresh = qs.get("fresh") == "1"
                 if qs.get("scope") == "all":
-                    return self._json(action_applications_all())
-                return self._json(action_applications())
+                    return self._json(action_applications_all(fresh=fresh))
+                return self._json(action_applications_cached(fresh=fresh))
             if path == "/api/clusters":
                 return self._json(action_clusters())
             if path == "/api/nkp/discover":
@@ -7827,7 +8213,7 @@ HTML = r"""<!DOCTYPE html>
     <div class="tcard">
       <div class="tbar"><div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap"><input type="text" id="appsSearch" placeholder="Rechercher" autocomplete="off">
         <div class="seg" id="appsScope" style="display:none"><button class="on" type="button" data-scope="one">Cluster actif</button><button type="button" data-scope="all">Tous les clusters</button></div></div>
-        <div style="display:flex;align-items:center;gap:14px"><span class="tinfo" id="appsInfo"></span>
+        <div style="display:flex;align-items:center;gap:14px"><span class="tinfo" id="appsInfo"></span><span class="tinfo" id="appsPager" style="display:none"></span>
           <button class="pact nsEdit" type="button" title="Filtrer la liste des namespaces"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5h16l-6.2 7.4V19l-3.6-1.8v-4.8z"/></svg></button></div></div>
       <table class="ht" id="appsTable"><thead><tr><th class="cb"><input type="checkbox" id="appsAll" title="Tout sélectionner"></th>
         <th>Nom</th><th>Namespace</th><th class="mc">Workspace</th><th class="mc">Cluster</th><th>Type</th><th>Politique</th><th class="ctr">Conformité</th><th class="ctr">Protection</th>
@@ -10030,10 +10416,11 @@ document.querySelectorAll("#appsScope button").forEach(b=>b.onclick=()=>{
   document.querySelectorAll("#appsScope button").forEach(x=>x.classList.toggle("on", x===b));
   loadApps();
 });
-async function loadApps(){
+// `fresh` (bouton Actualiser) : ignore le cache serveur de l'inventaire (apps_cache_ttl_s).
+async function loadApps(fresh){
   $("#appsRefresh").classList.add("busy");
   const all = appsScope==="all";
-  const r=await get(all ? "/api/applications?scope=all" : "/api/applications");
+  const r=await get("/api/applications?"+(all ? "scope=all" : "scope=one")+(fresh ? "&fresh=1" : ""));
   $("#appsRefresh").classList.remove("busy");
   apps=(r.apps||[]).map(a=>all ? a : Object.assign({}, a, {cluster_id:ACTIVE_CID}));
   appsFresh=r.freshness_hours||24; appsPolicy=r.policy||{};
@@ -10056,10 +10443,28 @@ function appsVisible(){
   return apps.filter(a=>!q || a.name.toLowerCase().includes(q) || appNs(a).toLowerCase().includes(q)
                            || (a.cluster||"").toLowerCase().includes(q) || (a.workspace||"").toLowerCase().includes(q));
 }
+// Pagination : au-delà de APPS_PAGE_SIZE lignes (grands clusters), le tableau est
+// découpé en pages ; la recherche s'applique à toutes les lignes, la sélection persiste.
+const APPS_PAGE_SIZE=100; let appsPage=0;
+function appsPageRows(rows){
+  const nPages=Math.max(1, Math.ceil(rows.length/APPS_PAGE_SIZE));
+  if(appsPage>=nPages) appsPage=nPages-1;
+  const pg=$("#appsPager");
+  if(rows.length<=APPS_PAGE_SIZE){ pg.style.display="none"; pg.innerHTML=""; return rows; }
+  const from=appsPage*APPS_PAGE_SIZE, to=Math.min(rows.length, from+APPS_PAGE_SIZE);
+  pg.style.display="";
+  pg.innerHTML=`<button class="pact" type="button" id="appsPrev" ${appsPage===0?"disabled":""} title="Page précédente">‹</button> `+
+    `<span>${from+1}–${to} / ${rows.length}</span> `+
+    `<button class="pact" type="button" id="appsNext" ${appsPage>=nPages-1?"disabled":""} title="Page suivante">›</button>`;
+  $("#appsPrev").onclick=()=>{ appsPage--; renderApps(); };
+  $("#appsNext").onclick=()=>{ appsPage++; renderApps(); };
+  return rows.slice(from, to);
+}
 function renderApps(){
-  const rows=appsVisible(), all=appsScope==="all";
-  const nNs=new Set(rows.map(a=>(a.cluster_id||"")+"|"+appNs(a))).size;
-  $("#appsInfo").textContent=rows.length+" application(s) · "+nNs+" namespace(s)";
+  const rowsAll=appsVisible(), all=appsScope==="all";
+  const nNs=new Set(rowsAll.map(a=>(a.cluster_id||"")+"|"+appNs(a))).size;
+  $("#appsInfo").textContent=rowsAll.length+" application(s) · "+nNs+" namespace(s)";
+  const rows=appsPageRows(rowsAll);
   let h="";
   appsClErr.forEach(c=>{ h+=`<tr class="grp"><td colspan="11">${c.workspace?esc(c.workspace)+'<span class="gs">›</span>':""}${esc(c.cluster)}`+
                              `<span class="ge">${stIc("ko")} ${esc(c.error||"injoignable")}</span></td></tr>`; });
@@ -10099,8 +10504,14 @@ function renderApps(){
     }).join("");
   }
   $("#appsBody").innerHTML=h;
+  // Sélection : on met à jour LA ligne cliquée (pas de reconstruction du tableau —
+  // coûteuse à 1 000 lignes), puis les actions et la case « tout ».
   document.querySelectorAll("#appsBody tr.clk").forEach(tr=>tr.onclick=()=>{
-    const k=tr.dataset.k; appsSel.has(k) ? appsSel.delete(k) : appsSel.add(k); renderApps(); });
+    const k=tr.dataset.k, on=!appsSel.has(k);
+    on ? appsSel.add(k) : appsSel.delete(k);
+    tr.classList.toggle("sel", on); const c=tr.querySelector('input[type="checkbox"]'); if(c) c.checked=on;
+    $("#appsAll").checked = rows.length>0 && rows.every(a=>appsSel.has(appKey(a)));
+    updateAppActs(); });
   $("#appsAll").checked = rows.length>0 && rows.every(a=>appsSel.has(appKey(a)));
   updateAppActs();
 }
@@ -10130,10 +10541,11 @@ function updateAppActs(){
 // Opération sur UNE application d'un autre cluster (vue « Tous les clusters ») : on
 // bascule d'abord le cluster actif, pour que confirmations et garde-fous le désignent.
 async function ensureCluster(a){ if(a && a.cluster_id && a.cluster_id!==ACTIVE_CID) await setActiveCluster(a.cluster_id); }
-$("#appsSearch").oninput=renderApps;
+$("#appsSearch").oninput=()=>{ appsPage=0; renderApps(); };
+// « Tout sélectionner » porte sur la PAGE affichée (jamais 1 000 lignes d'un coup à l'insu de l'opérateur).
 $("#appsAll").onchange=()=>{ const on=$("#appsAll").checked;
-  appsVisible().forEach(a=>on ? appsSel.add(appKey(a)) : appsSel.delete(appKey(a))); renderApps(); };
-$("#appsRefresh").onclick=()=>loadApps();
+  appsVisible().slice(appsPage*APPS_PAGE_SIZE, (appsPage+1)*APPS_PAGE_SIZE).forEach(a=>on ? appsSel.add(appKey(a)) : appsSel.delete(appKey(a))); renderApps(); };
+$("#appsRefresh").onclick=()=>loadApps(true);
 $("#actBackup").onclick=async()=>{
   const objs=selNsObjs();
   const cids=[...new Set(objs.map(a=>a.cluster_id))];
@@ -12608,6 +13020,13 @@ I18N_EN += [
     (">tout le namespace</a>", ">whole namespace</a>"),
     # Clone d'une application stateless
     ("Vérifier la copie", "Check the copy"),
+    # Grands clusters
+    (" (liste cluster-wide refusée ; repli par namespace non tenté au-delà de ", " (cluster-wide list refused; per-namespace fallback not attempted beyond "),
+    (" namespaces — accordez un droit de liste cluster-wide)", " namespaces — grant a cluster-wide list permission)"),
+    ('title="Page précédente"', 'title="Previous page"'),
+    ("<li><b>Grands clusters</b> : chaque dossier de sauvegardes porte un catalogue <code>_catalog.json</code> (résumé dérivé, reconstruit s'il manque — la restauration lit toujours <code>index.json</code>), l'inventaire est mis en cache quelques dizaines de secondes (<b>Actualiser</b> force le recalcul), la page est paginée par 100 et un passage « tous les namespaces » lit les PV une fois et travaille en parallèle. Réglages : <code>apps_fallback_max</code>, <code>apps_cache_ttl_s</code>, <code>backup_parallel</code>.</li>",
+     "<li><b>Large clusters</b>: each backup folder carries a <code>_catalog.json</code> catalog (derived summary, rebuilt if missing — restores always read <code>index.json</code>), the inventory is cached for a few dozen seconds (<b>Refresh</b> forces a recompute), the page is paginated by 100 and an “all namespaces” pass reads PVs once and works in parallel. Settings: <code>apps_fallback_max</code>, <code>apps_cache_ttl_s</code>, <code>backup_parallel</code>.</li>"),
+    ('title="Page suivante"', 'title="Next page"'),
     ("Application stateless : aucun volume à choisir.", "Stateless application: no volume to choose."),
     ("</b> : <b>stateless</b>, aucun volume à restaurer. La copie recrée ses workloads (", "</b>: <b>stateless</b>, no volume to restore. The copy recreates its workloads ("),
     (") et leurs dépendances depuis le cluster.", ") and their dependencies from the cluster."),
