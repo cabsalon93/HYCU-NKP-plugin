@@ -201,6 +201,30 @@ try:
     rr = H.action_clone_app({"namespace": "shop", "target_namespace": "shop-copy", "backup_path": d,
                              "items": [], "dry": True})
     check(not rr["ok"] and "Aucun volume" in rr["error"], "clone ordinaire sans volume : toujours refusé")
+
+    print("\n== Clone d'une application STATELESS depuis le cluster (simulation) ==")
+    H._list_namespace_workloads = lambda names: ({"shop": items}, {"shop": pvcs}, None)
+    applied.clear()
+    H._apply_manifest = capture
+    try:
+        r = H.action_clone_app({"namespace": "shop", "app": "redis", "suffix": "-copy", "items": [], "dry": True})
+        same_applied = list(applied); applied.clear()
+        r2 = H.action_clone_app({"namespace": "shop", "app": "redis", "target_namespace": "shop-copy",
+                                 "items": [], "dry": True, "clone_refs": True})
+        other_applied = list(applied)
+        r3 = H.action_clone_app({"namespace": "shop", "app": "wp", "suffix": "-copy", "items": [], "dry": True})
+        r4 = H.action_clone_app({"namespace": "shop", "app": "nope", "suffix": "-copy", "items": [], "dry": True})
+    finally:
+        H._apply_manifest = real_apply
+    check(r["ok"] and ("Deployment", "redis-copy") in same_applied and ("CronJob", "cleanup-copy") in same_applied
+          and not any(k in ("PersistentVolume", "PersistentVolumeClaim") for k, _ in same_applied),
+          "même namespace : workloads de l'application copiés avec suffixe, aucun PV/PVC")
+    check(r["preview"]["workloads"] == ["Deployment/redis-copy", "CronJob/cleanup-copy"] and not r["preview"]["pvcs"],
+          "aperçu : workloads clonés, aucun volume")
+    check(r2["ok"] and ("Namespace", "shop-copy") in other_applied and ("Deployment", "redis") in other_applied,
+          "autre namespace : namespace cible + workloads recréés")
+    check(not r3["ok"] and "monte le(s) volume(s)" in r3["error"], "application stateful demandée sans volume : refus explicite")
+    check(not r4["ok"] and "introuvable" in r4["error"], "application inconnue : refus")
 finally:
     H.action_namespaces, H._list_namespace_workloads, H.kubectl_json, H.resource_state = s_ns, s_wl, s_kj, s_rs
     H.CONFIG.clear(); H.CONFIG.update(saved)

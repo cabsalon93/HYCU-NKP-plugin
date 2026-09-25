@@ -317,8 +317,9 @@ Select **one** application → **Restore**. As in HYCU's *Application Restore*:
      **diff preview** (live → backup) before any `apply`. Volumes and data are
      untouched; a Secret **redacted** at backup time is never restored (it would
      overwrite the real secret).
-     **Stateless application**: **Restore** on its row opens this path directly
-     with **its** objects pre-ticked (workloads, Services, referenced
+     **Stateless application**: **Restore** on its row offers only the **copy** (clone
+     of its workloads and dependencies, as for a stateful application) and this
+     path, preselected, with **its** objects pre-ticked (workloads, Services, referenced
      ConfigMaps/Secrets) — the “Only the application's objects” box hides the rest
      of the namespace. A **deleted** stateless namespace can be recovered too
      (workloads + dependencies recreated from the snapshot, no volume).

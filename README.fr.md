@@ -325,8 +325,9 @@ HYCU :
      d'une sauvegarde, avec **aperçu des différences** (live → sauvegarde) avant
      tout `apply`. Ne touche ni aux volumes ni aux données ; un Secret **masqué**
      à la sauvegarde n'est jamais restauré (il écraserait le vrai secret).
-     **Application stateless** : **Restaurer** sur sa ligne ouvre directement ce
-     parcours avec **ses** objets précochés (workloads, Services, ConfigMaps/Secrets
+     **Application stateless** : **Restaurer** sur sa ligne ne propose que la **copie**
+     (clone de ses workloads et dépendances, comme pour une application stateful) et
+     ce parcours, présélectionné, avec **ses** objets précochés (workloads, Services, ConfigMaps/Secrets
      référencés) — case « Seulement les objets de l'application » pour masquer le
      reste du namespace. Un namespace stateless **supprimé** se récupère aussi
      (workloads + dépendances recréés depuis l'instantané, sans volume).

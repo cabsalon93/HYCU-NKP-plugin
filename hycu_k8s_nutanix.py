@@ -316,7 +316,7 @@ def save_config(updates):
 
 # Version horodatée de la build (format AAAAMMJJ-HHMM). À incrémenter à chaque
 # changement notable du programme ; affichée dans l'en-tête de l'interface.
-VERSION = "20260925-1200"
+VERSION = "20260925-1300"
 
 # Jeton anti-CSRF généré au démarrage, injecté dans la page et exigé sur les POST.
 CSRF_TOKEN = secrets.token_urlsafe(32)
@@ -2886,7 +2886,7 @@ HELP_SECTIONS = [
 <li><b>Restaurer le stockage vers de nouveaux volumes</b> : de nouveaux Volume Groups sont clonés, l'application y est rattachée ; les volumes d'origine sont conservés.</li>
 <li><b>Restaurer des objets de configuration</b> : ré-applique des objets choisis depuis l'instantané d'une sauvegarde, avec <b>aperçu des différences</b> avant tout apply. Ne touche ni aux volumes ni aux données.</li>
 </ol>
-<div class="tip"><b>Application stateless (sans volume) ?</b> Cliquez <b>Restaurer</b> sur sa ligne : l'assistant ouvre directement le parcours <b>objets de configuration</b> avec <b>ses</b> objets précochés (workloads, Services, ConfigMaps/Secrets référencés) — les autres applications du namespace ne sont pas touchées. Pour une application <b>stateful</b>, seuls <b>ses</b> volumes sont présélectionnés dans les parcours de stockage. <b>Tout le namespace</b> (ex. mariadb + wordpress découpés par leurs étiquettes) : cochez plusieurs applications du même namespace puis <b>Restaurer le namespace</b>, ou cliquez le lien « tout le namespace » dans l'assistant.</div>
+<div class="tip"><b>Application stateless (sans volume) ?</b> Cliquez <b>Restaurer</b> sur sa ligne : l'assistant ne propose que deux parcours — <b>copie</b> (clone de ses workloads et dépendances, même namespace avec suffixe ou autre namespace, comme pour une application stateful) et <b>objets de configuration</b> (présélectionné) avec <b>ses</b> objets précochés (workloads, Services, ConfigMaps/Secrets référencés) — les autres applications du namespace ne sont pas touchées. Pour une application <b>stateful</b>, seuls <b>ses</b> volumes sont présélectionnés dans les parcours de stockage. <b>Tout le namespace</b> (ex. mariadb + wordpress découpés par leurs étiquettes) : cochez plusieurs applications du même namespace puis <b>Restaurer le namespace</b>, ou cliquez le lien « tout le namespace » dans l'assistant.</div>
 <div class="tip">Déroulé conseillé : lancez d'abord en <b>simulation</b> (plan affiché, aucun effet), relisez le récapitulatif, puis désactivez la simulation et relancez. En mode réel, l'outil demande de <b>retaper le nom du cluster</b>. Après une restauration réelle, la <b>Vérification</b> s'ouvre automatiquement (PVC Bound, pods Running).</div>
 <div class="tip">Si une étape échoue, la séquence <b>s'arrête</b> et l'application reste arrêtée (jamais redémarrée sur des volumes incohérents). Corrigez puis <b>relancez</b> : la reprise est idempotente et les réplicas d'origine sont mémorisés.</div>
 <div class="tip"><b>Application supprimée du cluster ?</b> Tant que ses sauvegardes existent, elle reste listée dans <b>Applications</b> avec le badge « Supprimée — restaurable ». Cliquez <b>Restaurer</b> : le parcours de récupération recrée tout (namespace, PV/PVC, workloads, dépendances non masquées) depuis la sauvegarde choisie, en <b>réutilisant les volumes d'origine</b> — rien à saisir. Si un Volume Group a été supprimé avec le namespace mais reste « Protected deleted » dans HYCU, il est <b>restauré automatiquement</b> (HYCU connecté). Décochez « réutiliser » seulement si vous avez restauré les données sur de nouveaux volumes. Aucune dérogation DR n'est requise : la récupération reste sur le même cluster/contexte.</div>"""),
@@ -6193,7 +6193,9 @@ def _clone_workload_manifest(w, target_ns, same_ns, suffix, pvc_rename):
     _strip_meta(meta)
     meta.pop("ownerReferences", None)
     meta.setdefault("labels", {})[CLONE_LABEL] = CLONE_LABEL_VAL
-    if same_ns:
+    if same_ns and (w.get("kind") or "") == "CronJob":
+        meta["name"] = meta.get("name", "") + suffix       # pas de sélecteur : simple renommage
+    elif same_ns:
         meta["name"] = meta.get("name", "") + suffix
         spec = w.setdefault("spec", {})
         sel = (spec.setdefault("selector", {})).setdefault("matchLabels", {})
@@ -6479,15 +6481,18 @@ def action_clone_app(payload, log=None):
         return {"ok": False, "error": "Un suffixe est requis pour cloner dans le même namespace.", "log": []}
     if not K8S_NAME_RE.match(target_ns):
         return {"ok": False, "error": "Nom de namespace cible invalide : '%s'." % target_ns, "log": []}
-    # Sans volume : seule une récupération/DR d'une sauvegarde STATELESS (namespace sans
-    # PVC, workloads dans l'instantané) a un sens — vérifié plus bas, une fois l'instantané lu.
-    if not items and not from_backup:
+    # Sans volume : clone d'une application STATELESS (`app` : workloads live du
+    # namespace, aucun PVC), ou récupération/DR d'une sauvegarde STATELESS (namespace
+    # sans PVC, workloads dans l'instantané) — vérifié plus bas, une fois l'instantané lu.
+    app = (payload.get("app") or "").strip()
+    if not items and not from_backup and not app:
         return {"ok": False, "error": "Aucun volume sélectionné.", "log": []}
-    xerr = _backup_cluster_error(backup_path, backup_root, allow_dr=dr)
+    xerr = _backup_cluster_error(backup_path, backup_root, allow_dr=dr) if (items or from_backup) else None
     if xerr:
         return {"ok": False, "error": xerr, "log": []}
     bitems = None
     stateless = False
+    live_stateless = []               # workloads live de l'application stateless clonée
     if from_backup:
         # resources.json ABSENT ne bloque PAS : on restaure les volumes (PV/PVC) et on
         # avertit que workloads/dépendances ne seront pas recréés (sauvegarde ancienne).
@@ -6500,6 +6505,26 @@ def action_clone_app(payload, log=None):
                 return {"ok": False, "log": [], "error":
                         "Aucun volume sélectionné et aucun workload dans l'instantané de cette "
                         "sauvegarde : rien à recréer."}
+    elif not items:
+        # Clone STATELESS depuis le cluster : les workloads de l'application, qui ne
+        # doivent monter aucun PVC (sinon : sélectionner ses volumes, clone stateful).
+        wl_map, pvc_map, werr = _list_namespace_workloads([ns])
+        if werr and not wl_map.get(ns):
+            return {"ok": False, "error": "Lecture des workloads de « %s » impossible : %s" % (ns, werr), "log": []}
+        for w in wl_map.get(ns) or []:
+            owners = {o.get("kind") for o in ((w.get("metadata") or {}).get("ownerReferences") or [])}
+            if (w.get("kind") or "") in APP_WORKLOAD_KINDS and _app_key_of(w) == app \
+                    and not (owners & (set(APP_WORKLOAD_KINDS) | {"Job", "ReplicaSet"})):
+                live_stateless.append(json.loads(json.dumps(w)))
+        if not live_stateless:
+            return {"ok": False, "log": [], "error":
+                    "Application « %s » introuvable dans le namespace « %s » (aucun workload)." % (app, ns)}
+        mounted = sorted({c for w in live_stateless for c in _workload_pvcs(w, pvc_map.get(ns) or [])})
+        if mounted:
+            return {"ok": False, "log": [], "error":
+                    "L'application « %s » monte le(s) volume(s) %s : ce n'est pas une application stateless — "
+                    "sélectionnez ses volumes pour la cloner." % (app, ", ".join(mounted))}
+        stateless = True
     # Remap optionnel de la StorageClass (site DR : classes souvent différentes).
     dr_sc = (payload.get("dr_storageclass") or "").strip()
     if dr_sc and not K8S_NAME_RE.match(dr_sc):
@@ -6610,13 +6635,24 @@ def action_clone_app(payload, log=None):
                          "new_pv_name": clone_pv_name, "new_pvc_name": new_pvc_name,
                          "orig_pv_name": orig_pv_name})
 
-    if stateless:
-        # Récupération STATELESS : tous les workloads de l'instantané qui ne montent
-        # aucun PVC (le namespace n'en avait pas) — recréés avec leurs dépendances.
+    if stateless and live_stateless:
+        # Clone STATELESS depuis le cluster : copie des workloads de l'application.
+        workloads = live_stateless
+        warnings.append("Application stateless « %s » : aucun volume — seuls ses workloads (%s) et leurs "
+                        "dépendances sont copiés." % (app, ", ".join("%s/%s" % (w["kind"], w["metadata"]["name"])
+                                                                        for w in workloads)))
+    elif stateless:
+        # Récupération STATELESS : les workloads de l'instantané qui ne montent aucun PVC
+        # (le namespace n'en avait pas) — ceux de l'application `app` si elle est précisée.
         workloads = [json.loads(json.dumps(o)) for o in (bitems or [])
                      if (o.get("kind") or "") in APP_WORKLOAD_KINDS and not _workload_pvcs(o, [])
+                     and (not app or _app_key_of(o) == app)
                      and not ({x.get("kind") for x in ((o.get("metadata") or {}).get("ownerReferences") or [])}
                               & (set(APP_WORKLOAD_KINDS) | {"Job", "ReplicaSet"}))]
+        if not workloads:
+            return {"ok": False, "log": [], "error":
+                    "Aucun workload sans volume%s dans l'instantané de cette sauvegarde : rien à recréer."
+                    % ((" pour l'application « %s »" % app) if app else "")}
         warnings.append("Sauvegarde sans volume (application stateless) : seuls les workloads et "
                         "leurs dépendances sont recréés depuis l'instantané.")
     else:
@@ -8500,7 +8536,10 @@ function scrollPulse(el){ if(!el) return; el.scrollIntoView({behavior:"smooth",b
 function updateNextBar(){
   if($("#tab-restore").style.display==="none") return hideNextBar();
   const chks=[...document.querySelectorAll(".rsChk:checked")];
-  if(!chks.length) return hideNextBar();
+  const slClone = typeof rsStatelessClone==="function" && rsStatelessClone();
+  if(!chks.length && !slClone) return hideNextBar();
+  if(slClone && $("#rsPlan").style.display==="none")
+    return rsNext("Application stateless : aucun volume à choisir.","Vérifier la copie",()=>$("#rsPreview").click());
   const hyOn = conn.hycu && conn.hycu.connected;
   // Étape 3 : plan affiché et lancement possible -> guider vers le bouton Lancer.
   if($("#rsPlan").style.display!=="none" && !$("#rsGo").disabled){
@@ -9305,6 +9344,7 @@ document.querySelectorAll("#rsCloneNsMode button").forEach(b=>b.onclick=()=>{
 function cloneAppBody(){
   const same = state.cloneNsMode==="same";
   return {namespace:$("#rsNs").value, items:collectItems(), backup_path:state.backup_path, backup_root:state.backup_root,
+          app: rsStatelessClone() ? state.app.name : undefined,
           target_namespace: same? "" : $("#rsCloneTargetNs").value.trim(),
           suffix: same? ($("#rsCloneSuffix").value.trim()||"-clone") : "",
           clone_refs: same? false : !!($("#rsCloneRefs")&&$("#rsCloneRefs").checked)};
@@ -9321,7 +9361,7 @@ function renderCloneAppPlan(r){
   (r.warnings||[]).forEach(w=>html+=`<div class="warnbox">⚠ ${esc(w)}</div>`);
   if(r.manifests_preview){ html+=`<details style="margin-top:6px"><summary class="hint">Voir les manifestes des applications clonées</summary><pre class="box">${esc(r.manifests_preview)}</pre></details>`; }
   $("#rsRepl").innerHTML=html;
-  $("#rsSteps").innerHTML='<li>Créer le namespace cible (si « autre »)</li><li>Créer les PV/PVC clonés (sur le VG cloné)</li><li>Créer les applications clonées (elles démarrent automatiquement)</li><li>L\'application d\'origine n\'est PAS modifiée ni arrêtée</li>';
+  $("#rsSteps").innerHTML='<li>Créer le namespace cible (si « autre »)</li>'+(rsStatelessClone()?'':'<li>Créer les PV/PVC clonés (sur le VG cloné)</li>')+'<li>Créer les applications clonées (elles démarrent automatiquement)</li><li>L\'application d\'origine n\'est PAS modifiée ni arrêtée</li>';
   $("#rsPlan").style.display="block"; setRsStep(3);
   updateGoButton(r.ok);
   $("#rsPlan").scrollIntoView({behavior:"smooth",block:"start"});   // amener l'étape 3 sous les yeux
@@ -9341,7 +9381,7 @@ function collectItems(){
 $("#rsPreview").onclick=async()=>{
   $("#rsErr").innerHTML="";
   const items=collectItems();
-  if(!items.length){$("#rsErr").innerHTML='<div class="err">Cochez au moins un PVC.</div>';return;}
+  if(!items.length && !rsStatelessClone()){$("#rsErr").innerHTML='<div class="err">Cochez au moins un PVC.</div>';return;}
   if(isCloneApp()){
     if(state.cloneNsMode==="other" && !$("#rsCloneTargetNs").value.trim()){ $("#rsErr").innerHTML='<div class="err">Indiquez le namespace cible.</div>'; return; }
     const cb=cloneAppBody(); cb.dry=true;
@@ -10651,7 +10691,7 @@ function openRestoreModal(ns, app){
   state.ns=ns; applyGlobalNs();
   // Application ciblée (page Applications) : {name, type, pvcs, whole_ns}. Sans
   // application (namespace entier), l'assistant se comporte comme avant.
-  state.app = (app && app.name && !app.whole_ns) ? {ns:ns, name:app.name, type:app.type, pvcs:app.pvcs||[], unassigned:!!app.unassigned} : null;
+  state.app = (app && app.name && !app.whole_ns) ? {ns:ns, name:app.name, type:app.type, pvcs:app.pvcs||[], workloads:app.workloads||[], unassigned:!!app.unassigned} : null;
   rsWizKind=rsKindFromState(); rsSyncOpts();
   $("#rsWizApp").innerHTML=rsAppLabel();
   $("#rsWizCluster").innerHTML=`<b>${esc(ctxInfo.context||"—")}</b>`;
@@ -10659,9 +10699,17 @@ function openRestoreModal(ns, app){
   if($("#rsCustomDir").checked) $("#rsAdvWrap").open=true;
   rsRenderAppNote();
   openModal("mRestore");
-  if(state.app && state.app.type==="stateless"){ rsWizKind="objects"; rsSyncOpts(); rsShowPage("type"); return objOpen(); }
+  // Application STATELESS : les parcours de stockage n'ont pas de sens -> seules les cartes
+  // « copie » (clone des workloads + dépendances) et « objets de configuration » restent,
+  // la seconde présélectionnée (restauration = ré-appliquer ses objets).
+  const sl = !!(state.app && state.app.type==="stateless");
+  document.querySelectorAll('#rsPgType .opt').forEach(o=>{ o.style.display = (sl && (o.dataset.kind==="inplace"||o.dataset.kind==="reattach"||o.dataset.kind==="dr")) ? "none" : ""; });
+  if(sl){ rsWizKind="objects"; rsSyncOpts(); }
   rsShowPage("type");
 }
+// Clone d'une application STATELESS (aucun volume) : le formulaire n'a pas de volumes à
+// cocher ; le serveur copie les workloads de l'application (+ dépendances).
+function rsStatelessClone(){ return !!(state.app && state.app.type==="stateless" && rsWizKind==="cloneapp"); }
 // Note « application ciblée » de l'assistant, avec le lien « tout le namespace » : quand
 // une application fonctionnelle est découpée en plusieurs applications par ses étiquettes
 // (ex. mariadb + wordpress), l'opérateur élargit la restauration à tout le namespace.
@@ -10675,6 +10723,7 @@ function rsRenderAppNote(){
 }
 function rsTargetWholeNs(){
   state.app=null; rsRenderAppNote();
+  document.querySelectorAll('#rsPgType .opt').forEach(o=>o.style.display="");   // tous les parcours de nouveau
   $("#rsWizApp").innerHTML=rsAppLabel(); const oa=$("#objApp"); if(oa) oa.innerHTML=rsAppLabel();
   if(rsWizPage==="form"){ rsAutoCheck=true; document.querySelectorAll(".rsChk").forEach(c=>c.checked=true); rebuildVolCfgs(); }
   else if(rsWizPage==="objects"){ objLoadList(); }
@@ -10689,6 +10738,11 @@ async function rsToForm(){
   rsShowPage("form");
   rsAutoCheck=true;
   $("#rsPlan").style.display="none";
+  if(rsStatelessClone()){
+    state.ns=$("#rsNs").value||state.ns; state.backup_path=null; state.selected={};
+    $("#rsPvcs").innerHTML=`<div class="note">Application <b>${esc(state.app.name)}</b> : <b>stateless</b>, aucun volume à restaurer. La copie recrée ses workloads (${esc((state.app.workloads||[]).map(w=>w.kind+"/"+w.name).join(", ")||"—")}) et leurs dépendances depuis le cluster.</div>`;
+    $("#rsConfig").style.display="none"; setRsStep(2); rsWizSync(); return;
+  }
   $("#rsPvcs").innerHTML='<div class="hint"><span class="spin"></span>Chargement des volumes…</div>';
   await loadPvcs();
   rsWizSync();
@@ -10723,7 +10777,8 @@ function rsWizSync(){
   else if(rsWizPage==="form"){
     const n=document.querySelectorAll(".rsChk:checked").length;
     const hyOn=!!(conn.hycu && conn.hycu.connected);
-    if(state.mode==="inplace" && hyOn){ src=$("#rsInplaceRun"); lbl="Restaurer"; }
+    if(rsStatelessClone()){ lbl="Vérifier la copie"; act=()=>$("#rsPreview").click(); }
+    else if(state.mode==="inplace" && hyOn){ src=$("#rsInplaceRun"); lbl="Restaurer"; }
     else {
       const items=collectItems(), filled=items.length>0 && items.every(i=>(i.new_ref||"").trim());
       const batch=$("#hyBatchGo");
@@ -12551,6 +12606,24 @@ I18N_EN += [
     ('<h2 class="dtitle">Tâches</h2>', '<h2 class="dtitle">Jobs</h2>'),
     ("Restaurer le namespace", "Restore the namespace"),
     (">tout le namespace</a>", ">whole namespace</a>"),
+    # Clone d'une application stateless
+    ("Vérifier la copie", "Check the copy"),
+    ("Application stateless : aucun volume à choisir.", "Stateless application: no volume to choose."),
+    ("</b> : <b>stateless</b>, aucun volume à restaurer. La copie recrée ses workloads (", "</b>: <b>stateless</b>, no volume to restore. The copy recreates its workloads ("),
+    (") et leurs dépendances depuis le cluster.", ") and their dependencies from the cluster."),
+    ("Lecture des workloads de « ", "Reading the workloads of « "),
+    (" » impossible : ", " » failed: "),
+    (" » introuvable dans le namespace « ", " » not found in namespace « "),
+    (" » (aucun workload).", " » (no workload)."),
+    (" » monte le(s) volume(s) ", " » mounts volume(s) "),
+    (" : ce n'est pas une application stateless — sélectionnez ses volumes pour la cloner.", ": it is not a stateless application — select its volumes to clone it."),
+    ("Application stateless « ", "Stateless application « "),
+    (" » : aucun volume — seuls ses workloads (", " »: no volume — only its workloads ("),
+    (") et leurs dépendances sont copiés.", ") and their dependencies are copied."),
+    ("Aucun workload sans volume", "No workload without volume"),
+    (" pour l'application « ", " for the application « "),
+    (" » dans l'instantané de cette sauvegarde : rien à recréer.", " » in this backup's snapshot: nothing to recreate."),
+    (" dans l'instantané de cette sauvegarde : rien à recréer.", " in this backup's snapshot: nothing to recreate."),
     ("Restaurer plutôt <b>tout le namespace « ", "Rather restore <b>the whole namespace « "),
     (" »</b> (toutes ses applications)</a>", " »</b> (all its applications)</a>"),
     ("Aucun PVC ni workload dans le namespace '", "No PVC nor workload in namespace '"),
@@ -12563,8 +12636,8 @@ I18N_EN += [
      "<b>Applications</b>: one row per <b>application</b> (a namespace can hold several: workloads are grouped by the <code>app.kubernetes.io/instance</code>, <code>app.kubernetes.io/name</code> or <code>app</code> label), with its namespace and its <b>type</b>: <b>Stateful</b> (mounts volumes) or <b>Stateless</b> (configuration only). Select, then act at the top right: <b>Back up · Restore · Set Policy · Verify</b>. Backups stay <b>per namespace</b> (one consistent recipe); Restore targets the chosen application. <b>Active cluster / All clusters</b> toggle (grouped by NKP workspace)."),
     ("<b>Sauvegarder tous (filtrés)</b> : tous les namespaces autorisés d'un coup ; un namespace sans PVC <b>ni workload</b> est ignoré. Un namespace <b>stateless</b> (workloads sans volume) est sauvegardé : son instantané suffit à le restaurer.",
      "<b>Back up all (filtered)</b>: every allowed namespace at once; a namespace with no PVC <b>and no workload</b> is skipped. A <b>stateless</b> namespace (workloads without volume) is backed up: its snapshot is enough to restore it."),
-    ("<div class=\"tip\"><b>Application stateless (sans volume) ?</b> Cliquez <b>Restaurer</b> sur sa ligne : l'assistant ouvre directement le parcours <b>objets de configuration</b> avec <b>ses</b> objets précochés (workloads, Services, ConfigMaps/Secrets référencés) — les autres applications du namespace ne sont pas touchées. Pour une application <b>stateful</b>, seuls <b>ses</b> volumes sont présélectionnés dans les parcours de stockage. <b>Tout le namespace</b> (ex. mariadb + wordpress découpés par leurs étiquettes) : cochez plusieurs applications du même namespace puis <b>Restaurer le namespace</b>, ou cliquez le lien « tout le namespace » dans l'assistant.</div>",
-     "<div class=\"tip\"><b>Stateless application (no volume)?</b> Click <b>Restore</b> on its row: the wizard opens the <b>configuration objects</b> path directly with <b>its</b> objects pre-ticked (workloads, Services, referenced ConfigMaps/Secrets) — the other applications of the namespace are left untouched. For a <b>stateful</b> application, only <b>its</b> volumes are preselected in the storage paths. <b>The whole namespace</b> (e.g. mariadb + wordpress split by their labels): tick several applications of the same namespace then <b>Restore the namespace</b>, or click the “whole namespace” link in the wizard.</div>"),
+    ("<div class=\"tip\"><b>Application stateless (sans volume) ?</b> Cliquez <b>Restaurer</b> sur sa ligne : l'assistant ne propose que deux parcours — <b>copie</b> (clone de ses workloads et dépendances, même namespace avec suffixe ou autre namespace, comme pour une application stateful) et <b>objets de configuration</b> (présélectionné) avec <b>ses</b> objets précochés (workloads, Services, ConfigMaps/Secrets référencés) — les autres applications du namespace ne sont pas touchées. Pour une application <b>stateful</b>, seuls <b>ses</b> volumes sont présélectionnés dans les parcours de stockage. <b>Tout le namespace</b> (ex. mariadb + wordpress découpés par leurs étiquettes) : cochez plusieurs applications du même namespace puis <b>Restaurer le namespace</b>, ou cliquez le lien « tout le namespace » dans l'assistant.</div>",
+     "<div class=\"tip\"><b>Stateless application (no volume)?</b> Click <b>Restore</b> on its row: the wizard offers only two paths — <b>copy</b> (clone of its workloads and dependencies, same namespace with suffix or another namespace, as for a stateful application) and <b>configuration objects</b> (preselected) with <b>its</b> objects pre-ticked (workloads, Services, referenced ConfigMaps/Secrets) — the other applications of the namespace are left untouched. For a <b>stateful</b> application, only <b>its</b> volumes are preselected in the storage paths. <b>The whole namespace</b> (e.g. mariadb + wordpress split by their labels): tick several applications of the same namespace then <b>Restore the namespace</b>, or click the “whole namespace” link in the wizard.</div>"),
     ("Volume(s) absent(s) de la dernière sauvegarde : ", "Volume(s) missing from the latest backup: "),
     (" — relancez une sauvegarde", " — run a backup again"),
     (" sauvegarde(s) de configuration du namespace", " configuration backup(s) of the namespace"),
