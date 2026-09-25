@@ -107,6 +107,34 @@ try:
           "VG source (Nutanix) résolu vers l'identité HYCU -> points trouvés -> clone -> UUID")
     check(CALLS and CALLS[0]["source_uuid"] == HYU, "le clone HYCU utilise l'uuid HYCU résolu")
 
+    print("\n== Restauration IN-PLACE : VG recréé à son UUID d'origine (aucune découverte) ==")
+    prev_restore = H.action_hycu_restore
+    rest_calls = []
+    def fake_restore_call(p):
+        rest_calls.append(p)
+        # mode "inplace" -> action_hycu_restore mettra createVolumeGroup=false (restore sur place)
+        assert p["mode"] == "inplace" and p["source_uuid"] == NHY and not p["dry"]
+        return {"ok": True, "dry": False, "job_id": "job-r"}
+    H.action_hycu_restore = fake_restore_call
+    H.action_hycu_job = lambda jid: {"ok": True, "status": "OK"}
+    H._hycu_list_vgs = lambda: ([{"uuid": NHY, "name": "pvc-afae3cb2", "externalId": NSRC, "hasBackups": True}], None)
+    H.action_hycu_restore_points = lambda src: ({"ok": True, "points": [{"id": "rp-1", "restorable": True}]}
+                                                if src == NHY else {"ok": True, "points": []})
+    with H.CRED_LOCK:
+        H.SESSION_CREDS["hycu"] = {"access": "a", "secret": "b"}
+    r = H.action_hycu_provision_restore({"volumes": [{"pvc": "mariadb-pvc", "source_vg_uuid": NSRC,
+                                                      "vg_name": "pvc-afae3cb2"}], "dry": False})
+    check(r["ok"] and not r["dry"], "restauration in-place réelle OK")
+    check(rest_calls and rest_calls[0]["mode"] == "inplace" and rest_calls[0]["source_uuid"] == NHY,
+          "vgrestore in-place (createVolumeGroup=false) sur l'identité HYCU résolue")
+    # dry : plan seulement, aucun appel de restauration
+    rest_calls.clear()
+    r = H.action_hycu_provision_restore({"volumes": [{"pvc": "mariadb-pvc", "source_vg_uuid": NSRC,
+                                                      "vg_name": "pvc-afae3cb2"}], "dry": True})
+    check(r["ok"] and r["dry"] and not rest_calls, "simulation in-place : plan seulement, aucune restauration")
+    # NB : on garde HYCU connecté (les sections suivantes en ont besoin).
+    H.action_hycu_restore = prev_restore     # rendre le mock attendu par la suite
+
     print("\n== Découverte : ambiguïté jamais tranchée au hasard ==")
     H.action_hycu_restore_points = lambda src: {"ok": True, "points": [
         {"id": "rp-latest", "time": "2026-09-25 01:00", "restorable": True}]}

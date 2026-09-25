@@ -231,17 +231,22 @@ try:
     kinds3 = {(m.get("kind"), (m.get("metadata") or {}).get("name")) for m in applied3}
     check(("Deployment", "web") in kinds3, "workload recréé (réutilisation du VG d'origine)")
 
-    print("\n== VG d'origine SUPPRIMÉ : restauration auto via HYCU en un clic (reuse) ==")
+    print("\n== VG d'origine SUPPRIMÉ : restauration IN-PLACE auto via HYCU (reuse, 1 clic) ==")
     s_iqn = H.action_nutanix_iqn
-    s_prov = H.action_hycu_provision_clone
-    prov_calls = []
+    s_rest = H.action_hycu_provision_restore
+    s_clone = H.action_hycu_provision_clone
+    rest_calls, clone_calls = [], []
     H.action_nutanix_iqn = lambda u: {"ok": False, "error": "not found"}   # VG absent du cluster
-    def fake_prov(p):
-        prov_calls.append(p)
+    def fake_restore(p):
+        rest_calls.append(p)
         return {"ok": True, "dry": bool(p.get("dry", True)),
-                "items": [{"pvc": v["pvc"], "new_ref": None} for v in p.get("volumes", [])],
-                "log": [{"ok": True, "dry": True, "label": "Plan HYCU (test)"}]}
-    H.action_hycu_provision_clone = fake_prov
+                "log": [{"ok": True, "dry": True, "label": "Restauration HYCU sur place (test)"}]}
+    def fake_clone(p):
+        clone_calls.append(p)
+        return {"ok": True, "dry": bool(p.get("dry", True)),
+                "items": [{"pvc": v["pvc"], "new_ref": None} for v in p.get("volumes", [])], "log": []}
+    H.action_hycu_provision_restore = fake_restore
+    H.action_hycu_provision_clone = fake_clone
     applied5 = []
     def capture5(m, basename, dry, label):
         applied5.append(json.loads(json.dumps(m)))
@@ -251,21 +256,38 @@ try:
         H.SESSION_CREDS["hycu"] = {"access": "a", "secret": "b"}
         H.SESSION_CREDS["prismcentral"] = {"access": "a", "secret": "b"}
     try:
+        # Mode par défaut "restore" : restauration in-place, réutilisation de l'UUID d'origine.
         r = H.action_clone_app({**rec, "items": [{"pvc": "data", "new_ref": ""}]})
     finally:
         H._apply_manifest = real_apply
+    check(r["ok"], "récupération avec VG supprimé (mode restore) : %s" % (r.get("error") or "ok"))
+    check(len(rest_calls) == 1 and not clone_calls
+          and rest_calls[0]["volumes"][0]["source_vg_uuid"] == VG_OLD
+          and rest_calls[0]["volumes"][0]["vg_name"] == "pvc-orig",
+          "VG absent -> restauration IN-PLACE HYCU appelée (pas de clone)")
+    vh5 = [((m.get("spec") or {}).get("csi") or {}).get("volumeHandle")
+           for m in applied5 if m.get("kind") == "PersistentVolume"]
+    check(vh5 == ["NutanixVolumes-" + VG_OLD],
+          "le PV réutilise le VG d'ORIGINE (UUID conservé, aucune découverte)")
+
+    # Mode "clone" : bascule sur la création d'un nouveau VG.
+    rest_calls.clear(); clone_calls.clear()
+    saved_mode = H.CONFIG.get("recover_deleted_vg_mode")
+    H.CONFIG["recover_deleted_vg_mode"] = "clone"
+    H._apply_manifest = capture5
+    try:
+        r = H.action_clone_app({**rec, "items": [{"pvc": "data", "new_ref": ""}]})
+    finally:
+        H._apply_manifest = real_apply
+        H.CONFIG["recover_deleted_vg_mode"] = saved_mode
         H.action_nutanix_iqn = s_iqn
-        H.action_hycu_provision_clone = s_prov
+        H.action_hycu_provision_restore = s_rest
+        H.action_hycu_provision_clone = s_clone
         with H.CRED_LOCK:
             H.SESSION_CREDS["hycu"] = None
             H.SESSION_CREDS["prismcentral"] = None
-    check(r["ok"], "récupération avec VG supprimé : %s" % (r.get("error") or "ok"))
-    check(len(prov_calls) == 1 and prov_calls[0]["volumes"][0]["source_vg_uuid"] == VG_OLD
-          and prov_calls[0]["volumes"][0]["vg_name"] == "pvc-orig",
-          "VG absent -> provision HYCU appelée (source = Source UUID, nom = nom du PV)")
-    txt5 = json.dumps(r.get("log", []), ensure_ascii=False)
-    check("restauration automatique depuis HYCU" in txt5,
-          "journal : bascule automatique vers la restauration HYCU signalée")
+    check(r["ok"] and len(clone_calls) == 1 and not rest_calls,
+          "mode « clone » : bascule sur la création d'un nouveau VG")
 
     print("\n== Sauvegarde SANS resources.json : dégradé (volumes seulement), pas de blocage ==")
     ndir = os.path.join(tmp, "_contexts", "dr-site", "sansres", "2026-09-24_10-00-00_000000")

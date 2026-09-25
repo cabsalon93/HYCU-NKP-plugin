@@ -176,6 +176,10 @@ DEFAULT_CONFIG = {
     # HYCU, restaurer/cloner automatiquement le VG via HYCU et découvrir son nouvel UUID
     # — en un seul clic « Restaurer ». Requiert HYCU + Prism connectés.
     "recover_restore_deleted_vg": True,
+    # Mode de récupération d'un VG supprimé : "restore" = restauration IN-PLACE via HYCU
+    # (le VG revient à son UUID d'origine, on réutilise le PV tel quel — le plus simple) ;
+    # "clone" = HYCU crée un nouveau VG (nouvel UUID) et l'outil le découvre.
+    "recover_deleted_vg_mode": "restore",
     "config_backup_kinds": list(CONFIG_BACKUP_KINDS_DEFAULT),   # types namespacés exportés
     # False (défaut sûr) = les DONNÉES des Secrets sont MASQUÉES sur disque (structure
     # conservée, valeurs remplacées par « __REDACTED__ »). True = secrets en clair dans
@@ -312,7 +316,7 @@ def save_config(updates):
 
 # Version horodatée de la build (format AAAAMMJJ-HHMM). À incrémenter à chaque
 # changement notable du programme ; affichée dans l'en-tête de l'interface.
-VERSION = "20260925-0520"
+VERSION = "20260925-0620"
 
 # Jeton anti-CSRF généré au démarrage, injecté dans la page et exigé sur les POST.
 CSRF_TOKEN = secrets.token_urlsafe(32)
@@ -5228,6 +5232,78 @@ def action_hycu_provision_clone(payload):
     return {"ok": True, "dry": dry, "items": items, "log": log}
 
 
+def _resolve_source_and_point(pvc, src, vg_name, log):
+    """Commun aux deux modes : résout l'identité HYCU du VG (depuis le Source UUID
+    Nutanix ou le nom) et choisit le point de restauration le plus récent.
+    Renvoie (hycu_uuid, restore_point_id, erreur)."""
+    good = [p for p in (action_hycu_restore_points(src).get("points") or []) if p.get("restorable", True)]
+    hy_src = src
+    if not good:
+        resolved, rerr = _resolve_hycu_vg(src, vg_name)
+        if rerr:
+            return None, None, rerr
+        if resolved and resolved.lower() != src.lower():
+            hy_src = resolved
+            log.append(logentry("Identité HYCU du VG résolue pour %s" % pvc,
+                                stdout="%s -> %s" % (src, hy_src)))
+            good = [p for p in (action_hycu_restore_points(hy_src).get("points") or []) if p.get("restorable", True)]
+    else:
+        resolved, _ = _resolve_hycu_vg(src, vg_name)
+        if resolved:
+            hy_src = resolved
+    if not good:
+        return None, None, ("aucun point de restauration HYCU trouvé pour ce Volume Group. Vérifiez "
+                            "que l'application est (ou était) protégée dans HYCU.")
+    return hy_src, good[0].get("id"), None
+
+
+def action_hycu_provision_restore(payload):
+    """Restauration IN-PLACE d'un Volume Group supprimé via HYCU (createVolumeGroup=false) :
+    HYCU recrée le VG à SON IDENTITÉ D'ORIGINE (même UUID). Aucune découverte d'UUID —
+    on réutilise le Source UUID de la sauvegarde et le PV d'origine tel quel. Le plus
+    simple quand HYCU préserve l'UUID.
+    payload : { volumes:[{pvc, source_vg_uuid, vg_name?}], dry, job_timeout_s? }.
+    Renvoie { ok, dry, log, error }."""
+    dry = bool(payload.get("dry", True))
+    vols = payload.get("volumes") or []
+    if not vols:
+        return {"ok": False, "error": "Aucun volume à restaurer.", "log": []}
+    if not dry and not SESSION_CREDS.get("hycu"):
+        return {"ok": False, "error": "Connectez HYCU pour restaurer les volumes automatiquement "
+                "(sinon, saisissez les UUID manuellement).", "log": []}
+    timeout_s = int(payload.get("job_timeout_s") or 600)
+    log = []
+    for v in vols:
+        pvc = v.get("pvc")
+        src = (v.get("source_vg_uuid") or "").strip()
+        if not pvc or not src or not UUID_RE.search(src):
+            return {"ok": False, "error": "Volume « %s » : UUID du VG source manquant/invalide "
+                    "(re-lancez l'analyse HYCU)." % (pvc or "?"), "log": log}
+        hy_src, rp, err = _resolve_source_and_point(pvc, src, v.get("vg_name"), log)
+        if err:
+            return {"ok": False, "error": "Volume « %s » : %s" % (pvc, err), "log": log}
+        if dry:
+            log.append(logentry("Simulation : HYCU restaurera le Volume Group sur place (identité "
+                                "conservée) — aucune restauration réelle lancée.", dry=True, rc=None,
+                                stdout="%s : source HYCU %s, point de restauration %s, UUID conservé %s"
+                                       % (pvc, hy_src, rp, src)))
+            continue
+        rr = action_hycu_restore({"restore_point_id": rp, "mode": "inplace", "source_uuid": hy_src, "dry": False})
+        if not rr.get("ok"):
+            return {"ok": False, "error": "Volume « %s » : restauration HYCU refusée : %s"
+                    % (pvc, rr.get("error")), "log": log}
+        job_id = rr.get("job_id")
+        log.append(logentry("Restauration HYCU (sur place) lancée pour %s (VG %s, point %s, job %s)"
+                            % (pvc, hy_src, rp, job_id), stdout="Le VG est recréé à son UUID d'origine : %s" % src))
+        ok, st, jerr = _await_hycu_job(job_id, timeout_s=timeout_s)
+        if not ok:
+            return {"ok": False, "error": "Volume « %s » : %s" % (pvc, jerr), "log": log}
+        log.append(logentry("Volume Group restauré à son identité d'origine pour %s" % pvc,
+                            stdout="UUID conservé : %s" % src))
+    audit("hycu_provision_restore", count=len(vols), dry=dry)
+    return {"ok": True, "dry": dry, "log": log}
+
+
 # ----- HYCU : protéger réellement les données (assigner politique + sauvegarder) -----
 def action_hycu_policies():
     """Liste les politiques de protection HYCU."""
@@ -5986,21 +6062,29 @@ def action_clone_app(payload, log=None):
                         and _vg_exists(orig) is False):
                     # VG supprimé du cluster mais protégé dans HYCU -> restauration auto.
                     orig_pv_name = (old_pv.get("metadata") or {}).get("name") or ""
+                    vol = {"pvc": pvc_name, "source_vg_uuid": orig, "vg_name": orig_pv_name}
+                    mode = CONFIG.get("recover_deleted_vg_mode", "restore")
                     log.append(logentry("Volume d'origine de %s introuvable sur le cluster — "
                                         "restauration automatique depuis HYCU (« Protected deleted »)."
                                         % pvc_name, dry=dry, rc=None))
-                    prov = action_hycu_provision_clone({"volumes": [{"pvc": pvc_name,
-                                "source_vg_uuid": orig, "vg_name": orig_pv_name}], "dry": dry})
+                    if mode == "clone":
+                        # HYCU crée un NOUVEAU VG (nouvel UUID) que l'outil découvre.
+                        prov = action_hycu_provision_clone({"volumes": [vol], "dry": dry})
+                    else:
+                        # Restauration SUR PLACE : le VG revient à son UUID d'origine, on
+                        # réutilise le PV tel quel (new_ref reste l'UUID d'origine).
+                        prov = action_hycu_provision_restore({"volumes": [vol], "dry": dry})
                     for l in prov.get("log", []):
                         log.append(l)
                     if not prov.get("ok"):
                         return {"ok": False, "error": "« %s » : le volume d'origine n'existe plus et "
                                 "sa restauration automatique via HYCU a échoué : %s"
                                 % (pvc_name, prov.get("error")), "log": log}
-                    if not dry and prov.get("items"):
+                    if mode == "clone" and not dry and prov.get("items"):
                         disc = (prov["items"][0].get("new_ref") or "").strip()
                         if disc:
-                            new_ref = disc           # nouvel UUID (Source) du VG restauré
+                            new_ref = disc           # nouvel UUID (Source) du VG cloné
+                    # mode "restore" : new_ref reste = orig (UUID d'origine conservé)
         if not new_ref or not UUID_RE.search(new_ref):
             return {"ok": False, "error": "Référence du VG cloné manquante/invalide pour « %s » "
                     "(UUID du VG, volumeHandle, ou IQN)." % pvc_name, "log": []}
@@ -11980,6 +12064,15 @@ I18N_EN += [
     ("Créer les volumes automatiquement via HYCU", "Create the volumes automatically via HYCU"),
     ("Simulation du clone automatique via HYCU (aucun clone réel lancé).",
      "Simulation of the automatic clone via HYCU (no real clone launched)."),
+    ("Simulation : HYCU restaurera le Volume Group sur place (identité conservée) — aucune restauration réelle lancée.",
+     "Simulation: HYCU will restore the Volume Group in place (identity preserved) — no real restore launched."),
+    ("Restauration HYCU (sur place) lancée pour ", "HYCU restore (in place) started for "),
+    ("Le VG est recréé à son UUID d'origine : ", "The VG is recreated at its original UUID: "),
+    ("Volume Group restauré à son identité d'origine pour ", "Volume Group restored to its original identity for "),
+    ("UUID conservé : ", "UUID preserved: "),
+    ("Identité HYCU du VG résolue pour ", "VG HYCU identity resolved for "),
+    ("aucun point de restauration HYCU trouvé pour ce Volume Group. Vérifiez que l'application est (ou était) protégée dans HYCU.",
+     "no HYCU restore point found for this Volume Group. Check that the application is (or was) protected in HYCU."),
     ("Volume d'origine de ", "Original volume of "),
     (" introuvable sur le cluster — restauration automatique depuis HYCU (« Protected deleted »).",
      " not found on the cluster — automatic restore from HYCU (“Protected deleted”)."),

@@ -39,6 +39,8 @@
 
   "_section_backup_config": "— Sauvegarde de configuration étendue —",
   "config_backup_full": true,
+  "recover_restore_deleted_vg": true,
+  "recover_deleted_vg_mode": "restore",
   "backup_collect_restore_contract": true,
   "config_backup_kinds": [
     "deployment", "statefulset", "daemonset", "cronjob", "job",
