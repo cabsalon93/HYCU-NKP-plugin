@@ -316,7 +316,7 @@ def save_config(updates):
 
 # Version horodatée de la build (format AAAAMMJJ-HHMM). À incrémenter à chaque
 # changement notable du programme ; affichée dans l'en-tête de l'interface.
-VERSION = "20260925-1130"
+VERSION = "20260925-1200"
 
 # Jeton anti-CSRF généré au démarrage, injecté dans la page et exigé sur les POST.
 CSRF_TOKEN = secrets.token_urlsafe(32)
@@ -2886,7 +2886,7 @@ HELP_SECTIONS = [
 <li><b>Restaurer le stockage vers de nouveaux volumes</b> : de nouveaux Volume Groups sont clonés, l'application y est rattachée ; les volumes d'origine sont conservés.</li>
 <li><b>Restaurer des objets de configuration</b> : ré-applique des objets choisis depuis l'instantané d'une sauvegarde, avec <b>aperçu des différences</b> avant tout apply. Ne touche ni aux volumes ni aux données.</li>
 </ol>
-<div class="tip"><b>Application stateless (sans volume) ?</b> Cliquez <b>Restaurer</b> sur sa ligne : l'assistant ouvre directement le parcours <b>objets de configuration</b> avec <b>ses</b> objets précochés (workloads, Services, ConfigMaps/Secrets référencés) — les autres applications du namespace ne sont pas touchées. Pour une application <b>stateful</b>, seuls <b>ses</b> volumes sont présélectionnés dans les parcours de stockage.</div>
+<div class="tip"><b>Application stateless (sans volume) ?</b> Cliquez <b>Restaurer</b> sur sa ligne : l'assistant ouvre directement le parcours <b>objets de configuration</b> avec <b>ses</b> objets précochés (workloads, Services, ConfigMaps/Secrets référencés) — les autres applications du namespace ne sont pas touchées. Pour une application <b>stateful</b>, seuls <b>ses</b> volumes sont présélectionnés dans les parcours de stockage. <b>Tout le namespace</b> (ex. mariadb + wordpress découpés par leurs étiquettes) : cochez plusieurs applications du même namespace puis <b>Restaurer le namespace</b>, ou cliquez le lien « tout le namespace » dans l'assistant.</div>
 <div class="tip">Déroulé conseillé : lancez d'abord en <b>simulation</b> (plan affiché, aucun effet), relisez le récapitulatif, puis désactivez la simulation et relancez. En mode réel, l'outil demande de <b>retaper le nom du cluster</b>. Après une restauration réelle, la <b>Vérification</b> s'ouvre automatiquement (PVC Bound, pods Running).</div>
 <div class="tip">Si une étape échoue, la séquence <b>s'arrête</b> et l'application reste arrêtée (jamais redémarrée sur des volumes incohérents). Corrigez puis <b>relancez</b> : la reprise est idempotente et les réplicas d'origine sont mémorisés.</div>
 <div class="tip"><b>Application supprimée du cluster ?</b> Tant que ses sauvegardes existent, elle reste listée dans <b>Applications</b> avec le badge « Supprimée — restaurable ». Cliquez <b>Restaurer</b> : le parcours de récupération recrée tout (namespace, PV/PVC, workloads, dépendances non masquées) depuis la sauvegarde choisie, en <b>réutilisant les volumes d'origine</b> — rien à saisir. Si un Volume Group a été supprimé avec le namespace mais reste « Protected deleted » dans HYCU, il est <b>restauré automatiquement</b> (HYCU connecté). Décochez « réutiliser » seulement si vous avez restauré les données sur de nouveaux volumes. Aucune dérogation DR n'est requise : la récupération reste sur le même cluster/contexte.</div>"""),
@@ -10078,9 +10078,14 @@ function updateAppActs(){
   const objs=selAppObjs(), n=objs.length, anyMissing=objs.some(a=>a.missing), anyEmpty=objs.some(a=>a.type==="empty");
   $("#actBackup").disabled = !n || anyMissing || anyEmpty;
   ["#actPolicy","#actVerify"].forEach(id=>$(id).disabled = n!==1 || anyMissing);
-  // Restaurer : une seule ligne ; un namespace vide reste restaurable s'il a des sauvegardes
-  // (application supprimée mais namespace conservé) — restaurer une app SUPPRIMÉE est le cas clé.
-  $("#actRestore").disabled = n!==1 || (anyEmpty && !objs[0].protected);
+  // Restaurer : une application, OU plusieurs applications du MÊME namespace (= tout le
+  // namespace, ex. mariadb + wordpress séparés par leurs étiquettes). Un namespace vide
+  // reste restaurable s'il a des sauvegardes (application supprimée mais namespace
+  // conservé) — restaurer une app SUPPRIMÉE est le cas clé.
+  const sameNs = n>=1 && new Set(objs.map(a=>(a.cluster_id||ACTIVE_CID)+"|"+appNs(a))).size===1;
+  $("#actRestore").disabled = !sameNs || (anyEmpty && !objs[0].protected);
+  const rs=$("#actRestore span"); if(rs){ if(!rs.dataset.lbl) rs.dataset.lbl=rs.textContent;
+    rs.textContent = (sameNs && n>1) ? "Restaurer le namespace" : rs.dataset.lbl; }
 }
 // Opération sur UNE application d'un autre cluster (vue « Tous les clusters ») : on
 // bascule d'abord le cluster actif, pour que confirmations et garde-fous le désignent.
@@ -10095,9 +10100,10 @@ $("#actBackup").onclick=async()=>{
   if(cids.length===1) await ensureCluster(objs[0]);
   openBackupModal(objs.map(a=>a.name), objs);
 };
-$("#actRestore").onclick=async()=>{ const a=selAppObjs()[0]; await ensureCluster(a);
+$("#actRestore").onclick=async()=>{ const objs=selAppObjs(), a=objs[0]; await ensureCluster(a);
   if(a.missing) return openRecoverModal(appNs(a));
-  openRestoreModal(appNs(a), a); };
+  // Plusieurs applications du même namespace sélectionnées -> tout le namespace.
+  openRestoreModal(appNs(a), objs.length>1 ? null : a); };
 $("#actPolicy").onclick=async()=>{ const a=selAppObjs()[0]; await ensureCluster(a); openPolicyModal(appNs(a)); };
 $("#actVerify").onclick=async()=>{ const a=selAppObjs()[0]; await ensureCluster(a); gotoVerify(appNs(a), false); };
 
@@ -10632,9 +10638,14 @@ function rsShowPage(p){
 function rsAppLabel(){
   const a=state.app;
   if(!a || a.whole_ns) return esc(state.ns||"—");
+  // Lien « tout le namespace » : élargit la restauration à toutes les applications du
+  // namespace (visible sur chaque page de l'assistant, pas seulement la page Type).
   return esc(state.ns||"—")+' <span class="sep">›</span> '+esc(a.name)+
-    (a.type==="stateless" ? ' <span class="badge b-pending">Stateless</span>' : a.type==="stateful" ? ' <span class="badge b-bound">Stateful</span>' : "");
+    (a.type==="stateless" ? ' <span class="badge b-pending">Stateless</span>' : a.type==="stateful" ? ' <span class="badge b-bound">Stateful</span>' : "")+
+    ' <a href="#" class="rsWholeNs" style="margin-left:8px;font-weight:400;font-size:12px">tout le namespace</a>';
 }
+document.addEventListener("click", e=>{ const a=e.target.closest && e.target.closest(".rsWholeNs, #rsWholeNs");
+  if(a){ e.preventDefault(); rsTargetWholeNs(); } });
 function openRestoreModal(ns, app){
   ns = ns || state.ns || $("#rsNs").value; if(!ns) return;
   state.ns=ns; applyGlobalNs();
@@ -10646,16 +10657,28 @@ function openRestoreModal(ns, app){
   $("#rsWizCluster").innerHTML=`<b>${esc(ctxInfo.context||"—")}</b>`;
   ["#rsLog","#rsInplaceLog","#rsErr"].forEach(id=>$(id).innerHTML="");
   if($("#rsCustomDir").checked) $("#rsAdvWrap").open=true;
-  const note=$("#rsAppNote");
-  if(note){
-    note.style.display = state.app ? "block" : "none";
-    note.innerHTML = !state.app ? "" : state.app.type==="stateless"
-      ? `Application <b>${esc(state.app.name)}</b> : <b>stateless</b> (aucun volume). Sa restauration = ré-appliquer ses objets de configuration (workloads, Services, ConfigMaps…) depuis l'instantané d'une sauvegarde — parcours <b>« objets de configuration »</b>, présélectionné.`
-      : `Application <b>${esc(state.app.name)}</b> : <b>stateful</b> — ses volumes (${esc(state.app.pvcs.join(", ")||"—")}) seront présélectionnés ; les autres volumes du namespace restent décochés.`;
-  }
+  rsRenderAppNote();
   openModal("mRestore");
   if(state.app && state.app.type==="stateless"){ rsWizKind="objects"; rsSyncOpts(); rsShowPage("type"); return objOpen(); }
   rsShowPage("type");
+}
+// Note « application ciblée » de l'assistant, avec le lien « tout le namespace » : quand
+// une application fonctionnelle est découpée en plusieurs applications par ses étiquettes
+// (ex. mariadb + wordpress), l'opérateur élargit la restauration à tout le namespace.
+function rsRenderAppNote(){
+  const note=$("#rsAppNote"); if(!note) return;
+  note.style.display = state.app ? "block" : "none";
+  const link=`<div style="margin-top:6px"><a href="#" id="rsWholeNs">Restaurer plutôt <b>tout le namespace « ${esc(state.ns||"")} »</b> (toutes ses applications)</a></div>`;
+  note.innerHTML = !state.app ? "" : (state.app.type==="stateless"
+    ? `Application <b>${esc(state.app.name)}</b> : <b>stateless</b> (aucun volume). Sa restauration = ré-appliquer ses objets de configuration (workloads, Services, ConfigMaps…) depuis l'instantané d'une sauvegarde — parcours <b>« objets de configuration »</b>, présélectionné.`
+    : `Application <b>${esc(state.app.name)}</b> : <b>stateful</b> — ses volumes (${esc(state.app.pvcs.join(", ")||"—")}) seront présélectionnés ; les autres volumes du namespace restent décochés.`)+link;
+}
+function rsTargetWholeNs(){
+  state.app=null; rsRenderAppNote();
+  $("#rsWizApp").innerHTML=rsAppLabel(); const oa=$("#objApp"); if(oa) oa.innerHTML=rsAppLabel();
+  if(rsWizPage==="form"){ rsAutoCheck=true; document.querySelectorAll(".rsChk").forEach(c=>c.checked=true); rebuildVolCfgs(); }
+  else if(rsWizPage==="objects"){ objLoadList(); }
+  rsWizSync();
 }
 async function rsToForm(){
   if(!rsWizKind) return;
@@ -12526,6 +12549,10 @@ I18N_EN += [
     # Applications dans les namespaces (stateful / stateless)
     ("volumes sans workload", "volumes without workload"),
     ('<h2 class="dtitle">Tâches</h2>', '<h2 class="dtitle">Jobs</h2>'),
+    ("Restaurer le namespace", "Restore the namespace"),
+    (">tout le namespace</a>", ">whole namespace</a>"),
+    ("Restaurer plutôt <b>tout le namespace « ", "Rather restore <b>the whole namespace « "),
+    (" »</b> (toutes ses applications)</a>", " »</b> (all its applications)</a>"),
     ("Aucun PVC ni workload dans le namespace '", "No PVC nor workload in namespace '"),
     ("' : rien à sauvegarder.", "': nothing to back up."),
     ("Aucun volume sélectionné et aucun workload dans l'instantané de cette sauvegarde : rien à recréer.",
@@ -12536,8 +12563,8 @@ I18N_EN += [
      "<b>Applications</b>: one row per <b>application</b> (a namespace can hold several: workloads are grouped by the <code>app.kubernetes.io/instance</code>, <code>app.kubernetes.io/name</code> or <code>app</code> label), with its namespace and its <b>type</b>: <b>Stateful</b> (mounts volumes) or <b>Stateless</b> (configuration only). Select, then act at the top right: <b>Back up · Restore · Set Policy · Verify</b>. Backups stay <b>per namespace</b> (one consistent recipe); Restore targets the chosen application. <b>Active cluster / All clusters</b> toggle (grouped by NKP workspace)."),
     ("<b>Sauvegarder tous (filtrés)</b> : tous les namespaces autorisés d'un coup ; un namespace sans PVC <b>ni workload</b> est ignoré. Un namespace <b>stateless</b> (workloads sans volume) est sauvegardé : son instantané suffit à le restaurer.",
      "<b>Back up all (filtered)</b>: every allowed namespace at once; a namespace with no PVC <b>and no workload</b> is skipped. A <b>stateless</b> namespace (workloads without volume) is backed up: its snapshot is enough to restore it."),
-    ("<div class=\"tip\"><b>Application stateless (sans volume) ?</b> Cliquez <b>Restaurer</b> sur sa ligne : l'assistant ouvre directement le parcours <b>objets de configuration</b> avec <b>ses</b> objets précochés (workloads, Services, ConfigMaps/Secrets référencés) — les autres applications du namespace ne sont pas touchées. Pour une application <b>stateful</b>, seuls <b>ses</b> volumes sont présélectionnés dans les parcours de stockage.</div>",
-     "<div class=\"tip\"><b>Stateless application (no volume)?</b> Click <b>Restore</b> on its row: the wizard opens the <b>configuration objects</b> path directly with <b>its</b> objects pre-ticked (workloads, Services, referenced ConfigMaps/Secrets) — the other applications of the namespace are left untouched. For a <b>stateful</b> application, only <b>its</b> volumes are preselected in the storage paths.</div>"),
+    ("<div class=\"tip\"><b>Application stateless (sans volume) ?</b> Cliquez <b>Restaurer</b> sur sa ligne : l'assistant ouvre directement le parcours <b>objets de configuration</b> avec <b>ses</b> objets précochés (workloads, Services, ConfigMaps/Secrets référencés) — les autres applications du namespace ne sont pas touchées. Pour une application <b>stateful</b>, seuls <b>ses</b> volumes sont présélectionnés dans les parcours de stockage. <b>Tout le namespace</b> (ex. mariadb + wordpress découpés par leurs étiquettes) : cochez plusieurs applications du même namespace puis <b>Restaurer le namespace</b>, ou cliquez le lien « tout le namespace » dans l'assistant.</div>",
+     "<div class=\"tip\"><b>Stateless application (no volume)?</b> Click <b>Restore</b> on its row: the wizard opens the <b>configuration objects</b> path directly with <b>its</b> objects pre-ticked (workloads, Services, referenced ConfigMaps/Secrets) — the other applications of the namespace are left untouched. For a <b>stateful</b> application, only <b>its</b> volumes are preselected in the storage paths. <b>The whole namespace</b> (e.g. mariadb + wordpress split by their labels): tick several applications of the same namespace then <b>Restore the namespace</b>, or click the “whole namespace” link in the wizard.</div>"),
     ("Volume(s) absent(s) de la dernière sauvegarde : ", "Volume(s) missing from the latest backup: "),
     (" — relancez une sauvegarde", " — run a backup again"),
     (" sauvegarde(s) de configuration du namespace", " configuration backup(s) of the namespace"),

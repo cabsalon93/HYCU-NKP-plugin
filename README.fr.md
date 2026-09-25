@@ -330,6 +330,10 @@ HYCU :
      référencés) — case « Seulement les objets de l'application » pour masquer le
      reste du namespace. Un namespace stateless **supprimé** se récupère aussi
      (workloads + dépendances recréés depuis l'instantané, sans volume).
+     **Tout le namespace** (une application fonctionnelle découpée par ses
+     étiquettes, ex. `mariadb` + `wordpress`) : cochez plusieurs applications du même
+     namespace puis **Restaurer le namespace**, ou cliquez « tout le namespace »
+     dans l'assistant — tous les volumes / objets sont alors présélectionnés.
 2. **Options** : application et cluster cibles, **sauvegarde de configuration** à
    partir de laquelle reconstruire (la plus récente par défaut), **volumes** (tous
    présélectionnés) et un **point de restauration HYCU** par volume (**le plus

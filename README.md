@@ -322,6 +322,10 @@ Select **one** application → **Restore**. As in HYCU's *Application Restore*:
      ConfigMaps/Secrets) — the “Only the application's objects” box hides the rest
      of the namespace. A **deleted** stateless namespace can be recovered too
      (workloads + dependencies recreated from the snapshot, no volume).
+     **Whole namespace** (one functional application split by its labels, e.g.
+     `mariadb` + `wordpress`): tick several applications of the same namespace then
+     **Restore the namespace**, or click “whole namespace” in the wizard — every
+     volume / object is then preselected.
 2. **Options**: target application and cluster, **configuration backup** to
    rebuild from (most recent by default), **volumes** (all pre-selected) and one
    **HYCU restore point** per volume (**most recent pre-selected**). Generated
