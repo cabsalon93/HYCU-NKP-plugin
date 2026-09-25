@@ -19,6 +19,8 @@ def check(c, m):
 tmp = tempfile.mkdtemp()
 saved = dict(H.CONFIG)
 saved_kj = H.kubectl_json
+saved_rs = H.resource_state
+saved_rest = H._rest
 
 
 def boom(args):
@@ -84,6 +86,8 @@ try:
 
     print("\n== Garde-fou allow_dr_restore ==")
     H.kubectl_json = boom
+    # Récupération : le serveur vérifie que le namespace a DISPARU (une lecture, stubée ici).
+    H.resource_state = lambda kind, name, ns=None: ("absent", "")
     payload = {"namespace": "boutique", "target_namespace": "boutique", "backup_path": bdir,
                "items": [{"pvc": "data", "new_ref": VG_NEW}], "dry": True, "dr_restore": True,
                "dr_storageclass": "dr-class", "clone_refs": True}
@@ -236,7 +240,7 @@ try:
     s_rest = H.action_hycu_provision_restore
     s_clone = H.action_hycu_provision_clone
     rest_calls, clone_calls = [], []
-    H.action_nutanix_iqn = lambda u: {"ok": False, "error": "not found"}   # VG absent du cluster
+    H._rest = lambda sysname, method, path, body=None, timeout=30: {"ok": False, "status": 404, "error": "HTTP 404"}   # VG absent (404 explicite)
     def fake_restore(p):
         rest_calls.append(p)
         return {"ok": True, "dry": bool(p.get("dry", True)),
@@ -281,6 +285,7 @@ try:
         H._apply_manifest = real_apply
         H.CONFIG["recover_deleted_vg_mode"] = saved_mode
         H.action_nutanix_iqn = s_iqn
+        H._rest = saved_rest
         H.action_hycu_provision_restore = s_rest
         H.action_hycu_provision_clone = s_clone
         with H.CRED_LOCK:
@@ -327,6 +332,8 @@ try:
           "avertissement clair : volumes seulement")
 finally:
     H.kubectl_json = saved_kj
+    H.resource_state = saved_rs
+    H._rest = saved_rest
     H._LOCAL_CTX.update({"name": None, "at": 0.0})
     H.CONFIG.clear(); H.CONFIG.update(saved)
     shutil.rmtree(tmp, ignore_errors=True)

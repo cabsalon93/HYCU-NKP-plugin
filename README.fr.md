@@ -278,6 +278,11 @@ manuel des manifestes décrit dans la procédure HYCU).
 - **Sauvegarder tous (filtrés)** : sauvegarde en une fois **tous les namespaces
   autorisés** par le filtre, ou **tous** les namespaces du cluster si aucun filtre.
   Un namespace sans PVC est **ignoré** (pas une erreur).
+- **Sauvegarde partielle** : si un PV lié n'a pas pu être lu (API indisponible,
+  droits), la sauvegarde est conservée avec un marqueur `index.partial` et la
+  liste des erreurs, l'opération est signalée en échec et **aucune ancienne
+  version n'est purgée** (une sauvegarde incomplète ne remplace jamais une
+  sauvegarde complète).
 - **Dossier de destination (optionnel)** : par défaut `hycu-backups/` (à côté du
   programme) ; tout dossier de la machine qui exécute l'outil est possible, p. ex.
   `D:\sauvegardes\hycu` ou `/mnt/backups`.
@@ -409,7 +414,7 @@ la page **Réglages** de l'interface. Toutes les clés sont optionnelles.
 | `strip_claimref` | `false` | `true` = retirer entièrement `claimRef` du PV (laisse le PVC recréé rebinder). `false` = conserver `claimRef` (name+namespace) sans uid/resourceVersion. |
 | `auto_backup_enabled` | `false` | Sauvegarde automatique planifiée de tous les namespaces autorisés par le filtre, tant que l'outil tourne. |
 | `auto_backup_interval_hours` | `24` | Intervalle entre deux sauvegardes automatiques (heures, minimum 0,25). |
-| `auto_backup_keep` | `15` | Rétention « compteur » : versions conservées par namespace. |
+| `auto_backup_keep` | `15` | Rétention « compteur » : versions conservées par namespace. `0` = illimité (aucune purge). Les sauvegardes partielles ne sont jamais purgées automatiquement. |
 | `auto_backup_retention` | `"count"` | `"gfs"` = rétention grand-père/père/fils : la plus récente de chaque **jour** / **semaine** / **mois** est conservée. |
 | `auto_backup_keep_daily` / `_weekly` / `_monthly` | `7` / `4` / `12` | Fenêtres GFS (jours / semaines ISO / mois). La sauvegarde la plus récente est toujours conservée. |
 | `namespace_label_selector` | `""` | Sélecteur d'étiquettes appliqué à la liste des namespaces (tous clusters), ex. `hycu.io/backup=true` : les équipes s'incluent via leurs manifestes (GitOps). Vide = inactif. |
@@ -496,7 +501,7 @@ vrai cluster** :
 | « Contexte : indisponible » | `kubectl` absent du PATH ou contexte non configuré. |
 | « Namespace non autorisé » | Le namespace n'est pas dans `namespace_filter`. Dans la page Vérification, le bouton **« Autoriser « ns » et réessayer »** l'ajoute en un clic ; un namespace créé par un clone d'application est ajouté automatiquement. |
 | « Contexte non autorisé » | Le contexte courant n'est pas dans `allowed_contexts`. |
-| Namespace détruit, application absente ? | Elle reste listée tant qu'une sauvegarde existe (badge « Supprimée — restaurable ») : **Restaurer** → récupération depuis la sauvegarde (namespace, PV/PVC, workloads, dépendances non masquées), sans dérogation DR — restaurez d'abord les Volume Groups dans HYCU et collez leurs UUID. |
+| Namespace détruit, application absente ? | Elle reste listée tant qu'une sauvegarde existe (badge « Supprimée — restaurable ») : **Restaurer** → récupération depuis la sauvegarde (namespace, PV/PVC, workloads, dépendances non masquées), sans dérogation DR. Le Volume Group d'origine est réutilisé s'il existe encore ; s'il a été supprimé mais reste « Protected deleted » dans HYCU, l'outil le restaure **in-place** automatiquement (`recover_restore_deleted_vg`). La récupération est **refusée** si le namespace existe encore (utilisez Restaurer/Cloner) ou si son état ne peut pas être vérifié. |
 | PVC/PV reste `Terminating` | L'outil patche les finalizers automatiquement ; sinon vérifier qu'aucun pod ne monte encore le volume. |
 | « Jeton anti-CSRF invalide » | Rechargez la page (le jeton est régénéré à chaque démarrage). |
 | Les connexions redemandent le déverrouillage | Comportement attendu : une nouvelle session navigateur (navigateur relancé, fenêtre privée) verrouille les identifiants — re-saisissez la phrase secrète du coffre. |

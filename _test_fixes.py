@@ -60,7 +60,7 @@ check(r_scheme.get("ok") is False and "Schéma" in (r_scheme.get("error") or "")
 
 print("\n== V7 : clone d'app refuse la réf SOURCE / le nom du VG ==")
 H.CONFIG["namespace_filter"] = []
-H._load_old_pv = lambda ns, pvc, bp, root=None: (H.json.loads(H.json.dumps(SRC_PV)), "pvc-" + PVCU)
+H._load_old_pv = lambda ns, pvc, bp, root=None, no_live=False: (H.json.loads(H.json.dumps(SRC_PV)), "pvc-" + PVCU)
 H._load_backup_pvc = lambda bp, pvc, root=None: H.json.loads(H.json.dumps(SRC_PVC))
 base_clone = {"namespace": "wordpress", "target_namespace": "", "suffix": "-clone", "dry": True}
 # réf = UUID du VG SOURCE -> same_uuid

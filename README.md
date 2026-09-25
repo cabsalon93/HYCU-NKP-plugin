@@ -274,6 +274,10 @@ cleanup described in the HYCU procedure).
 - **Back up all (filtered)**: backs up in one go **all namespaces allowed** by
   the filter, or **all** namespaces of the cluster if no filter. A namespace
   without PVCs is **skipped** (not an error).
+- **Partial backup**: if a bound PV could not be read (API unavailable, RBAC),
+  the backup is kept with an `index.partial` marker and the error list, the
+  operation is reported as failed and **no older version is pruned** (an
+  incomplete backup never replaces a complete one).
 - **Destination folder (optional)**: by default `hycu-backups/` (next to the
   program); any folder on the machine running the tool can be used, e.g.
   `D:\backups\hycu` or `/mnt/backups`.
@@ -397,7 +401,7 @@ Copy `hycu_config.example.json` → `hycu_config.json`. Also editable via the
 | `strip_claimref` | `false` | `true` = remove `claimRef` entirely from the PV (lets the recreated PVC rebind). `false` = keep `claimRef` (name+namespace) without uid/resourceVersion. |
 | `auto_backup_enabled` | `false` | Scheduled automatic backup of all namespaces allowed by the filter, while the tool runs. |
 | `auto_backup_interval_hours` | `24` | Interval between automatic backups (hours, minimum 0.25). |
-| `auto_backup_keep` | `15` | “Count” retention: versions kept per namespace. |
+| `auto_backup_keep` | `15` | “Count” retention: versions kept per namespace. `0` = unlimited (no pruning). Partial backups are never pruned automatically. |
 | `auto_backup_retention` | `"count"` | `"gfs"` = grandfather-father-son retention: the most recent backup of each **day** / **week** / **month** is kept. |
 | `auto_backup_keep_daily` / `_weekly` / `_monthly` | `7` / `4` / `12` | GFS windows (days / ISO weeks / months). The most recent backup is always kept. |
 | `namespace_label_selector` | `""` | Label selector applied to the namespace list (all clusters), e.g. `hycu.io/backup=true`: app teams opt in through their manifests (GitOps). Empty = inactive. |
@@ -486,7 +490,7 @@ cluster**:
 | “Context: unavailable” | `kubectl` missing from PATH or context not configured. |
 | “Namespace not allowed” | The namespace is not in `namespace_filter`. On the Verification page, the **“Allow « ns » and retry”** button adds it in one click; a namespace created by an application clone is added automatically. |
 | “Context not allowed” | The current context is not in `allowed_contexts`. |
-| Namespace destroyed, application gone? | It stays listed as long as a backup exists (“Deleted — restorable” badge): **Restore** → recovery from the backup (namespace, PV/PVC, workloads, non-redacted dependencies), no DR override needed — first restore the Volume Groups in HYCU and paste their UUIDs. |
+| Namespace destroyed, application gone? | It stays listed as long as a backup exists (“Deleted — restorable” badge): **Restore** → recovery from the backup (namespace, PV/PVC, workloads, non-redacted dependencies), no DR override needed. The original Volume Group is reused if it still exists; if it was deleted but remains “Protected deleted” in HYCU, the tool restores it **in-place** automatically (`recover_restore_deleted_vg`). Recovery is **refused** if the namespace still exists (use Restore/Clone) or if its state cannot be checked. |
 | PVC/PV stuck in `Terminating` | The tool patches finalizers automatically; otherwise check no pod still mounts the volume. |
 | “Invalid anti-CSRF token” | Reload the page (the token is regenerated at each startup). |
 | Connections ask to be unlocked again | Expected: a new browser session (restarted browser, private window) locks the credentials — enter the vault passphrase again. |

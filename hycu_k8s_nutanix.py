@@ -316,7 +316,7 @@ def save_config(updates):
 
 # Version horodatée de la build (format AAAAMMJJ-HHMM). À incrémenter à chaque
 # changement notable du programme ; affichée dans l'en-tête de l'interface.
-VERSION = "20260925-0620"
+VERSION = "20260925-0930"
 
 # Jeton anti-CSRF généré au démarrage, injecté dans la page et exigé sur les POST.
 CSRF_TOKEN = secrets.token_urlsafe(32)
@@ -637,7 +637,10 @@ def _local_context_name(max_age=15.0):
         with use_cluster(LOCAL_CID):
             r = kubectl(["config", "current-context"])
         name = r["stdout"].strip() if (r["ok"] and r["stdout"]) else None
-    _LOCAL_CTX.update({"name": name, "at": now})
+    # Un échec transitoire de kubectl n'est JAMAIS mis en cache : sinon, pendant 15 s,
+    # les sauvegardes seraient rangées sans contexte (disposition « legacy »), visibles
+    # et purgeables depuis n'importe quel autre contexte.
+    _LOCAL_CTX.update({"name": name, "at": now if name else 0.0})
     return name
 
 
@@ -1832,15 +1835,26 @@ def action_pvcs(ns):
     return {"ok": True, "pvcs": pvcs, "error": None}
 
 
-def action_backup(ns, dest=None):
+def action_backup(ns, dest=None, protect=None):
     """Exporte + nettoie tous les PV/PVC du namespace (étapes 1-3 du document).
-    `dest` (optionnel) = dossier de destination choisi par l'utilisateur (vide = défaut)."""
+    `dest` (optionnel) = dossier de destination choisi par l'utilisateur (vide = défaut).
+    `protect` = chemins de sauvegarde à ne jamais purger par la rétention (ex. la
+    sauvegarde SOURCE d'une restauration en cours)."""
     if not _namespace_allowed(ns):
         return {"ok": False, "error": "Namespace '%s' non autorisé par la configuration." % ns}
     root, derr = _resolve_backup_dest(dest)
     if derr:
         return {"ok": False, "error": derr}
     ferr = _storage_floor_error(root)
+    if ferr:
+        # Donner d'abord sa chance à la rétention/au quota de libérer de la place :
+        # sinon le plancher bloque la seule purge capable de le lever (verrou).
+        try:
+            _prune_backups(root, ns, CONFIG.get("auto_backup_keep", 15), protect=protect)
+            enforce_storage_quota(root)
+        except Exception as e:
+            print("Rétention avant sauvegarde : %s" % e)
+        ferr = _storage_floor_error(root)
     if ferr:
         audit("backup_refused_storage", namespace=ns, root=root)
         return {"ok": False, "error": ferr}
@@ -1856,6 +1870,7 @@ def action_backup(ns, dest=None):
              "context": action_context().get("context"),
              "cluster": _cluster_label(), "cluster_id": _current_cid(), "volumes": []}
     files = []
+    pv_errors = []                    # PV attendus mais illisibles -> sauvegarde PARTIELLE
     for pvc in items:
         name = pvc["metadata"]["name"]
         pv_name = pvc.get("spec", {}).get("volumeName")
@@ -1875,7 +1890,16 @@ def action_backup(ns, dest=None):
                 files.append(os.path.basename(pv_path))
                 entry["pv_file"] = os.path.basename(pv_path)
                 entry["analysis"] = analyse_pv(clean_v)
+            else:
+                # Ne JAMAIS avaler l'échec : sans le manifeste du PV, ce volume n'est pas
+                # restaurable ; la sauvegarde est marquée PARTIELLE et n'entraîne aucune
+                # purge des versions précédentes (complètes).
+                entry["pv_error"] = perr or "PV introuvable"
+                pv_errors.append("%s (PV %s) : %s" % (name, pv_name, entry["pv_error"]))
         index["volumes"].append(entry)
+    if pv_errors:
+        index["partial"] = True
+        index["pv_errors"] = pv_errors
 
     # Instantané de configuration ÉTENDUE (Deployments, Services, Secrets…) — lecture
     # seule, additif, n'échoue jamais la sauvegarde PV/PVC (voir _backup_namespace_resources).
@@ -1899,19 +1923,31 @@ def action_backup(ns, dest=None):
         except Exception as e:
             print("Contrat de restauration (%s) ignoré : %s" % (ns, e))
 
-    with open(os.path.join(d, "index.json"), "w", encoding="utf-8") as f:
+    # Écriture ATOMIQUE de l'index : un arrêt brutal ne laisse jamais un index tronqué
+    # (dossier invisible, non purgeable, non compté).
+    idx_tmp = os.path.join(d, "index.json.tmp")
+    with open(idx_tmp, "w", encoding="utf-8") as f:
         json.dump(index, f, indent=2)
+    os.replace(idx_tmp, os.path.join(d, "index.json"))
 
+    if pv_errors:
+        audit("backup", namespace=ns, dir=d, count=len(items), resources=resources_count,
+              partial=True, pv_errors=len(pv_errors))
+        return {"ok": False, "partial": True, "dir": d, "root": root, "count": len(items),
+                "files": files, "volumes": index["volumes"], "resources_count": resources_count,
+                "error": "Sauvegarde PARTIELLE de « %s » : manifeste de PV illisible pour %s. Les "
+                         "versions précédentes sont conservées (aucune purge)." % (ns, " ; ".join(pv_errors))}
     audit("backup", namespace=ns, dir=d, count=len(items), resources=resources_count)
     # Garde-fous stockage : la rétention par namespace s'applique aussi aux sauvegardes
     # MANUELLES (sinon elles s'accumulent sans limite), puis le quota global éventuel.
+    pruned = 0
     try:
-        _prune_backups(root, ns, CONFIG.get("auto_backup_keep", 15))
+        pruned = _prune_backups(root, ns, CONFIG.get("auto_backup_keep", 15), protect=protect)
         enforce_storage_quota(root)
     except Exception as e:
         print("Garde-fou stockage après sauvegarde : %s" % e)
     return _s3_after_backup(
-        {"ok": True, "error": None, "dir": d, "root": root, "count": len(items),
+        {"ok": True, "error": None, "dir": d, "root": root, "count": len(items), "pruned": pruned,
          "files": files, "volumes": index["volumes"], "resources_count": resources_count})
 
 
@@ -1943,7 +1979,8 @@ def action_backup_all(dest=None):
         if b.get("ok"):
             backed_up += 1
             vol_total += b.get("count", 0)
-            results.append({"ns": ns, "ok": True, "count": b.get("count", 0), "dir": b.get("dir")})
+            results.append({"ns": ns, "ok": True, "count": b.get("count", 0), "dir": b.get("dir"),
+                            "pruned": int(b.get("pruned") or 0)})
         else:
             err = b.get("error") or ""
             results.append({"ns": ns, "ok": False, "skipped": "Aucun PVC" in err,
@@ -2028,21 +2065,31 @@ def _gfs_keep_paths(backups, daily, weekly, monthly):
     return keep
 
 
-def _prune_backups(root, ns, keep):
-    """Rétention : mode « count » (garder les `keep` plus récentes) ou « gfs »
+def _prune_backups(root, ns, keep, protect=None):
+    """Rétention : mode « count » (garder les `keep` plus récentes ; 0 = pas de
+    rétention compteur, comme les autres réglages où 0 = illimité) ou « gfs »
     (quotidiennes/hebdomadaires/mensuelles — auto_backup_retention). Ne supprime QUE
     des dossiers de sauvegarde de l'outil (index.json présent) — jamais autre chose.
-    Renvoie le nombre supprimé."""
+    `protect` : chemins supplémentaires à ne jamais supprimer (ex. la sauvegarde SOURCE
+    d'une restauration en cours). Renvoie le nombre supprimé (audité s'il est > 0)."""
     try:
-        keep = max(1, int(keep))
+        keep = int(keep)
     except (TypeError, ValueError):
         keep = 15
+    mode = (CONFIG.get("auto_backup_retention") or "count")
+    if mode != "gfs" and keep <= 0:
+        return 0
     # Ne JAMAIS supprimer la sauvegarde de sécurité d'une transaction de restauration
-    # en cours : c'est la seule source des manifestes pour la reprise après échec.
+    # en cours (seule source des manifestes pour la reprise), ni les chemins protégés.
     txn = _load_txn(ns)
-    protected = os.path.realpath(txn["backup_dir"]) if (txn and txn.get("backup_dir")) else None
+    protected = set()
+    if txn and txn.get("backup_dir"):
+        protected.add(os.path.realpath(txn["backup_dir"]))
+    for p in (protect or []):
+        if p:
+            protected.add(os.path.realpath(p))
     backups = list_backups(ns, root)             # liste triée : plus récentes d'abord
-    if (CONFIG.get("auto_backup_retention") or "count") == "gfs":
+    if mode == "gfs":
         def _n(key, dflt):
             try:
                 return max(0, int(CONFIG.get(key)))
@@ -2056,13 +2103,16 @@ def _prune_backups(root, ns, keep):
         doomed = backups[keep:]
     removed = 0
     for b in doomed:
-        if protected and os.path.realpath(b["path"]) == protected:
+        if os.path.realpath(b["path"]) in protected:
             continue
         try:
             shutil.rmtree(b["path"])
             removed += 1
         except OSError as e:
             print("Rétention sauvegarde auto : suppression impossible de %s : %s" % (b["path"], e))
+    if removed:
+        audit("backup_prune", namespace=ns, removed=removed, mode=mode,
+              keep=(keep if mode != "gfs" else None))
     return removed
 
 
@@ -2122,9 +2172,15 @@ def _auto_backup_one(runner, dest):
     if failed:
         summary += " ; %d en ÉCHEC : %s" % (len(failed), ", ".join(failed[:5]))
     if ok and r.get("root"):
+        # La rétention est appliquée par action_backup (une fois par namespace) ; on
+        # additionne ce qu'elle a réellement supprimé.
         removed = 0
         for res in r.get("results") or []:
-            if res.get("ok") and res.get("ns"):
+            if not (res.get("ok") and res.get("ns")):
+                continue
+            if "pruned" in res:                  # action_backup a déjà appliqué la rétention
+                removed += int(res.get("pruned") or 0)
+            else:                                # runner externe : appliquer ici
                 removed += _prune_backups(r["root"], res["ns"], CONFIG.get("auto_backup_keep", 15))
         if removed:
             summary += " ; %d ancienne(s) version(s) supprimée(s)" % removed
@@ -2163,7 +2219,7 @@ def action_auto_backup_status():
     last = float(AUTO_BACKUP.get("last_run") or 0)
     enabled = bool(CONFIG.get("auto_backup_enabled"))
     try:
-        keep = max(1, int(CONFIG.get("auto_backup_keep") or 15))
+        keep = max(0, int(CONFIG.get("auto_backup_keep", 15)))   # 0 = illimité (pas de compteur)
     except (TypeError, ValueError):
         keep = 15
     return {"ok": True, "enabled": enabled,
@@ -2566,7 +2622,7 @@ HELP_SECTIONS = [
 <li><b>Applications → Définir la politique</b> : l'outil associe chaque PVC à son <b>Volume Group</b> HYCU (correspondance par UUID), assigne une politique HYCU et peut lancer une sauvegarde.</li>
 <li>Une correspondance « par nom » doit être <b>confirmée</b> (case à cocher) ; une ambiguïté n'est jamais tranchée automatiquement.</li>
 </ul>"""),
-    ("restaurer", "Restaurer — les 4 parcours", """
+    ("restaurer", "Restaurer — les 5 parcours", """
 <ol>
 <li><b>Restaurer toute l'application (copie)</b> : volumes + objets vers le même namespace (suffixe) ou un autre. L'original n'est pas modifié. Idéal pour vérifier une sauvegarde.</li>
 <li><b>Restaurer le stockage sur place</b> : HYCU restaure les données <b>dans</b> les volumes d'origine ; l'application est arrêtée puis redémarrée. Choisissez un point de restauration par volume (le plus récent est présélectionné).</li>
@@ -2575,7 +2631,7 @@ HELP_SECTIONS = [
 </ol>
 <div class="tip">Déroulé conseillé : lancez d'abord en <b>simulation</b> (plan affiché, aucun effet), relisez le récapitulatif, puis désactivez la simulation et relancez. En mode réel, l'outil demande de <b>retaper le nom du cluster</b>. Après une restauration réelle, la <b>Vérification</b> s'ouvre automatiquement (PVC Bound, pods Running).</div>
 <div class="tip">Si une étape échoue, la séquence <b>s'arrête</b> et l'application reste arrêtée (jamais redémarrée sur des volumes incohérents). Corrigez puis <b>relancez</b> : la reprise est idempotente et les réplicas d'origine sont mémorisés.</div>
-<div class="tip"><b>Application supprimée du cluster ?</b> Tant que ses sauvegardes existent, elle reste listée dans <b>Applications</b> avec le badge « Supprimée — restaurable ». Cliquez <b>Restaurer</b> : le parcours de récupération recrée tout (namespace, PV/PVC, workloads, dépendances non masquées) depuis la sauvegarde choisie — restaurez d'abord ses Volume Groups dans HYCU et collez leurs UUID. Aucune dérogation DR n'est requise : la récupération reste sur le même cluster/contexte.</div>"""),
+<div class="tip"><b>Application supprimée du cluster ?</b> Tant que ses sauvegardes existent, elle reste listée dans <b>Applications</b> avec le badge « Supprimée — restaurable ». Cliquez <b>Restaurer</b> : le parcours de récupération recrée tout (namespace, PV/PVC, workloads, dépendances non masquées) depuis la sauvegarde choisie, en <b>réutilisant les volumes d'origine</b> — rien à saisir. Si un Volume Group a été supprimé avec le namespace mais reste « Protected deleted » dans HYCU, il est <b>restauré automatiquement</b> (HYCU connecté). Décochez « réutiliser » seulement si vous avez restauré les données sur de nouveaux volumes. Aucune dérogation DR n'est requise : la récupération reste sur le même cluster/contexte.</div>"""),
     ("s3", "Export S3 (optionnel)", """
 <ul>
 <li>⚙ → Sources → <b>Stockage objet S3</b> : endpoint compatible S3 (Nutanix Objects, MinIO, AWS…), bucket, clés d'accès → <b>Tester &amp; connecter</b>.</li>
@@ -2842,10 +2898,17 @@ def _stop_workloads(current, ns, dry, log):
 
 
 def _restart_workloads(desired, ns, dry, log):
-    """Scale-up des workloads à leur nombre de réplicas d'origine."""
+    """Scale-up des workloads à leur nombre de réplicas d'origine. Renvoie (ok, [commandes
+    de redémarrage restantes]) : un scale-up en échec ne doit jamais passer inaperçu
+    (l'application resterait à 0 réplica avec un résultat « terminé »)."""
+    failed = []
     for w in desired:
-        log.append(kubectl(["scale", w["kind"], w["name"], "-n", ns, "--replicas=%s" % w["replicas"]],
-                           dry=dry, label="Redémarrage %s/%s -> %s" % (w["kind"], w["name"], w["replicas"])))
+        r = kubectl(["scale", w["kind"], w["name"], "-n", ns, "--replicas=%s" % w["replicas"]],
+                    dry=dry, label="Redémarrage %s/%s -> %s" % (w["kind"], w["name"], w["replicas"]))
+        log.append(r)
+        if not (r["ok"] or r.get("dry")):
+            failed.append("kubectl scale %s %s -n %s --replicas=%s" % (w["kind"], w["name"], ns, w["replicas"]))
+    return (not failed), failed
 
 
 def _pods_using_pvcs(ns, pvc_names):
@@ -3017,8 +3080,11 @@ def _backup_cluster_error(backup_path, backup_root=None, allow_dr=False):
     return None
 
 
-def _load_old_pv(ns, pvc_name, backup_path, backup_root=None):
-    """Renvoie (old_pv, pv_name) depuis la sauvegarde si fournie, sinon en live."""
+def _load_old_pv(ns, pvc_name, backup_path, backup_root=None, no_live=False):
+    """Renvoie (old_pv, pv_name) depuis la sauvegarde si fournie, sinon en live.
+    `no_live=True` (DR / récupération « depuis la sauvegarde seule ») : JAMAIS de repli
+    sur le cluster — le « live » serait le cluster CIBLE, dont un PVC homonyme fournirait
+    un mauvais gabarit et un mauvais UUID de référence."""
     bp = _safe_backup_path(backup_path, backup_root)
     if bp:
         idx_path = os.path.join(bp, "index.json")
@@ -3029,6 +3095,8 @@ def _load_old_pv(ns, pvc_name, backup_path, backup_root=None):
                 if v["pvc"] == pvc_name and v.get("pv_file"):
                     with open(os.path.join(bp, v["pv_file"]), encoding="utf-8") as f:
                         return json.load(f), v.get("pv")
+    if no_live:
+        return None, None
     # repli : lecture live
     live = action_pvcs(ns)
     pv_name = None
@@ -3125,6 +3193,8 @@ def _prepare_one(ns, item, mode, backup_path, backup_root=None):
             "old_volume_handle": built["old_volume_handle"], "old_iqn": built["old_iqn"],
             "replacements": built["replacements"], "no_change": built["no_change"],
             "stripped": built["stripped"], "warn": warn,
+            "looks_like_vg_name": bool(built.get("looks_like_vg_name")),
+            "same_uuid": bool(built.get("same_uuid")),
             "pvc_captured": pvc_manifest is not None, "pvc_manifest": pvc_manifest,
             "manifest_preview": json.dumps(built["manifest"], indent=2),
             "manifest": built["manifest"]}
@@ -3434,6 +3504,23 @@ def _execute_restore_locked(payload, log=None):
                 "results": prep.get("results")}
 
     prepared = [r for r in prep["results"] if r.get("ok")]
+    destructive_started = False      # vrai dès la première suppression réelle
+    # Garde AVANT toute destruction (la prévisualisation n'émet qu'un avertissement) :
+    # une référence qui est le NOM du VG (« pvc-<uuid-du-PVC> ») ou, en clone, l'UUID du
+    # VG SOURCE détruirait PVC/PV pour recréer un PV sur un VG inexistant / partagé.
+    if not dry and not payload.get("force_same_uuid"):
+        bad_name = [r["pvc"] for r in prepared if r.get("looks_like_vg_name")]
+        if bad_name:
+            return {"ok": False, "log": [], "results": prep.get("results"),
+                    "error": "Référence invalide pour %s : c'est le NOM du Volume Group (« pvc-<uuid> »), "
+                             "pas son UUID. Rien n'a été modifié." % ", ".join(bad_name)}
+        if payload.get("mode", "clone") == "clone":
+            same = [r["pvc"] for r in prepared if r.get("same_uuid")]
+            if same:
+                return {"ok": False, "log": [], "results": prep.get("results"),
+                        "error": "Référence identique au VG SOURCE pour %s : un clone doit pointer un "
+                                 "NOUVEAU Volume Group (multi-attach sinon). Rien n'a été modifié."
+                                 % ", ".join(same)}
     aborted = False
     abort_detail = ""
 
@@ -3454,7 +3541,7 @@ def _execute_restore_locked(payload, log=None):
                                        % (txn.get("started"), txn.get("mode"))))
         backup_dir = (txn or {}).get("backup_dir")
         if not txn and CONFIG.get("backup_before_restore", True):
-            b = action_backup(ns)
+            b = action_backup(ns, protect=[payload.get("backup_path")])
             log.append(logentry("Sauvegarde de sécurité du namespace avant restauration",
                                 ok=bool(b.get("ok")), rc=0 if b.get("ok") else -1,
                                 stdout=("Manifestes : %s" % b.get("dir")) if b.get("dir") else "",
@@ -3474,6 +3561,8 @@ def _execute_restore_locked(payload, log=None):
     current, desired, werr = _resolve_workloads(ns)
     if werr:
         log.append(logentry("Inventaire des workloads impossible", ok=False, rc=-1, stderr=werr))
+        if not dry and not txn:
+            _clear_txn(ns)           # rien n'a été détruit : pas de reprise à prévoir
         return _err("Inventaire des Deployments/StatefulSets impossible (%s) — restauration annulée : "
                     "sans lui, l'application ne serait ni arrêtée proprement ni redémarrée." % werr, log=log)
     log.append({"ok": True, "dry": dry, "label": "Réplicas mémorisés", "rc": 0, "stderr": "",
@@ -3513,7 +3602,12 @@ def _execute_restore_locked(payload, log=None):
         pvc_name = r["pvc"]
         pv_old = r.get("old_pv_name")
         new_name = r["new_pv_name"]
-        retain = bool(CONFIG.get("retain_source_pv", True))
+        # Retain TOUJOURS forcé quand le nouveau PV re-pointe le MÊME Volume Group (restore
+        # sur place) : avec reclaimPolicy=Delete, supprimer l'ancien PV détruirait le VG
+        # sur lequel on s'apprête à redémarrer l'application. La config ne peut pas
+        # désactiver cette protection.
+        same_vg = bool(r.get("old_volume_handle")) and r.get("new_volume_handle") == r.get("old_volume_handle")
+        retain = bool(CONFIG.get("retain_source_pv", True)) or same_vg or payload.get("mode") == "inplace"
 
         # Réécrire hypervisorAttachedDiskUUIDs avec le disque du VG cloné (clone) AVANT
         # l'apply : sans lui, le CSI tente l'attach iSCSI et l'attachement échoue.
@@ -3521,11 +3615,11 @@ def _execute_restore_locked(payload, log=None):
             disk_ok = _set_clone_disk_uuids(r.get("manifest"), r.get("new_volume_handle"), dry, log)
             if not disk_ok and not dry and CONFIG.get("clone_require_disk_uuids", True):
                 aborted = True
-                abort_detail = ("disque introuvable pour le Volume Group de %s — soit Prism Central "
-                                "n'est pas connecté, soit ce Volume Group n'existe plus (supprimé avec "
-                                "le namespace). Dans ce cas, décochez « réutiliser les volumes d'origine » "
-                                "et utilisez « Créer les volumes automatiquement via HYCU ». PV non recréé "
-                                "pour éviter un volume non attachable" % pvc_name)
+                abort_detail = (("disque introuvable pour le Volume Group de %s : Prism Central n'est pas "
+                                 "connecté (connectez-le puis relancez)" if not SESSION_CREDS.get("prismcentral")
+                                 else "disque introuvable pour le Volume Group de %s : ce Volume Group "
+                                 "n'existe plus côté Nutanix — restaurez-le dans HYCU puis relancez")
+                                % pvc_name + " — PV non recréé pour éviter un volume non attachable")
                 break
 
         if dry:
@@ -3560,6 +3654,7 @@ def _execute_restore_locked(payload, log=None):
                         abort_detail = "protection (Retain) du PV source %s — suppression annulée pour " \
                                        "ne pas risquer la perte du Volume Group" % pv_old
                         break
+            destructive_started = True
             if not _delete_and_unblock("pvc", pvc_name, ns, log):
                 aborted = True
                 abort_detail = "suppression du PVC %s" % pvc_name
@@ -3600,8 +3695,13 @@ def _execute_restore_locked(payload, log=None):
                                   "par votre déploiement applicatif (vérifiez ensuite qu'il devient Bound)."})
 
     # 4. Redémarrer l'application — UNIQUEMENT si rien n'a échoué.
+    restart_failed = []
     if not aborted:
-        _restart_workloads(desired, ns, dry, log)
+        ok_restart, restart_failed = _restart_workloads(desired, ns, dry, log)
+        if not ok_restart:
+            log.append({"ok": False, "dry": dry, "label": "REDÉMARRAGE INCOMPLET", "rc": -1, "stdout": "",
+                        "cmd": "", "stderr": "Les volumes sont restaurés mais un scale-up a échoué : "
+                        "l'application est (partiellement) ARRÊTÉE. Relancez à la main : " + "; ".join(restart_failed)})
     else:
         log.append({"ok": False, "dry": dry, "label": "SÉQUENCE INTERROMPUE", "rc": -1, "stdout": "",
                     "cmd": "", "stderr": ("Échec à l'étape : %s. " % (abort_detail or "inconnue")) +
@@ -3618,7 +3718,9 @@ def _execute_restore_locked(payload, log=None):
         mism = []
         for r in prepared:
             got, exp = vh_by_pvc.get(r["pvc"]), r["new_volume_handle"]
-            if got and exp and got != exp:
+            if exp and not got:
+                mism.append("%s non lié (aucun volumeHandle observé)" % r["pvc"])
+            elif got and exp and got != exp:
                 mism.append("%s lié à %s au lieu de %s" % (r["pvc"], got, exp))
         if mism:
             log.append(logentry("⚠ volumeHandle INATTENDU — vérifiez le volume réellement monté",
@@ -3629,18 +3731,27 @@ def _execute_restore_locked(payload, log=None):
         log.append(logentry("Vérification finale", cmd="kubectl get pvc/pv/pods",
                             stdout=json.dumps(v, indent=2)))
 
-    ok_all = (not aborted) and all(r["ok"] or r.get("dry") for r in log)
-    # Transaction : effacée si la restauration s'est terminée sans interruption (réel).
-    # Si interrompue, le marqueur reste -> le prochain run est traité comme une reprise.
-    if not dry and not aborted:
+    ok_all = (not aborted) and not restart_failed and all(r["ok"] or r.get("dry") for r in log)
+    # Transaction : effacée si la restauration s'est terminée sans interruption (réel),
+    # y compris quand seul le redémarrage a échoué (PV/PVC cohérents : rejouer la
+    # séquence serait inutile et destructif ; le scale-up manquant est indiqué).
+    # Interrompue AVANT toute suppression (inventaire, arrêt, attente des pods) : le
+    # marqueur est aussi effacé — rien n'est à reprendre, et le laisser bloquerait la
+    # sauvegarde automatique du namespace.
+    if not dry and (not aborted or not destructive_started):
         _clear_txn(ns)
     # Rappel : un VG CLONÉ tout neuf n'est pas protégé dans HYCU -> le signaler.
     reprotect = []
     if payload.get("mode", "clone") == "clone" and not dry and not aborted:
         reprotect = [{"pvc": r["pvc"], "new_pv_name": r["new_pv_name"],
                       "new_volume_handle": r["new_volume_handle"]} for r in prepared]
-    audit("restore_end", namespace=ns, dry=dry, ok=ok_all, aborted=aborted)
-    return {"ok": ok_all, "error": None, "dry": dry, "aborted": aborted, "log": log,
+    audit("restore_end", namespace=ns, dry=dry, ok=ok_all, aborted=aborted,
+          restart_failed=bool(restart_failed))
+    err = None
+    if restart_failed:
+        err = ("Volumes restaurés mais redémarrage incomplet — relancez à la main : "
+               + "; ".join(restart_failed))
+    return {"ok": ok_all, "error": err, "dry": dry, "aborted": aborted, "log": log,
             "reprotect": reprotect}
 
 
@@ -3922,10 +4033,15 @@ def _sigv4_auth(method, host, path, query, headers, payload_hash, region, servic
     (host inclus), clés en minuscules. Vérifié contre le vecteur officiel AWS."""
     datestamp = amzdate[:8]
     signed = ";".join(sorted(headers))
+    # `path` est DÉJÀ encodé par l'appelant (_s3_object_url) : ne pas le ré-encoder (un
+    # « % » deviendrait « %25 » et la signature ne correspondrait plus à l'URL envoyée).
+    # La chaîne de requête canonique est TRIÉE par nom de paramètre (exigence SigV4) :
+    # sans tri, « continuation-token » ajouté en fin casse la page 2 d'un listing.
+    canonical_query = "&".join(sorted(query.split("&"))) if query else ""
     canonical = "\n".join([
         method,
-        urllib.parse.quote(path, safe="/-_.~"),
-        query,
+        path or "/",
+        canonical_query,
         "".join("%s:%s\n" % (k, " ".join(str(headers[k]).split())) for k in sorted(headers)),
         signed,
         payload_hash,
@@ -4052,14 +4168,23 @@ def action_s3_list():
     return _ok(objects=out, prefix=prefix, bucket=CONFIG.get("s3_bucket"))
 
 
-def _safe_extract_zip(data, dest):
+IMPORT_MAX_BYTES = 2 * 1024 ** 3     # taille DÉCOMPRESSÉE maximale d'un export importé
+
+
+def _safe_extract_zip(data, dest, max_bytes=IMPORT_MAX_BYTES):
     """Extrait un zip en mémoire vers `dest`, en retirant le dossier racine unique
-    et en BLOQUANT toute traversée (zip-slip). Renvoie (nb fichiers, erreur)."""
+    et en BLOQUANT toute traversée (zip-slip) et toute archive « gonflée » (zip bomb :
+    taille annoncée ET taille réellement écrite bornées). Renvoie (nb fichiers, erreur)."""
     try:
         zf = zipfile.ZipFile(io.BytesIO(data))
     except zipfile.BadZipFile:
         return 0, "l'objet n'est pas un zip valide (mauvaise phrase de déchiffrement ?)"
     names = [n for n in zf.namelist() if not n.endswith("/")]
+    announced = sum((zf.getinfo(n).file_size or 0) for n in names)
+    if announced > max_bytes:
+        return 0, "archive rejetée : taille décompressée annoncée %d Mo > %d Mo" % (
+            announced // (1024 * 1024), max_bytes // (1024 * 1024))
+    written = 0
     roots = {n.split("/", 1)[0] for n in names if "/" in n}
     strip = (roots.pop() + "/") if (len(roots) == 1 and all("/" in n for n in names)) else ""
     dest_real = os.path.realpath(dest)
@@ -4071,7 +4196,14 @@ def _safe_extract_zip(data, dest):
             return 0, "archive rejetée : chemin hors zone (« %s »)" % n
         os.makedirs(os.path.dirname(target), exist_ok=True)
         with zf.open(n) as src, open(target, "wb") as f:
-            shutil.copyfileobj(src, f)
+            while True:
+                chunk = src.read(1024 * 1024)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > max_bytes:          # taille réelle > annoncée (bombe)
+                    return 0, "archive rejetée : contenu décompressé supérieur à %d Mo" % (max_bytes // (1024 * 1024))
+                f.write(chunk)
         count += 1
     return count, None
 
@@ -4097,6 +4229,10 @@ def action_s3_import(payload):
                 and re.fullmatch(r"[A-Za-z0-9._-]{1,80}", ts)):
             results.append({"key": label, "ok": False, "error": "clé invalide"})
             continue
+        ferr = _storage_floor_error(CONFIG["backup_root"])   # AVANT de télécharger
+        if ferr:
+            results.append({"key": label, "ok": False, "error": ferr})
+            break
         r = _s3_request("GET", key, b"", "", want_body=True)
         if not r["ok"]:
             results.append({"key": label, "ok": False, "error": r.get("error")})
@@ -4113,10 +4249,6 @@ def action_s3_import(payload):
                                 "error": "déchiffrement impossible (phrase incorrecte ou objet altéré)"})
                 continue
         dest = os.path.join(CONFIG["backup_root"], "_imports", cluster, nsname, ts)
-        ferr = _storage_floor_error(CONFIG["backup_root"])
-        if ferr:
-            results.append({"key": label, "ok": False, "error": ferr})
-            break
         n, err = _safe_extract_zip(data, dest)
         if err:
             shutil.rmtree(dest, ignore_errors=True)
@@ -4317,7 +4449,7 @@ _VAULT_MAGIC = b"HV2"
 
 def _derive_keys(passphrase, salt, iters=None):
     if iters is None:
-        iters = int(CONFIG.get("pbkdf2_iterations") or 200000)
+        iters = _pbkdf2_iters()
     dk = hashlib.pbkdf2_hmac("sha256", passphrase.encode("utf-8"), salt, iters, dklen=64)
     return dk[:32], dk[32:]   # (clé de chiffrement, clé MAC)
 
@@ -4331,12 +4463,22 @@ def _keystream(enc_key, nonce, length):
     return bytes(out[:length])
 
 
+def _pbkdf2_iters():
+    """Itérations PBKDF2 BORNÉES [1000 ; 10 000 000] à l'écriture — les mêmes bornes que
+    le déchiffrement, sinon un réglage hors bornes produit un coffre/export illisible."""
+    try:
+        v = int(CONFIG.get("pbkdf2_iterations") or 200000)
+    except (TypeError, ValueError):
+        v = 200000
+    return max(1000, min(v, 10_000_000))
+
+
 def _xor(data, ks):
     return bytes(a ^ b for a, b in zip(data, ks))
 
 
 def encrypt_secret(plaintext, passphrase):
-    iters = int(CONFIG.get("pbkdf2_iterations") or 200000)
+    iters = _pbkdf2_iters()
     salt = secrets.token_bytes(16)
     nonce = secrets.token_bytes(16)
     enc_key, mac_key = _derive_keys(passphrase, salt, iters)
@@ -4375,7 +4517,7 @@ _VAULT_MAGIC_BIN = b"HV2B"
 
 
 def encrypt_bytes(data, passphrase):
-    iters = int(CONFIG.get("pbkdf2_iterations") or 200000)
+    iters = _pbkdf2_iters()
     salt = secrets.token_bytes(16)
     nonce = secrets.token_bytes(16)
     enc_key, mac_key = _derive_keys(passphrase, salt, iters)
@@ -4599,10 +4741,13 @@ def action_nutanix_vgs(query=""):
             fresh = sum(1 for vg in items if keep(vg))
             meta = data.get("metadata") or {}
             total = meta.get("grand_total_entities") or meta.get("total_entities")
-            if not items or len(items) < page_size or fresh == 0:
+            if not items or fresh == 0:
                 break
-            if total is not None and page * page_size >= total:
-                break
+            if total is not None:
+                if len(seen) >= total:
+                    break
+            elif len(items) < page_size:
+                break                            # sans total : une page courte = la dernière
             page += 1
     else:                                       # Prism Central v3 : offset/length
         offset = 0
@@ -4617,11 +4762,14 @@ def action_nutanix_vgs(query=""):
             fresh = sum(1 for vg in items if keep(vg))
             meta = data.get("metadata") or {}
             total = meta.get("total_matches")
-            if not items or len(items) < page_size or fresh == 0:
+            if not items or fresh == 0:
                 break
-            if total is not None and offset + page_size >= total:
+            if total is not None:
+                if len(seen) >= total:
+                    break
+            elif len(items) < page_size:
                 break
-            offset += page_size
+            offset += len(items)                 # avancer de ce que le serveur a réellement renvoyé
     return {"ok": True, "vgs": vgs, "source": sysname}
 
 
@@ -4924,9 +5072,12 @@ def _hycu_list_vgs():
             seen.add(uid); out.append(it); fresh += 1
         meta = data.get("metadata") or {}
         total = meta.get("totalEntityCount", total)
-        if not items or len(items) < page_size or fresh == 0:  # fresh==0 -> page qui ne progresse plus
+        if not items or fresh == 0:              # fresh==0 -> page qui ne progresse plus
             break
-        if total is not None and page * page_size >= total:
+        if total is not None:
+            if len(out) >= total:
+                break
+        elif len(items) < page_size:             # sans total : une page courte = la dernière
             break
         page += 1
     return out, None
@@ -4965,9 +5116,16 @@ def action_hycu_restore_points(source_uuid):
                 when = datetime.datetime.fromtimestamp(int(ms) / 1000.0).strftime("%Y-%m-%d %H:%M")
             except (ValueError, TypeError, OSError):
                 when = str(ms)
-        out.append({"id": it.get("uuid"), "time": when,
+        try:
+            ms_i = int(ms) if ms else 0
+        except (ValueError, TypeError):
+            ms_i = 0
+        out.append({"id": it.get("uuid"), "time": when, "ms": ms_i,
                     "status": it.get("status"),
                     "restorable": it.get("restoreAvailable", True)})
+    # L'API ne garantit pas l'ordre : « le plus récent » = points[0] pour tous les
+    # appelants (auto-provisionnement, contrat, UI) -> tri explicite, plus récent d'abord.
+    out.sort(key=lambda p: p.get("ms") or 0, reverse=True)
     return {"ok": True, "points": out}
 
 
@@ -5030,8 +5188,11 @@ def action_hycu_job(job_id):
 
 # ---- Auto-provisionnement (P2) : cloner un VG via HYCU et DÉCOUVRIR son nouvel UUID,
 #      pour supprimer la saisie manuelle d'UUID lors des restaurations. -----------------
-_JOB_OK = {"OK", "SUCCESS", "SUCCEEDED", "COMPLETED", "DONE", "FINISHED"}
-_JOB_KO = {"ERROR", "FAILED", "ABORTED", "CANCELED", "CANCELLED", "TIMEOUT"}
+# Statuts terminaux de job HYCU — UNE seule source de vérité pour toutes les attentes
+# (serveur et JS). WARNING = terminé avec avertissements : succès, signalé au journal.
+_JOB_OK = {"OK", "SUCCESS", "SUCCEEDED", "COMPLETED", "COMPLETE", "DONE", "FINISHED", "WARNING"}
+_JOB_KO = {"ERROR", "FAILED", "FATAL", "ABORTED", "ABORT", "CANCELED", "CANCELLED", "TIMEOUT"}
+_JOB_READ_ERRORS_TOLERATED = 5       # hoquets réseau consécutifs tolérés avant abandon
 
 
 def _discover_vg_uuid_by_name(name):
@@ -5063,7 +5224,7 @@ def _discover_vg_uuid_by_name(name):
         ext = []
         for v in items or []:
             if isinstance(v, dict) and (v.get("name") or "").strip().lower() == nl:
-                m = UUID_RE.search(v.get("externalId") or "") or (UUID_RE.search(v.get("uuid") or "") if v.get("uuid") else None)
+                m = UUID_RE.search(v.get("externalId") or "")     # jamais l'uuid interne HYCU
                 if m:
                     ext.append(m.group(0))
         ext = list(dict.fromkeys(ext))
@@ -5109,15 +5270,20 @@ def _resolve_hycu_vg(source_uuid, vg_name=None):
 
 
 def _vg_exists(uuid):
-    """Le Volume Group existe-t-il encore côté Nutanix ? True/False, ou None si
-    indéterminable (Prism/PE non connecté). Sert à décider, en récupération, s'il faut
-    réutiliser le VG d'origine (existe) ou le restaurer depuis HYCU (supprimé)."""
-    if not uuid or not (SESSION_CREDS.get("prismcentral") or SESSION_CREDS.get("nutanix")):
+    """Le Volume Group existe-t-il encore côté Nutanix ? True / False / None.
+    SEUL un 404 explicite vaut « absent » (False) : toute autre erreur (500, session
+    expirée, timeout) renvoie None = indéterminable, et l'appelant NE déclenche PAS de
+    restauration in-place (qui écraserait un VG encore vivant)."""
+    sysname = _nutanix_source()
+    if not uuid or not sysname:
         return None
     try:
-        return bool(action_nutanix_iqn(uuid).get("ok"))
+        r = _rest(sysname, "GET", "/volume_groups/%s" % urllib.parse.quote(str(uuid)))
     except Exception:
         return None
+    if r.get("ok"):
+        return True
+    return False if r.get("status") == 404 else None
 
 
 def _await_hycu_job(job_id, timeout_s=600, poll_s=3):
@@ -5125,11 +5291,18 @@ def _await_hycu_job(job_id, timeout_s=600, poll_s=3):
     if not job_id:
         return False, None, "Identifiant de job HYCU manquant."
     deadline = time.time() + max(5, int(timeout_s))
-    last = None
+    last, read_errors = None, 0
     while time.time() < deadline:
         j = action_hycu_job(job_id)
         if not j.get("ok"):
-            return False, last, j.get("error") or "Lecture du job HYCU impossible."
+            # Un hoquet réseau pendant un clone de plusieurs minutes ne doit pas faire
+            # échouer le provisionnement (VG orphelin jamais découvert) : on retente.
+            read_errors += 1
+            if read_errors > _JOB_READ_ERRORS_TOLERATED:
+                return False, last, j.get("error") or "Lecture du job HYCU impossible."
+            time.sleep(max(1, int(poll_s)))
+            continue
+        read_errors = 0
         st = (j.get("status") or "").strip().upper()
         last = st or last
         if st in _JOB_OK:
@@ -5172,7 +5345,9 @@ def action_hycu_provision_clone(payload):
             return {"ok": False, "error": "Volume « %s » : UUID du VG source manquant/invalide "
                     "(re-lancez l'analyse HYCU)." % (pvc or "?"), "items": [], "log": log}
         # Nom imposé, UNIQUE : garantit une découverte non ambiguë par le nom.
-        new_name = re.sub(r"[^a-zA-Z0-9-]", "-", "hycurestore-%s-%s-%d" % (pvc, ts, i))[:60].strip("-")
+        # Unicité (horodatage + index) EN TÊTE : seule la partie « pvc » peut être tronquée,
+        # sinon deux volumes aux noms longs recevraient le même nom (clone réel + ambiguïté).
+        new_name = re.sub(r"[^a-zA-Z0-9-]", "-", "hycurestore-%s-%d-%s" % (ts, i, pvc))[:60].strip("-")
         # Identité HYCU du VG source : les points de restauration se listent avec l'uuid
         # HYCU, distinct de l'externalId Nutanix. Résolu depuis l'UUID Nutanix ou le nom
         # (le VG peut avoir été SUPPRIMÉ du cluster ; HYCU garde son catalogue).
@@ -5404,8 +5579,11 @@ def _reject_stale_vgs(ns, uuids):
     match = action_hycu_match(ns)
     if not match.get("ok"):
         return "Re-vérification de la correspondance impossible : %s" % match.get("error")
+    # Seule une correspondance de CONFIANCE (UUID exact) autorise une opération HYCU :
+    # un match « par nom » n'est qu'une suggestion (cf. action_hycu_match) et ne doit
+    # jamais suffire à restaurer/protéger un volume.
     allowed = {m["hycu_vg_uuid"] for m in match.get("matches", [])
-               if m.get("matched") and m.get("hycu_vg_uuid")}
+               if m.get("matched") and m.get("trusted") and m.get("hycu_vg_uuid")}
     bad = [u for u in uuids if u and u not in allowed]
     if bad:
         return ("Volume Group(s) hors de la correspondance actuelle du namespace « %s » : %s. "
@@ -5583,11 +5761,11 @@ def _wait_hycu_job(job_id, log, timeout=1800, label="Job HYCU"):
         if r["ok"]:
             job = _hycu_first(r.get("json") or {})
             status = str((job or {}).get("status") or "").upper()
-            if status in ("OK", "DONE", "SUCCESS", "COMPLETED", "COMPLETE"):
+            if status in _JOB_OK:
                 log.append({"ok": True, "dry": False, "label": "%s terminé" % label, "rc": 0,
                             "stdout": status, "stderr": ""})
                 return True
-            if status in ("FAILED", "ERROR", "FATAL", "ABORTED", "ABORT"):
+            if status in _JOB_KO:
                 log.append({"ok": False, "dry": False, "label": "%s en échec" % label, "rc": -1,
                             "stdout": "", "stderr": status})
                 return False
@@ -6004,6 +6182,20 @@ def action_clone_app(payload, log=None):
     # l'app d'origine n'existe plus, on peut donc réutiliser son Volume Group d'ORIGINE
     # (aucun risque de multi-attach) et l'UUID est déjà dans la sauvegarde -> saisie nulle.
     recover = bool(payload.get("from_backup_only")) and not dr
+    if recover:
+        # La garde `same_uuid` n'est levée que parce que l'app d'origine n'existe plus :
+        # on le VÉRIFIE (une lecture, celle du namespace) — un namespace encore présent
+        # doit passer par le clone ordinaire (nouveau VG), jamais par ce raccourci.
+        st_ns, st_err = resource_state("namespace", ns)
+        if st_ns == "present":
+            return {"ok": False, "log": [], "error":
+                    "Le namespace « %s » existe encore sur le cluster : la récupération est réservée "
+                    "à une application SUPPRIMÉE. Pour une copie, utilisez « Restaurer toute "
+                    "l'application (copie) »." % ns}
+        if st_ns != "absent":
+            return {"ok": False, "log": [], "error":
+                    "Impossible de vérifier l'existence du namespace « %s » (%s) : récupération refusée "
+                    "par prudence." % (ns, st_err or "kubectl")}
     if from_backup and not backup_path:
         return {"ok": False, "error": "Restauration DR : choisissez une sauvegarde source.", "log": []}
     if not from_backup and not _namespace_allowed(ns):
@@ -6041,12 +6233,16 @@ def action_clone_app(payload, log=None):
             return guard
 
     prepared, pvc_rename = [], {}
+    warnings = []
+    deferred_provision = []           # effets HYCU RÉELS : après verrou + pré-vol seulement
     for it in items:
         pvc_name = it.get("pvc")
         new_ref = (it.get("new_ref") or it.get("new_iqn") or "").strip()
-        old_pv, _ = _load_old_pv(ns, pvc_name, backup_path, backup_root)
+        old_pv, _ = _load_old_pv(ns, pvc_name, backup_path, backup_root, no_live=from_backup)
         if old_pv is None:
-            return {"ok": False, "error": "Manifeste du PV introuvable pour « %s »." % pvc_name, "log": []}
+            return {"ok": False, "error": "Manifeste du PV introuvable pour « %s »%s." % (
+                pvc_name, " dans la sauvegarde (aucune lecture du cluster en mode « depuis la sauvegarde seule »)"
+                if from_backup else ""), "log": []}
         # Récupération : si l'humain n'a rien saisi, on réutilise le VG d'ORIGINE dont
         # l'UUID (Source UUID Nutanix) est dans la sauvegarde. MAIS si ce VG n'existe plus
         # sur le cluster (reclaimPolicy=Delete) et qu'il est « Protected deleted » dans
@@ -6067,24 +6263,27 @@ def action_clone_app(payload, log=None):
                     log.append(logentry("Volume d'origine de %s introuvable sur le cluster — "
                                         "restauration automatique depuis HYCU (« Protected deleted »)."
                                         % pvc_name, dry=dry, rc=None))
-                    if mode == "clone":
-                        # HYCU crée un NOUVEAU VG (nouvel UUID) que l'outil découvre.
-                        prov = action_hycu_provision_clone({"volumes": [vol], "dry": dry})
+                    prov_fn = action_hycu_provision_clone if mode == "clone" else action_hycu_provision_restore
+                    if dry:
+                        # Simulation : lectures HYCU seulement (plan, points de restauration).
+                        prov = prov_fn({"volumes": [vol], "dry": True})
+                        for l in prov.get("log", []):
+                            log.append(l)
+                        if not prov.get("ok"):
+                            return {"ok": False, "error": "« %s » : le volume d'origine n'existe plus et "
+                                    "sa restauration automatique via HYCU a échoué : %s"
+                                    % (pvc_name, prov.get("error")), "log": log}
+                        if mode == "clone":
+                            warnings.append("« %s » : HYCU créera un NOUVEAU Volume Group (nouvel UUID "
+                                            "découvert à l'exécution réelle) — l'aperçu montre encore "
+                                            "l'UUID d'origine." % pvc_name)
                     else:
-                        # Restauration SUR PLACE : le VG revient à son UUID d'origine, on
-                        # réutilise le PV tel quel (new_ref reste l'UUID d'origine).
-                        prov = action_hycu_provision_restore({"volumes": [vol], "dry": dry})
-                    for l in prov.get("log", []):
-                        log.append(l)
-                    if not prov.get("ok"):
-                        return {"ok": False, "error": "« %s » : le volume d'origine n'existe plus et "
-                                "sa restauration automatique via HYCU a échoué : %s"
-                                % (pvc_name, prov.get("error")), "log": log}
-                    if mode == "clone" and not dry and prov.get("items"):
-                        disc = (prov["items"][0].get("new_ref") or "").strip()
-                        if disc:
-                            new_ref = disc           # nouvel UUID (Source) du VG cloné
-                    # mode "restore" : new_ref reste = orig (UUID d'origine conservé)
+                        # Réel : DIFFÉRÉ après le verrou d'action et le pré-vol de collision —
+                        # aucun clone/restore HYCU ne doit partir si le run va être refusé.
+                        deferred_provision.append({"pvc": pvc_name, "vol": vol, "mode": mode,
+                                                   "orig": orig, "old_vh": vh})
+                    # mode "restore" : new_ref reste = orig (UUID d'origine conservé) ; mode
+                    # "clone" : le PV préparé est re-pointé après découverte (réel).
         if not new_ref or not UUID_RE.search(new_ref):
             return {"ok": False, "error": "Référence du VG cloné manquante/invalide pour « %s » "
                     "(UUID du VG, volumeHandle, ou IQN)." % pvc_name, "log": []}
@@ -6134,7 +6333,6 @@ def action_clone_app(payload, log=None):
 
     workloads = (_workloads_from_items(bitems, [it["pvc"] for it in items]) if from_backup
                  else _find_workloads_using_pvcs(ns, [it["pvc"] for it in items]))
-    warnings = []
     if from_backup and not dr:
         warnings.append("Récupération « depuis la sauvegarde seule » : workloads et dépendances "
                         "proviennent de la sauvegarde « %s » (le namespace n'existe plus sur le "
@@ -6256,17 +6454,65 @@ def action_clone_app(payload, log=None):
                 st, _ = resource_state((w.get("kind") or "Deployment").lower(), w["metadata"]["name"], target_ns)
                 if st != "absent":
                     coll.append("%s %s/%s" % (w.get("kind"), target_ns, w["metadata"]["name"]))
+            # Un VG ne doit être pointé que par UN PV : refuser si un PV vivant porte déjà
+            # le volumeHandle qu'on s'apprête à créer (DR relancée deux fois, PV « Released »
+            # de l'app supprimée encore présent…). Les volumes qui vont être CLONÉS par HYCU
+            # (nouvel UUID découvert plus bas) ne sont pas concernés par ce contrôle.
+            deferred_clone = {dp["pvc"] for dp in deferred_provision if dp["mode"] == "clone"}
+            pvs_live, pverr = kubectl_json(["get", "pv"])
+            if pverr:
+                return {"ok": False, "error": "Pré-vol impossible (liste des PV : %s) — rien n'a été créé." % pverr,
+                        "log": []}
+            handles = {}
+            for pv in (pvs_live or {}).get("items", []) or []:
+                h = ((pv.get("spec") or {}).get("csi") or {}).get("volumeHandle")
+                if h:
+                    handles.setdefault(h, []).append((pv.get("metadata") or {}).get("name"))
+            for p in prepared:
+                if p["pvc"] in deferred_clone:
+                    continue
+                h = ((p["pv"].get("spec") or {}).get("csi") or {}).get("volumeHandle")
+                others = [n for n in handles.get(h, []) if n != p["new_pv_name"]]
+                if h and others:
+                    coll.append("Volume Group %s déjà pointé par le PV %s (volume %s) — supprimez ce PV "
+                                "d'abord" % (h, ", ".join(str(x) for x in others), p["pvc"]))
             if coll:
                 return {"ok": False, "error": "Objet(s) déjà présent(s) — refus pour ne rien écraser : %s. "
                         "Changez le suffixe ou le namespace cible." % ", ".join(coll), "log": []}
+        # Provisionnement HYCU DIFFÉRÉ (réel) : après verrou et pré-vol, jamais avant.
+        for dp in deferred_provision:
+            prov_fn = action_hycu_provision_clone if dp["mode"] == "clone" else action_hycu_provision_restore
+            prov = prov_fn({"volumes": [dp["vol"]], "dry": False})
+            for l in prov.get("log", []):
+                log.append(l)
+            if not prov.get("ok"):
+                return {"ok": False, "log": log, "warnings": warnings, "preview": preview,
+                        "error": "« %s » : le volume d'origine n'existe plus et sa restauration "
+                                 "automatique via HYCU a échoué : %s" % (dp["pvc"], prov.get("error"))}
+            if dp["mode"] == "clone" and prov.get("items"):
+                disc = (prov["items"][0].get("new_ref") or "").strip()
+                new_vh = derive_volume_handle(disc, dp["old_vh"]) if disc else None
+                if disc and new_vh:
+                    for p in prepared:
+                        if p["pvc"] == dp["pvc"]:
+                            p["pv"] = _replace_in_leaves(p["pv"], [(dp["orig"], disc)])
+                            csi = (p["pv"].get("spec") or {}).get("csi")
+                            if isinstance(csi, dict):
+                                csi["volumeHandle"] = new_vh
+                    log.append(logentry("PV de %s re-pointé sur le VG cloné par HYCU" % dp["pvc"],
+                                        stdout="%s -> %s" % (dp["orig"], disc)))
         # Pré-résoudre le disque de CHAQUE VG cloné (renseigne hypervisorAttachedDiskUUIDs)
         # AVANT toute création : si introuvable en réel, on abandonne sans rien créer.
         for p in prepared:
             handle = ((p["pv"].get("spec") or {}).get("csi") or {}).get("volumeHandle")
             if not _set_clone_disk_uuids(p["pv"], handle, dry, log) and not dry and CONFIG.get("clone_require_disk_uuids", True):
                 return {"ok": False, "log": log, "warnings": warnings, "preview": preview,
-                        "error": "Disque du VG cloné introuvable pour « %s » (Prism Central requis) — "
-                                 "rien n'a été créé." % p["new_pvc_name"]}
+                        "error": (("Prism Central n'est pas connecté : impossible de renseigner le disque "
+                                   "du volume « %s » — rien n'a été créé." if not SESSION_CREDS.get("prismcentral")
+                                   else "Volume Group du volume « %s » introuvable côté Nutanix (supprimé ?) — "
+                                   "connectez HYCU pour qu'il soit restauré automatiquement, ou décochez "
+                                   "« réutiliser les volumes d'origine » et utilisez « Créer les volumes "
+                                   "automatiquement via HYCU ». Rien n'a été créé.") % p["new_pvc_name"])}
         if not same_ns:
             log.append(_apply_manifest({"apiVersion": "v1", "kind": "Namespace",
                                         "metadata": {"name": target_ns}},
@@ -6330,6 +6576,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Type", ct)
             self.send_header("Content-Length", str(len(data)))
             self.send_header("X-Content-Type-Options", "nosniff")
+            # Anti-clickjacking : la page (jeton CSRF dans le DOM, confirmations « réel ») ne
+            # doit être encadrable par aucun site tiers.
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Content-Security-Policy", "frame-ancestors 'none'")
+            self.send_header("Referrer-Policy", "no-referrer")
             # Empêche le navigateur de servir une ancienne version en cache.
             self.send_header("Cache-Control", "no-store, must-revalidate")
             self.send_header("Pragma", "no-cache")
@@ -6522,7 +6773,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._send(403, "Forbidden", "text/plain")
         if self.headers.get("X-CSRF-Token") != CSRF_TOKEN:
             return self._json({"error": "Jeton anti-CSRF invalide ou absent."}, 403)
-        length = int(self.headers.get("Content-Length", 0) or 0)
+        try:
+            length = int(self.headers.get("Content-Length", 0) or 0)
+        except (TypeError, ValueError):
+            return self._json({"error": "En-tête Content-Length invalide."}, 400)
         if length > 5 * 1024 * 1024:
             return self._json({"error": "Charge trop volumineuse."}, 413)
         try:
@@ -7822,7 +8076,7 @@ function isCloneApp(){ return state.mode==="clone" && state.cloneSub==="cloneapp
 function badge(phase){
   const p=(phase||"").toLowerCase();
   const c = p==="bound"?"b-bound":p==="lost"?"b-lost":p==="pending"?"b-pending":"b-na";
-  return `<span class="badge ${c}">${phase||"—"}</span>`;
+  return `<span class="badge ${c}">${esc(phase||"—")}</span>`;
 }
 function esc(s){return (s==null?"":String(s)).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
 // Cluster Kubernetes ACTIF : chaque requête le désigne (en-tête X-HYCU-Cluster) ;
@@ -8235,7 +8489,7 @@ $("#abRet").onchange=abRetSync;
 function abRetLabel(s){
   return s.retention==="gfs"
     ? "GFS "+((s.gfs||{}).daily??7)+" j / "+((s.gfs||{}).weekly??4)+" sem / "+((s.gfs||{}).monthly??12)+" mois"
-    : (s.keep||15)+" versions";
+    : (s.keep===0 ? "illimitée (pas de compteur)" : (s.keep||15)+" versions");
 }
 async function loadAutoBackup(){
   const s=await get("/api/auto_backup");
@@ -8390,12 +8644,15 @@ $("#rsCustomDir").onchange=()=>{ savePref("customDir",$("#rsCustomDir").checked)
 $("#rsBackupRoot").addEventListener("change",()=>{ savePref("backupRoot",$("#rsBackupRoot").value.trim()); if($("#rsCustomDir").checked && $("#rsNs").value) loadPvcs(); });
 $("#rsBackupSel").onchange=applyBackupSelection;   // changer de sauvegarde de config sans re-fetch
 let rsBackups = [];   // sauvegardes de config du namespace courant (la plus récente en premier)
+let loadPvcsSeq=0;     // jeton anti-course : un fetch dépassé (autre namespace/cluster) est ignoré
 async function loadPvcs(){
   const sel=$("#rsNs"); if(!sel.value) return;
   const ns=sel.value; state.ns=ns; state.pvcNs=ns; rsHyMatch=null; rsInplaceSel={};
+  const seq=++loadPvcsSeq;
   const customRoot = $("#rsCustomDir").checked ? $("#rsBackupRoot").value.trim() : "";
   state.backup_root = customRoot || null;
   const bk=await get("/api/backups?ns="+encodeURIComponent(ns)+(customRoot?("&root="+encodeURIComponent(customRoot)):""));
+  if(seq!==loadPvcsSeq || state.ns!==ns) return;   // périmé : une autre application a été ouverte entre-temps
   rsBackups = bk.backups || [];
   const wrap=$("#rsBackupSelWrap"), selEl=$("#rsBackupSel");
   if(rsBackups.length){
@@ -8652,7 +8909,15 @@ async function hyBatchRun(){
                 mode:"clone", new_name:row.newName, dry:dry()};
     const r=await post("/api/hycu/restore",body);
     if(!r.ok){ row.stat.innerHTML=errBox(r.error); failed++; continue; }
-    if(r.dry){ row.stat.innerHTML=`<div class="warnbox" style="margin-top:6px">Simulation — appel HYCU qui serait envoyé :</div><pre class="box">${esc(JSON.stringify(r.planned,null,2))}</pre>`; continue; }
+    if(r.dry){
+      row.stat.innerHTML=`<div class="warnbox" style="margin-top:6px">Simulation — appel HYCU qui serait envoyé :</div><pre class="box">${esc(JSON.stringify(r.planned,null,2))}</pre>`;
+      // En simulation aucun VG n'est créé : on inscrit une référence PROVISOIRE (le VG
+      // source) pour pouvoir dérouler l'aperçu du plan ; en réel elle sera remplacée
+      // par l'UUID du VG cloné découvert.
+      const m=((rsHyMatch&&rsHyMatch.matches)||[]).find(x=>x.pvc===row.pvc);
+      if(m && m.nutanix_uuid){ setRef(row.pvc, m.nutanix_uuid);
+        row.stat.innerHTML+='<div class="hint">Référence provisoire (VG source) inscrite pour la simulation — remplacée par le VG cloné en réel.</div>'; }
+      continue; }
     if(!r.job_id){ row.stat.innerHTML='<div class="warnbox" style="margin-top:6px">Job HYCU non identifié — récupérez la référence via le volet Avancé une fois le clone terminé.</div>'; failed++; continue; }
     const ok=await pollJobBar(r.job_id, row.stat);
     if(!ok){ failed++; continue; }
@@ -9231,8 +9496,8 @@ async function pollJobBar(id, target){
     const pct=(r.progress!=null)?r.progress:0, status=r.status||"?";
     el.innerHTML=`<div class="hint" style="margin-top:8px">Job <code>${esc(id)}</code> — ${esc(status)}${r.progress!=null?(' · '+pct+'%'):''}</div>
        <div class="jbar"><span style="width:${pct}%"></span></div>`;
-    if(/OK|DONE|SUCCESS|COMPLET/i.test(status)){ el.innerHTML+='<div class="note" style="margin-top:6px">Job terminé avec succès.</div>'; return true; }
-    if(/FAIL|ERROR|FATAL|ABORT/i.test(status)){ el.innerHTML+='<div class="err" style="margin-top:6px">Job en échec — vérifiez dans HYCU.</div>'; return false; }
+    if(/^(OK|DONE|SUCCESS|SUCCEEDED|COMPLETED?|FINISHED|WARNING)$/i.test(status)){ el.innerHTML+='<div class="note" style="margin-top:6px">Job terminé avec succès.</div>'; return true; }
+    if(/^(FAILED|ERROR|FATAL|ABORTED?|CANCEL+ED|TIMEOUT)$/i.test(status)){ el.innerHTML+='<div class="err" style="margin-top:6px">Job en échec — vérifiez dans HYCU.</div>'; return false; }
     await new Promise(s=>setTimeout(s,3000));
   }
   el.innerHTML+='<div class="hint">Suivi interrompu (délai) — le job continue côté HYCU.</div>';
@@ -10001,6 +10266,7 @@ function rsNextFromType(){
   if(rsWizKind==="cloneapp") return rsShowPage("target");
   if(rsWizKind==="objects") return objOpen();
   if(rsWizKind==="dr") return drOpen("dr");
+  if(rsWizKind==="recover") return drOpen("recover", drRecoverNs);
   return rsToForm();
 }
 function rsTargetToForm(){
@@ -10123,7 +10389,7 @@ var drAllowed=false, drBusy=false, drBackups=[], drMode="dr", drRecoverNs=null;
 // la dérogation allow_dr_restore (le serveur vérifie que la sauvegarde est d'ici).
 function openRecoverModal(ns){
   state.ns=ns;
-  rsWizKind="dr"; rsSyncOpts();
+  rsWizKind="recover"; rsSyncOpts();   // kind dédié : « Retour » puis « Suivant » ne devient jamais une DR
   ["#rsLog","#rsInplaceLog","#rsErr"].forEach(id=>{ const e=$(id); if(e) e.innerHTML=""; });
   openModal("mRestore");
   drOpen("recover", ns);
@@ -10132,8 +10398,12 @@ $("#drOpenCfg").onclick=()=>{ closeModal("mRestore"); switchTab("settings"); };
 async function drOpen(mode, recoverNs){
   drMode = mode==="recover" ? "recover" : "dr";
   drRecoverNs = drMode==="recover" ? (recoverNs||null) : null;
-  drBusy=false; $("#drLog").innerHTML=""; $("#drErr").innerHTML="";
+  // Rien de l'ouverture précédente ne doit rester cliquable pendant le chargement :
+  // occupé + listes vidées, jusqu'au rendu des sauvegardes fraîches.
+  drBusy=true; drBackups=[]; $("#drVols").innerHTML=""; $("#drBackupSel").innerHTML=""; $("#drTargetNs").value="";
+  $("#drLog").innerHTML=""; $("#drErr").innerHTML="";
   $("#drSc").value="";                 // jamais de remap hérité d'un parcours précédent
+  $("#drRefs").checked=true;
   rsShowPage("dr");
   if(drMode==="recover"){
     $("#mRestoreTitle").innerHTML=esc(RS_TITLE)+'<span class="sep">›</span>'+esc("Restaurer l'application supprimée « "+recoverNs+" »");
@@ -10150,12 +10420,13 @@ async function drOpen(mode, recoverNs){
   drAllowed = drMode==="recover" ? !!r.ok : !!(r.ok && r.allowed);
   $("#drGate").style.display = drAllowed? "none":"block";
   $("#drForm").style.display = drAllowed? "block":"none";
-  if(!drAllowed){ rsWizSync(); return; }
+  if(!drAllowed){ drBusy=false; rsWizSync(); return; }
   drBackups=(r.backups||[]).filter(b=> drMode==="recover"
     ? (b.restorable_here && b.namespace===drRecoverNs) : true);
   $("#drBackupSel").innerHTML = drBackups.length? drBackups.map((b,i)=>
     `<option value="${i}">${esc(b.cluster)}${b.context&&b.cluster_id==="local"?" ("+esc(b.context)+")":""} › ${esc(b.namespace)} › ${esc(b.timestamp)}${b.imported?" · import S3":""}</option>`).join("")
     : '<option value="">(aucune sauvegarde)</option>';
+  drBusy=false;
   drRenderVols();
   rsWizSync();
 }
@@ -10207,12 +10478,17 @@ $("#drAuto").onclick=async()=>{
     source_vg_uuid:hy[t.dataset.pvc]||refs[t.dataset.pvc]||"", vg_name:names[t.dataset.pvc]||""}));
   if(!volumes.length || volumes.some(v=>!v.source_vg_uuid)){
     $("#drErr").innerHTML=errBox("UUID du VG source absent de la sauvegarde : automatisation impossible, saisissez les UUID manuellement."); return; }
+  if(!dry() && !(await confirmDanger({title:"Clones HYCU RÉELS", lines:[
+      "Déclencher dans HYCU le <b>clone</b> de <b>"+volumes.length+"</b> Volume Group(s) (nouveaux VG créés) ?",
+      "Les nouveaux identifiants seront inscrits automatiquement dans la grille."]}))) return;
+  const btn=$("#drAuto"); btn.disabled=true; drBusy=true; rsWizSync();
   $("#drErr").innerHTML=""; $("#drLog").innerHTML='<div class="hint"><span class="spin"></span>HYCU : création des volumes…</div>';
-  const r=await post("/api/hycu/provision_clone", {volumes, dry:dry()});
-  if(!r.ok){ $("#drErr").innerHTML=errBox(r.error); $("#drLog").innerHTML=renderLog(r.log||[]); return; }
-  if(!r.dry){ (r.items||[]).forEach(it=>{ const el=document.querySelector('.drRef[data-pvc="'+(window.CSS&&CSS.escape?CSS.escape(it.pvc):it.pvc)+'"]'); if(el && it.new_ref) el.value=it.new_ref; }); }
-  $("#drLog").innerHTML=renderLog(r.log||[]);
-  rsWizSync();
+  try{
+    const r=await post("/api/hycu/provision_clone", {volumes, dry:dry()});
+    if(!r.ok){ $("#drErr").innerHTML=errBox(r.error); $("#drLog").innerHTML=renderLog(r.log||[]); return; }
+    if(!r.dry){ (r.items||[]).forEach(it=>{ const el=document.querySelector('.drRef[data-pvc="'+(window.CSS&&CSS.escape?CSS.escape(it.pvc):it.pvc)+'"]'); if(el && it.new_ref) el.value=it.new_ref; }); }
+    $("#drLog").innerHTML=renderLog(r.log||[]);
+  } finally { btn.disabled=false; drBusy=false; rsWizSync(); }
 };
 $("#drTargetNs").oninput=()=>rsWizSync();
 async function drRun(){
@@ -10230,7 +10506,9 @@ async function drRun(){
       "Cluster CIBLE : <b>"+esc(ctxInfo.context||"?")+"</b> · namespace cible : <b>"+esc($("#drTargetNs").value)+"</b>",
       drMode==="recover"
         ? "L'application sera RECRÉÉE sur ce cluster depuis la sauvegarde (namespace, PV/PVC, workloads, dépendances non masquées)."
-        : "La garde inter-cluster est LEVÉE pour cette opération : l'application sera recréée sur ce cluster depuis la sauvegarde (PV/PVC, workloads, dépendances non masquées)."]});
+        : "La garde inter-cluster est LEVÉE pour cette opération : l'application sera recréée sur ce cluster depuis la sauvegarde (PV/PVC, workloads, dépendances non masquées).",
+      ...((drMode==="recover" && drRecoverReuse() && conn.hycu && conn.hycu.connected)
+        ? ["Si un volume d'origine a disparu du cluster, HYCU le RESTAURERA automatiquement (opération HYCU réelle) avant la recréation."] : [])]});
     if(!res) return;
     if(typeof res==="string") confirmedCtx=res;
   }
@@ -10353,8 +10631,11 @@ $("#langBtn").onclick=()=>{
 # il REMPLACE l'UI embarquée (coloration/lint/autocomplétion dans l'éditeur). Le `.py`
 # reste 100 % autonome : sans `ui.html`, l'UI embarquée ci-dessus est utilisée.
 # (Pour créer le point de départ : dumper la constante HTML dans ui.html.)
-_UI_PATH = os.path.join(os.getcwd(), "ui.html")
-if os.path.isfile(_UI_PATH):
+# Interface de développement : un ui.html À CÔTÉ DU PROGRAMME remplace l'interface
+# embarquée — uniquement si HYCU_DEV_UI=1 (jamais en production : un fichier déposé dans
+# le répertoire courant d'un conteneur ne doit pas substituer l'UI).
+_UI_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui.html")
+if os.environ.get("HYCU_DEV_UI") == "1" and os.path.isfile(_UI_PATH):
     try:
         with open(_UI_PATH, encoding="utf-8") as _f:
             HTML = _f.read()
@@ -10393,7 +10674,6 @@ I18N_EN += [
     ("Un coffre d'identifiants chiffré a été trouvé. Saisissez la phrase secrète maîtresse",
      "An encrypted credentials vault was found. Enter the master passphrase"),
     ("pour reconnecter automatiquement HYCU / Nutanix.", "to reconnect HYCU / Nutanix automatically."),
-    ("Phrase secrète maîtresse", "Master passphrase"),
     ("Phrase secrète (≥ 8 caractères)", "Passphrase (≥ 8 characters)"),
     ("Phrase secrète", "Passphrase"),
     (">Plus tard<", ">Later<"),
@@ -10417,10 +10697,7 @@ I18N_EN += [
     ("||'erreur'", "||'error'"),
     # --- En-tête, bandeau simulation, navigation ---
     ("Protection Kubernetes sur Nutanix", "Kubernetes Protection on Nutanix"),
-    ("Sauvegarde &amp; restauration guidées · Nutanix", "Guided backup &amp; restore · Nutanix"),
     ("Contexte kubectl détecté : <b>", "Detected kubectl context: <b>"),
-    ("Contexte kubectl : ", "kubectl context: "),
-    ('title="Version de la build"', 'title="Build version"'),
     ('title="Afficher l\'interface en anglais">EN</button>', 'title="Passer en français / Switch to French">FR</button>'),
     ('const PAGE_LANG="fr"', 'const PAGE_LANG="en"'),
     ("⚠ hors liste autorisée", "⚠ not in allowed list"),
@@ -10430,11 +10707,6 @@ I18N_EN += [
      "Turn it off only when you are ready to act for real."),
     ('"MODE RÉEL — les commandes seront exécutées"', '"REAL MODE — commands will be executed"'),
     ('aria-label="Sections de l\'outil"', 'aria-label="Tool sections"'),
-    (">1 · Sauvegarder<", ">1 · Back up<"),
-    (">2 · Restaurer<", ">2 · Restore<"),
-    (">3 · Vérifier<", ">3 · Verify<"),
-    (">Connexions<", ">Connections<"),
-    (">⚙ Réglages<", ">⚙ Settings<"),
 ]
 
 # --- Onglet Sauvegarder (HTML + JS) et protection HYCU ---
@@ -10524,19 +10796,12 @@ I18N_EN += [
     (">2 · Configurer<", ">2 · Configure<"),
     (">3 · Lancer<", ">3 · Launch<"),
     ("Choisir le namespace et les volumes", "Choose the namespace and volumes"),
-    ("Cochez le(s) PVC à restaurer. Plusieurs volumes d'une même application sont",
-     "Tick the PVC(s) to restore. Several volumes of the same application are"),
-    ("restaurés en une seule transaction (arrêt unique, redémarrage unique).",
-     "restored in a single transaction (one stop, one restart)."),
     ("Lire les sauvegardes depuis un dossier personnalisé", "Read backups from a custom folder"),
     ("Ex. D:\\sauvegardes\\hycu  ou  /mnt/backups  (dossier contenant &lt;namespace&gt;/&lt;horodatage&gt;/)",
      "E.g. D:\\backups\\hycu  or  /mnt/backups  (folder containing &lt;namespace&gt;/&lt;timestamp&gt;/)"),
     ("Les sauvegardes lues (et utilisées pour la restauration) seront cherchées ici, au lieu de <code>hycu-backups/</code>.",
      "Backups will be read (and used for the restore) from here instead of <code>hycu-backups/</code>."),
     ("Sauvegarde de configuration à restaurer", "Configuration backup to restore"),
-    ("Manifestes PV/PVC utilisés (le « squelette »). Indépendant du point de restauration HYCU des <b>données</b>. Par défaut : la plus récente.",
-     "PV/PVC manifests used (the “skeleton”). Independent of the HYCU restore point for the <b>data</b>. Default: the most recent."),
-    ("Type d'opération HYCU (pour tout le lot)", "HYCU operation type (for the whole batch)"),
     (">Clone (nouveau VG)<", ">Clone (new VG)<"),
     (">Restauration sur place<", ">Restore in place<"),
     ("Que faire du clone ?", "What to do with the clone?"),
@@ -10551,17 +10816,8 @@ I18N_EN += [
      "Also clone the dependencies (Secrets, ConfigMaps, ServiceAccount, Services targeting the app)"),
     ("— nécessaire pour que les pods démarrent dans l'autre namespace",
      "— required for the pods to start in the other namespace"),
-    ("Indiquer le(s) Volume Group(s) restauré(s)", "Identify the restored Volume Group(s)"),
     ("Restauration sur place orchestrée", "Orchestrated in-place restore"),
-    ("Choisissez un point de restauration HYCU par volume (bouton « Point de restauration HYCU » ci-dessus),",
-     "Choose one HYCU restore point per volume (“HYCU restore point” button above),"),
-    ("puis lancez : <b>arrêt → restore in-place → redémarrage</b>. Aucune référence à saisir ni recréation de PV/PVC.",
-     "then launch: <b>stop → in-place restore → restart</b>. No reference to enter, no PV/PVC recreation."),
     ("Lancer la restauration sur place", "Launch the in-place restore"),
-    ("Flux manuel (avancé) — si vous avez déjà restauré/cloné le VG dans HYCU vous-même",
-     "Manual flow (advanced) — if you already restored/cloned the VG in HYCU yourself"),
-    ("Prévisualiser le plan", "Preview the plan"),
-    ("(réf. VG)", "(VG ref.)"),
     ("Vérifier puis lancer", "Review then launch"),
     ("Vérifiez les remplacements dérivés et la séquence, puis lancez.",
      "Review the derived replacements and the sequence, then launch."),
@@ -10570,18 +10826,6 @@ I18N_EN += [
     ("retapez le nom du contexte kubectl", "retype the kubectl context name"),
     ("Lancer la restauration", "Launch the restore"),
     # Guides de flux (lignes complètes, remplacées avant les fragments plus courts)
-    ("<b>Restauration sur place (recommandé) :</b> sur chaque volume, cliquez « Point de restauration HYCU » et choisissez le point, puis « <b>Lancer la restauration sur place</b> » ci-dessous. <span class='hint'>Aucune référence à saisir.</span>",
-     "<b>In-place restore (recommended):</b> on each volume, click “HYCU restore point” and pick the point, then “<b>Launch the in-place restore</b>” below. <span class='hint'>No reference to enter.</span>"),
-    ("<b>Restauration sur place — flux manuel :</b> restaurez le VG dans HYCU, renseignez la référence du VG (UUID) par volume, puis « <b>Prévisualiser le plan</b> ». <span class='hint'>Connectez HYCU pour le flux orchestré.</span>",
-     "<b>In-place restore — manual flow:</b> restore the VG in HYCU, fill in the VG reference (UUID) per volume, then “<b>Preview the plan</b>”. <span class='hint'>Connect HYCU for the orchestrated flow.</span>"),
-    ("<b>Clone d'application — 2 étapes :</b> <b>(A)</b> sur chaque volume, « ⚙ Orchestrer depuis HYCU (clone) » → crée le VG cloné et récupère sa référence. <b>(B)</b> quand tous les volumes ont leur référence, « <b>Prévisualiser le plan</b> » puis « <b>Lancer le clone de l'application</b> » crée la copie (namespace, PV/PVC, workloads, dépendances).",
-     "<b>Application clone — 2 steps:</b> <b>(A)</b> on each volume, “⚙ Orchestrate from HYCU (clone)” → creates the cloned VG and fetches its reference. <b>(B)</b> once every volume has its reference, “<b>Preview the plan</b>” then “<b>Launch the application clone</b>” creates the copy (namespace, PV/PVC, workloads, dependencies)."),
-    ("<b>Clone d'application — flux manuel :</b> <b>(A)</b> clonez le VG de chaque volume dans HYCU et collez sa référence (UUID). <b>(B)</b> « <b>Prévisualiser le plan</b> » puis « <b>Lancer le clone de l'application</b> ». <span class='hint'>Connectez HYCU pour cloner et récupérer la référence automatiquement.</span>",
-     "<b>Application clone — manual flow:</b> <b>(A)</b> clone each volume's VG in HYCU and paste its reference (UUID). <b>(B)</b> “<b>Preview the plan</b>” then “<b>Launch the application clone</b>”. <span class='hint'>Connect HYCU to clone and fetch the reference automatically.</span>"),
-    ("<b>Clone (rattacher à l'app existante) :</b> sur chaque volume, « ⚙ Orchestrer depuis HYCU (clone) » → VG cloné + référence, puis « <b>Prévisualiser le plan</b> » → « <b>Lancer le clone</b> ».",
-     "<b>Clone (reattach to the existing app):</b> on each volume, “⚙ Orchestrate from HYCU (clone)” → cloned VG + reference, then “<b>Preview the plan</b>” → “<b>Launch the clone</b>”."),
-    ("<b>Clone (rattacher) — flux manuel :</b> clonez le VG dans HYCU, collez la référence (UUID) par volume, puis « <b>Prévisualiser le plan</b> » → « <b>Lancer le clone</b> ». <span class='hint'>Connectez HYCU pour automatiser.</span>",
-     "<b>Clone (reattach) — manual flow:</b> clone the VG in HYCU, paste the reference (UUID) per volume, then “<b>Preview the plan</b>” → “<b>Launch the clone</b>”. <span class='hint'>Connect HYCU to automate.</span>"),
 ]
 
 # --- Onglet Restaurer : JS (volumes, orchestration HYCU, in-place, clone d'app) ---
@@ -10595,56 +10839,15 @@ I18N_EN += [
     ("Aucun volume. Sauvegardez d'abord la configuration de cette application (Applications → Sauvegarder).",
      "No volume. First back up this application's configuration (Applications → Back up)."),
     ("· source : ", "· source: "),
-    ("Nom du nouveau PV (modifiable)", "New PV name (editable)"),
     ("Rechercher le VG dans Prism", "Search for the VG in Prism"),
-    ("⚙ Orchestrer depuis HYCU (clone)", "⚙ Orchestrate from HYCU (clone)"),
-    ("Point de restauration HYCU", "HYCU restore point"),
-    ("Saisie manuelle / avancé — référence du Volume Group", "Manual entry / advanced — Volume Group reference"),
-    ("Référence du Volume Group restauré/cloné — UUID du VG ", "Reference of the restored/cloned Volume Group — VG UUID "),
-    ("(uniquement pour le flux manuel)", "(manual flow only)"),
     ("(UUID du VG, ou NutanixVolumes-&lt;uuid&gt;, ou IQN legacy)", "(VG UUID, or NutanixVolumes-&lt;uuid&gt;, or legacy IQN)"),
     ("Recherche du Volume Group HYCU…", "Searching for the HYCU Volume Group…"),
-    ("Aucun Volume Group HYCU associé à ce PVC. Vérifiez la connexion HYCU / la correspondance (onglet Sauvegarder).",
-     "No HYCU Volume Group matched to this PVC. Check the HYCU connection / the mapping (Back up tab)."),
-    ("Aucun Volume Group HYCU associé à ce PVC.", "No HYCU Volume Group matched to this PVC."),
-    (">aucun point<", ">no points<"),
-    ("VG HYCU : <b>", "HYCU VG: <b>"),
     ("(correspondance '", "(match '"),
     ("' — à vérifier)<", "' — to verify)<"),
     ('placeholder="auto-détecté"', 'placeholder="auto-detected"'),
     ("Point de restauration", "Restore point"),
     ("Nom du VG cloné", "Cloned VG name"),
-    ("Suffixe horodaté = nom unique à chaque clone (modifiable).",
-     "Timestamped suffix = unique name for each clone (editable)."),
-    ("'Cloner dans HYCU':'Restaurer dans HYCU'", "'Clone in HYCU':'Restore in HYCU'"),
-    (" puis récupérer la réf. du VG<", " then fetch the VG ref.<"),
-    ("Choisissez un point de restauration.", "Choose a restore point."),
-    ("Opération HYCU RÉELLE", "REAL HYCU operation"),
-    ('"Déclencher dans HYCU le <b>"', '"Trigger in HYCU the <b>"'),
-    ('"clone":"restore sur place"', '"clone":"in-place restore"'),
-    ('"</b> de ce Volume Group ?"', '"</b> of this Volume Group?"'),
     ("Simulation — appel HYCU qui serait envoyé :", "Simulation — HYCU call that would be sent:"),
-    ("Job HYCU lancé : ", "HYCU job started: "),
-    (r"Job HYCU non identifié — impossible de confirmer la fin du clone. Récupérez la réf. du VG via « Rechercher le VG dans Prism » une fois le clone terminé dans HYCU.",
-     r"HYCU job not identified — cannot confirm the clone completion. Fetch the VG ref. via “Search for the VG in Prism” once the clone finishes in HYCU."),
-    (r"Le job HYCU n\'a pas abouti — référence du VG non récupérée.",
-     r"The HYCU job did not succeed — VG reference not fetched."),
-    (r"Opération HYCU terminée. Connectez Nutanix (Prism) pour récupérer la réf. du VG automatiquement, sinon utilisez « Rechercher le VG dans Prism » ou collez l\'UUID du VG.",
-     r"HYCU operation finished. Connect Nutanix (Prism) to fetch the VG ref. automatically, otherwise use “Search for the VG in Prism” or paste the VG UUID."),
-    (r"Récupération de l\'UUID du VG cloné depuis Nutanix…",
-     r"Fetching the cloned VG UUID from Nutanix…"),
-    (" » introuvable côté Nutanix — récupérez la réf. manuellement via « Rechercher le VG dans Prism ».",
-     " » not found on Nutanix — fetch the ref. manually via “Search for the VG in Prism”."),
-    ("?'Aucun':'Plusieurs'} VG nommé(s) exactement « ", "?'No':'Multiple'} VG named exactly « "),
-    (" » côté Nutanix — récupérez la réf. manuellement via « Rechercher le VG dans Prism » pour choisir le bon.",
-     " » on Nutanix — fetch the ref. manually via “Search for the VG in Prism” to pick the right one."),
-    ("VG trouvé mais UUID non exposé — récupérez la réf. manuellement.",
-     "VG found but UUID not exposed — fetch the ref. manually."),
-    ("Référence du VG (UUID <code>", "VG reference (UUID <code>"),
-    ("</code>) remplie automatiquement depuis « ", "</code>) auto-filled from « "),
-    (" ». Cliquez « Prévisualiser le plan ».", " ». Click “Preview the plan”."),
-    ("Sélectionner ce point", "Select this point"),
-    ("✓ sélectionné", "✓ selected"),
     (" volume(s) prêt(s)", " volume(s) ready"),
     ('" · MODE RÉEL"', '" · REAL MODE"'),
     ("Sélectionnez un point de restauration par volume.", "Select a restore point for each volume."),
@@ -10736,7 +10939,6 @@ I18N_EN += [
     ("· prêts ", "· ready "),
     (">Aucun pod.<", ">No pods.<"),
     # Réglages
-    ("Cluster cible (contexte kubectl)", "Target cluster (kubectl context)"),
     ("Choisissez explicitement le cluster, au lieu de suivre le contexte courant.",
      "Choose the cluster explicitly instead of following the current context."),
     ("L'outil ajoute <code>--context</code> (et <code>--kubeconfig</code>) à chaque commande kubectl.",
@@ -10751,8 +10953,6 @@ I18N_EN += [
     ("Laissez vide ce que vous ne voulez pas contraindre.", "Leave blank anything you don't want to constrain."),
     ("Binaire kubectl", "kubectl binary"),
     ("Préfixe volumeHandle (vide = auto)", "volumeHandle prefix (empty = auto)"),
-    ("Contextes autorisés (séparés par des virgules ; vide = tous)", "Allowed contexts (comma-separated; empty = all)"),
-    ("Namespaces autorisés (vide = tous)", "Allowed namespaces (empty = all)"),
     ("Timeout d'attente (s)", "Wait timeout (s)"),
     ("Suffixe de nom de clone", "Clone name suffix"),
     ("Exiger la confirmation du contexte avant toute action réelle",
@@ -10805,8 +11005,6 @@ I18N_EN += [
     ("URL Prism Central", "Prism Central URL"),
     ("exemple.com", "example.com"),
     ("Mémoriser les connexions (chiffré)", "Remember connections (encrypted)"),
-    ("Option : enregistrer les identifiants saisis ci-dessus dans un coffre <b>chiffré</b>",
-     "Optional: store the credentials entered above in an <b>encrypted</b> vault"),
     ("(<code>hycu_secrets.enc</code>), protégé par une <b>phrase secrète maîtresse</b> — jamais stockée.",
      "(<code>hycu_secrets.enc</code>), protected by a <b>master passphrase</b> — never stored."),
     ("Par défaut, rien n'est écrit (RAM seulement), le choix le plus sûr.",
@@ -11046,9 +11244,6 @@ I18N_EN += [
      ". The scale-down will not stop them — stop them manually"),
     ("(DaemonSet/Job/Operator/pod nu) avant de continuer.", "(DaemonSet/Job/Operator/bare pod) before continuing."),
     ("attente de l'arrêt des pods", "waiting for the pods to stop"),
-    ("disque introuvable pour le Volume Group de ", "disk not found for the Volume Group of "),
-    (" — soit Prism Central n'est pas connecté, soit ce Volume Group n'existe plus (supprimé avec le namespace). Dans ce cas, décochez « réutiliser les volumes d'origine » et utilisez « Créer les volumes automatiquement via HYCU ». PV non recréé pour éviter un volume non attachable",
-     " — either Prism Central is not connected, or this Volume Group no longer exists (deleted with the namespace). In that case, untick “reuse the original volumes” and use “Create the volumes automatically via HYCU”. PV not recreated to avoid an unattachable volume"),
     ("Protection du VG source : PV ", "Protecting the source VG: PV "),
     ("Protection du VG : PV ", "Protecting the VG: PV "),
     ("Évite que la suppression du PV/PVC ne supprime le Volume Group Nutanix",
@@ -11248,8 +11443,6 @@ I18N_EN += [
     ("Objet(s) déjà présent(s) — refus pour ne rien écraser : ",
      "Object(s) already present — refusing to overwrite anything: "),
     ("Changez le suffixe ou le namespace cible.", "Change the suffix or the target namespace."),
-    ("Disque du VG cloné introuvable pour « ", "Cloned VG disk not found for « "),
-    (" » (Prism Central requis) — ", " » (Prism Central required) — "),
     ("rien n'a été créé.", "nothing was created."),
     ("Namespace cible « ", "Target namespace « "),
     (" déjà présent — conservé", " already present — kept"),
@@ -11344,16 +11537,12 @@ I18N_EN += [
      "Regularly backs up the <b>PV/PVC manifests</b> (the restore “recipe”) of all"),
     ("namespaces autorisés par le filtre — tant que l'outil est lancé. <b>Pas les données</b> des volumes :",
      "namespaces allowed by the filter — while the tool is running. <b>Not the data</b> of the volumes:"),
-    ("elles sont protégées par HYCU (voir « ", "they are protected by HYCU (see « "),
-    (" » ci-dessous).", " » below)."),
     ("Sauvegarde automatique</label>", "Automatic backup</label>"),
     ("Intervalle (heures)", "Interval (hours)"),
     ("Versions à conserver", "Versions to keep"),
     ('? "Activée" : "Désactivée"', '? "Enabled" : "Disabled"'),
     (">Désactivée</b>", ">Disabled</b>"),
     ('"Toutes les "', '"Every "'),
-    ('" h · conserve les "', '" h · keeps the last "'),
-    ('" dernières versions par namespace."', '" versions per namespace."'),
     ("Sauvegarde en cours…", "Backup in progress…"),
     ('" Dernière : "', '" Last: "'),
     ('" · Prochaine : "', '" · Next: "'),
@@ -11361,7 +11550,6 @@ I18N_EN += [
     (" namespace(s) sauvegardé(s), ", " namespace(s) backed up, "),
     (" ancienne(s) version(s) supprimée(s)", " old version(s) deleted"),
     # Fenêtre « À propos » (bouton ? de l'en-tête).
-    ("À propos de cet outil", "About this tool"),
     ("Plugin pour HYCU Enterprise Cloud", "Plugin for HYCU Enterprise Cloud"),
     ("Plugin gratuit, fourni « tel quel », sans aucune garantie ni engagement de HYCU.",
      "This is a free plugin, provided as-is, without any warranty or engagement from HYCU."),
@@ -11375,14 +11563,10 @@ I18N_EN += [
 # --- Interface « HYCU Enterprise Cloud » : pages, modales, assistant de restauration ---
 I18N_EN += [
     # Barre du haut / barre latérale
-    ("Cluster Kubernetes ciblé (contexte kubectl) — cliquer pour le changer",
-     "Target Kubernetes cluster (kubectl context) — click to change it"),
-    ("Sources (HYCU, Prism Central, Prism Element)", "Sources (HYCU, Prism Central, Prism Element)"),
     ('title="Tableau de bord"', 'title="Dashboard"'),
     ('<span class="nl">Tableau de bord</span>', '<span class="nl">Dashboard</span>'),
     ('<span class="nl">Politiques</span>', '<span class="nl">Policies</span>'),
     ('<span class="nl">Tâches</span>', '<span class="nl">Jobs</span>'),
-    ('<span class="nl">Réglages</span>', '<span class="nl">Settings</span>'),
     ("Réduire / déployer le menu", "Collapse / expand the menu"),
     ("Sections de l'outil", "Tool sections"),
     ('title="Fermer"', 'title="Close"'),
@@ -11390,8 +11574,6 @@ I18N_EN += [
     ('placeholder="Rechercher"', 'placeholder="Search"'),
     ('title="Tout sélectionner"', 'title="Select all"'),
     # Tableau de bord
-    ('<h2 class="dtitle">Politique ', '<h2 class="dtitle">Policy '),
-    ('<h2 class="dtitle">Tâches ', '<h2 class="dtitle">Jobs '),
     ('<h2 class="dtitle">Dernières tâches</h2>', '<h2 class="dtitle">Recent jobs</h2>'),
     ('dnums("Protection"', 'dnums("Protection"'),
     ('"Conformité"', '"Compliance"'),
@@ -11401,7 +11583,6 @@ I18N_EN += [
     ('<span class="k">Rétention</span>', '<span class="k">Retention</span>'),
     ('<span class="k">Dernière exécution</span>', '<span class="k">Last run</span>'),
     ('<span class="k">Prochaine exécution</span>', '<span class="k">Next run</span>'),
-    ('>Contexte kubectl</div>', '>kubectl context</div>'),
     ('"Opérationnel"', '"Operational"'),
     ('"Indisponible"', '"Unavailable"'),
     ('<span class="k">Filtre des namespaces</span>', '<span class="k">Namespace filter</span>'),
@@ -11421,7 +11602,6 @@ I18N_EN += [
     ('<th>Politique</th>', '<th>Policy</th>'),
     ('<th class="ctr">Conformité</th>', '<th class="ctr">Compliance</th>'),
     ('<th>Dernière sauvegarde</th>', '<th>Last backup</th>'),
-    ('<td>Application Kubernetes</td>', '<td>Kubernetes application</td>'),
     ('"Configuration auto · "', '"Automatic configuration · "'),
     (': "Aucune";', ': "None";'),
     ("Aucune application ne correspond à la recherche.", "No application matches the search."),
@@ -11442,7 +11622,6 @@ I18N_EN += [
     ('<th class="ctr">État</th>', '<th class="ctr">Status</th>'),
     ("Configuration Kubernetes", "Kubernetes configuration"),
     ("Manifestes PV/PVC et ressources des namespaces du filtre", "PV/PVC manifests and resources of the filtered namespaces"),
-    (" versions</td>", " versions</td>"),
     ('"Activée")', '"Enabled")'),
     ('"Désactivée")', '"Disabled")'),
     ("Politiques HYCU (données des volumes)", "HYCU policies (volume data)"),
@@ -11499,8 +11678,6 @@ I18N_EN += [
     ("Avancé — dossier de sauvegardes personnalisé", "Advanced — custom backup folder"),
     ("Chargement des volumes…", "Loading volumes…"),
     # Sources
-    ("Enregistrez ici les systèmes utilisés par l'outil. Les identifiants restent en mémoire le temps de la session (ou dans le coffre chiffré si vous le choisissez).",
-     "Register here the systems used by the tool. Credentials stay in memory for the session (or in the encrypted vault if you choose it)."),
     ('"Sauvegarde & restauration (API REST)"', '"Backup & restore (REST API)"'),
     ('"Nutanix — Volume Groups (API v2)"', '"Nutanix — Volume Groups (v2 API)"'),
     ('"Nutanix — multi-cluster (API v3/v4)"', '"Nutanix — multi-cluster (v3/v4 API)"'),
@@ -11519,8 +11696,6 @@ I18N_EN += [
     ("Cluster Kubernetes actif — cliquer pour en choisir un autre", "Active Kubernetes cluster — click to choose another one"),
     ('"Cluster Kubernetes actif"+', '"Active Kubernetes cluster"+'),
     ('" — cliquer pour en choisir un autre"', '" — click to choose another one"'),
-    ("Sources (HYCU, Prism Central, Prism Element, clusters Kubernetes)",
-     "Sources (HYCU, Prism Central, Prism Element, Kubernetes clusters)"),
     ("⚠ jeton expiré", "⚠ token expired"),
     ('"configuration locale"', '"local configuration"'),
     ('"kubeconfig importé"', '"imported kubeconfig"'),
@@ -11568,7 +11743,6 @@ I18N_EN += [
     ('==="*"?"Tous":', '==="*"?"All":'),
     ('id="clLocalCfg" type="button">Ouvrir les réglages<', 'id="clLocalCfg" type="button">Open settings<'),
     ('id="clRemove" type="button">Retirer<', 'id="clRemove" type="button">Remove<'),
-    ('"Cluster introuvable."', '"Cluster not found."'),
     ('li("Contexte kubectl"', 'li("kubectl context"'),
     ('li("Serveur API"', 'li("API server"'),
     ('li("Workspace NKP"', 'li("NKP workspace"'),
@@ -11610,14 +11784,8 @@ I18N_EN += [
     ("Contextes / clusters autorisés (séparés par des virgules ; vide = tous)", "Allowed contexts / clusters (comma-separated; empty = all)"),
     ("Namespaces autorisés — cluster local (vide = tous)", "Allowed namespaces — local cluster (empty = all)"),
     # Messages du serveur
-    (" inconnu (retiré, ou session verrouillée) : sélectionnez un cluster dans la barre du haut. Aucune commande n'a été exécutée.",
-     " unknown (removed, or session locked): select a cluster in the top bar. No command was executed."),
     ("Authentification par plugin exec (« ", "Exec plugin authentication (« "),
-    (" ») : cette commande doit être installée là où tourne l'outil (absente de l'image conteneur par défaut) ; elle peut aussi ouvrir un navigateur (OIDC) que l'outil ne peut pas piloter.",
-     " »): this command must be installed where the tool runs (absent from the default container image); it may also open a browser (OIDC) that the tool cannot drive."),
     ("Authentification « auth-provider » (", "« auth-provider » authentication ("),
-    (") : mécanisme déprécié, jeton OIDC à durée de vie courte — prévoyez un jeton de ServiceAccount pour un usage durable.",
-     "): deprecated mechanism, short-lived OIDC token — use a ServiceAccount token for long-term use."),
     ("Le jeton est lu depuis un fichier local (", "The token is read from a local file ("),
     (") : il doit exister là où tourne l'outil.", "): it must exist where the tool runs."),
     ("Le jeton a EXPIRÉ : régénérez le kubeconfig.", "The token has EXPIRED: regenerate the kubeconfig."),
@@ -11637,8 +11805,6 @@ I18N_EN += [
     ("Kubeconfig illisible : ", "Unreadable kubeconfig: "),
     ("kubectl config view a échoué", "kubectl config view failed"),
     ("Aucun contexte dans ce kubeconfig.", "No context in this kubeconfig."),
-    ("Connexion établie, mais la liste des namespaces est refusée (RBAC) : l'outil ne verra que les namespaces explicitement autorisés.",
-     "Connected, but listing namespaces is forbidden (RBAC): the tool will only see explicitly allowed namespaces."),
     ("Cluster injoignable.", "Cluster unreachable."),
     ("Nom de cluster invalide (1 à 63 caractères, lettres/chiffres/-/./_).", "Invalid cluster name (1 to 63 characters, letters/digits/-/./_)."),
     ("Ce nom est réservé au cluster local : choisissez-en un autre.", "This name is reserved for the local cluster: choose another one."),
@@ -11650,32 +11816,22 @@ I18N_EN += [
     ("Le cluster local (configuration) ne peut pas être retiré ici : voir Réglages.",
      "The local cluster (configuration) cannot be removed here: see Settings."),
     ("Cluster inconnu.", "Unknown cluster."),
-    ("Le cluster actif ne semble pas être un cluster de management NKP (ressource Workspace introuvable ou accès refusé) : ",
-     "The active cluster does not look like an NKP management cluster (Workspace resource not found or access denied): "),
     ("Liste des clusters NKP (KommanderCluster) indisponible : ", "NKP cluster list (KommanderCluster) unavailable: "),
     ("Confirmez d'abord l'avertissement sur les privilèges requis.", "First acknowledge the warning about required privileges."),
     ("Nom invalide.", "Invalid name."),
     (" » illisible : ", " » unreadable: "),
     ("Aucun kubeconfig trouvé dans le Secret « ", "No kubeconfig found in Secret « "),
     ("Aucun cluster importé.", "No cluster imported."),
-    ("Kubeconfig refusé : authentification par plugin exec (commande externe) non autorisée pour un kubeconfig importé automatiquement.",
-     "Kubeconfig refused: exec plugin authentication (external command) is not allowed for an automatically imported kubeconfig."),
     ("Cette sauvegarde provient du cluster « ", "This backup comes from cluster « "),
     (" », alors que le cluster actif est « ", " », while the active cluster is « "),
-    (" ». La restauration inter-clusters n'est pas prise en charge : sélectionnez le cluster d'origine dans la barre du haut.",
-     " ». Cross-cluster restore is not supported: select the source cluster in the top bar."),
     ("Cluster local non configuré.", "Local cluster not configured."),
     ("aucun cluster disponible", "no cluster available"),
     ("Sauvegarde introuvable ou hors de la zone autorisée : ", "Backup not found or outside the allowed area: "),
-    ("Vérifiez le dossier de sauvegardes (Avancé) puis resélectionnez la sauvegarde.",
-     "Check the backups folder (Advanced) then reselect the backup."),
     ("Sauvegarde illisible (", "Unreadable backup ("),
     (") : index.json manquant ou corrompu (", "): index.json missing or corrupt ("),
     ("Restauration en cours (transaction) : sauvegarde différée.", "Restore in progress (transaction): backup deferred."),
     (" en ÉCHEC : ", " FAILED: "),
     ("Inventaire des Deployments/StatefulSets impossible (", "Deployments/StatefulSets inventory unavailable ("),
-    (") — restauration annulée : sans lui, l'application ne serait ni arrêtée proprement ni redémarrée.",
-     ") — restore cancelled: without it, the application would be neither stopped cleanly nor restarted."),
     (") — séquence annulée.", ") — sequence cancelled."),
     ("état des pods invérifiable (kubectl en erreur) : ", "pod state unverifiable (kubectl failing): "),
     ("⚠ Liste des pods indisponible (contrôle des pods non gérés sauté)",
@@ -11708,10 +11864,7 @@ I18N_EN += [
      "<b>Automatic export</b>: send every successful backup (manual and scheduled) to the bucket"),
     ("Test en lecture seule (liste du bucket, 1 objet). Objets créés :",
      "Read-only test (bucket listing, 1 object). Objects created:"),
-    ("L'échec d'un export n'échoue jamais la sauvegarde locale (visible dans les Tâches).",
-     "A failed export never fails the local backup (visible in Jobs)."),
     ("Test du bucket…", "Testing bucket…"),
-    ('" » accessible."', '" » reachable."'),
     ("Export automatique activé.", "Automatic export enabled."),
     ("Export automatique désactivé (cochez la case pour l'activer).", "Automatic export disabled (tick the box to enable it)."),
     ("Export automatique désactivé", "Automatic export disabled"),
@@ -11784,10 +11937,6 @@ I18N_EN += [
     ("Phrase de chiffrement des exports (à conserver : elle sert au déchiffrement)",
      "Export encryption passphrase (keep it: it is needed for decryption)"),
     ("Déchiffrement hors interface : ", "Decryption outside the UI: "),
-    ("Chiffrement activé : choisissez une phrase de chiffrement des exports (elle servira aussi au déchiffrement — conservez-la précieusement).",
-     "Encryption enabled: choose an export encryption passphrase (also needed for decryption — keep it safe)."),
-    ("chiffrement activé mais phrase de chiffrement absente : renseignez-la dans ⚙ Sources > Stockage objet S3",
-     "encryption enabled but encryption passphrase missing: enter it in ⚙ Sources > S3 object storage"),
     # Restauration d'objets
     ("Restaurer des objets de configuration", "Restore configuration objects"),
     ("Ré-applique des objets choisis (Deployments, Services, ConfigMaps…) depuis l'instantané d'une sauvegarde, avec aperçu des différences. Ne touche ni aux volumes ni aux données.",
@@ -11800,12 +11949,9 @@ I18N_EN += [
     ("Appliquer (simulation)", "Apply (simulation)"),
     ("Appliquer (réel)", "Apply (real)"),
     ("objet(s) dans l'instantané)", "object(s) in the snapshot)"),
-    ("Aucune sauvegarde pour ce namespace — lancez d'abord une sauvegarde (Applications → Sauvegarder).",
-     "No backup for this namespace — run a backup first (Applications → Back up)."),
     ("(aucune sauvegarde)", "(no backup)"),
     ("Instantané vide.", "Empty snapshot."),
     ("Secret masqué — non restaurable", "Secret redacted — not restorable"),
-    ("Comparaison avec l'état live…", "Comparing with the live state…"),
     ('"Identique au live — apply sans effet"', '"Identical to live — apply is a no-op"'),
     ('"Diffère du live"', '"Differs from live"'),
     ('"Absent du live — sera (re)créé"', '"Absent from live — will be (re)created"'),
@@ -11818,8 +11964,6 @@ I18N_EN += [
     ("Application…", "Applying…"),
     (" objet(s) appliqué(s)", " object(s) applied"),
     (" ignoré(s)", " skipped"),
-    ("Cette sauvegarde ne contient pas d'instantané de ressources (resources.json) : elle est antérieure à la fonction, ou config_backup_full était désactivé.",
-     "This backup has no resource snapshot (resources.json): it predates the feature, or config_backup_full was disabled."),
     ("resources.json illisible : ", "resources.json unreadable: "),
     ("Secret masqué à la sauvegarde : non restaurable.", "Secret redacted at backup time: not restorable."),
     ("Aucun objet sélectionné.", "No object selected."),
@@ -11828,20 +11972,8 @@ I18N_EN += [
     ("Restaurez ce Secret depuis sa source d'origine.", "Restore this Secret from its original source."),
     ("Appliquer ", "Apply "),
     (" objet(s) en échec.", " object(s) failed."),
-    ('" — sauvegarde"', '" — backup"'),
-    ("+++ sauvegarde", "+++ backup"),
-    ("--- live", "--- live"),
-    ("<b>activée</b>sauvegarde automatique</span>", "<b>enabled</b>automatic backup</span>"),
-    ("<b>désactivée</b>sauvegarde automatique</span>", "<b>disabled</b>automatic backup</span>"),
-    ("Stockage objet S3 : activé (chiffré).", "S3 object storage: enabled (encrypted)."),
-    ("Stockage objet S3 : activé.", "S3 object storage: enabled."),
-    ("Stockage objet S3 : configuré, export auto désactivé.", "S3 object storage: configured, auto export disabled."),
-    ("Stockage objet S3 : non configuré.", "S3 object storage: not configured."),
     ("<h2>Export hors cluster</h2>", "<h2>Off-cluster export</h2>"),
-    ("automatique activée, intervalle ", "backup enabled, interval "),
-    ("automatique désactivée, intervalle ", "backup disabled, interval "),
     (" h, rétention ", " h, retention "),
-    (">joignable<", ">reachable<"),
     (' · "+(x.index||{}).resources_count+" objets"', ' · "+(x.index||{}).resources_count+" objects"'),
     # Menu « ? » + page d'aide (/help)
     ('title="Aide &amp; À propos"', 'title="Help &amp; About"'),
@@ -11907,7 +12039,7 @@ I18N_EN += [
      "<b>Applications → Set Policy</b>: the tool matches each PVC to its HYCU <b>Volume Group</b> (UUID match), assigns a HYCU policy and can start a backup."),
     ("Une correspondance « par nom » doit être <b>confirmée</b> (case à cocher) ; une ambiguïté n'est jamais tranchée automatiquement.",
      "A “by name” match must be <b>confirmed</b> (checkbox); an ambiguity is never resolved automatically."),
-    ("Restaurer — les 4 parcours", "Restore — the 4 flows"),
+    ("Restaurer — les 5 parcours", "Restore — the 5 flows"),
     ("<b>Restaurer toute l'application (copie)</b> : volumes + objets vers le même namespace (suffixe) ou un autre. L'original n'est pas modifié. Idéal pour vérifier une sauvegarde.",
      "<b>Restore the whole application (copy)</b>: volumes + objects into the same namespace (suffix) or another one. The original is untouched. Ideal to verify a backup."),
     ("<b>Restaurer le stockage sur place</b> : HYCU restaure les données <b>dans</b> les volumes d'origine ; l'application est arrêtée puis redémarrée. Choisissez un point de restauration par volume (le plus récent est présélectionné).",
@@ -11962,8 +12094,6 @@ I18N_EN += [
     (" · historique conservé ", " · history kept "),
     (" j (Réglages)", " d (Settings)"),
     ("Historique des tâches (jours ; 0 = illimité)", "Job history (days; 0 = unlimited)"),
-    ('">Stockage <', '">Storage <'),
-    ('">Santé des clusters <', '">Cluster health <'),
     ('"Pas encore contrôlé"', '"Not checked yet"'),
     (">Gérer les clusters</a>", ">Manage clusters</a>"),
     ("Dossier absent : ", "Folder missing: "),
@@ -11976,9 +12106,6 @@ I18N_EN += [
     ("Plancher d'espace libre (Mo ; 0 = désactivé)", "Free-space floor (MB; 0 = disabled)"),
     ('<span class="k">Sauvegardes</span>', '<span class="k">Backups</span>'),
     ("Cette sauvegarde a été prise sur le contexte kubectl « ", "This backup was taken on kubectl context « "),
-    (" », alors que le contexte actif est « ", " », while the active context is « "),
-    (" ». Rebasculez sur le contexte d'origine (Réglages) avant de restaurer.",
-     " ». Switch back to the original context (Settings) before restoring."),
     ("Quota des sauvegardes (Go ; 0 = illimité)", "Backup quota (GB; 0 = unlimited)"),
     ("Sous le plancher, toute sauvegarde est refusée ; au-delà du quota, les plus anciennes sont purgées (la plus récente de chaque application est toujours gardée).",
      "Below the floor, every backup is refused; above the quota, the oldest are pruned (the most recent of each application is always kept)."),
@@ -11988,8 +12115,6 @@ I18N_EN += [
     ('<span class="k">Quota</span>', '<span class="k">Quota</span>'),
     ("Espace disque insuffisant sous ", "Not enough disk space under "),
     (" Mo libres (plancher : ", " MB free (floor: "),
-    (" Mo). Sauvegarde REFUSÉE pour ne pas saturer le stockage — libérez de la place, réduisez la rétention (Politiques) ou l'historique des tâches (Réglages).",
-     " MB). Backup REFUSED to avoid filling the storage — free some space, reduce retention (Policies) or the job history (Settings)."),
     # ---- Reprise d'activité (DR) + import S3 ----
     ("Restauration DR (autre cluster / contexte)", "DR restore (another cluster / context)"),
     ("Reprise d'activité : recrée une application sur CE cluster depuis une sauvegarde d'un cluster disparu (ou importée du bucket S3). Sources lues depuis la seule sauvegarde. Nécessite le réglage « Autoriser la restauration DR ».",
@@ -12006,7 +12131,6 @@ I18N_EN += [
     ("Recréer les dépendances depuis la sauvegarde (Secrets non masqués, ConfigMaps, ServiceAccounts, Services)",
      "Recreate dependencies from the backup (non-redacted Secrets, ConfigMaps, ServiceAccounts, Services)"),
     ("Volumes — collez l'UUID du VG restauré/cloné sur le site cible", "Volumes — paste the UUID of the VG restored/cloned on the target site"),
-    ("UUID du Volume Group restauré sur le site cible (8-4-4-4-12)", "UUID of the Volume Group restored on the target site (8-4-4-4-12)"),
     ('"Restaurer (simulation)"', '"Restore (simulation)"'),
     ('"Restaurer (réel)"', '"Restore (real)"'),
     ("Restauration DR RÉELLE", "REAL DR restore"),
@@ -12016,8 +12140,6 @@ I18N_EN += [
     ("La garde inter-cluster est LEVÉE pour cette opération : l'application sera recréée sur ce cluster depuis la sauvegarde (PV/PVC, workloads, dépendances non masquées).",
      "The cross-cluster guard is LIFTED for this operation: the application will be recreated on this cluster from the backup (PV/PVC, workloads, non-redacted dependencies)."),
     ("Restauration DR…", "DR restore…"),
-    ("Restauration DR terminée. Vérifiez l'application, puis re-protégez ses Volume Groups dans HYCU.",
-     "DR restore finished. Verify the application, then re-protect its Volume Groups in HYCU."),
     (" · import S3", " · S3 import"),
     ("Aucun volume dans cette sauvegarde.", "No volume in this backup."),
     ("<b>Autoriser la restauration DR</b> (inter-cluster / inter-contexte)", "<b>Allow DR restore</b> (cross-cluster / cross-context)"),
@@ -12028,22 +12150,15 @@ I18N_EN += [
     ("Les exports rapatriés vont dans <code>hycu-backups/_imports/…</code> ; ils se restaurent via la <b>Restauration DR</b> de l'assistant (ou sur leur cluster d'origine).",
      "Repatriated exports go to <code>hycu-backups/_imports/…</code>; they are restored through the wizard's <b>DR restore</b> (or on their source cluster)."),
     ("Liste du bucket…", "Listing bucket…"),
-    ("Aucun export de l'outil dans ce bucket.", "No export from this tool in that bucket."),
     ('<th>Chiffré</th>', '<th>Encrypted</th>'),
     (" fichier(s)", " file(s)"),
     ('"Import S3 (rapatriement)"', '"S3 import (repatriation)"'),
     ('"Restauration d\'objets de configuration"', '"Configuration objects restore"'),
-    ("MODE DR : toutes les sources (workloads, dépendances) proviennent de la sauvegarde « ",
-     "DR MODE: every source (workloads, dependencies) comes from backup « "),
     (" » — aucune lecture du cluster d'origine.", " » — no read from the origin cluster."),
     ("StorageClass remappée vers « ", "StorageClass remapped to « "),
     (" » sur les PV/PVC recréés.", " » on the recreated PV/PVCs."),
     ("Instantané resources.json vide ou absent : seuls PV et PVC seront recréés.",
      "resources.json snapshot empty or missing: only PV and PVC will be recreated."),
-    ("Référencé(s) par l'app mais absent(s) de la SAUVEGARDE (ou Secret masqué) — à recréer à la main dans « ",
-     "Referenced by the app but absent from the BACKUP (or redacted Secret) — recreate manually in « "),
-    ("Restauration DR refusée : le réglage « Autoriser la restauration DR » est désactivé (⚙ → Réglages). Activez-le le temps de l'opération, puis réessayez.",
-     "DR restore refused: the “Allow DR restore” setting is disabled (⚙ → Settings). Enable it for the operation, then retry."),
     ("Restauration DR : choisissez une sauvegarde source.", "DR restore: choose a source backup."),
     # ---- Applications supprimées mais sauvegardées (récupération même cluster) ----
     ("Supprimée — restaurable", "Deleted — restorable"),
@@ -12055,29 +12170,184 @@ I18N_EN += [
     ("Restauration d'une application SUPPRIMÉE", "Restore of a DELETED application"),
     ("L'application sera RECRÉÉE sur ce cluster depuis la sauvegarde (namespace, PV/PVC, workloads, dépendances non masquées).",
      "The application will be RECREATED on this cluster from the backup (namespace, PV/PVC, workloads, non-redacted dependencies)."),
-    ("Récupération « depuis la sauvegarde seule » : workloads et dépendances proviennent de la sauvegarde « ",
-     "Recovery “from the backup alone”: workloads and dependencies come from backup « "),
     ("Réutiliser les volumes d'origine de l'application ", "Reuse the application's original volumes "),
     ("Rien à saisir : l'application est rebranchée sur ses volumes Nutanix d'origine (leurs identifiants sont dans la sauvegarde). Décochez seulement si vous avez restauré les données sur de <b>nouveaux</b> volumes dans HYCU.",
      "Nothing to enter: the application is reconnected to its original Nutanix volumes (their IDs are in the backup). Only untick if you restored the data onto <b>new</b> volumes in HYCU."),
     ("Nouveaux volumes — collez l'identifiant (UUID) fourni par HYCU", "New volumes — paste the ID (UUID) provided by HYCU"),
     ("Créer les volumes automatiquement via HYCU", "Create the volumes automatically via HYCU"),
+    # (paires historiques conservées : certaines clés ne sont visibles qu'à l'exécution)
+    ('Phrase secrète maîtresse', 'Master passphrase'),
+    ('Sauvegarde &amp; restauration guidées · Nutanix', 'Guided backup &amp; restore · Nutanix'),
+    ('Contexte kubectl : ', 'kubectl context: '),
+    ('title="Version de la build"', 'title="Build version"'),
+    ('>1 · Sauvegarder<', '>1 · Back up<'),
+    ('>2 · Restaurer<', '>2 · Restore<'),
+    ('>3 · Vérifier<', '>3 · Verify<'),
+    ('>Connexions<', '>Connections<'),
+    ('>⚙ Réglages<', '>⚙ Settings<'),
+    ("Cochez le(s) PVC à restaurer. Plusieurs volumes d'une même application sont", 'Tick the PVC(s) to restore. Several volumes of the same application are'),
+    ('restaurés en une seule transaction (arrêt unique, redémarrage unique).', 'restored in a single transaction (one stop, one restart).'),
+    ('Manifestes PV/PVC utilisés (le « squelette »). Indépendant du point de restauration HYCU des <b>données</b>. Par défaut : la plus récente.', 'PV/PVC manifests used (the “skeleton”). Independent of the HYCU restore point for the <b>data</b>. Default: the most recent.'),
+    ("Type d'opération HYCU (pour tout le lot)", 'HYCU operation type (for the whole batch)'),
+    ('Indiquer le(s) Volume Group(s) restauré(s)', 'Identify the restored Volume Group(s)'),
+    ('Choisissez un point de restauration HYCU par volume (bouton « Point de restauration HYCU » ci-dessus),', 'Choose one HYCU restore point per volume (“HYCU restore point” button above),'),
+    ('puis lancez : <b>arrêt → restore in-place → redémarrage</b>. Aucune référence à saisir ni recréation de PV/PVC.', 'then launch: <b>stop → in-place restore → restart</b>. No reference to enter, no PV/PVC recreation.'),
+    ('Flux manuel (avancé) — si vous avez déjà restauré/cloné le VG dans HYCU vous-même', 'Manual flow (advanced) — if you already restored/cloned the VG in HYCU yourself'),
+    ('Prévisualiser le plan', 'Preview the plan'),
+    ('(réf. VG)', '(VG ref.)'),
+    ("<b>Restauration sur place (recommandé) :</b> sur chaque volume, cliquez « Point de restauration HYCU » et choisissez le point, puis « <b>Lancer la restauration sur place</b> » ci-dessous. <span class='hint'>Aucune référence à saisir.</span>", "<b>In-place restore (recommended):</b> on each volume, click “HYCU restore point” and pick the point, then “<b>Launch the in-place restore</b>” below. <span class='hint'>No reference to enter.</span>"),
+    ("<b>Restauration sur place — flux manuel :</b> restaurez le VG dans HYCU, renseignez la référence du VG (UUID) par volume, puis « <b>Prévisualiser le plan</b> ». <span class='hint'>Connectez HYCU pour le flux orchestré.</span>", "<b>In-place restore — manual flow:</b> restore the VG in HYCU, fill in the VG reference (UUID) per volume, then “<b>Preview the plan</b>”. <span class='hint'>Connect HYCU for the orchestrated flow.</span>"),
+    ("<b>Clone d'application — 2 étapes :</b> <b>(A)</b> sur chaque volume, « ⚙ Orchestrer depuis HYCU (clone) » → crée le VG cloné et récupère sa référence. <b>(B)</b> quand tous les volumes ont leur référence, « <b>Prévisualiser le plan</b> » puis « <b>Lancer le clone de l'application</b> » crée la copie (namespace, PV/PVC, workloads, dépendances).", '<b>Application clone — 2 steps:</b> <b>(A)</b> on each volume, “⚙ Orchestrate from HYCU (clone)” → creates the cloned VG and fetches its reference. <b>(B)</b> once every volume has its reference, “<b>Preview the plan</b>” then “<b>Launch the application clone</b>” creates the copy (namespace, PV/PVC, workloads, dependencies).'),
+    ("<b>Clone d'application — flux manuel :</b> <b>(A)</b> clonez le VG de chaque volume dans HYCU et collez sa référence (UUID). <b>(B)</b> « <b>Prévisualiser le plan</b> » puis « <b>Lancer le clone de l'application</b> ». <span class='hint'>Connectez HYCU pour cloner et récupérer la référence automatiquement.</span>", "<b>Application clone — manual flow:</b> <b>(A)</b> clone each volume's VG in HYCU and paste its reference (UUID). <b>(B)</b> “<b>Preview the plan</b>” then “<b>Launch the application clone</b>”. <span class='hint'>Connect HYCU to clone and fetch the reference automatically.</span>"),
+    ("<b>Clone (rattacher à l'app existante) :</b> sur chaque volume, « ⚙ Orchestrer depuis HYCU (clone) » → VG cloné + référence, puis « <b>Prévisualiser le plan</b> » → « <b>Lancer le clone</b> ».", '<b>Clone (reattach to the existing app):</b> on each volume, “⚙ Orchestrate from HYCU (clone)” → cloned VG + reference, then “<b>Preview the plan</b>” → “<b>Launch the clone</b>”.'),
+    ("<b>Clone (rattacher) — flux manuel :</b> clonez le VG dans HYCU, collez la référence (UUID) par volume, puis « <b>Prévisualiser le plan</b> » → « <b>Lancer le clone</b> ». <span class='hint'>Connectez HYCU pour automatiser.</span>", "<b>Clone (reattach) — manual flow:</b> clone the VG in HYCU, paste the reference (UUID) per volume, then “<b>Preview the plan</b>” → “<b>Launch the clone</b>”. <span class='hint'>Connect HYCU to automate.</span>"),
+    ('Nom du nouveau PV (modifiable)', 'New PV name (editable)'),
+    ('⚙ Orchestrer depuis HYCU (clone)', '⚙ Orchestrate from HYCU (clone)'),
+    ('Point de restauration HYCU', 'HYCU restore point'),
+    ('Saisie manuelle / avancé — référence du Volume Group', 'Manual entry / advanced — Volume Group reference'),
+    ('Référence du Volume Group restauré/cloné — UUID du VG ', 'Reference of the restored/cloned Volume Group — VG UUID '),
+    ('(uniquement pour le flux manuel)', '(manual flow only)'),
+    ('Aucun Volume Group HYCU associé à ce PVC. Vérifiez la connexion HYCU / la correspondance (onglet Sauvegarder).', 'No HYCU Volume Group matched to this PVC. Check the HYCU connection / the mapping (Back up tab).'),
+    ('Aucun Volume Group HYCU associé à ce PVC.', 'No HYCU Volume Group matched to this PVC.'),
+    ('>aucun point<', '>no points<'),
+    ('VG HYCU : <b>', 'HYCU VG: <b>'),
+    ('Suffixe horodaté = nom unique à chaque clone (modifiable).', 'Timestamped suffix = unique name for each clone (editable).'),
+    ("'Cloner dans HYCU':'Restaurer dans HYCU'", "'Clone in HYCU':'Restore in HYCU'"),
+    (' puis récupérer la réf. du VG<', ' then fetch the VG ref.<'),
+    ('Choisissez un point de restauration.', 'Choose a restore point.'),
+    ('Opération HYCU RÉELLE', 'REAL HYCU operation'),
+    ('"Déclencher dans HYCU le <b>"', '"Trigger in HYCU the <b>"'),
+    ('"clone":"restore sur place"', '"clone":"in-place restore"'),
+    ('"</b> de ce Volume Group ?"', '"</b> of this Volume Group?"'),
+    ('Job HYCU lancé : ', 'HYCU job started: '),
+    ('Job HYCU non identifié — impossible de confirmer la fin du clone. Récupérez la réf. du VG via « Rechercher le VG dans Prism » une fois le clone terminé dans HYCU.', 'HYCU job not identified — cannot confirm the clone completion. Fetch the VG ref. via “Search for the VG in Prism” once the clone finishes in HYCU.'),
+    ("Le job HYCU n\\'a pas abouti — référence du VG non récupérée.", 'The HYCU job did not succeed — VG reference not fetched.'),
+    ("Opération HYCU terminée. Connectez Nutanix (Prism) pour récupérer la réf. du VG automatiquement, sinon utilisez « Rechercher le VG dans Prism » ou collez l\\'UUID du VG.", 'HYCU operation finished. Connect Nutanix (Prism) to fetch the VG ref. automatically, otherwise use “Search for the VG in Prism” or paste the VG UUID.'),
+    ("Récupération de l\\'UUID du VG cloné depuis Nutanix…", 'Fetching the cloned VG UUID from Nutanix…'),
+    (' » introuvable côté Nutanix — récupérez la réf. manuellement via « Rechercher le VG dans Prism ».', ' » not found on Nutanix — fetch the ref. manually via “Search for the VG in Prism”.'),
+    ("?'Aucun':'Plusieurs'} VG nommé(s) exactement « ", "?'No':'Multiple'} VG named exactly « "),
+    (' » côté Nutanix — récupérez la réf. manuellement via « Rechercher le VG dans Prism » pour choisir le bon.', ' » on Nutanix — fetch the ref. manually via “Search for the VG in Prism” to pick the right one.'),
+    ('VG trouvé mais UUID non exposé — récupérez la réf. manuellement.', 'VG found but UUID not exposed — fetch the ref. manually.'),
+    ('Référence du VG (UUID <code>', 'VG reference (UUID <code>'),
+    ('</code>) remplie automatiquement depuis « ', '</code>) auto-filled from « '),
+    (' ». Cliquez « Prévisualiser le plan ».', ' ». Click “Preview the plan”.'),
+    ('Sélectionner ce point', 'Select this point'),
+    ('✓ sélectionné', '✓ selected'),
+    ('Cluster cible (contexte kubectl)', 'Target cluster (kubectl context)'),
+    ('Contextes autorisés (séparés par des virgules ; vide = tous)', 'Allowed contexts (comma-separated; empty = all)'),
+    ('Namespaces autorisés (vide = tous)', 'Allowed namespaces (empty = all)'),
+    ('Option : enregistrer les identifiants saisis ci-dessus dans un coffre <b>chiffré</b>', 'Optional: store the credentials entered above in an <b>encrypted</b> vault'),
+    (" — soit Prism Central n'est pas connecté, soit ce Volume Group n'existe plus (supprimé avec le namespace). Dans ce cas, décochez « réutiliser les volumes d'origine » et utilisez « Créer les volumes automatiquement via HYCU ». PV non recréé pour éviter un volume non attachable", ' — either Prism Central is not connected, or this Volume Group no longer exists (deleted with the namespace). In that case, untick “reuse the original volumes” and use “Create the volumes automatically via HYCU”. PV not recreated to avoid an unattachable volume'),
+    ('Disque du VG cloné introuvable pour « ', 'Cloned VG disk not found for « '),
+    (' » (Prism Central requis) — ', ' » (Prism Central required) — '),
+    ('elles sont protégées par HYCU (voir « ', 'they are protected by HYCU (see « '),
+    (' » ci-dessous).', ' » below).'),
+    ('" h · conserve les "', '" h · keeps the last "'),
+    ('" dernières versions par namespace."', '" versions per namespace."'),
+    ('À propos de cet outil', 'About this tool'),
+    ('Cluster Kubernetes ciblé (contexte kubectl) — cliquer pour le changer', 'Target Kubernetes cluster (kubectl context) — click to change it'),
+    ('Sources (HYCU, Prism Central, Prism Element)', 'Sources (HYCU, Prism Central, Prism Element)'),
+    ('<span class="nl">Réglages</span>', '<span class="nl">Settings</span>'),
+    ('<h2 class="dtitle">Politique ', '<h2 class="dtitle">Policy '),
+    ('<h2 class="dtitle">Tâches ', '<h2 class="dtitle">Jobs '),
+    ('>Contexte kubectl</div>', '>kubectl context</div>'),
+    ('<td>Application Kubernetes</td>', '<td>Kubernetes application</td>'),
+    (' versions</td>', ' versions</td>'),
+    ("Enregistrez ici les systèmes utilisés par l'outil. Les identifiants restent en mémoire le temps de la session (ou dans le coffre chiffré si vous le choisissez).", 'Register here the systems used by the tool. Credentials stay in memory for the session (or in the encrypted vault if you choose it).'),
+    ('Sources (HYCU, Prism Central, Prism Element, clusters Kubernetes)', 'Sources (HYCU, Prism Central, Prism Element, Kubernetes clusters)'),
+    ('"Cluster introuvable."', '"Cluster not found."'),
+    ('" » accessible."', '" » reachable."'),
+    ("Aucune sauvegarde pour ce namespace — lancez d'abord une sauvegarde (Applications → Sauvegarder).", 'No backup for this namespace — run a backup first (Applications → Back up).'),
+    ("Comparaison avec l'état live…", 'Comparing with the live state…'),
+    ('" — sauvegarde"', '" — backup"'),
+    ('+++ sauvegarde', '+++ backup'),
+    ('--- live', '--- live'),
+    ('<b>activée</b>sauvegarde automatique</span>', '<b>enabled</b>automatic backup</span>'),
+    ('<b>désactivée</b>sauvegarde automatique</span>', '<b>disabled</b>automatic backup</span>'),
+    ('Stockage objet S3 : activé (chiffré).', 'S3 object storage: enabled (encrypted).'),
+    ('Stockage objet S3 : activé.', 'S3 object storage: enabled.'),
+    ('Stockage objet S3 : configuré, export auto désactivé.', 'S3 object storage: configured, auto export disabled.'),
+    ('Stockage objet S3 : non configuré.', 'S3 object storage: not configured.'),
+    ('automatique activée, intervalle ', 'backup enabled, interval '),
+    ('automatique désactivée, intervalle ', 'backup disabled, interval '),
+    ('>joignable<', '>reachable<'),
+    ('Restaurer — les 4 parcours', 'Restore — the 4 flows'),
+    ('">Stockage <', '">Storage <'),
+    ('">Santé des clusters <', '">Cluster health <'),
+    ('UUID du Volume Group restauré sur le site cible (8-4-4-4-12)', 'UUID of the Volume Group restored on the target site (8-4-4-4-12)'),
+    ("Restauration DR terminée. Vérifiez l'application, puis re-protégez ses Volume Groups dans HYCU.", 'DR restore finished. Verify the application, then re-protect its Volume Groups in HYCU.'),
+    ("Aucun export de l'outil dans ce bucket.", 'No export from this tool in that bucket.'),
+    ("<b>Application supprimée du cluster ?</b> Tant que ses sauvegardes existent, elle reste listée dans <b>Applications</b> avec le badge « Supprimée — restaurable ». Cliquez <b>Restaurer</b> : le parcours de récupération recrée tout (namespace, PV/PVC, workloads, dépendances non masquées) depuis la sauvegarde choisie — restaurez d'abord ses Volume Groups dans HYCU et collez leurs UUID. Aucune dérogation DR n'est requise : la récupération reste sur le même cluster/contexte.", '<b>Application deleted from the cluster?</b> As long as its backups exist, it stays listed under <b>Applications</b> with the “Deleted — restorable” badge. Click <b>Restore</b>: the recovery flow recreates everything (namespace, PV/PVC, workloads, non-redacted dependencies) from the selected backup — first restore its Volume Groups in HYCU and paste their UUIDs. No DR override is required: the recovery stays on the same cluster/context.'),
+    # ---- correctifs (lots 1-3) : nouveaux messages serveur/UI ----
+    (" inconnu (retiré, ou session verrouillée) : sélectionnez un cluster dans la barre du haut. Aucune commande n'a été exécutée.", ' unknown (removed, or session locked): select a cluster in the top bar. No command was executed.'),
+    (" ») : cette commande doit être installée là où tourne l'outil (absente de l'image conteneur par défaut) ; elle peut aussi ouvrir un navigateur (OIDC) que l'outil ne peut pas piloter.", ' »): this command must be installed where the tool runs (absent from the default container image); it may also open a browser (OIDC) that the tool cannot drive.'),
+    (') : mécanisme déprécié, jeton OIDC à durée de vie courte — prévoyez un jeton de ServiceAccount pour un usage durable.', '): deprecated mechanism, short-lived OIDC token — use a ServiceAccount token for long-term use.'),
+    ("Connexion établie, mais la liste des namespaces est refusée (RBAC) : l'outil ne verra que les namespaces explicitement autorisés.", 'Connected, but listing namespaces is forbidden (RBAC): the tool will only see explicitly allowed namespaces.'),
+    ('Le cluster actif ne semble pas être un cluster de management NKP (ressource Workspace introuvable ou accès refusé) : ', 'The active cluster does not look like an NKP management cluster (Workspace resource not found or access denied): '),
+    ('Kubeconfig refusé : authentification par plugin exec (commande externe) non autorisée pour un kubeconfig importé automatiquement.', 'Kubeconfig refused: exec plugin authentication (external command) is not allowed for an automatically imported kubeconfig.'),
+    (" ». La restauration inter-clusters n'est pas prise en charge : sélectionnez le cluster d'origine dans la barre du haut.", ' ». Cross-cluster restore is not supported: select the source cluster in the top bar.'),
+    ('Vérifiez le dossier de sauvegardes (Avancé) puis resélectionnez la sauvegarde.', 'Check the backups folder (Advanced) then reselect the backup.'),
+    (") — restauration annulée : sans lui, l'application ne serait ni arrêtée proprement ni redémarrée.", ') — restore cancelled: without it, the application would be neither stopped cleanly nor restarted.'),
+    ("L'échec d'un export n'échoue jamais la sauvegarde locale (visible dans les Tâches).", 'A failed export never fails the local backup (visible in Jobs).'),
+    ('Chiffrement activé : choisissez une phrase de chiffrement des exports (elle servira aussi au déchiffrement — conservez-la précieusement).', 'Encryption enabled: choose an export encryption passphrase (also needed for decryption — keep it safe).'),
+    ('chiffrement activé mais phrase de chiffrement absente : renseignez-la dans ⚙ Sources > Stockage objet S3', 'encryption enabled but encryption passphrase missing: enter it in ⚙ Sources > S3 object storage'),
+    ("Cette sauvegarde ne contient pas d'instantané de ressources (resources.json) : elle est antérieure à la fonction, ou config_backup_full était désactivé.", 'This backup has no resource snapshot (resources.json): it predates the feature, or config_backup_full was disabled.'),
+    (' », alors que le contexte actif est « ', ' », while the active context is « '),
+    (" ». Rebasculez sur le contexte d'origine (Réglages) avant de restaurer.", ' ». Switch back to the original context (Settings) before restoring.'),
+    (" Mo). Sauvegarde REFUSÉE pour ne pas saturer le stockage — libérez de la place, réduisez la rétention (Politiques) ou l'historique des tâches (Réglages).", ' MB). Backup REFUSED to avoid filling the storage — free some space, reduce retention (Policies) or the job history (Settings).'),
+    ('MODE DR : toutes les sources (workloads, dépendances) proviennent de la sauvegarde « ', 'DR MODE: every source (workloads, dependencies) comes from backup « '),
+    ("Référencé(s) par l'app mais absent(s) de la SAUVEGARDE (ou Secret masqué) — à recréer à la main dans « ", 'Referenced by the app but absent from the BACKUP (or redacted Secret) — recreate manually in « '),
+    ("Restauration DR refusée : le réglage « Autoriser la restauration DR » est désactivé (⚙ → Réglages). Activez-le le temps de l'opération, puis réessayez.", 'DR restore refused: the “Allow DR restore” setting is disabled (⚙ → Settings). Enable it for the operation, then retry.'),
+    ('Récupération « depuis la sauvegarde seule » : workloads et dépendances proviennent de la sauvegarde « ', 'Recovery “from the backup alone”: workloads and dependencies come from backup « '),
+    ('Simulation : HYCU restaurera le Volume Group sur place (identité conservée) — aucune restauration réelle lancée.', 'Simulation: HYCU will restore the Volume Group in place (identity preserved) — no real restore launched.'),
+    ("aucun point de restauration HYCU trouvé pour ce Volume Group. Vérifiez que l'application est (ou était) protégée dans HYCU.", 'no HYCU restore point found for this Volume Group. Check that the application is (or was) protected in HYCU.'),
+    (' introuvable sur le cluster — restauration automatique depuis HYCU (« Protected deleted »).', ' not found on the cluster — automatic restore from HYCU (“Protected deleted”).'),
+    (" : le volume d'origine n'existe plus et sa restauration automatique via HYCU a échoué : ", ': the original volume no longer exists and its automatic restore via HYCU failed: '),
+    (" » (le namespace n'existe plus sur le cluster).", ' » (the namespace no longer exists on the cluster).'),
+    ("Cette sauvegarde ne contient pas d'instantané de ressources : seuls les volumes (PV/PVC) sont restaurés. Recréez les workloads et dépendances depuis une sauvegarde plus récente, ou manuellement.", 'This backup has no resource snapshot: only the volumes (PV/PVC) are restored. Recreate the workloads and dependencies from a more recent backup, or manually.'),
+    ('<h2 class="dtitle">Santé des clusters</h2>', '<h2 class="dtitle">Cluster health</h2>'),
+    ('" j / "', '" d / "'),
+    ('>recommandé<', '>recommended<'),
+    ("Aucun volume à provisionner.", "No volume to provision."),
+    ("Aucun volume à restaurer.", "No volume to restore."),
+    (" : restauration HYCU refusée : ", ": HYCU restore refused: "),
+    (" : clone HYCU refusé : ", ": HYCU clone refused: "),
+    ("Impossible de vérifier l'existence du namespace « ", "Cannot verify that namespace « "),
+    ("Référence invalide pour ", "Invalid reference for "),
+    ("Référence identique au VG SOURCE pour ", "Reference identical to the SOURCE VG for "),
+    ("Sauvegarde PARTIELLE de « ", "PARTIAL backup of « "),
+    (" » : manifeste de PV illisible pour ", " »: PV manifest unreadable for "),
+    ("REDÉMARRAGE INCOMPLET", "INCOMPLETE RESTART"),
+    ("Volumes restaurés mais redémarrage incomplet — relancez à la main : ",
+     "Volumes restored but restart incomplete — restart manually: "),
+    (" non lié (aucun volumeHandle observé)", " not bound (no volumeHandle observed)"),
+    ("archive rejetée : taille décompressée annoncée ", "archive rejected: announced uncompressed size "),
+    ("archive rejetée : contenu décompressé supérieur à ", "archive rejected: uncompressed content larger than "),
+    ("En-tête Content-Length invalide.", "Invalid Content-Length header."),
+    ("Pré-vol impossible (liste des PV : ", "Pre-flight impossible (PV list: "),
+    (") — rien n'a été créé.", ") — nothing was created."),
+    ("Volume Group ", "Volume Group "),
+    (" déjà pointé par le PV ", " already pointed to by PV "),
+    ("PV de ", "PV of "),
+    (" re-pointé sur le VG cloné par HYCU", " re-pointed to the VG cloned by HYCU"),
+    (" » — rien n'a été créé.", " » — nothing was created."),
+    ("Volume Group du volume « ", "Volume Group of volume « "),
+    ("disque introuvable pour le Volume Group de ", "disk not found for the Volume Group of "),
+    ("illimitée (pas de compteur)", "unlimited (no counter)"),
+    ("Les nouveaux identifiants seront inscrits automatiquement dans la grille.", "The new IDs will be filled into the grid automatically."),
+    ("Si un volume d'origine a disparu du cluster, HYCU le RESTAURERA automatiquement (opération HYCU réelle) avant la recréation.",
+     "If an original volume has disappeared from the cluster, HYCU will RESTORE it automatically (real HYCU operation) before the recreation."),
+    ("Référence provisoire (VG source) inscrite pour la simulation — remplacée par le VG cloné en réel.",
+     "Provisional reference (source VG) filled in for the simulation — replaced by the cloned VG in real mode."),
+    ("Rétention avant sauvegarde : ", "Retention before backup: "),
     ("Simulation du clone automatique via HYCU (aucun clone réel lancé).",
      "Simulation of the automatic clone via HYCU (no real clone launched)."),
-    ("Simulation : HYCU restaurera le Volume Group sur place (identité conservée) — aucune restauration réelle lancée.",
-     "Simulation: HYCU will restore the Volume Group in place (identity preserved) — no real restore launched."),
     ("Restauration HYCU (sur place) lancée pour ", "HYCU restore (in place) started for "),
     ("Le VG est recréé à son UUID d'origine : ", "The VG is recreated at its original UUID: "),
     ("Volume Group restauré à son identité d'origine pour ", "Volume Group restored to its original identity for "),
     ("UUID conservé : ", "UUID preserved: "),
     ("Identité HYCU du VG résolue pour ", "VG HYCU identity resolved for "),
-    ("aucun point de restauration HYCU trouvé pour ce Volume Group. Vérifiez que l'application est (ou était) protégée dans HYCU.",
-     "no HYCU restore point found for this Volume Group. Check that the application is (or was) protected in HYCU."),
     ("Volume d'origine de ", "Original volume of "),
-    (" introuvable sur le cluster — restauration automatique depuis HYCU (« Protected deleted »).",
-     " not found on the cluster — automatic restore from HYCU (“Protected deleted”)."),
-    (" : le volume d'origine n'existe plus et sa restauration automatique via HYCU a échoué : ",
-     ": the original volume no longer exists and its automatic restore via HYCU failed: "),
     (" : source HYCU ", ": HYCU source "),
     (" (identité HYCU résolue depuis ", " (HYCU identity resolved from "),
     (", point de restauration ", ", restore point "),
@@ -12089,9 +12359,6 @@ I18N_EN += [
     ("HYCU : création des volumes…", "HYCU: creating the volumes…"),
     ("UUID du Volume Group (8-4-4-4-12)", "Volume Group UUID (8-4-4-4-12)"),
     ("UUID du VG restauré/cloné sur le site cible (8-4-4-4-12)", "UUID of the VG restored/cloned on the target site (8-4-4-4-12)"),
-    (" » (le namespace n'existe plus sur le cluster).", " » (the namespace no longer exists on the cluster)."),
-    ("Cette sauvegarde ne contient pas d'instantané de ressources : seuls les volumes (PV/PVC) sont restaurés. Recréez les workloads et dépendances depuis une sauvegarde plus récente, ou manuellement.",
-     "This backup has no resource snapshot: only the volumes (PV/PVC) are restored. Recreate the workloads and dependencies from a more recent backup, or manually."),
     ("Cette sauvegarde ne contient <b>que les volumes</b> (pas d'instantané des workloads/dépendances) : elle est antérieure à cette fonction, ou la sauvegarde de config étendue était désactivée. La restauration recréera <b>les volumes (PV/PVC)</b> ; recréez les workloads depuis une sauvegarde plus récente ou manuellement.",
      "This backup contains <b>only the volumes</b> (no snapshot of workloads/dependencies): it predates this feature, or extended config backup was disabled. The restore will recreate <b>the volumes (PV/PVC)</b>; recreate the workloads from a more recent backup or manually."),
     ("Nom de StorageClass cible invalide : « ", "Invalid target StorageClass name: « "),
@@ -12108,8 +12375,8 @@ I18N_EN += [
     ("<b>Importer depuis le bucket</b> (même carte) : rapatrie des exports vers <code>hycu-backups/_imports/…</code> — le chemin retour, indispensable en reprise d'activité.",
      "<b>Import from the bucket</b> (same card): repatriates exports to <code>hycu-backups/_imports/…</code> — the return path, essential for disaster recovery."),
     ("Reprise d'activité (DR)", "Disaster recovery (DR)"),
-    ("<b>Application supprimée du cluster ?</b> Tant que ses sauvegardes existent, elle reste listée dans <b>Applications</b> avec le badge « Supprimée — restaurable ». Cliquez <b>Restaurer</b> : le parcours de récupération recrée tout (namespace, PV/PVC, workloads, dépendances non masquées) depuis la sauvegarde choisie — restaurez d'abord ses Volume Groups dans HYCU et collez leurs UUID. Aucune dérogation DR n'est requise : la récupération reste sur le même cluster/contexte.",
-     "<b>Application deleted from the cluster?</b> As long as its backups exist, it stays listed under <b>Applications</b> with the “Deleted — restorable” badge. Click <b>Restore</b>: the recovery flow recreates everything (namespace, PV/PVC, workloads, non-redacted dependencies) from the selected backup — first restore its Volume Groups in HYCU and paste their UUIDs. No DR override is required: the recovery stays on the same cluster/context."),
+    ("<b>Application supprimée du cluster ?</b> Tant que ses sauvegardes existent, elle reste listée dans <b>Applications</b> avec le badge « Supprimée — restaurable ». Cliquez <b>Restaurer</b> : le parcours de récupération recrée tout (namespace, PV/PVC, workloads, dépendances non masquées) depuis la sauvegarde choisie, en <b>réutilisant les volumes d'origine</b> — rien à saisir. Si un Volume Group a été supprimé avec le namespace mais reste « Protected deleted » dans HYCU, il est <b>restauré automatiquement</b> (HYCU connecté). Décochez « réutiliser » seulement si vous avez restauré les données sur de nouveaux volumes. Aucune dérogation DR n'est requise : la récupération reste sur le même cluster/contexte.",
+     "<b>Application deleted from the cluster?</b> As long as its backups exist, it stays listed under <b>Applications</b> with the “Deleted — restorable” badge. Click <b>Restore</b>: the recovery flow recreates everything (namespace, PV/PVC, workloads, non-redacted dependencies) from the selected backup, <b>reusing the original volumes</b> — nothing to enter. If a Volume Group was deleted with the namespace but remains “Protected deleted” in HYCU, it is <b>restored automatically</b> (HYCU connected). Untick “reuse” only if you restored the data onto new volumes. No DR override is required: the recovery stays on the same cluster/context."),
     ("Namespace détruit, application absente ?</td><td>Elle reste listée tant qu'une sauvegarde existe (badge « Supprimée — restaurable ») : bouton Restaurer → récupération depuis la sauvegarde.",
      "Namespace destroyed, application gone?</td><td>It stays listed as long as a backup exists (“Deleted — restorable” badge): Restore button → recovery from the backup."),
     ("<b>Préparez le retour</b> : activez l'export S3 automatique (chiffré de préférence) — le filet de sécurité doit vivre hors du cluster. Gardez en lieu sûr : <code>hycu_config.json</code>, <code>hycu_secrets.enc</code>, la phrase du coffre et celle des exports (kit DR).",

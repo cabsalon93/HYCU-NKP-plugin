@@ -37,7 +37,7 @@ try:
         {"id": "rp-latest", "time": "2026-09-25 01:00", "restorable": True}]}
     r = H.action_hycu_provision_clone({"volumes": [{"pvc": "data", "source_vg_uuid": SRC}], "dry": True})
     check(r["ok"] and r["dry"], "plan simulé OK")
-    check(r["items"][0]["new_ref"] is None and r["items"][0].get("planned_name", "").startswith("hycurestore-data-"),
+    check(r["items"][0]["new_ref"] is None and r["items"][0].get("planned_name", "").startswith("hycurestore-") and r["items"][0]["planned_name"].endswith("-data"),
           "plan : aucun UUID encore, nom de VG cible imposé")
 
     print("\n== Simulation informative : identité HYCU résolue (VG supprimé), point affiché ==")
