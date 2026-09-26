@@ -327,7 +327,7 @@ def save_config(updates):
 
 # Version horodatée de la build (format AAAAMMJJ-HHMM). À incrémenter à chaque
 # changement notable du programme ; affichée dans l'en-tête de l'interface.
-VERSION = "20260926-0900"
+VERSION = "20260926-1100"
 
 # Jeton anti-CSRF généré au démarrage, injecté dans la page et exigé sur les POST.
 CSRF_TOKEN = secrets.token_urlsafe(32)
@@ -2515,6 +2515,8 @@ def _auto_backup_run(now=None, runner=None):
     # pris » de la boucle est une course (une restauration peut démarrer juste
     # après) ; on ACQUIERT le verrou pour la durée de la sauvegarde. Occupé ->
     # passage sauté, retentera au tick suivant.
+    if BULK["running"]:
+        return None                              # restauration en masse : passage sauté (retentera)
     if not ACTION_LOCK.acquire(blocking=False):
         return None
     AUTO_BACKUP["running"] = True
@@ -2992,6 +2994,32 @@ def _app_object_indexes(items, app):
     return sel
 
 
+def _backup_roots():
+    """Dossiers de sauvegardes consultés : backup_root + dossier de la sauvegarde
+    automatique s'il diffère. [None] désigne backup_root."""
+    roots = [None]
+    ab_dest = (CONFIG.get("auto_backup_dest") or "").strip()
+    if ab_dest and os.path.abspath(os.path.expanduser(ab_dest)) != os.path.abspath(CONFIG["backup_root"]):
+        roots.append(ab_dest)
+    return roots
+
+
+def _active_catalogs(roots=None, with_base=False):
+    """Catalogues des sauvegardes du cluster/contexte ACTIF : dossier du cluster + ancienne
+    disposition locale (versions du contexte courant, ou sans contexte — même règle que
+    list_backups). Liste de {ns: [versions]} ; `with_base` : liste de (base, {ns: [versions]})."""
+    out = []
+    for root in (roots or _backup_roots()):
+        base = os.path.abspath(os.path.expanduser(root)) if root else CONFIG["backup_root"]
+        croot = _cluster_root(base)
+        out.append((croot, _catalog_all(croot)))
+        if _current_cid() == LOCAL_CID and croot != base:
+            ctx = _local_context_name() or ""
+            legacy = _catalog_all(base)
+            out.append((base, {ns: [v for v in vs if (v.get("context") or "") in ("", ctx)] for ns, vs in legacy.items()}))
+    return out if with_base else [c for _b, c in out]
+
+
 def action_applications():
     """Applications des namespaces autorisés (une ligne par APPLICATION, plusieurs
     par namespace possibles — voir _apps_from_workloads), avec l'état de protection
@@ -3006,22 +3034,9 @@ def action_applications():
     info = action_namespaces()
     names = list(info.get("namespaces") or [])
     live = set(names)
-    roots = [None]
-    ab_dest = (CONFIG.get("auto_backup_dest") or "").strip()
-    if ab_dest and os.path.abspath(os.path.expanduser(ab_dest)) != os.path.abspath(CONFIG["backup_root"]):
-        roots.append(ab_dest)
-    # Sauvegardes du cluster/contexte ACTIF depuis le CATALOGUE (aucune lecture
-    # d'index.json) : dossier du cluster + ancienne disposition locale (versions du
-    # contexte courant, ou sans contexte — même règle que list_backups).
-    cats = []
-    for root in roots:
-        base = os.path.abspath(os.path.expanduser(root)) if root else CONFIG["backup_root"]
-        croot = _cluster_root(base)
-        cats.append(_catalog_all(croot))
-        if _current_cid() == LOCAL_CID and croot != base:
-            ctx = _local_context_name() or ""
-            legacy = _catalog_all(base)
-            cats.append({ns: [v for v in vs if (v.get("context") or "") in ("", ctx)] for ns, vs in legacy.items()})
+    roots = _backup_roots()
+    # Sauvegardes du cluster/contexte ACTIF depuis le CATALOGUE (aucune lecture d'index.json).
+    cats = _active_catalogs(roots)
     # namespaces présents UNIQUEMENT dans les sauvegardes
     flt = _ns_filter()
     if info.get("ok"):
@@ -3391,6 +3406,13 @@ HELP_SECTIONS = [
 <div class="tip">Déroulé conseillé : lancez d'abord en <b>simulation</b> (plan affiché, aucun effet), relisez le récapitulatif, puis désactivez la simulation et relancez. En mode réel, l'outil demande de <b>retaper le nom du cluster</b>. Après une restauration réelle, la <b>Vérification</b> s'ouvre automatiquement (PVC Bound, pods Running).</div>
 <div class="tip">Si une étape échoue, la séquence <b>s'arrête</b> et l'application reste arrêtée (jamais redémarrée sur des volumes incohérents). Corrigez puis <b>relancez</b> : la reprise est idempotente et les réplicas d'origine sont mémorisés.</div>
 <div class="tip"><b>Application supprimée du cluster ?</b> Tant que ses sauvegardes existent, elle reste listée dans <b>Applications</b> avec le badge « Supprimée — restaurable ». Cliquez <b>Restaurer</b> : le parcours de récupération recrée tout (namespace, PV/PVC, workloads, dépendances non masquées) depuis la sauvegarde choisie, en <b>réutilisant les volumes d'origine</b> — rien à saisir. Si un Volume Group a été supprimé avec le namespace mais reste « Protected deleted » dans HYCU, il est <b>restauré automatiquement</b> (HYCU connecté). Décochez « réutiliser » seulement si vous avez restauré les données sur de nouveaux volumes. Aucune dérogation DR n'est requise : la récupération reste sur le même cluster/contexte.</div>"""),
+    ("masse", "Restauration en masse (même cluster)", """
+<ul>
+<li><b>Applications → Restaurer en masse</b> : recrée d'un coup <b>tous les namespaces supprimés</b> du cluster actif depuis leur dernière sauvegarde antérieure à un <b>instant de référence</b> (namespace, PV/PVC, workloads, dépendances, Secrets si le coffre est déverrouillé, Volume Groups restaurés par HYCU s'ils ont disparu, applications stateless). Les namespaces <b>encore présents</b> sont ignorés : une application vivante se restaure depuis sa propre ligne.</li>
+<li><b>Préparer le plan</b> montre, avant tout, les namespaces retenus (sauvegarde choisie, contenu, avertissements : Secrets masqués ou chiffrés avec coffre verrouillé, sauvegarde partielle, sans instantané) et ceux ignorés, avec la raison.</li>
+<li><b>Simuler</b> exécute le plan en simulation, en arrière-plan, avec un journal par namespace ; <b>Lancer (réel)</b> n'est possible qu'après une simulation complète et sans échec du <b>même</b> plan, bandeau Simulation désactivé, et confirmation du cluster.</li>
+<li>Exécution <b>séquentielle</b> (les restaurations HYCU durent des minutes chacune : comptez des heures pour des centaines de namespaces) ; <b>Arrêter</b> termine le namespace en cours ; <b>Reprendre</b> rejoue seulement les namespaces restants ou en échec — un namespace déjà recréé n'est jamais refait. Le journal (<code>_bulk_restore.json</code>) survit à un redémarrage ; la sauvegarde automatique est suspendue pendant le run.</li>
+</ul>"""),
     ("s3", "Export S3 (optionnel)", """
 <ul>
 <li>⚙ → Sources → <b>Stockage objet S3</b> : endpoint compatible S3 (Nutanix Objects, MinIO, AWS…), bucket, clés d'accès → <b>Tester &amp; connecter</b>.</li>
@@ -6920,6 +6942,251 @@ def action_dr_backups():
     return _ok(backups=out, allowed=bool(CONFIG.get("allow_dr_restore")))
 
 
+# ------------------------------------------------------------------------------
+# RESTAURATION EN MASSE (même cluster) : recréer d'un coup tous les namespaces
+# SUPPRIMÉS du cluster actif depuis leur dernière sauvegarde antérieure à un instant
+# de référence T. C'est l'orchestration de la récupération existante (action_clone_app
+# « depuis la sauvegarde seule » : namespace, PV/PVC, workloads, dépendances, Secrets
+# déchiffrés, VG restaurés par HYCU s'ils ont disparu, applications stateless).
+#   - plan lisible AVANT tout (namespaces retenus / ignorés, sauvegarde choisie,
+#     avertissements) ; les namespaces encore PRÉSENTS sont ignorés : une application
+#     vivante se restaure depuis sa propre ligne, jamais en masse à l'insu de l'opérateur ;
+#   - journal persistant <dossier du cluster>/_bulk_restore.json : survit à un
+#     redémarrage, un namespace déjà recréé n'est jamais refait (reprise idempotente) ;
+#   - exécution SÉQUENTIELLE en arrière-plan (un seul verrou d'action, HYCU sollicité
+#     proprement), arrêt propre (le namespace en cours se termine), reprise ;
+#   - le RÉEL exige une simulation complète et réussie du MÊME plan, puis la
+#     confirmation du contexte comme les autres orchestrateurs.
+# ------------------------------------------------------------------------------
+BULK_FILE = "_bulk_restore.json"
+BULK = {"running": False, "stop": False}
+BULK_LOCK = threading.Lock()
+
+
+def _bulk_path():
+    return os.path.join(_cluster_root(CONFIG["backup_root"]), BULK_FILE)
+
+
+def _bulk_load():
+    try:
+        with open(_bulk_path(), encoding="utf-8") as f:
+            j = json.load(f)
+        return j if isinstance(j, dict) and isinstance(j.get("items"), list) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _bulk_save(j):
+    p = _bulk_path()
+    try:
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p + ".tmp", "w", encoding="utf-8") as f:
+            json.dump(j, f)
+        os.replace(p + ".tmp", p)
+    except OSError as e:
+        print("Journal de restauration en masse non écrit : %s" % e)
+
+
+def _parse_as_of(s):
+    """Instant de référence (ISO local, ex. 2026-09-26T08:30) -> (epoch, erreur) ; vide = maintenant."""
+    s = (s or "").strip()
+    if not s:
+        return time.time(), None
+    try:
+        return datetime.datetime.fromisoformat(s.replace("Z", "")).timestamp(), None
+    except ValueError:
+        return None, "Instant de référence invalide : « %s » (format AAAA-MM-JJTHH:MM)." % s
+
+
+def action_bulk_plan(payload):
+    """Plan de restauration en masse (lecture seule) : pour chaque namespace du
+    cluster/contexte actif ayant une sauvegarde, la dernière version antérieure à
+    l'instant de référence (complète de préférence). Retenu si le namespace est ABSENT
+    du cluster ; ignoré (avec la raison) sinon. Avertissements par namespace : Secrets
+    masqués / chiffrés avec coffre verrouillé, sauvegarde partielle, sans instantané."""
+    as_of, err = _parse_as_of(payload.get("as_of"))
+    if err:
+        return _err(err)
+    exclude = {str(x).strip() for x in (payload.get("exclude") or []) if str(x).strip()}
+    only = {str(x).strip() for x in (payload.get("namespaces") or []) if str(x).strip()}
+    live, lerr = kubectl_json(["get", "ns"])
+    if lerr:
+        return _err("Liste des namespaces du cluster impossible (%s) : plan refusé par prudence." % lerr)
+    present = {(i.get("metadata") or {}).get("name") for i in ((live or {}).get("items") or [])}
+    flt = _ns_filter()
+    pw_ok = bool(_backup_secret_passphrase())
+    allv = {}
+    for base, cat in _active_catalogs(with_base=True):
+        for ns, vs in cat.items():
+            for v in vs:
+                allv.setdefault(ns, []).append((base, v))
+    items, skipped = [], []
+    for ns in sorted(allv):
+        if flt and ns not in flt:
+            continue
+        if only and ns not in only:
+            continue
+        if ns in exclude:
+            skipped.append({"ns": ns, "reason": "exclu par l'opérateur"})
+            continue
+        vs = [(b, v) for b, v in allv[ns] if (v.get("epoch") or 0) <= as_of]
+        if not vs:
+            skipped.append({"ns": ns, "reason": "aucune sauvegarde antérieure à l'instant de référence"})
+            continue
+        full = [(b, v) for b, v in vs if not v.get("partial")]
+        base, v = max(full or vs, key=lambda bv: bv[1].get("epoch") or 0)
+        if ns in present:
+            skipped.append({"ns": ns, "reason": "présent sur le cluster — se restaure depuis sa propre ligne (Applications)"})
+            continue
+        stateless = bool(not v.get("volumes") and any(a.get("type") == "stateless" for a in (v.get("apps") or [])))
+        if not v.get("volumes") and not stateless:
+            skipped.append({"ns": ns, "reason": "sauvegarde sans volume ni workload : rien à recréer"})
+            continue
+        warns = []
+        if v.get("partial"):
+            warns.append("sauvegarde PARTIELLE (un PV était illisible) : seule version antérieure à l'instant de référence")
+        if not v.get("has_resources"):
+            warns.append("sans instantané de ressources : volumes seuls, workloads et dépendances à recréer à la main")
+        elif v.get("secrets") == "redacted" or (v.get("secrets") is None):
+            warns.append("Secrets masqués dans cette sauvegarde : à recréer à la main après la restauration")
+        elif v.get("secrets") == "encrypted" and not pw_ok:
+            warns.append("Secrets chiffrés et coffre VERROUILLÉ : ils ne seront pas recréés — déverrouillez le coffre avant de lancer")
+        items.append({"ns": ns, "backup_path": _catalog_backup_path(base, ns, v), "timestamp": v.get("ts"),
+                      "created": v.get("created") or "", "volumes": list(v.get("volumes") or []),
+                      "stateless": stateless, "secrets": v.get("secrets"), "partial": bool(v.get("partial")),
+                      "apps": [a.get("name") for a in (v.get("apps") or []) if a.get("name")],
+                      "warnings": warns})
+    return _ok(as_of=as_of, as_of_iso=datetime.datetime.fromtimestamp(as_of).isoformat(timespec="minutes"),
+               items=items, skipped=skipped, cluster=_cluster_label(), context=action_context().get("context"),
+               vault_unlocked=pw_ok, hycu=bool(SESSION_CREDS.get("hycu")),
+               prism=bool(SESSION_CREDS.get("prismcentral") or SESSION_CREDS.get("nutanix")),
+               running=BULK["running"])
+
+
+def _bulk_counts(j):
+    c = {"total": len(j.get("items") or []), "done": 0, "failed": 0, "pending": 0, "running": 0, "stopped": 0}
+    for it in j.get("items") or []:
+        c[it.get("status") or "pending"] = c.get(it.get("status") or "pending", 0) + 1
+    return c
+
+
+def action_bulk_status():
+    """Journal courant (plan, états par namespace, journal des étapes borné) + progression."""
+    j = _bulk_load()
+    if not j:
+        return _ok(journal=None, running=BULK["running"], counts=None)
+    return _ok(journal=j, running=BULK["running"], counts=_bulk_counts(j))
+
+
+def action_bulk_stop():
+    if not BULK["running"]:
+        return _err("Aucune restauration en masse en cours.")
+    BULK["stop"] = True
+    return _ok(stopping=True)
+
+
+def _bulk_worker(j, confirm_context, cid):
+    """Exécute les namespaces en attente, un par un, en journalisant chaque verdict."""
+    try:
+        with use_cluster(cid):
+            for it in j["items"]:
+                if BULK["stop"]:
+                    for x in j["items"]:
+                        if x.get("status") in ("pending", "running"):
+                            x["status"] = "stopped"
+                    j["stopped"] = True
+                    break
+                if it.get("status") == "done":
+                    continue                              # reprise : jamais refait
+                it.update(status="running", started=datetime.datetime.now().isoformat(timespec="seconds"),
+                          error=None)
+                _bulk_save(j)
+                body = {"namespace": it["ns"], "target_namespace": it["ns"], "backup_path": it["backup_path"],
+                        "items": [{"pvc": p, "new_ref": ""} for p in (it.get("volumes") or [])],
+                        "dry": bool(j.get("dry", True)), "from_backup_only": True, "clone_refs": True,
+                        "confirm_context": confirm_context}
+                log = []
+                try:
+                    r = action_clone_app(body, log=log)
+                except Exception as e:                   # un namespace en erreur n'arrête pas les autres
+                    r = {"ok": False, "error": "Erreur interne : %s" % e, "log": log}
+                it["status"] = "done" if r.get("ok") else "failed"
+                it["error"] = r.get("error")
+                it["run_warnings"] = [str(w)[:300] for w in (r.get("warnings") or [])][:10]
+                it["log"] = [{"ok": bool(l.get("ok")), "dry": bool(l.get("dry")), "label": str(l.get("label") or "")[:200],
+                              "stderr": str(l.get("stderr") or "")[:200]} for l in (r.get("log") or log)][-25:]
+                it["ended"] = datetime.datetime.now().isoformat(timespec="seconds")
+                _bulk_save(j)
+                _apps_cache_clear()
+            else:
+                j["done"] = True
+                j["stopped"] = False
+            j["ended"] = datetime.datetime.now().isoformat(timespec="seconds")
+            _bulk_save(j)
+            c = _bulk_counts(j)
+            audit("bulk_restore", dry=bool(j.get("dry", True)), ok=(c["failed"] == 0 and not j.get("stopped")),
+                  namespaces=c["total"], done=c["done"], failed=c["failed"], stopped=bool(j.get("stopped")),
+                  as_of=j.get("as_of"))
+    finally:
+        BULK["running"] = False
+        BULK["stop"] = False
+
+
+def action_bulk_run(payload):
+    """Démarre (ou reprend) une restauration en masse en arrière-plan. Simulation par
+    défaut ; le RÉEL exige : garde contexte, ET une simulation terminée sans échec du même
+    plan (mêmes namespaces, même instant de référence) — sauf reprise d'un run réel."""
+    dry = bool(payload.get("dry", True))
+    resume = bool(payload.get("resume"))
+    with BULK_LOCK:
+        if BULK["running"]:
+            return _err("Une restauration en masse est déjà en cours.")
+        if not dry:
+            guard = _context_guard(payload)
+            if guard:
+                return guard
+        prev = _bulk_load()
+        if resume:
+            if not prev:
+                return _err("Aucun journal à reprendre.")
+            todo = [it for it in prev["items"] if it.get("status") != "done"]
+            if not todo:
+                return _err("Rien à reprendre : tous les namespaces du journal sont déjà recréés.")
+            if not dry and prev.get("dry", True):
+                return _err("Ce journal est une simulation : lancez le réel depuis le plan, pas par reprise.")
+            for it in todo:
+                it["status"] = "pending"
+            j = prev
+            j.update(dry=dry, done=False, stopped=False,
+                     resumed=datetime.datetime.now().isoformat(timespec="seconds"))
+        else:
+            plan = action_bulk_plan(payload)
+            if not plan.get("ok"):
+                return plan
+            if not plan["items"]:
+                return _err("Rien à restaurer : aucun namespace supprimé avec une sauvegarde antérieure "
+                            "à l'instant de référence.")
+            wanted = {it["ns"] for it in plan["items"]}
+            if not dry:
+                sim_ok = (prev and prev.get("dry") and prev.get("done") and not prev.get("stopped")
+                          and _bulk_counts(prev)["failed"] == 0 and prev.get("as_of") == plan["as_of_iso"]
+                          and {it["ns"] for it in prev["items"]} == wanted)
+                if not sim_ok:
+                    return _err("Lancez d'abord une SIMULATION complète et sans échec de ce plan (mêmes "
+                                "namespaces, même instant de référence) avant le réel.")
+            j = {"id": secrets.token_hex(6), "started": datetime.datetime.now().isoformat(timespec="seconds"),
+                 "dry": dry, "as_of": plan["as_of_iso"], "cluster": plan["cluster"], "context": plan["context"],
+                 "done": False, "stopped": False, "skipped": plan["skipped"],
+                 "items": [dict(it, status="pending", error=None, log=[]) for it in plan["items"]]}
+        BULK["running"] = True
+        BULK["stop"] = False
+        _bulk_save(j)
+    audit("bulk_restore_start", dry=dry, resume=resume, namespaces=len(j["items"]), as_of=j.get("as_of"))
+    t = threading.Thread(target=_bulk_worker, args=(j, payload.get("confirm_context"), _current_cid()), daemon=True)
+    t.start()
+    return _ok(id=j["id"], dry=dry, namespaces=len(j["items"]), resumed=resume)
+
+
 def action_clone_app(payload, log=None):
     """Crée une COPIE de l'application sur le(s) volume(s) cloné(s), SANS toucher à
     l'app d'origine. Cible : même namespace (avec suffixe) ou autre namespace.
@@ -7553,6 +7820,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._json(action_s3_list())
             if path == "/api/dr/backups":
                 return self._json(action_dr_backups())
+            if path == "/api/bulk/status":
+                return self._json(action_bulk_status())
             if path == "/api/auto_backup":
                 return self._json(action_auto_backup_status())
             if path == "/api/applications":
@@ -7668,6 +7937,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._json(_run_async(action_orchestrate_inplace, payload))
             if path == "/api/clone_app":
                 return self._json(_run_async(action_clone_app, payload))
+            if path == "/api/bulk/plan":
+                return self._json(action_bulk_plan(payload))
+            if path == "/api/bulk/run":
+                return self._json(action_bulk_run(payload))
+            if path == "/api/bulk/stop":
+                return self._json(action_bulk_stop())
         except Exception as e:
             print("Erreur POST %s : %s" % (path, e))
             return self._json({"ok": False, "error": "Erreur interne."}, 500)
@@ -8324,6 +8599,7 @@ HTML = r"""<!DOCTYPE html>
         <button class="pact" id="actRestore" type="button" disabled><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4.4 12.5a7.6 7.6 0 1 0 2.1-5.8"/><path d="M4.2 4.3v3.9h3.9"/><path d="M12 8.3v4l2.6 1.9"/></svg><span>Restaurer</span></button>
         <button class="pact" id="actPolicy" type="button" disabled><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l7.5 3v5.4c0 4.6-3.2 8.3-7.5 9.6-4.3-1.3-7.5-5-7.5-9.6V6z"/><path d="M12 8.8v6.4M8.8 12h6.4"/></svg><span>Définir la politique</span></button>
         <button class="pact" id="actVerify" type="button" disabled><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="8.6"/><path d="M8.3 12.2l2.5 2.5 5-5.3"/></svg><span>Vérifier</span></button>
+        <button class="pact" id="actBulk" type="button" title="Recréer tous les namespaces supprimés du cluster actif depuis leurs sauvegardes"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3.5" y="4" width="17" height="5" rx="1.2"/><rect x="3.5" y="11" width="17" height="5" rx="1.2"/><path d="M6 18.5h12M4.4 21a7 7 0 0 0 1.9-5.3"/><path d="M4.2 13.2v3.6h3.6"/></svg><span>Restaurer en masse</span></button>
       </div></div>
     <div class="tcard">
       <div class="tbar"><div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap"><input type="text" id="appsSearch" placeholder="Rechercher" autocomplete="off">
@@ -8490,6 +8766,26 @@ HTML = r"""<!DOCTYPE html>
 
     </div>
     <div class="hm-foot" id="mBackupFoot"><button class="lnk" type="button" data-close="mBackup">Fermer</button><button class="btn" id="bkRunSel" type="button" style="display:none">Sauvegarder la sélection</button></div>
+  </div>
+</div>
+<div id="mBulk" class="hmodal-bg" style="display:none">
+  <div class="hmodal" style="max-width:860px">
+    <div class="hm-head"><h2>Restauration en masse</h2><div class="hm-ico"><button type="button" data-close="mBulk" title="Fermer">✕</button></div></div>
+    <div class="hm-body">
+      <div class="note">Recrée <b>tous les namespaces supprimés</b> du cluster actif (<b id="bulkCluster"></b>) depuis leur dernière sauvegarde antérieure à l'instant de référence : namespace, PV/PVC, workloads, dépendances, Secrets (coffre déverrouillé), Volume Groups restaurés par HYCU s'ils ont disparu, applications stateless. Les namespaces <b>encore présents</b> sont ignorés : une application vivante se restaure depuis sa propre ligne. Exécution séquentielle et journalisée, reprise possible ; <b>simulation obligatoire</b> avant le réel.</div>
+      <div class="row" style="margin-top:10px">
+        <div style="flex:none;width:230px"><label class="fld">Instant de référence</label><input type="datetime-local" id="bulkAsOf"></div>
+        <div><label class="fld">Namespaces à exclure (virgules, optionnel)</label><input type="text" id="bulkExclude" placeholder="kube-system, monitoring" autocomplete="off"></div>
+        <div style="flex:none;align-self:flex-end"><button class="btn ghost" id="bulkPlanBtn" type="button">Préparer le plan</button></div>
+      </div>
+      <div id="bulkPlanOut" style="margin-top:10px"></div>
+      <div id="bulkRunOut" style="margin-top:10px"></div>
+    </div>
+    <div class="hm-foot"><button class="lnk" type="button" data-close="mBulk">Fermer</button>
+      <button class="btn ghost" id="bulkStop" type="button" style="display:none">Arrêter</button>
+      <button class="btn ghost" id="bulkResume" type="button" style="display:none">Reprendre</button>
+      <button class="btn" id="bulkSim" type="button" disabled>Simuler</button>
+      <button class="btn danger" id="bulkReal" type="button" disabled>Lancer (réel)</button></div>
   </div>
 </div>
 <div id="mPolicy" class="hmodal-bg" style="display:none">
@@ -10724,6 +11020,107 @@ function openPolicyModal(ns){
   $("#mPolicyTitle").innerHTML=esc("Définir la politique")+(ns ? '<span class="sep">›</span>'+esc(ns) : "");
   openModal("mPolicy");
   if(conn.hycu && conn.hycu.connected) setTimeout(()=>$("#bkMatch").click(), 30);   // analyse : lecture seule
+}
+
+// ============================ Restauration en masse (même cluster) ============================
+// Plan (lecture seule) -> Simuler (journal, arrière-plan) -> Lancer (réel : simulation
+// du même plan exigée par le serveur, confirmation du contexte) ; suivi par polling,
+// arrêt propre et reprise (les namespaces déjà recréés ne sont jamais refaits).
+let bulkPlan=null, bulkStatus=null, bulkTimer=null, bulkWasRunning=false;
+function bulkNowLocal(){ const d=new Date(); const p=n=>String(n).padStart(2,"0");
+  return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`; }
+function bulkExclude(){ return ($("#bulkExclude").value||"").split(",").map(s=>s.trim()).filter(Boolean); }
+function openBulkModal(){
+  bulkPlan=null; $("#bulkAsOf").value=bulkNowLocal(); $("#bulkPlanOut").innerHTML=""; $("#bulkRunOut").innerHTML="";
+  $("#bulkCluster").textContent=ctxInfo.context||"—";
+  openModal("mBulk"); bulkSyncBtns(); bulkPoll();
+}
+$("#actBulk").onclick=openBulkModal;
+function bulkSamePlan(j){
+  return !!(j && bulkPlan && j.as_of===bulkPlan.as_of_iso && j.items.length===bulkPlan.items.length
+            && j.items.every((it,i)=>it.ns===bulkPlan.items[i].ns));
+}
+function bulkSyncBtns(){
+  const running=!!(bulkStatus&&bulkStatus.running), j=bulkStatus&&bulkStatus.journal, c=bulkStatus&&bulkStatus.counts;
+  const n=!!(bulkPlan&&bulkPlan.items.length);
+  const simOk=!!(j && j.dry && j.done && !j.stopped && c && c.failed===0 && bulkSamePlan(j));
+  $("#bulkSim").disabled = !n || running;
+  $("#bulkReal").disabled = !n || running || !simOk || dry();
+  $("#bulkReal").title = dry() ? "Désactivez le bandeau Simulation pour lancer le réel." : (!simOk ? "Simulez d'abord ce plan (sans échec)." : "");
+  $("#bulkStop").style.display = running ? "" : "none";
+  $("#bulkResume").style.display = (j && !running && !j.done && j.items.some(it=>it.status!=="done")) ? "" : "none";
+}
+async function bulkMakePlan(){
+  const b=$("#bulkPlanBtn"); b.disabled=true;
+  $("#bulkPlanOut").innerHTML='<div class="hint"><span class="spin"></span>Analyse des sauvegardes et du cluster…</div>';
+  const r=await post("/api/bulk/plan",{as_of:$("#bulkAsOf").value, exclude:bulkExclude()});
+  b.disabled=false;
+  if(!r.ok){ bulkPlan=null; $("#bulkPlanOut").innerHTML=errBox(r.error); bulkSyncBtns(); return; }
+  bulkPlan=r; $("#bulkPlanOut").innerHTML=bulkRenderPlan(r); bulkSyncBtns();
+}
+$("#bulkPlanBtn").onclick=bulkMakePlan;
+function bulkRenderPlan(r){
+  const rows=r.items.map(it=>`<tr><td style="color:var(--strong);font-weight:500">${esc(it.ns)}</td><td>${esc((it.created||it.timestamp||"").replace("T"," ").slice(0,16))}</td>
+     <td>${it.stateless?'<span class="badge b-pending">Stateless</span>':(it.volumes.length+" volume(s)")}${it.partial?' <span class="badge b-lost">partielle</span>':''}</td>
+     <td>${(it.warnings||[]).length?'<span class="ko">⚠ '+esc(it.warnings.join(" · "))+'</span>':'<span class="ok">✓</span>'}</td></tr>`).join("");
+  const sk=(r.skipped||[]).map(s=>`<li><b>${esc(s.ns)}</b> — ${esc(s.reason)}</li>`).join("");
+  const warnN=r.items.filter(it=>(it.warnings||[]).length).length;
+  return `<div class="note"><b>${r.items.length}</b> namespace(s) à recréer sur <b>${esc(r.context||r.cluster||"?")}</b> · instant de référence ${esc((r.as_of_iso||"").replace("T"," "))}${warnN?` · <span class="ko">${warnN} avec avertissement</span>`:""}${r.vault_unlocked?"":' · <span class="ko">coffre verrouillé</span>'}${r.hycu?"":' · <span class="hint">HYCU non connecté : les Volume Groups disparus ne seront pas restaurés</span>'}</div>
+    ${r.items.length?`<div class="tcard" style="box-shadow:none;border:1px solid var(--rule);max-height:300px;overflow:auto"><table class="ht" id="bulkPlanTable"><thead><tr><th>Namespace</th><th>Sauvegarde</th><th>Contenu</th><th>Avertissements</th></tr></thead><tbody>${rows}</tbody></table></div>`:'<div class="hint">Aucun namespace supprimé avec une sauvegarde antérieure à l\'instant de référence.</div>'}
+    ${sk?`<details style="margin-top:8px"><summary class="hint">${(r.skipped||[]).length} namespace(s) ignoré(s)</summary><ul class="dlist" style="margin-top:6px">${sk}</ul></details>`:""}`;
+}
+async function bulkStart(dryRun){
+  let confirmedCtx="";
+  if(!dryRun){
+    const needCtx = ctxInfo.require_confirm ? (ctxInfo.context||"") : null;
+    const res=await confirmDanger({title:"Restauration en masse RÉELLE", requireText:needCtx, lines:[
+      "<b>"+bulkPlan.items.length+"</b> namespace(s) seront RECRÉÉS sur <b>"+esc(ctxInfo.context||"?")+"</b> depuis leurs sauvegardes.",
+      "Exécution séquentielle et journalisée ; les Volume Groups disparus seront restaurés par HYCU (opérations réelles).",
+      "Les namespaces présents ne sont pas touchés."]});
+    if(!res) return; if(typeof res==="string") confirmedCtx=res;
+  }
+  const body={as_of:$("#bulkAsOf").value, exclude:bulkExclude(), dry:dryRun};
+  if(!dryRun && ctxInfo.require_confirm) body.confirm_context=confirmedCtx;
+  const r=await post("/api/bulk/run", body);
+  if(!r.ok){ $("#bulkRunOut").innerHTML=errBox(r.error); return; }
+  bulkPoll();
+}
+$("#bulkSim").onclick=()=>bulkStart(true);
+$("#bulkReal").onclick=()=>bulkStart(false);
+$("#dry").addEventListener("change",()=>{ if($("#mBulk").style.display!=="none") bulkSyncBtns(); });   // bandeau Simulation
+$("#bulkStop").onclick=async()=>{ const r=await post("/api/bulk/stop",{}); if(!r.ok) $("#bulkRunOut").insertAdjacentHTML("afterbegin", errBox(r.error)); };
+$("#bulkResume").onclick=async()=>{
+  const j=bulkStatus&&bulkStatus.journal; if(!j) return;
+  let confirmedCtx="";
+  if(!j.dry){
+    const needCtx = ctxInfo.require_confirm ? (ctxInfo.context||"") : null;
+    const res=await confirmDanger({title:"Reprendre la restauration en masse (RÉEL)", requireText:needCtx, lines:[
+      "Les namespaces restants (en attente, arrêtés ou en échec) seront recréés ; ceux déjà recréés ne sont pas refaits."]});
+    if(!res) return; if(typeof res==="string") confirmedCtx=res;
+  }
+  const body={resume:true, dry:j.dry}; if(!j.dry && ctxInfo.require_confirm) body.confirm_context=confirmedCtx;
+  const r=await post("/api/bulk/run", body);
+  if(!r.ok){ $("#bulkRunOut").innerHTML=errBox(r.error); return; }
+  bulkPoll();
+};
+async function bulkPoll(){
+  clearTimeout(bulkTimer);
+  if($("#mBulk").style.display==="none") return;
+  const st=await get("/api/bulk/status"); if(!st.ok) return;
+  bulkStatus=st; bulkRenderStatus(st); bulkSyncBtns();
+  if(st.running){ bulkWasRunning=true; bulkTimer=setTimeout(bulkPoll, 2000); }
+  else if(bulkWasRunning){ bulkWasRunning=false; loadApps(true); }   // namespaces recréés : inventaire à jour
+}
+function bulkRenderStatus(st){
+  const j=st.journal; if(!j){ $("#bulkRunOut").innerHTML=""; return; }
+  const c=st.counts, pct=c.total?Math.round(100*(c.done+c.failed)/c.total):0;
+  const IC={done:"ok",failed:"ko",running:"run",pending:"na",stopped:"wn"};
+  const head = st.running ? '<span class="spin"></span> En cours' : j.stopped ? "Arrêtée" : j.done ? (c.failed ? "Terminée avec échecs" : "Terminée") : "Interrompue";
+  $("#bulkRunOut").innerHTML=`<div class="${j.dry?'warnbox':'note'}" id="bulkHead"><b>${j.dry?"Simulation":"Réel"}</b> · ${head} · ${c.done+c.failed} / ${c.total} (${c.failed} échec(s)) · instant de référence ${esc((j.as_of||"").replace("T"," "))}${j.started?" · démarrée "+esc(j.started.replace("T"," ")):""}</div>
+    <div style="height:6px;background:var(--rule);border-radius:3px;margin:6px 0 10px"><div style="height:6px;width:${pct}%;background:#41327C;border-radius:3px"></div></div>
+    <div class="tcard" style="box-shadow:none;border:1px solid var(--rule);max-height:320px;overflow:auto"><table class="ht" id="bulkStatusTable"><thead><tr><th>Namespace</th><th>État</th><th>Détail</th></tr></thead><tbody>${
+      j.items.map(it=>`<tr><td style="color:var(--strong);font-weight:500">${esc(it.ns)}</td><td>${stIc(IC[it.status]||"na", it.status)} ${esc(it.status)}</td>
+        <td>${it.error?'<span class="ko">'+esc(it.error)+'</span>':''}${(it.run_warnings||[]).length?'<div class="hint">⚠ '+esc(it.run_warnings.join(" · "))+'</div>':''}${(it.log||[]).length?`<details><summary class="hint">${it.log.length} étape(s)</summary>${renderLog(it.log)}</details>`:''}</td></tr>`).join("")}</tbody></table></div>`;
 }
 
 // ============================ Modale Sources (engrenage) ============================
@@ -13025,6 +13422,15 @@ I18N_EN += [
     ("Si une étape échoue, la séquence <b>s'arrête</b> et l'application reste arrêtée (jamais redémarrée sur des volumes incohérents). Corrigez puis <b>relancez</b> : la reprise est idempotente et les réplicas d'origine sont mémorisés.",
      "If a step fails, the sequence <b>stops</b> and the application stays stopped (never restarted on inconsistent volumes). Fix then <b>relaunch</b>: resumption is idempotent and original replicas are remembered."),
     ("Export S3 (optionnel)", "S3 export (optional)"),
+    ("Restauration en masse (même cluster)", "Bulk restore (same cluster)"),
+    ("<li><b>Applications → Restaurer en masse</b> : recrée d'un coup <b>tous les namespaces supprimés</b> du cluster actif depuis leur dernière sauvegarde antérieure à un <b>instant de référence</b> (namespace, PV/PVC, workloads, dépendances, Secrets si le coffre est déverrouillé, Volume Groups restaurés par HYCU s'ils ont disparu, applications stateless). Les namespaces <b>encore présents</b> sont ignorés : une application vivante se restaure depuis sa propre ligne.</li>",
+     "<li><b>Applications → Bulk restore</b>: recreates at once <b>every deleted namespace</b> of the active cluster from its latest backup prior to a <b>reference time</b> (namespace, PV/PVC, workloads, dependencies, Secrets when the vault is unlocked, Volume Groups restored by HYCU if they are gone, stateless applications). Namespaces <b>still present</b> are skipped: a live application is restored from its own row.</li>"),
+    ("<li><b>Préparer le plan</b> montre, avant tout, les namespaces retenus (sauvegarde choisie, contenu, avertissements : Secrets masqués ou chiffrés avec coffre verrouillé, sauvegarde partielle, sans instantané) et ceux ignorés, avec la raison.</li>",
+     "<li><b>Prepare the plan</b> first shows the selected namespaces (chosen backup, content, warnings: redacted Secrets or encrypted with a locked vault, partial backup, no snapshot) and the skipped ones, with the reason.</li>"),
+    ("<li><b>Simuler</b> exécute le plan en simulation, en arrière-plan, avec un journal par namespace ; <b>Lancer (réel)</b> n'est possible qu'après une simulation complète et sans échec du <b>même</b> plan, bandeau Simulation désactivé, et confirmation du cluster.</li>",
+     "<li><b>Simulate</b> runs the plan in simulation, in the background, with a journal per namespace; <b>Start (real)</b> is only possible after a complete, failure-free simulation of the <b>same</b> plan, with the Simulation banner off and the cluster confirmed.</li>"),
+    ("<li>Exécution <b>séquentielle</b> (les restaurations HYCU durent des minutes chacune : comptez des heures pour des centaines de namespaces) ; <b>Arrêter</b> termine le namespace en cours ; <b>Reprendre</b> rejoue seulement les namespaces restants ou en échec — un namespace déjà recréé n'est jamais refait. Le journal (<code>_bulk_restore.json</code>) survit à un redémarrage ; la sauvegarde automatique est suspendue pendant le run.</li>",
+     "<li><b>Sequential</b> execution (each HYCU restore takes minutes: expect hours for hundreds of namespaces); <b>Stop</b> finishes the current namespace; <b>Resume</b> replays only the remaining or failed namespaces — a namespace already recreated is never redone. The journal (<code>_bulk_restore.json</code>) survives a restart; the automatic backup is suspended during the run.</li>"),
     ("⚙ → Sources → <b>Stockage objet S3</b> : endpoint compatible S3 (Nutanix Objects, MinIO, AWS…), bucket, clés d'accès → <b>Tester &amp; connecter</b>.",
      "⚙ → Sources → <b>S3 object storage</b>: S3-compatible endpoint (Nutanix Objects, MinIO, AWS…), bucket, access keys → <b>Test &amp; connect</b>."),
     ("Cochez <b>Export automatique</b> : chaque sauvegarde réussie part aussi en <code>.zip</code> vers le bucket — le filet de sécurité vit hors du cluster.",
@@ -13146,6 +13552,63 @@ I18N_EN += [
     ("Secrets sauvegardés EN CLAIR (aucune phrase de coffre disponible) : déverrouillez le coffre (⚙ → Sources) ou fournissez HYCU_VAULT_PASSPHRASE pour les chiffrer.",
      "Secrets backed up IN CLEAR (no vault passphrase available): unlock the vault (⚙ → Sources) or provide HYCU_VAULT_PASSPHRASE to encrypt them."),
     ("Secret chiffré — déverrouillez le coffre", "Secret encrypted — unlock the vault"),
+    # Restauration en masse (même cluster)
+    ('title="Recréer tous les namespaces supprimés du cluster actif depuis leurs sauvegardes"', 'title="Recreate every deleted namespace of the active cluster from its backups"'),
+    ("<span>Restaurer en masse</span>", "<span>Bulk restore</span>"),
+    ("<h2>Restauration en masse</h2>", "<h2>Bulk restore</h2>"),
+    ("Recrée <b>tous les namespaces supprimés</b> du cluster actif (<b id=\"bulkCluster\"></b>) depuis leur dernière sauvegarde antérieure à l'instant de référence : namespace, PV/PVC, workloads, dépendances, Secrets (coffre déverrouillé), Volume Groups restaurés par HYCU s'ils ont disparu, applications stateless. Les namespaces <b>encore présents</b> sont ignorés : une application vivante se restaure depuis sa propre ligne. Exécution séquentielle et journalisée, reprise possible ; <b>simulation obligatoire</b> avant le réel.",
+     "Recreates <b>every deleted namespace</b> of the active cluster (<b id=\"bulkCluster\"></b>) from its latest backup prior to the reference time: namespace, PV/PVC, workloads, dependencies, Secrets (vault unlocked), Volume Groups restored by HYCU if they are gone, stateless applications. Namespaces <b>still present</b> are skipped: a live application is restored from its own row. Sequential, journaled, resumable; <b>simulation is mandatory</b> before the real run."),
+    ("Instant de référence</label>", "Reference time</label>"),
+    ("Namespaces à exclure (virgules, optionnel)", "Namespaces to exclude (comma-separated, optional)"),
+    (">Préparer le plan<", ">Prepare the plan<"),
+    (">Arrêter<", ">Stop<"),
+    (">Reprendre<", ">Resume<"),
+    (">Simuler<", ">Simulate<"),
+    (">Lancer (réel)<", ">Start (real)<"),
+    ("Désactivez le bandeau Simulation pour lancer le réel.", "Turn off the Simulation banner to start the real run."),
+    ("Simulez d'abord ce plan (sans échec).", "Simulate this plan first (without failure)."),
+    ("Analyse des sauvegardes et du cluster…", "Analysing backups and cluster…"),
+    (" namespace(s) à recréer sur <b>", " namespace(s) to recreate on <b>"),
+    ("</b> · instant de référence ", "</b> · reference time "),
+    (" avec avertissement</span>", " with a warning</span>"),
+    (">coffre verrouillé<", ">vault locked<"),
+    ("HYCU non connecté : les Volume Groups disparus ne seront pas restaurés", "HYCU not connected: vanished Volume Groups will not be restored"),
+    ("<th>Sauvegarde</th><th>Contenu</th><th>Avertissements</th>", "<th>Backup</th><th>Content</th><th>Warnings</th>"),
+    (">partielle<", ">partial<"),
+    ("Aucun namespace supprimé avec une sauvegarde antérieure à l'instant de référence.", "No deleted namespace with a backup prior to the reference time."),
+    (" namespace(s) ignoré(s)</summary>", " namespace(s) skipped</summary>"),
+    ("Restauration en masse RÉELLE", "REAL bulk restore"),
+    ("</b> namespace(s) seront RECRÉÉS sur <b>", "</b> namespace(s) will be RECREATED on <b>"),
+    ("</b> depuis leurs sauvegardes.", "</b> from their backups."),
+    ("Exécution séquentielle et journalisée ; les Volume Groups disparus seront restaurés par HYCU (opérations réelles).", "Sequential, journaled execution; vanished Volume Groups will be restored by HYCU (real operations)."),
+    ("Les namespaces présents ne sont pas touchés.", "Present namespaces are left untouched."),
+    ("Reprendre la restauration en masse (RÉEL)", "Resume the bulk restore (REAL)"),
+    ("Les namespaces restants (en attente, arrêtés ou en échec) seront recréés ; ceux déjà recréés ne sont pas refaits.", "The remaining namespaces (pending, stopped or failed) will be recreated; those already recreated are not redone."),
+    ('<span class="spin"></span> En cours', '<span class="spin"></span> Running'),
+    ('"Arrêtée" : j.done ? (c.failed ? "Terminée avec échecs" : "Terminée") : "Interrompue"', '"Stopped" : j.done ? (c.failed ? "Finished with failures" : "Finished") : "Interrupted"'),
+    (' échec(s)) · instant de référence ', ' failure(s)) · reference time '),
+    ('" · démarrée "', '" · started "'),
+    ("<th>Namespace</th><th>État</th><th>Détail</th>", "<th>Namespace</th><th>State</th><th>Detail</th>"),
+    (" étape(s)</summary>", " step(s)</summary>"),
+    ("Instant de référence invalide : « ", "Invalid reference time: « "),
+    (" » (format AAAA-MM-JJTHH:MM).", " » (format YYYY-MM-DDTHH:MM)."),
+    ("Liste des namespaces du cluster impossible (", "Cannot list the cluster's namespaces ("),
+    (") : plan refusé par prudence.", "): plan refused out of caution."),
+    ("exclu par l'opérateur", "excluded by the operator"),
+    ("aucune sauvegarde antérieure à l'instant de référence", "no backup prior to the reference time"),
+    ("présent sur le cluster — se restaure depuis sa propre ligne (Applications)", "present on the cluster — restore it from its own row (Applications)"),
+    ("sauvegarde sans volume ni workload : rien à recréer", "backup without volume or workload: nothing to recreate"),
+    ("sauvegarde PARTIELLE (un PV était illisible) : seule version antérieure à l'instant de référence", "PARTIAL backup (a PV was unreadable): only version prior to the reference time"),
+    ("sans instantané de ressources : volumes seuls, workloads et dépendances à recréer à la main", "no resource snapshot: volumes only, workloads and dependencies to recreate by hand"),
+    ("Secrets masqués dans cette sauvegarde : à recréer à la main après la restauration", "Secrets redacted in this backup: recreate them by hand after the restore"),
+    ("Secrets chiffrés et coffre VERROUILLÉ : ils ne seront pas recréés — déverrouillez le coffre avant de lancer", "Secrets encrypted and vault LOCKED: they will not be recreated — unlock the vault before starting"),
+    ("Une restauration en masse est déjà en cours.", "A bulk restore is already running."),
+    ("Aucune restauration en masse en cours.", "No bulk restore is running."),
+    ("Aucun journal à reprendre.", "No journal to resume."),
+    ("Rien à reprendre : tous les namespaces du journal sont déjà recréés.", "Nothing to resume: every namespace of the journal is already recreated."),
+    ("Ce journal est une simulation : lancez le réel depuis le plan, pas par reprise.", "This journal is a simulation: start the real run from the plan, not by resuming."),
+    ("Rien à restaurer : aucun namespace supprimé avec une sauvegarde antérieure à l'instant de référence.", "Nothing to restore: no deleted namespace with a backup prior to the reference time."),
+    ("Lancez d'abord une SIMULATION complète et sans échec de ce plan (mêmes namespaces, même instant de référence) avant le réel.", "First run a complete SIMULATION without failure of this plan (same namespaces, same reference time) before the real run."),
     ("Les <b>Secrets</b> de cette sauvegarde sont <b>masqués</b> : ils ne seront pas recréés (à recréer à la main après la restauration).",
      "The <b>Secrets</b> of this backup are <b>redacted</b>: they will not be recreated (recreate them by hand after the restore)."),
     ("Les <b>Secrets</b> de cette sauvegarde sont <b>chiffrés</b> avec la phrase du coffre : déverrouillez le coffre (⚙ → Sources) avant de lancer, sinon ils ne seront pas recréés.",

@@ -582,6 +582,30 @@ planifiée) soit aussi envoyée en `.zip` vers le bucket, sous la clé
   non maîtrisé. Déchiffrement hors interface :
   `python3 hycu_k8s_nutanix.py --decrypt sauvegarde.zip.enc`.
 
+### Restauration en masse (même cluster)
+**Applications → Restaurer en masse** recrée d'un coup **tous les namespaces
+supprimés** du cluster actif depuis leur dernière sauvegarde antérieure à un
+**instant de référence** : namespace, PV/PVC, workloads, dépendances, Secrets
+(coffre déverrouillé), Volume Groups restaurés in-place par HYCU s'ils ont disparu,
+applications stateless. Les namespaces **encore présents** sont ignorés : une
+application vivante se restaure depuis sa propre ligne, jamais en masse.
+
+1. **Préparer le plan** : namespaces retenus (sauvegarde choisie, contenu,
+   avertissements : Secrets masqués ou chiffrés avec coffre verrouillé, sauvegarde
+   partielle, sans instantané) et namespaces ignorés avec la raison. Exclusions
+   possibles.
+2. **Simuler** : exécution du plan en simulation, en arrière-plan, journal par
+   namespace.
+3. **Lancer (réel)** : possible seulement après une simulation complète et sans
+   échec du **même** plan (mêmes namespaces, même instant), bandeau Simulation
+   désactivé, confirmation du cluster.
+
+Exécution **séquentielle** (chaque restauration HYCU prend des minutes : comptez des
+heures pour des centaines de namespaces), journal `_bulk_restore.json` dans le dossier
+du cluster (survit à un redémarrage), **Arrêter** termine le namespace en cours,
+**Reprendre** rejoue seulement les namespaces restants ou en échec. La sauvegarde
+automatique est suspendue pendant le run ; chaque namespace est audité dans les Tâches.
+
 ### Reprise d'activité (mode DR)
 
 Le scénario : le cluster (ou le site) primaire est perdu ; HYCU détient toujours les

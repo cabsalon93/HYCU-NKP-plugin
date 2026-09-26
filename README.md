@@ -570,6 +570,28 @@ lives **outside the cluster** it protects.
   seal, iterations encoded in the file) — the bucket can be untrusted storage.
   Decryption outside the UI: `python3 hycu_k8s_nutanix.py --decrypt backup.zip.enc`.
 
+### Bulk restore (same cluster)
+**Applications → Bulk restore** recreates at once **every deleted namespace** of the
+active cluster from its latest backup prior to a **reference time**: namespace,
+PV/PVC, workloads, dependencies, Secrets (vault unlocked), Volume Groups restored
+in place by HYCU if they are gone, stateless applications. Namespaces **still
+present** are skipped: a live application is restored from its own row, never in bulk.
+
+1. **Prepare the plan**: selected namespaces (chosen backup, content, warnings:
+   redacted Secrets or encrypted with a locked vault, partial backup, no snapshot)
+   and skipped namespaces with the reason. Exclusions are possible.
+2. **Simulate**: runs the plan in simulation, in the background, with a journal per
+   namespace.
+3. **Start (real)**: only after a complete, failure-free simulation of the **same**
+   plan (same namespaces, same time), with the Simulation banner off and the
+   cluster confirmed.
+
+**Sequential** execution (each HYCU restore takes minutes: expect hours for hundreds
+of namespaces), `_bulk_restore.json` journal in the cluster folder (survives a
+restart), **Stop** finishes the current namespace, **Resume** replays only the
+remaining or failed namespaces. The automatic backup is suspended during the run;
+every namespace is audited in Jobs.
+
 ### Disaster recovery (DR mode)
 
 The scenario: the primary cluster (or site) is lost; HYCU still holds the Volume

@@ -55,7 +55,7 @@ spec:
           # Image VERSIONNÉE (un tag git v<version> publie ghcr.io/...:v<version>).
           # Montée de version : kubectl -n hycu set image deployment/hycu hycu=...:vNOUVELLE
           # Retour arrière   : kubectl -n hycu rollout undo deployment hycu
-          image: ghcr.io/cabsalon93/hycu-nkp-plugin:v20260926-0900
+          image: ghcr.io/cabsalon93/hycu-nkp-plugin:v20260926-1100
           ports:
             - containerPort: 8765
           env:

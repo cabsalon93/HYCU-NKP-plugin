@@ -36,6 +36,7 @@ SUITES = [
     "_test_apps",            # applications dans les namespaces : stateful/stateless, filtre d'objets, stateless
     "_test_scale",           # grands clusters : extraction légère, repli borné, catalogue, cache, passage parallèle
     "_test_secrets",         # Secrets sauvegardés : chiffrés (coffre), clair + avertissement, masqués ; recréés à la récupération
+    "_test_bulk",            # restauration en masse : plan, journal, simulation puis réel, arrêt/reprise, garde-fous
 ]
 
 
