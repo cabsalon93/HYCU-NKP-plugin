@@ -185,6 +185,12 @@ DEFAULT_CONFIG = {
     # conservée, valeurs remplacées par « __REDACTED__ »). True = secrets en clair dans
     # la sauvegarde (à n'activer que si le dossier de sauvegarde est lui-même protégé).
     "config_backup_include_secret_data": False,
+    # Données des Secrets dans la sauvegarde — indispensables pour recréer une application
+    # (récupération, DR, bulk restore) : "auto" (défaut) = CHIFFRÉES avec la phrase du
+    # coffre si elle est disponible (coffre déverrouillé, ou HYCU_VAULT_PASSPHRASE[_FILE]),
+    # sinon en clair avec avertissement ; "encrypted" = chiffrées, sinon masquées ;
+    # "clear" = en clair ; "redacted" = masquées (ancien comportement).
+    "backup_secrets": "auto",
     # Sauvegarde AUTOMATIQUE planifiée : tant que l'outil tourne, sauvegarde la config
     # PV/PVC de tous les namespaces autorisés par namespace_filter, à intervalle régulier.
     "auto_backup_enabled": False,
@@ -321,7 +327,7 @@ def save_config(updates):
 
 # Version horodatée de la build (format AAAAMMJJ-HHMM). À incrémenter à chaque
 # changement notable du programme ; affichée dans l'en-tête de l'interface.
-VERSION = "20260925-1500"
+VERSION = "20260926-0900"
 
 # Jeton anti-CSRF généré au démarrage, injecté dans la page et exigé sur les POST.
 CSRF_TOKEN = secrets.token_urlsafe(32)
@@ -1306,13 +1312,32 @@ def _backup_namespace_resources(ns, d):
     sauvegarde PV/PVC ne doit jamais échouer à cause de cet extra. Renvoie
     (nombre d'objets, liste des types ignorés)."""
     kinds = CONFIG.get("config_backup_kinds") or CONFIG_BACKUP_KINDS_DEFAULT
-    include_secret = bool(CONFIG.get("config_backup_include_secret_data"))
-    out, skipped = [], []
+    # Secrets : chiffrés (secrets.enc, phrase du coffre), en clair, ou masqués — voir
+    # _secrets_mode. Dans resources.json, un Secret chiffré reste MASQUÉ (structure
+    # conservée) avec l'annotation hycu.backup/secret-data=encrypted ; la lecture
+    # (_load_backup_resources) le recompose quand la phrase est disponible.
+    mode = _secrets_mode()
+    pw = _backup_secret_passphrase() if mode in ("auto", "encrypted") else ""
+    if mode == "auto":
+        eff = "encrypted" if pw else "clear"
+    elif mode == "encrypted":
+        eff = "encrypted" if pw else "redacted"
+    else:
+        eff = mode
+    include_secret = (eff == "clear")
+    out, skipped, secret_objs = [], [], []
 
     def take(data):
         for item in (data or {}).get("items", []):
             try:
-                out.append(_clean_resource(json.loads(json.dumps(item)), include_secret))
+                raw = json.loads(json.dumps(item))
+                if eff == "encrypted" and (raw.get("kind") or "").lower() == "secret":
+                    secret_objs.append(_clean_resource(json.loads(json.dumps(raw)), True))
+                    red = _clean_resource(raw, False)
+                    red.setdefault("metadata", {}).setdefault("annotations", {})["hycu.backup/secret-data"] = "encrypted"
+                    out.append(red)
+                else:
+                    out.append(_clean_resource(raw, include_secret))
             except Exception:
                 pass
 
@@ -1329,10 +1354,80 @@ def _backup_namespace_resources(ns, d):
                 skipped.append(kind)
                 continue
             take(data)
+    if eff == "encrypted" and secret_objs:
+        sp = os.path.join(d, SECRETS_FILE)
+        with open(sp, "wb") as f:
+            f.write(encrypt_bytes(json.dumps(secret_objs).encode("utf-8"), pw))
+        try:
+            os.chmod(sp, 0o600)
+        except OSError:
+            pass
     with open(os.path.join(d, "resources.json"), "w", encoding="utf-8") as f:
         json.dump({"namespace": ns, "kinds": kinds, "secret_data_included": include_secret,
-                   "items": out}, f, indent=2)
-    return len(out), skipped, out
+                   "secrets": eff, "items": out}, f, indent=2)
+    return len(out), skipped, out, eff
+
+
+SECRETS_FILE = "secrets.enc"      # Secrets chiffrés d'une sauvegarde (format HV2B, phrase du coffre)
+_VAULT_PW = ""                    # phrase du coffre en MÉMOIRE de session — jamais sur disque
+
+
+def _backup_secret_passphrase():
+    """Phrase secrète servant à chiffrer/déchiffrer les Secrets sauvegardés : celle du
+    coffre, déverrouillé dans l'interface (mémoire) ou fournie par l'environnement
+    (HYCU_VAULT_PASSPHRASE[_FILE], déploiement Kubernetes). Vide = indisponible."""
+    return _VAULT_PW or _vault_env_passphrase() or ""
+
+
+def _secrets_mode():
+    """Mode de sauvegarde des données des Secrets (réglage backup_secrets) :
+    auto | encrypted | clear | redacted. L'ancien réglage
+    config_backup_include_secret_data=true équivaut à « clear »."""
+    m = str(CONFIG.get("backup_secrets") or "auto").strip().lower()
+    if m not in ("auto", "encrypted", "clear", "redacted"):
+        m = "auto"
+    if m == "auto" and CONFIG.get("config_backup_include_secret_data"):
+        m = "clear"
+    return m
+
+
+def _obj_secret_encrypted(obj):
+    """Secret dont les données sont dans secrets.enc (chiffrées) et pas encore recomposées."""
+    if (obj.get("kind") or "").lower() != "secret":
+        return False
+    ann = (obj.get("metadata") or {}).get("annotations") or {}
+    return ann.get("hycu.backup/secret-data") == "encrypted" and _obj_is_redacted(obj)
+
+
+def _merge_backup_secrets(bp, items):
+    """Recompose les Secrets chiffrés de la sauvegarde `bp` dans `items` quand la phrase
+    du coffre est disponible ; sinon ils restent masqués (non restaurables) et l'appelant
+    peut le signaler. Renvoie (items, état) — état : merged | locked | none."""
+    sp = os.path.join(bp, SECRETS_FILE)
+    if not os.path.isfile(sp) or not any(_obj_secret_encrypted(o) for o in items):
+        return items, "none"
+    pw = _backup_secret_passphrase()
+    if not pw:
+        return items, "locked"
+    try:
+        with open(sp, "rb") as f:
+            data = decrypt_bytes(f.read(), pw)
+    except OSError:
+        data = None
+    if data is None:
+        return items, "locked"                      # mauvaise phrase / fichier altéré
+    try:
+        full = {(o.get("metadata") or {}).get("name"): o
+                for o in json.loads(data.decode("utf-8")) if isinstance(o, dict)}
+    except ValueError:
+        return items, "locked"
+    out = []
+    for o in items:
+        if _obj_secret_encrypted(o) and (o.get("metadata") or {}).get("name") in full:
+            out.append(json.loads(json.dumps(full[o["metadata"]["name"]])))
+        else:
+            out.append(o)
+    return out, "merged"
 
 
 # ------------------------------------------------------------------------------
@@ -1729,7 +1824,7 @@ def _catalog_summary(path, idx):
             "resources_count": idx.get("resources_count"),
             "has_resources": os.path.isfile(os.path.join(path, "resources.json")),
             "partial": bool(idx.get("partial")), "apps": idx.get("apps") or [],
-            "size": size, "files": files}
+            "secrets": idx.get("secrets"), "size": size, "files": files}
 
 
 def _catalog_load(base):
@@ -2139,13 +2234,23 @@ def action_backup(ns, dest=None, protect=None, pv_cache=None, defer_quota=False)
     # seule, additif, n'échoue jamais la sauvegarde PV/PVC (voir _backup_namespace_resources).
     resources_count = None
     res_items = []
+    secrets_mode = None
     if CONFIG.get("config_backup_full", True):
         try:
-            resources_count, _skipped, res_items = _backup_namespace_resources(ns, d)
+            resources_count, _skipped, res_items, secrets_mode = _backup_namespace_resources(ns, d)
             index["resources_count"] = resources_count
+            index["secrets"] = secrets_mode
             files.append("resources.json")
+            if os.path.isfile(os.path.join(d, SECRETS_FILE)):
+                files.append(SECRETS_FILE)
         except Exception as e:
             print("Sauvegarde de config étendue (%s) ignorée : %s" % (ns, e))
+    # Secrets en clair faute de phrase de coffre (mode auto) : dit explicitement, pas caché.
+    secrets_warning = None
+    if secrets_mode == "clear" and _secrets_mode() == "auto":
+        secrets_warning = ("Secrets sauvegardés EN CLAIR (aucune phrase de coffre disponible) : "
+                           "déverrouillez le coffre (⚙ → Sources) ou fournissez HYCU_VAULT_PASSPHRASE "
+                           "pour les chiffrer.")
     # Applications du namespace (workloads regroupés, PVC montés, stateful/stateless) :
     # mémorisées dans l'index pour cibler la restauration — y compris quand le
     # namespace n'existera plus (récupération).
@@ -2190,7 +2295,7 @@ def action_backup(ns, dest=None, protect=None, pv_cache=None, defer_quota=False)
                 "files": files, "volumes": index["volumes"], "resources_count": resources_count,
                 "error": "Sauvegarde PARTIELLE de « %s » : manifeste de PV illisible pour %s. Les "
                          "versions précédentes sont conservées (aucune purge)." % (ns, " ; ".join(pv_errors))}
-    audit("backup", namespace=ns, dir=d, count=len(items), resources=resources_count)
+    audit("backup", namespace=ns, dir=d, count=len(items), resources=resources_count, secrets=secrets_mode)
     # Garde-fous stockage : la rétention par namespace s'applique aussi aux sauvegardes
     # MANUELLES (sinon elles s'accumulent sans limite), puis le quota global éventuel.
     pruned = 0
@@ -2202,7 +2307,8 @@ def action_backup(ns, dest=None, protect=None, pv_cache=None, defer_quota=False)
         print("Garde-fou stockage après sauvegarde : %s" % e)
     return _s3_after_backup(
         {"ok": True, "error": None, "dir": d, "root": root, "count": len(items), "pruned": pruned,
-         "files": files, "volumes": index["volumes"], "resources_count": resources_count})
+         "files": files, "volumes": index["volumes"], "resources_count": resources_count,
+         "secrets": secrets_mode, "secrets_warning": secrets_warning})
 
 
 def action_backup_all(dest=None):
@@ -3256,7 +3362,7 @@ HELP_SECTIONS = [
 </ul>"""),
     ("sauvegarde", "Sauvegarder", """
 <ul>
-<li><b>Applications → Sauvegarder</b> : exporte et nettoie les manifestes <b>PV/PVC</b> (la « recette » du restore) + un <b>instantané des autres objets</b> (Deployments, Services, ConfigMaps, Secrets <i>masqués</i>…) dans <code>resources.json</code>.</li>
+<li><b>Applications → Sauvegarder</b> : exporte et nettoie les manifestes <b>PV/PVC</b> (la « recette » du restore) + un <b>instantané des autres objets</b> (Deployments, Services, ConfigMaps, Secrets…) dans <code>resources.json</code> — les données des Secrets sont <b>chiffrées</b> (<code>secrets.enc</code>, phrase du coffre) ; sans coffre déverrouillé ni <code>HYCU_VAULT_PASSPHRASE</code>, elles restent en clair et la sauvegarde le signale (réglage <code>backup_secrets</code>).</li>
 <li><b>Sauvegarder tous (filtrés)</b> : tous les namespaces autorisés d'un coup ; un namespace sans PVC <b>ni workload</b> est ignoré. Un namespace <b>stateless</b> (workloads sans volume) est sauvegardé : son instantané suffit à le restaurer.</li>
 <li>Dossier par défaut : <code>hycu-backups/</code> — <b>copiez-le hors du cluster</b> (téléchargement .zip dans l'assistant de restauration, ou export S3 automatique, voir plus bas).</li>
 <li>Le filtre des namespaces (entonnoir) et le <b>sélecteur d'étiquettes</b> (Réglages) bornent ce que l'outil voit et touche.</li>
@@ -3302,7 +3408,7 @@ HELP_SECTIONS = [
 <li><b>Sans saisie (HYCU connecté)</b> : le bouton <b>« Créer les volumes automatiquement via HYCU »</b> clone les Volume Groups depuis leurs sauvegardes HYCU et inscrit tout seul les nouveaux identifiants — plus aucun UUID à recopier. En simulation, seul le plan est affiché.</li>
 <li><b>Après</b> : vérifiez l'application, re-protégez ses Volume Groups dans HYCU, désactivez la dérogation DR.</li>
 </ol>
-<div class="tip">Tout le reste du temps, laissez « Autoriser la restauration DR » désactivé : la garde inter-cluster/contexte protège contre les restaurations croisées accidentelles. Un Secret masqué à la sauvegarde n'est jamais restauré : re-provisionnez-le depuis sa source.</div>"""),
+<div class="tip">Tout le reste du temps, laissez « Autoriser la restauration DR » désactivé : la garde inter-cluster/contexte protège contre les restaurations croisées accidentelles. Un Secret masqué à la sauvegarde n'est jamais restauré : re-provisionnez-le depuis sa source. Un Secret <b>chiffré</b> est recréé dès que le coffre est déverrouillé.</div>"""),
     ("rapport", "Rapport & supervision", """
 <ul>
 <li>Page <b>Tâches</b> → <b>Rapport HTML</b> (conformité : applications, RPO, santé des clusters, tâches) ou <b>CSV</b> (Excel).</li>
@@ -3942,7 +4048,9 @@ def _load_backup_resources(backup_path, backup_root=None, allow_dr=False, missin
             doc = json.load(f)
     except (OSError, ValueError) as e:
         return None, "resources.json illisible : %s" % e
-    return doc.get("items") or [], None
+    # Secrets chiffrés (secrets.enc) : recomposés si la phrase du coffre est disponible.
+    items, _state = _merge_backup_secrets(bp, doc.get("items") or [])
+    return items, None
 
 
 def _obj_is_redacted(obj):
@@ -3990,7 +4098,8 @@ def action_objects_list(payload):
     out = []
     for i, obj in enumerate(items):
         k = _obj_key(obj)
-        row = {"i": i, "kind": k["kind"], "name": k["name"], "redacted": _obj_is_redacted(obj)}
+        row = {"i": i, "kind": k["kind"], "name": k["name"], "redacted": _obj_is_redacted(obj),
+               "encrypted": _obj_secret_encrypted(obj)}      # chiffré et coffre verrouillé
         if in_app is not None:
             row["in_app"] = i in in_app
         out.append(row)
@@ -5257,6 +5366,8 @@ def action_save_credentials(payload):
             pass                            # best-effort (Windows / FS sans POSIX perms)
     except Exception as e:
         return {"ok": False, "error": "Écriture du coffre impossible : %s" % e}
+    global _VAULT_PW
+    _VAULT_PW = pw                      # sert aussi à chiffrer les Secrets des sauvegardes
     save_config({"remember_credentials": True})
     audit("creds_saved", systems=names, clusters=[c["name"] for c in clusters])
     return {"ok": True, "saved": names, "clusters": [c["name"] for c in clusters]}
@@ -5279,6 +5390,8 @@ def action_load_credentials(payload):
         creds = json.loads(data.decode("utf-8"))
     except Exception:
         return {"ok": False, "error": "Données déchiffrées illisibles."}
+    global _VAULT_PW
+    _VAULT_PW = pw                      # phrase validée : chiffre/déchiffre les Secrets sauvegardés
     loaded = []
     with CRED_LOCK:
         for k, v in creds.items():
@@ -6800,6 +6913,8 @@ def action_dr_backups():
                             "stateless": (not (v.get("volumes") or [])
                                           and any((a.get("type") == "stateless") for a in (v.get("apps") or []))),
                             "apps": [a.get("name") for a in (v.get("apps") or []) if a.get("name")],
+                            # Secrets : encrypted (phrase du coffre requise) | clear | redacted | None (ancien)
+                            "secrets": v.get("secrets"),
                             "imported": imported})
     out.sort(key=lambda b: b.get("created") or "", reverse=True)
     return _ok(backups=out, allowed=bool(CONFIG.get("allow_dr_restore")))
@@ -8440,6 +8555,7 @@ HTML = r"""<!DOCTYPE html>
           <div style="flex:none;width:260px"><label class="fld">StorageClass cible (vide = inchangée)</label><input type="text" id="drSc" placeholder="nutanix-volume" autocomplete="off"></div>
           <div style="align-self:flex-end"><label class="fld"><input type="checkbox" id="drRefs" checked style="width:auto"> Recréer les dépendances depuis la sauvegarde (Secrets non masqués, ConfigMaps, ServiceAccounts, Services)</label></div>
         </div>
+        <div class="note" id="drSecretsNote" style="display:none;margin:8px 0"></div>
         <div class="note" id="drNoRes" style="display:none;margin:8px 0">Cette sauvegarde ne contient <b>que les volumes</b> (pas d'instantané des workloads/dépendances) : elle est antérieure à cette fonction, ou la sauvegarde de config étendue était désactivée. La restauration recréera <b>les volumes (PV/PVC)</b> ; recréez les workloads depuis une sauvegarde plus récente ou manuellement.</div>
         <div id="drReuseWrap" style="display:none;margin:6px 0 4px">
           <label class="fld" style="display:flex;gap:9px;align-items:flex-start;cursor:pointer;font-weight:600">
@@ -9250,9 +9366,10 @@ $("#bkRun").onclick=async()=>{
      <span><b>${esc(v.pvc)}</b> → PV ${esc(v.pv||"—")} ${tag}</span></li>`;
   }).join("");
   const resLine = (r.resources_count!=null)
-    ? ` <span class="hint">+ ${r.resources_count} ressource(s) de config (Deployments, Services, Secrets…)</span>` : "";
+    ? ` <span class="hint">+ ${r.resources_count} ressource(s) de config (Deployments, Services, Secrets…)${r.secrets==="encrypted"?" · Secrets chiffrés":r.secrets==="redacted"?" · Secrets masqués":""}</span>` : "";
+  const secWarn = r.secrets_warning ? `<div class="warnbox">⚠ ${esc(r.secrets_warning)}</div>` : "";
   $("#bkOut").innerHTML=`<div class="note">${r.count} volume(s) sauvegardé(s) dans
-     <code>${esc(r.dir)}</code>${resLine}${dlBackupLink(r.dir, r.root)}</div><ul class="pvc-list" style="margin-top:10px">${rows}</ul>
+     <code>${esc(r.dir)}</code>${resLine}${dlBackupLink(r.dir, r.root)}</div>${secWarn}<ul class="pvc-list" style="margin-top:10px">${rows}</ul>
      <div class="warnbox">⚠ Récupérez cette sauvegarde <b>hors du cluster</b> via ⬇ Télécharger (.zip) — ou copiez le dossier vers un autre stockage : c'est votre filet de sécurité en cas de sinistre.</div>`;
 };
 $("#bkRunAll").onclick=async()=>{
@@ -11278,6 +11395,11 @@ function drRenderVols(){
   $("#drTargetNs").value=b? b.namespace : "";
   // Honnêteté : sauvegarde sans instantané de ressources -> volumes uniquement.
   $("#drNoRes").style.display = (b && b.has_resources===false)? "block":"none";
+  // Secrets de la sauvegarde : masqués (non recréés) ou chiffrés (coffre à déverrouiller).
+  const sn=$("#drSecretsNote"), sm=b&&b.secrets;
+  if(sn){ sn.style.display = (sm==="redacted"||sm==="encrypted") ? "block" : "none";
+    sn.innerHTML = sm==="redacted" ? "Les <b>Secrets</b> de cette sauvegarde sont <b>masqués</b> : ils ne seront pas recréés (à recréer à la main après la restauration)."
+      : sm==="encrypted" ? "Les <b>Secrets</b> de cette sauvegarde sont <b>chiffrés</b> avec la phrase du coffre : déverrouillez le coffre (⚙ → Sources) avant de lancer, sinon ils ne seront pas recréés." : ""; }
   const refs=(b&&b.vol_refs)||{};
   // En récupération, chaque champ est PRÉ-REMPLI avec l'UUID d'origine (issu de la
   // sauvegarde) : l'humain n'a rien à taper. En DR, les champs restent vides (nouveaux VG).
@@ -11404,7 +11526,7 @@ async function objLoadList(){
   $("#objBody").innerHTML=objItems.length? objItems.map(o=>`<tr class="clk${o.redacted?'':' '}${appOn&&!o.in_app?' objOther':''}" data-i="${o.i}">
      <td class="cb"><input type="checkbox" class="objChk" data-i="${o.i}" ${o.redacted?"disabled":""} ${appOn&&o.in_app&&!o.redacted?"checked":""}></td>
      <td>${esc(o.kind)}</td><td style="color:var(--strong);font-weight:500">${esc(o.name)}</td>
-     <td>${o.redacted?'<span class="badge b-pending">Secret masqué — non restaurable</span>':(appOn&&!o.in_app?'<span class="hint">autre application / partagé</span>':"")}</td></tr>`).join("")
+     <td>${o.encrypted?'<span class="badge b-pending">Secret chiffré — déverrouillez le coffre</span>':o.redacted?'<span class="badge b-pending">Secret masqué — non restaurable</span>':(appOn&&!o.in_app?'<span class="hint">autre application / partagé</span>':"")}</td></tr>`).join("")
     : '<tr><td colspan="4" class="tempty">Instantané vide.</td></tr>';
   document.querySelectorAll("#objBody tr.clk").forEach(tr=>tr.onclick=e=>{
     if(e.target.classList.contains("objChk")) return rsWizSync();
@@ -12868,8 +12990,8 @@ I18N_EN += [
     ("Les kubeconfigs sont des <b>secrets</b> : mémoire de session + coffre chiffré (jamais en clair sur disque).",
      "Kubeconfigs are <b>secrets</b>: session memory + encrypted vault (never in clear on disk)."),
     ("Sauvegarder", "Back up"),
-    ("<b>Applications → Sauvegarder</b> : exporte et nettoie les manifestes <b>PV/PVC</b> (la « recette » du restore) + un <b>instantané des autres objets</b> (Deployments, Services, ConfigMaps, Secrets <i>masqués</i>…) dans <code>resources.json</code>.",
-     "<b>Applications → Back up</b>: exports and cleans the <b>PV/PVC</b> manifests (the restore “recipe”) + a <b>snapshot of the other objects</b> (Deployments, Services, ConfigMaps, <i>redacted</i> Secrets…) into <code>resources.json</code>."),
+    ("<b>Applications → Sauvegarder</b> : exporte et nettoie les manifestes <b>PV/PVC</b> (la « recette » du restore) + un <b>instantané des autres objets</b> (Deployments, Services, ConfigMaps, Secrets…) dans <code>resources.json</code> — les données des Secrets sont <b>chiffrées</b> (<code>secrets.enc</code>, phrase du coffre) ; sans coffre déverrouillé ni <code>HYCU_VAULT_PASSPHRASE</code>, elles restent en clair et la sauvegarde le signale (réglage <code>backup_secrets</code>).",
+     "<b>Applications → Back up</b>: exports and cleans the <b>PV/PVC</b> manifests (the restore “recipe”) + a <b>snapshot of the other objects</b> (Deployments, Services, ConfigMaps, Secrets…) into <code>resources.json</code> — Secret data is <b>encrypted</b> (<code>secrets.enc</code>, vault passphrase); without an unlocked vault or <code>HYCU_VAULT_PASSPHRASE</code> it stays in clear and the backup says so (<code>backup_secrets</code> setting)."),
     ("<b>Sauvegarder tous (filtrés)</b> : tous les namespaces autorisés d'un coup ; un namespace sans PVC est ignoré.",
      "<b>Back up all (filtered)</b>: every allowed namespace at once; a namespace without PVCs is skipped."),
     ("Dossier par défaut : <code>hycu-backups/</code> — <b>copiez-le hors du cluster</b> (téléchargement .zip dans l'assistant de restauration, ou export S3 automatique, voir plus bas).",
@@ -13020,6 +13142,14 @@ I18N_EN += [
     (">tout le namespace</a>", ">whole namespace</a>"),
     # Clone d'une application stateless
     ("Vérifier la copie", "Check the copy"),
+    # Secrets sauvegardés (chiffrés / clair / masqués)
+    ("Secrets sauvegardés EN CLAIR (aucune phrase de coffre disponible) : déverrouillez le coffre (⚙ → Sources) ou fournissez HYCU_VAULT_PASSPHRASE pour les chiffrer.",
+     "Secrets backed up IN CLEAR (no vault passphrase available): unlock the vault (⚙ → Sources) or provide HYCU_VAULT_PASSPHRASE to encrypt them."),
+    ("Secret chiffré — déverrouillez le coffre", "Secret encrypted — unlock the vault"),
+    ("Les <b>Secrets</b> de cette sauvegarde sont <b>masqués</b> : ils ne seront pas recréés (à recréer à la main après la restauration).",
+     "The <b>Secrets</b> of this backup are <b>redacted</b>: they will not be recreated (recreate them by hand after the restore)."),
+    ("Les <b>Secrets</b> de cette sauvegarde sont <b>chiffrés</b> avec la phrase du coffre : déverrouillez le coffre (⚙ → Sources) avant de lancer, sinon ils ne seront pas recréés.",
+     "The <b>Secrets</b> of this backup are <b>encrypted</b> with the vault passphrase: unlock the vault (⚙ → Sources) before starting, otherwise they will not be recreated."),
     # Grands clusters
     (" (liste cluster-wide refusée ; repli par namespace non tenté au-delà de ", " (cluster-wide list refused; per-namespace fallback not attempted beyond "),
     (" namespaces — accordez un droit de liste cluster-wide)", " namespaces — grant a cluster-wide list permission)"),
@@ -13303,8 +13433,8 @@ I18N_EN += [
      "<b>Wizard → DR restore</b>: pick the source backup (lost cluster or S3 import), the target namespace, paste each restored VG's UUID, remap the StorageClass if the target site uses another one — simulation first, then real (target cluster retyped)."),
     ("<b>Après</b> : vérifiez l'application, re-protégez ses Volume Groups dans HYCU, désactivez la dérogation DR.",
      "<b>Afterwards</b>: verify the application, re-protect its Volume Groups in HYCU, disable the DR override."),
-    ("Tout le reste du temps, laissez « Autoriser la restauration DR » désactivé : la garde inter-cluster/contexte protège contre les restaurations croisées accidentelles. Un Secret masqué à la sauvegarde n'est jamais restauré : re-provisionnez-le depuis sa source.",
-     "The rest of the time, keep “Allow DR restore” disabled: the cross-cluster/context guard protects against accidental crossed restores. A Secret redacted at backup time is never restored: re-provision it from its source."),
+    ("Tout le reste du temps, laissez « Autoriser la restauration DR » désactivé : la garde inter-cluster/contexte protège contre les restaurations croisées accidentelles. Un Secret masqué à la sauvegarde n'est jamais restauré : re-provisionnez-le depuis sa source. Un Secret <b>chiffré</b> est recréé dès que le coffre est déverrouillé.",
+     "The rest of the time, keep “Allow DR restore” disabled: the cross-cluster/context guard protects against accidental crossed restores. A Secret redacted at backup time is never restored: re-provision it from its source. An <b>encrypted</b> Secret is recreated as soon as the vault is unlocked."),
     ("Guide complet : fichiers <code>README.md</code> / <code>README.fr.md</code> du dépôt (installation, configuration détaillée, déploiement Kubernetes).",
      "Full guide: the repository's <code>README.md</code> / <code>README.fr.md</code> (installation, detailed configuration, Kubernetes deployment)."),
     ("<th>État</th>", "<th>Status</th>"),

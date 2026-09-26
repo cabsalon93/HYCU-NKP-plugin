@@ -274,10 +274,11 @@ manuel des manifestes décrit dans la procédure HYCU).
   sauvegarde capture aussi les autres ressources du namespace (Deployments,
   StatefulSets, Services, ConfigMaps, Secrets, Ingress…) dans `resources.json` —
   lecture seule, n'échoue jamais la sauvegarde PV/PVC. **Les données des Secrets
-  sont masquées par défaut** (structure conservée, valeurs remplacées par
-  `__REDACTED__` ; `config_backup_include_secret_data` pour les conserver). C'est
-  un **instantané de config** (référence / restore manuel) — la restauration
-  automatique reste centrée PV/PVC. Désactivable via `config_backup_full: false`.
+  sont chiffrées** dans `secrets.enc` avec la phrase du coffre (coffre déverrouillé
+  ou `HYCU_VAULT_PASSPHRASE[_FILE]`) ; sans phrase disponible elles sont conservées
+  en clair et la sauvegarde le signale (`backup_secrets` pour choisir un autre
+  mode). Cet instantané sert à la restauration d'objets, à la récupération d'une
+  application supprimée et à la DR. Désactivable via `config_backup_full: false`.
 - **Sauvegarder tous (filtrés)** : sauvegarde en une fois **tous les namespaces
   autorisés** par le filtre, ou **tous** les namespaces du cluster si aucun filtre.
   Un namespace sans PVC **ni workload** est **ignoré** (pas une erreur). Un namespace
@@ -451,7 +452,8 @@ la page **Réglages** de l'interface. Toutes les clés sont optionnelles.
 | `recover_deleted_vg_mode` | `restore` | Mode de récupération d'un VG supprimé : `restore` = restauration **in-place** via HYCU (le VG revient à son UUID d'origine, le PV est réutilisé tel quel) ; `clone` = HYCU crée un **nouveau** VG (nouvel UUID) que l'outil découvre. |
 | `backup_collect_restore_contract` | `true` | À chaque sauvegarde, collecter *best-effort* (sans jamais échouer le backup) le « contrat de restauration » — nom/UUID du Volume Group côté HYCU, disque(s), Prism Element, dernier point de restauration HYCU — pour permettre une restauration ultérieure **sans saisie manuelle d'UUID**, y compris en reprise d'activité. Ignoré si HYCU/Prism ne sont pas connectés. |
 | `config_backup_kinds` | *(liste par défaut)* | Types de ressources namespacées exportés par l'instantané de config étendue. |
-| `config_backup_include_secret_data` | `false` | `false` = données des Secrets masquées sur disque ; `true` = conservées en clair (uniquement si le dossier de sauvegarde est lui-même protégé). |
+| `backup_secrets` | `"auto"` | Données des **Secrets** dans la sauvegarde (indispensables pour recréer une application) : `auto` = **chiffrées** dans `secrets.enc` avec la phrase du coffre si elle est disponible (coffre déverrouillé dans l'interface, ou `HYCU_VAULT_PASSPHRASE[_FILE]`), sinon **en clair avec avertissement** ; `encrypted` = chiffrées, sinon masquées ; `clear` = en clair ; `redacted` = masquées. À la restauration, les Secrets chiffrés sont recomposés si le coffre est déverrouillé ; un Secret masqué ou verrouillé n'est **jamais** appliqué. |
+| `config_backup_include_secret_data` | `false` | Ancien réglage : `true` équivaut à `backup_secrets: clear`. |
 | `auto_backup_dest` | `""` | Dossier de destination des sauvegardes automatiques (vide = `hycu-backups/`). |
 | `require_context_confirm` | `true` | Exiger la re-saisie du contexte avant toute action réelle. |
 | `cluster_health_minutes` | `5` | Intervalle (min) du contrôle de santé des clusters (lecture seule). `0` = désactivé. |

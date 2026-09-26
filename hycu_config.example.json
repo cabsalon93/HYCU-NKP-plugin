@@ -48,6 +48,7 @@
     "role", "rolebinding", "networkpolicy", "poddisruptionbudget",
     "horizontalpodautoscaler"
   ],
+  "backup_secrets": "auto",
   "config_backup_include_secret_data": false,
 
   "_section_backup_auto": "— Sauvegarde automatique planifiée —",

@@ -270,10 +270,12 @@ cleanup described in the HYCU procedure).
 - **Extended configuration snapshot**: alongside the PV/PVC manifests, the backup
   also captures the namespace's other resources (Deployments, StatefulSets,
   Services, ConfigMaps, Secrets, Ingresses…) into `resources.json` — read-only,
-  never fails the PV/PVC backup. **Secret data is redacted by default** (structure
-  kept, values replaced by `__REDACTED__`; set `config_backup_include_secret_data`
-  to keep them). This is a **config reference/snapshot** — the automated restore
-  stays PV/PVC-centric. Disable with `config_backup_full: false`.
+  never fails the PV/PVC backup. **Secret data is encrypted** into `secrets.enc`
+  with the vault passphrase (vault unlocked, or `HYCU_VAULT_PASSPHRASE[_FILE]`);
+  without an available passphrase it is kept in clear and the backup says so
+  (`backup_secrets` to choose another mode). This snapshot drives object restore,
+  the recovery of a deleted application and DR. Disable with
+  `config_backup_full: false`.
 - **Back up all (filtered)**: backs up in one go **all namespaces allowed** by
   the filter, or **all** namespaces of the cluster if no filter. A namespace
   with no PVC **and no workload** is **skipped** (not an error). A **stateless**
@@ -438,7 +440,8 @@ Copy `hycu_config.example.json` → `hycu_config.json`. Also editable via the
 | `recover_deleted_vg_mode` | `restore` | Deleted-VG recovery mode: `restore` = **in-place** restore via HYCU (the VG returns to its original UUID, the PV is reused as-is); `clone` = HYCU creates a **new** VG (new UUID) that the tool discovers. |
 | `backup_collect_restore_contract` | `true` | On each backup, collect *best-effort* (never failing the backup) the “restore contract” — Volume Group name/UUID on the HYCU side, disk(s), Prism Element, latest HYCU restore point — to enable a later restore **without manually entering any UUID**, disaster recovery included. Skipped when HYCU/Prism are not connected. |
 | `config_backup_kinds` | *(curated list)* | Namespaced resource kinds exported by the extended config snapshot. |
-| `config_backup_include_secret_data` | `false` | `false` = Secret data redacted on disk; `true` = keep it in clear (only if the backup folder is itself protected). |
+| `backup_secrets` | `"auto"` | **Secret** data in the backup (required to recreate an application): `auto` = **encrypted** into `secrets.enc` with the vault passphrase when available (vault unlocked in the UI, or `HYCU_VAULT_PASSPHRASE[_FILE]`), otherwise **in clear with a warning**; `encrypted` = encrypted, otherwise redacted; `clear` = in clear; `redacted` = redacted. On restore, encrypted Secrets are recomposed when the vault is unlocked; a redacted or locked Secret is **never** applied. |
+| `config_backup_include_secret_data` | `false` | Legacy setting: `true` is equivalent to `backup_secrets: clear`. |
 | `auto_backup_dest` | `""` | Destination folder for automatic backups (empty = `hycu-backups/`). |
 | `require_context_confirm` | `true` | Require retyping the context before any real action. |
 | `cluster_health_minutes` | `5` | Interval (min) of the read-only cluster health check. `0` = disabled. |

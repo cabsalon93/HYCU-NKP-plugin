@@ -35,6 +35,7 @@ SUITES = [
     "_test_lots123",         # correctifs analyse 2026-09-25 : C1–C6, B3/B4/B6/B16/B17, partiel, SigV4, gardes
     "_test_apps",            # applications dans les namespaces : stateful/stateless, filtre d'objets, stateless
     "_test_scale",           # grands clusters : extraction légère, repli borné, catalogue, cache, passage parallèle
+    "_test_secrets",         # Secrets sauvegardés : chiffrés (coffre), clair + avertissement, masqués ; recréés à la récupération
 ]
 
 

@@ -60,7 +60,8 @@ try:
             return None, "error: the server doesn't have a resource type \"ingress\""  # RBAC/absent
         return {"items": []}, None
     H.kubectl_json = fake
-    n, skipped, _items = H._backup_namespace_resources("wordpress", tmp)
+    H.CONFIG["backup_secrets"] = "redacted"
+    n, skipped, _items, _mode = H._backup_namespace_resources("wordpress", tmp)
     check(n == 2, "2 objets exportés (Deployment + Secret)")
     check(skipped == ["ingress"], "type en erreur IGNORÉ (pas d'échec)")
     saved = json.load(open(os.path.join(tmp, "resources.json"), encoding="utf-8"))
@@ -72,6 +73,7 @@ finally:
     H.kubectl_json = old_kj
     H.CONFIG["config_backup_kinds"] = old_kinds
     H.CONFIG["config_backup_include_secret_data"] = old_incl
+    H.CONFIG.pop("backup_secrets", None)
     shutil.rmtree(tmp, ignore_errors=True)
 
 # ---- action_metrics_text : format Prometheus ----
