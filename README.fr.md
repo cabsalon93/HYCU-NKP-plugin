@@ -324,7 +324,9 @@ HYCU :
 1. **Type de restauration** (cartes au choix) :
    - **Restaurer toute l'application (copie)** — volumes **et** objets
      (workloads, dépendances) dans le même namespace (suffixe) ou dans un autre ;
-     l'original n'est pas modifié.
+     l'original n'est pas modifié. Les workloads **sans volume** de l'application
+     (frontend, workers…) sont copiés avec ceux qui montent les volumes : une
+     application = tous ses workloads.
    - **Restaurer le stockage sur place** — les données reviennent dans les volumes
      d'origine ; l'application est arrêtée puis redémarrée.
    - **Restaurer le stockage vers de nouveaux volumes** — de nouveaux Volume Groups

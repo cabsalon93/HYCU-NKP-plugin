@@ -318,7 +318,9 @@ Select **one** application → **Restore**. As in HYCU's *Application Restore*:
 1. **Restore type** (option cards):
    - **Restore the whole application (copy)** — volumes **and** objects
      (workloads, dependencies) into the same namespace (suffix) or another one;
-     the original is not modified.
+     the original is not modified. The application's workloads **without volume**
+     (frontend, workers…) are copied along with those mounting the volumes: an
+     application = all its workloads.
    - **Restore storage in place** — the data returns into the original volumes;
      the application is stopped, then restarted.
    - **Restore storage to new volumes** — new Volume Groups are cloned and the

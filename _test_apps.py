@@ -202,6 +202,77 @@ try:
                              "items": [], "dry": True})
     check(not rr["ok"] and "Aucun volume" in rr["error"], "clone ordinaire sans volume : toujours refusé")
 
+    print("\n== Une application = TOUS ses workloads (stateless compris) — récupération et clone ==")
+    # sauvegarde shop2 : wp-wordpress (monte wp-data), wp-mariadb (STS volumeClaimTemplates -> data-wp-mariadb-0),
+    # front (stateless, application wp), redis (stateless, autre application)
+    front_wp = wl("Deployment", "wp-front", inst)
+    snap2 = [items[0], items[1], front_wp, items[2], svc_wp, svc_other, cm_wp, sec_wp]
+    d2 = os.path.join(H._cluster_root(tmp), "shop2", "2026-09-25_04-00-00_000004")
+    os.makedirs(d2)
+    for pvcn in ("wp-data", "data-wp-mariadb-0"):
+        pv = {"apiVersion": "v1", "kind": "PersistentVolume", "metadata": {"name": "pv-" + pvcn},
+              "spec": {"storageClassName": "nutanix-volume", "capacity": {"storage": "1Gi"}, "accessModes": ["ReadWriteOnce"],
+                       "claimRef": {"name": pvcn, "namespace": "shop2"},
+                       "csi": {"driver": "csi.nutanix.com", "volumeHandle": "NutanixVolumes-11111111-2222-3333-4444-%012d" % len(pvcn)}}}
+        pvc = {"apiVersion": "v1", "kind": "PersistentVolumeClaim", "metadata": {"name": pvcn, "namespace": "shop2"},
+               "spec": {"storageClassName": "nutanix-volume", "accessModes": ["ReadWriteOnce"],
+                        "resources": {"requests": {"storage": "1Gi"}}, "volumeName": "pv-" + pvcn}}
+        json.dump(pv, open(os.path.join(d2, "pv_pv-%s.json" % pvcn), "w"))
+        json.dump(pvc, open(os.path.join(d2, "pvc_%s.json" % pvcn), "w"))
+    json.dump({"namespace": "shop2", "items": snap2}, open(os.path.join(d2, "resources.json"), "w"))
+    json.dump({"namespace": "shop2", "created": "2026-09-25T04:00:00", "context": "ctx-test", "cluster_id": "local",
+               "resources_count": len(snap2),
+               "volumes": [{"pvc": p, "pv": "pv-" + p, "pv_file": "pv_pv-%s.json" % p, "pvc_file": "pvc_%s.json" % p,
+                            "analysis": {"old_volume_handle": "NutanixVolumes-11111111-2222-3333-4444-%012d" % len(p)}}
+                           for p in ("wp-data", "data-wp-mariadb-0")]}, open(os.path.join(d2, "index.json"), "w"))
+    H._CATALOGS.clear()
+    H.resource_state = lambda kind, name, ns=None: ("absent", "")
+    s_vg = H._vg_exists
+    H._vg_exists = lambda u: True
+    def run_rec(app=None):
+        applied.clear()
+        H._apply_manifest = capture
+        try:
+            body = {"namespace": "shop2", "target_namespace": "shop2", "backup_path": d2, "dry": True,
+                    "from_backup_only": True, "clone_refs": True,
+                    "items": [{"pvc": "wp-data", "new_ref": ""}, {"pvc": "data-wp-mariadb-0", "new_ref": ""}]}
+            if app:
+                body["app"] = app
+            return H.action_clone_app(body), list(applied)
+        finally:
+            H._apply_manifest = real_apply
+    r, ap = run_rec()
+    kinds = {(k, n) for k, n in ap}
+    check(r["ok"] and {("Deployment", "wp-wordpress"), ("StatefulSet", "wp-mariadb"), ("Deployment", "wp-front"), ("Deployment", "redis")} <= kinds,
+          "récupération du namespace : workloads stateful (dont STS volumeClaimTemplates) ET stateless recréés : %s" % (r.get("error") or "ok"))
+    check(any("sans volume du namespace" in w for w in r.get("warnings", [])), "avertissement listant les workloads sans volume ajoutés")
+    r2, ap2 = run_rec(app="wp")
+    kinds2 = {(k, n) for k, n in ap2}
+    check(r2["ok"] and {("Deployment", "wp-wordpress"), ("StatefulSet", "wp-mariadb"), ("Deployment", "wp-front")} <= kinds2
+          and ("Deployment", "redis") not in kinds2, "application ciblée : ses workloads stateless suivent, ceux des autres applications non")
+    H._vg_exists = s_vg
+    # clone LIVE d'une application stateful : les workloads sans volume de l'application suivent aussi
+    H._list_namespace_workloads = lambda names, full=False: ({"shop": items + [front_wp]}, {"shop": pvcs}, None)
+    s_fw, s_lop, s_lbp, s_kj2 = H._find_workloads_using_pvcs, H._load_old_pv, H._load_backup_pvc, H.kubectl_json
+    H._find_workloads_using_pvcs = lambda ns, names: [json.loads(json.dumps(items[0]))]
+    pv_wp = {"apiVersion": "v1", "kind": "PersistentVolume", "metadata": {"name": "pv-wp"},
+             "spec": {"capacity": {"storage": "1Gi"}, "accessModes": ["ReadWriteOnce"], "claimRef": {"name": "wp-data", "namespace": "shop"},
+                      "csi": {"driver": "csi.nutanix.com", "volumeHandle": "NutanixVolumes-11111111-2222-3333-4444-555555555555"}}}
+    H._load_old_pv = lambda ns, pvc, bp, br=None, no_live=False: (json.loads(json.dumps(pv_wp)), "pv-wp")
+    H._load_backup_pvc = lambda bp, pvc, br=None: {"apiVersion": "v1", "kind": "PersistentVolumeClaim", "metadata": {"name": "wp-data", "namespace": "shop"},
+                                                   "spec": {"accessModes": ["ReadWriteOnce"], "resources": {"requests": {"storage": "1Gi"}}, "volumeName": "pv-wp"}}
+    applied.clear(); H._apply_manifest = capture
+    try:
+        r3 = H.action_clone_app({"namespace": "shop", "app": "wp", "suffix": "-copy", "dry": True,
+                                 "items": [{"pvc": "wp-data", "new_ref": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}]})
+    finally:
+        H._apply_manifest = real_apply
+        H._find_workloads_using_pvcs, H._load_old_pv, H._load_backup_pvc, H.kubectl_json = s_fw, s_lop, s_lbp, s_kj2
+    kinds3 = {(k, n) for k, n in applied}
+    check(r3["ok"] and ("Deployment", "wp-wordpress-copy") in kinds3 and ("Deployment", "wp-front-copy") in kinds3
+          and not any(n and n.startswith("redis") for _k, n in applied),
+          "clone live de l'application wp : frontend stateless copié avec la base, redis non : %s" % (r3.get("error") or "ok"))
+
     print("\n== Clone d'une application STATELESS depuis le cluster (simulation) ==")
     H._list_namespace_workloads = lambda names, full=False: ({"shop": items}, {"shop": pvcs}, None)
     applied.clear()

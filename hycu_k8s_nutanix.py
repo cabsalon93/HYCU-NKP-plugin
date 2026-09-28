@@ -327,7 +327,7 @@ def save_config(updates):
 
 # Version horodatée de la build (format AAAAMMJJ-HHMM). À incrémenter à chaque
 # changement notable du programme ; affichée dans l'en-tête de l'interface.
-VERSION = "20260928-1900"
+VERSION = "20260928-2000"
 
 # Jeton anti-CSRF généré au démarrage, injecté dans la page et exigé sur les POST.
 CSRF_TOKEN = secrets.token_urlsafe(32)
@@ -6797,10 +6797,9 @@ def _find_workloads_using_pvcs(ns, pvc_names):
         if not data:
             continue
         for w in data.get("items", []):
-            vols = ((w.get("spec") or {}).get("template", {}).get("spec", {}).get("volumes")) or []
-            used = [(v.get("persistentVolumeClaim") or {}).get("claimName") for v in vols]
-            if any(c in wanted for c in used):
-                w.setdefault("kind", "Deployment" if kind == "deployment" else "StatefulSet")
+            w.setdefault("kind", "Deployment" if kind == "deployment" else "StatefulSet")
+            # volumes du pod template ET volumeClaimTemplates d'un StatefulSet
+            if any(c in wanted for c in _workload_pvcs(w, list(wanted))):
                 out.append(w)
     return out
 
@@ -6966,9 +6965,9 @@ def _workloads_from_items(bitems, pvc_names):
     for o in bitems or []:
         if (o.get("kind") or "") not in ("Deployment", "StatefulSet"):
             continue
-        vols = ((o.get("spec") or {}).get("template", {}).get("spec", {}).get("volumes")) or []
-        used = [(v.get("persistentVolumeClaim") or {}).get("claimName") for v in vols]
-        if any(c in wanted for c in used):
+        # volumes du pod template ET volumeClaimTemplates d'un StatefulSet (PVC
+        # « <template>-<sts>-<n> » sauvegardés comme les autres : le STS recréé les adopte).
+        if any(c in wanted for c in _workload_pvcs(o, list(wanted))):
             out.append(json.loads(json.dumps(o)))
     return out
 
@@ -7533,6 +7532,31 @@ def action_clone_app(payload, log=None):
     else:
         workloads = (_workloads_from_items(bitems, [it["pvc"] for it in items]) if from_backup
                      else _find_workloads_using_pvcs(ns, [it["pvc"] for it in items]))
+        # Une application = TOUS ses workloads : ceux qui ne montent aucun volume (frontend,
+        # workers…) sont copiés/recréés aussi — ceux de l'application ciblée (`app`), ou de
+        # tout le namespace quand aucune application n'est ciblée. Jusqu'ici seuls les
+        # workloads montant les volumes sélectionnés suivaient : la copie de « pacman »
+        # n'avait que sa base, pas son frontend.
+        if from_backup:
+            pool = list(bitems or [])
+        else:
+            wl_map, _pm, _werr = _list_namespace_workloads([ns], full=True)
+            pool = wl_map.get(ns) or []
+        have = {((w.get("kind") or ""), (w.get("metadata") or {}).get("name")) for w in workloads}
+        extra = []
+        for w in pool:
+            kind = w.get("kind") or ""
+            owners = {x.get("kind") for x in ((w.get("metadata") or {}).get("ownerReferences") or [])}
+            if (kind not in APP_WORKLOAD_KINDS or (kind, (w.get("metadata") or {}).get("name")) in have
+                    or owners & (set(APP_WORKLOAD_KINDS) | {"Job", "ReplicaSet"})
+                    or _workload_pvcs(w, []) or (app and _app_key_of(w) != app)):
+                continue
+            extra.append(json.loads(json.dumps(w)))
+        if extra:
+            workloads = list(workloads) + extra
+            warnings.append("Workloads sans volume %s copiés aussi : %s." % (
+                ("de l'application « %s »" % app) if app else "du namespace",
+                ", ".join("%s/%s" % (w["kind"], w["metadata"]["name"]) for w in extra)))
     if from_backup and not dr:
         warnings.append("Récupération « depuis la sauvegarde seule » : workloads et dépendances "
                         "proviennent de la sauvegarde « %s » (le namespace n'existe plus sur le "
@@ -10254,7 +10278,7 @@ document.querySelectorAll("#rsCloneNsMode button").forEach(b=>b.onclick=()=>{
 function cloneAppBody(){
   const same = state.cloneNsMode==="same";
   return {namespace:$("#rsNs").value, items:collectItems(), backup_path:state.backup_path, backup_root:state.backup_root,
-          app: rsStatelessClone() ? state.app.name : undefined,
+          app: (state.app && !state.app.unassigned) ? state.app.name : undefined,   // application ciblée : tous ses workloads
           target_namespace: same? "" : $("#rsCloneTargetNs").value.trim(),
           suffix: same? ($("#rsCloneSuffix").value.trim()||"-clone") : "",
           clone_refs: same? false : !!($("#rsCloneRefs")&&$("#rsCloneRefs").checked)};
@@ -13676,6 +13700,9 @@ I18N_EN += [
     (">tout le namespace</a>", ">whole namespace</a>"),
     # Clone d'une application stateless
     ("Vérifier la copie", "Check the copy"),
+    ("Workloads sans volume de l'application « ", "Workloads without volume of the application « "),
+    ("Workloads sans volume du namespace copiés aussi : ", "Workloads without volume of the namespace copied too: "),
+    (" » copiés aussi : ", " » copied too: "),
     # Secrets sauvegardés (chiffrés / clair / masqués)
     ("Secrets sauvegardés EN CLAIR (aucune phrase de coffre disponible) : déverrouillez le coffre (⚙ → Sources) ou fournissez HYCU_VAULT_PASSPHRASE pour les chiffrer.",
      "Secrets backed up IN CLEAR (no vault passphrase available): unlock the vault (⚙ → Sources) or provide HYCU_VAULT_PASSPHRASE to encrypt them."),
