@@ -327,7 +327,7 @@ def save_config(updates):
 
 # Version horodatée de la build (format AAAAMMJJ-HHMM). À incrémenter à chaque
 # changement notable du programme ; affichée dans l'en-tête de l'interface.
-VERSION = "20260928-1830"
+VERSION = "20260928-1900"
 
 # Jeton anti-CSRF généré au démarrage, injecté dans la page et exigé sur les POST.
 CSRF_TOKEN = secrets.token_urlsafe(32)
@@ -4598,6 +4598,11 @@ def action_verify(ns):
             entry = {"name": i["metadata"]["name"], "phase": i.get("status", {}).get("phase"),
                      "ready": "%d/%d" % (ready, len(cs)), "waiting": ", ".join(waiting)}
             ev = events.get(i["metadata"]["name"])
+            scheduled = bool((i.get("spec") or {}).get("nodeName"))
+            # Un FailedScheduling est un vestige dès que le pod est placé sur un nœud
+            # (PVC lié entre-temps) : ne pas l'afficher comme problème courant.
+            if ev and ev["reason"] == "FailedScheduling" and scheduled:
+                ev = None
             if ev and (i.get("status", {}).get("phase") != "Running" or ready < len(cs)):
                 entry["issue"] = {"reason": ev["reason"], "message": ev["message"], "count": ev["count"]}
             out["pods"].append(entry)

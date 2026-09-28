@@ -92,6 +92,23 @@ check(v["ok"] and pods["db-1"]["issue"]["reason"] == "FailedAttachVolume" and po
       and "Attach Client failed" in pods["db-1"]["issue"]["message"] and pods["db-1"]["waiting"] == "ContainerCreating",
       "pod bloqué : dernier événement Warning (le plus récent, pas le Normal) + raison d'attente")
 check("issue" not in pods["web-1"], "pod Running et prêt : ancien Warning ignoré")
+def kj_verify2(args):
+    if args[:2] == ["get", "pods"]:
+        return {"items": [{"metadata": {"name": "db-2"}, "spec": {"nodeName": "worker-1"}, "status": {"phase": "Pending", "containerStatuses": [
+                    {"ready": False, "state": {"waiting": {"reason": "ContainerCreating"}}}]}}]}, None
+    if args[:2] == ["get", "events"]:
+        return {"items": [{"type": "Warning", "reason": "FailedScheduling", "message": "pod has unbound immediate PersistentVolumeClaims",
+                           "lastTimestamp": "2026-09-28T14:20:00Z", "count": 1, "involvedObject": {"kind": "Pod", "name": "db-2"}}]}, None
+    return kj_verify(args)
+H.kubectl_json = kj_verify2
+H._namespace_allowed = lambda ns: True
+try:
+    v2 = H.action_verify("ns")
+finally:
+    H.kubectl_json = s_kj
+    H._namespace_allowed = s_allowed
+check("issue" not in v2["pods"][0] and v2["pods"][0]["waiting"] == "ContainerCreating",
+      "FailedScheduling d'avant la liaison du PVC : ignoré dès que le pod est placé sur un nœud")
 
 print("\n== 4d. IQN du PV cloné aligné sur la cible iSCSI réelle du VG (HYCU : « hycu-clone-vg-… ») ==")
 def fake_raw_vg(system, method, path, body=None, timeout=30):
