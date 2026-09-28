@@ -327,7 +327,7 @@ def save_config(updates):
 
 # Version horodatée de la build (format AAAAMMJJ-HHMM). À incrémenter à chaque
 # changement notable du programme ; affichée dans l'en-tête de l'interface.
-VERSION = "20260928-1700"
+VERSION = "20260928-1830"
 
 # Jeton anti-CSRF généré au démarrage, injecté dans la page et exigé sur les POST.
 CSRF_TOKEN = secrets.token_urlsafe(32)
@@ -4404,6 +4404,7 @@ def _execute_restore_locked(payload, log=None):
         # Réécrire hypervisorAttachedDiskUUIDs avec le disque du VG cloné (clone) AVANT
         # l'apply : sans lui, le CSI tente l'attach iSCSI et l'attachement échoue.
         if payload.get("mode", "clone") == "clone":
+            _fix_clone_iqn(r.get("manifest"), r.get("new_volume_handle"), dry, log)
             disk_ok = _set_clone_disk_uuids(r.get("manifest"), r.get("new_volume_handle"), dry, log,
                                             source_had="hypervisorAttachedDiskUUIDs" in (r.get("stripped") or []))
             if not disk_ok and not dry and CONFIG.get("clone_require_disk_uuids", True):
@@ -5685,6 +5686,61 @@ def _clone_vg_disk_uuids(vg_uuid):
     return ",".join(ids) if ids else None
 
 
+def _vg_target_name(vg_uuid):
+    """Nom de la cible iSCSI (`targetName`) d'un VG, via Prism Central v4 ; None si illisible."""
+    enc = urllib.parse.quote(str(vg_uuid))
+    r = _rest_raw("prismcentral", "GET", "/api/volumes/v4.0.b1/config/volume-groups/%s" % enc)
+    if not r.get("ok"):
+        return None
+    return (((r.get("json") or {}).get("data") or {}).get("targetName")) or None
+
+
+def _iqn_for_target(iqn, target_name):
+    """IQN attendu par le CSI pour une cible : préfixe de l'IQN source (« iqn.2010-06.com.nutanix: »),
+    nom de cible réel, suffixe conservé (« -tgt0 »)."""
+    prefix, sep, rest = (iqn or "").partition(":")
+    if not sep:
+        return None
+    m = re.search(r"(-tgt\d+)$", rest)
+    return "%s:%s%s" % (prefix, target_name, m.group(1) if m else "")
+
+
+def _fix_clone_iqn(pv_manifest, new_volume_handle, dry, log):
+    """Aligne `volumeAttributes.iqn` du PV sur le NOM DE CIBLE RÉEL du Volume Group.
+    L'outil dérive l'IQN en remplaçant l'UUID dans l'IQN source (« ntnx-k8s-<uuid> »,
+    convention du CSI), mais un VG créé par HYCU porte une cible « hycu-clone-vg-<uuid> » :
+    le worker cherche alors une cible inexistante (« iscsiadm: No records found »). Lu via
+    Prism Central v4 ; sans PC, l'IQN dérivé est conservé et signalé. Jamais bloquant."""
+    csi = (pv_manifest.get("spec") or {}).get("csi") if isinstance(pv_manifest, dict) else None
+    va = csi.get("volumeAttributes") if isinstance(csi, dict) else None
+    iqn = (va or {}).get("iqn")
+    vg_uuid = split_volume_handle(new_volume_handle or "")[1]
+    if not iqn or ":" not in iqn or not vg_uuid:
+        return True
+    if dry:
+        log.append(logentry("Aligner l'IQN du PV sur la cible iSCSI réelle du VG %s" % vg_uuid, dry=True, rc=None,
+                            stdout="Lu via Prism Central v4 (un VG créé par HYCU porte une cible « hycu-clone-vg-… »)."))
+        return True
+    if not SESSION_CREDS.get("prismcentral"):
+        log.append(logentry("IQN du PV non vérifié (Prism Central non connecté)", ok=False, rc=-1,
+                            stderr="Si le pod reste en FailedMount (« iscsiadm: No records found »), connectez "
+                                   "Prism Central et relancez : la cible iSCSI du VG restauré peut différer de l'IQN dérivé."))
+        return True
+    tn = _vg_target_name(vg_uuid)
+    if not tn:
+        log.append(logentry("IQN du PV non vérifié (cible iSCSI du VG %s illisible)" % vg_uuid, ok=False, rc=-1,
+                            stderr="Prism Central n'a pas renvoyé le targetName du VG."))
+        return True
+    new_iqn = _iqn_for_target(iqn, tn)
+    if new_iqn and new_iqn != iqn:
+        va["iqn"] = new_iqn
+        log.append(logentry("IQN du PV aligné sur la cible iSCSI réelle du VG",
+                            stdout="%s -> %s" % (iqn, new_iqn)))
+    else:
+        log.append(logentry("IQN du PV conforme à la cible iSCSI du VG", stdout=iqn))
+    return True
+
+
 def _set_clone_disk_uuids(pv_manifest, new_volume_handle, dry, log, source_had=True):
     """Réécrit `volumeAttributes.hypervisorAttachedDiskUUIDs` du PV cloné avec l'extId
     du disque du VG CLONÉ (lu via Prism Central v4) — UNIQUEMENT si le PV SOURCE portait
@@ -5780,17 +5836,33 @@ def _refresh_pv_disk(ns, pvc_name, dry, log):
     # comme « changé » sur un simple ré-ordonnancement des extId renvoyés par l'API v4.
     def _disk_set(s):
         return frozenset(x for x in (s or "").split(",") if x)
-    if not new_disk or _disk_set(new_disk) == _disk_set(old_disk):
-        return True, ""                                  # disque inchangé -> rien à faire
-    log.append(logentry("Disque du VG remplacé par le restore in-place — rafraîchissement du PV %s" % pv_name,
-                        stdout="hypervisorAttachedDiskUUIDs : %s -> %s" % (old_disk, new_disk)))
+    # Le PV ne porte l'attribut disque que s'il l'avait (politique miroir) : on ne
+    # compare le disque que dans ce cas. La cible iSCSI (targetName), elle, peut changer
+    # à chaque restore in-place (HYCU recrée le VG avec une cible « hycu-… »).
+    disk_changed = bool(old_disk) and bool(new_disk) and _disk_set(new_disk) != _disk_set(old_disk)
+    old_iqn = (csi.get("volumeAttributes") or {}).get("iqn")
+    tn = _vg_target_name(vg_uuid) if old_iqn else None
+    new_iqn = _iqn_for_target(old_iqn, tn) if tn else None
+    iqn_changed = bool(new_iqn) and new_iqn != old_iqn
+    if not disk_changed and not iqn_changed:
+        return True, ""                                  # rien n'a changé -> rien à faire
+    what = []
+    if disk_changed:
+        what.append("hypervisorAttachedDiskUUIDs : %s -> %s" % (old_disk, new_disk))
+    if iqn_changed:
+        what.append("iqn : %s -> %s" % (old_iqn, new_iqn))
+    log.append(logentry("VG modifié par le restore in-place — rafraîchissement du PV %s" % pv_name,
+                        stdout=" ; ".join(what)))
     if dry:
-        log.append(logentry("Recréer le PV %s avec le disque à jour (Retain -> delete -> apply)" % pv_name,
+        log.append(logentry("Recréer le PV %s avec les attributs à jour (Retain -> delete -> apply)" % pv_name,
                             dry=True, rc=None))
         return True, ""
     new_pv = clean_pv(json.loads(json.dumps(pv_live)))
-    new_pv.setdefault("spec", {}).setdefault("csi", {}).setdefault("volumeAttributes", {})[
-        "hypervisorAttachedDiskUUIDs"] = new_disk
+    va_new = new_pv.setdefault("spec", {}).setdefault("csi", {}).setdefault("volumeAttributes", {})
+    if disk_changed:
+        va_new["hypervisorAttachedDiskUUIDs"] = new_disk
+    if iqn_changed:
+        va_new["iqn"] = new_iqn
     # Filet de sécurité : le PV recréé est forcé en Retain pour qu'une suppression
     # ULTÉRIEURE (autre échec, nettoyage opérateur, teardown de namespace) ne détruise
     # PAS le Volume Group restauré (reclaimPolicy=Delete par défaut côté Nutanix). Sans
@@ -7628,6 +7700,7 @@ def action_clone_app(payload, log=None):
         # AVANT toute création : si introuvable en réel, on abandonne sans rien créer.
         for p in prepared:
             handle = ((p["pv"].get("spec") or {}).get("csi") or {}).get("volumeHandle")
+            _fix_clone_iqn(p["pv"], handle, dry, log)        # cible iSCSI réelle (VG HYCU : « hycu-clone-vg-… »)
             if not _set_clone_disk_uuids(p["pv"], handle, dry, log, source_had=p.get("src_disk_attr", True)) \
                     and not dry and CONFIG.get("clone_require_disk_uuids", True):
                 return {"ok": False, "log": log, "warnings": warnings, "preview": preview,
@@ -12743,6 +12816,18 @@ I18N_EN += [
      "Set hypervisorAttachedDiskUUIDs (cloned VG disk "),
     ("Lu via Prism Central v4 ; sans lui le CSI tente l'attach iSCSI (échec).",
      "Read via Prism Central v4; without it the CSI attempts the iSCSI attach (fails)."),
+    ("Aligner l'IQN du PV sur la cible iSCSI réelle du VG ", "Align the PV's IQN with the VG's real iSCSI target "),
+    ("Lu via Prism Central v4 (un VG créé par HYCU porte une cible « hycu-clone-vg-… »).", "Read through Prism Central v4 (a VG created by HYCU carries a “hycu-clone-vg-…” target)."),
+    ("IQN du PV non vérifié (Prism Central non connecté)", "PV IQN not checked (Prism Central not connected)"),
+    ("Si le pod reste en FailedMount (« iscsiadm: No records found »), connectez Prism Central et relancez : la cible iSCSI du VG restauré peut différer de l'IQN dérivé.",
+     "If the pod stays in FailedMount (“iscsiadm: No records found”), connect Prism Central and retry: the restored VG's iSCSI target may differ from the derived IQN."),
+    ("IQN du PV non vérifié (cible iSCSI du VG ", "PV IQN not checked (iSCSI target of VG "),
+    (" illisible)", " unreadable)"),
+    ("Prism Central n'a pas renvoyé le targetName du VG.", "Prism Central did not return the VG's targetName."),
+    ("IQN du PV aligné sur la cible iSCSI réelle du VG", "PV IQN aligned with the VG's real iSCSI target"),
+    ("IQN du PV conforme à la cible iSCSI du VG", "PV IQN matches the VG's iSCSI target"),
+    ("VG modifié par le restore in-place — rafraîchissement du PV ", "VG changed by the in-place restore — refreshing PV "),
+    (" avec les attributs à jour (Retain -> delete -> apply)", " with up-to-date attributes (Retain -> delete -> apply)"),
     ("hypervisorAttachedDiskUUIDs non ajouté (le PV source ne le porte pas)",
      "hypervisorAttachedDiskUUIDs not added (the source PV does not carry it)"),
     ("Le CSI de ce cluster attache le Volume Group sans cet attribut, comme pour le PV d'origine : forme du PV source reproduite.",

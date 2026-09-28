@@ -504,6 +504,11 @@ vrai cluster** :
    l'outil **n'en ajoute pas** : constaté sur un cluster NKP, l'ajouter fait échouer
    l'attachement Nutanix (`FailedAttachVolume … hypervisor Attach Client failed`) alors
    que le driver attache très bien le VG sans lui, comme pour le PV d'origine.
+   **IQN** : un VG créé par HYCU porte une cible iSCSI `hycu-clone-vg-<uuid>` alors que
+   le CSI attend `ntnx-k8s-<uuid>` ; l'outil lit le `targetName` réel via Prism Central
+   et aligne `volumeAttributes.iqn` du PV (clone, nouveaux volumes, récupération, et
+   rafraîchissement du PV après un restore sur place). Sans Prism Central, l'IQN dérivé
+   est conservé et signalé (`iscsiadm: No records found` si la cible diffère).
 2. **`Retain` du PV source (perte de données)** : avant de supprimer l'ancien PV/PVC,
    l'outil passe le PV source en `persistentVolumeReclaimPolicy: Retain` (option
    `retain_source_pv`, défaut `true`) pour que le CSI **ne supprime pas** le Volume
