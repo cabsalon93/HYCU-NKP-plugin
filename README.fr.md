@@ -496,13 +496,14 @@ la page **Réglages** de l'interface. Toutes les clés sont optionnelles.
 Ces points dépendent de l'environnement et **ne peuvent pas être vérifiés sans le
 vrai cluster** :
 
-1. **`hypervisorAttachedDiskUUIDs` (point #1)** : sur le CSI Nutanix moderne (NKP), le
-   VG est attaché à la VM worker et le PV porte `volumeAttributes.hypervisorAttachedDiskUUIDs`
-   = UUID du **disque attaché du VG source**. L'outil le **purge** du PV cloné (option
-   `clone_strip_runtime_attrs`, défaut `true`) pour que le driver le repeuple à l'attach.
-   **À confirmer sur un PV cloné réel** : le driver localise bien le volume par
-   `volumeHandle` seul (montage OK) — sinon il faudra réécrire ce champ avec l'UUID du
-   disque **cloné** plutôt que le purger.
+1. **`hypervisorAttachedDiskUUIDs` (point #1)** : politique **miroir du PV source**.
+   Si le PV d'origine porte `volumeAttributes.hypervisorAttachedDiskUUIDs` (UUID du
+   disque attaché du VG source), l'outil le **réécrit** sur le PV cloné avec le disque
+   du VG **cloné** (lu via Prism Central v4 ; `clone_fix_disk_uuids`, abandon si
+   introuvable avec `clone_require_disk_uuids`). Si le PV d'origine **ne le porte pas**,
+   l'outil **n'en ajoute pas** : constaté sur un cluster NKP, l'ajouter fait échouer
+   l'attachement Nutanix (`FailedAttachVolume … hypervisor Attach Client failed`) alors
+   que le driver attache très bien le VG sans lui, comme pour le PV d'origine.
 2. **`Retain` du PV source (perte de données)** : avant de supprimer l'ancien PV/PVC,
    l'outil passe le PV source en `persistentVolumeReclaimPolicy: Retain` (option
    `retain_source_pv`, défaut `true`) pour que le CSI **ne supprime pas** le Volume

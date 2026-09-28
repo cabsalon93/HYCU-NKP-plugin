@@ -484,14 +484,14 @@ Copy `hycu_config.example.json` → `hycu_config.json`. Also editable via the
 These points depend on the environment and **cannot be verified without the real
 cluster**:
 
-1. **`hypervisorAttachedDiskUUIDs` (point #1)**: on the modern Nutanix CSI
-   (NKP), the VG is attached to the worker VM and the PV carries
-   `volumeAttributes.hypervisorAttachedDiskUUIDs` = UUID of the **source VG's
-   attached disk**. The tool **purges** it from the cloned PV (option
-   `clone_strip_runtime_attrs`, default `true`) so the driver repopulates it at
-   attach time. **To confirm on a real cloned PV**: the driver locates the
-   volume by `volumeHandle` alone (mount OK) — otherwise this field will need to
-   be rewritten with the **cloned** disk's UUID rather than purged.
+1. **`hypervisorAttachedDiskUUIDs` (point #1)**: **mirror-the-source-PV** policy.
+   If the original PV carries `volumeAttributes.hypervisorAttachedDiskUUIDs` (UUID of
+   the source VG's attached disk), the tool **rewrites** it on the cloned PV with the
+   **cloned** VG's disk (read through Prism Central v4; `clone_fix_disk_uuids`, abort
+   if not found with `clone_require_disk_uuids`). If the original PV **does not carry
+   it**, the tool **does not add it**: observed on an NKP cluster, adding it makes the
+   Nutanix attachment fail (`FailedAttachVolume … hypervisor Attach Client failed`)
+   while the driver attaches the VG perfectly without it, as for the original PV.
 2. **`Retain` on the source PV (data loss)**: before deleting the old PV/PVC,
    the tool switches the source PV to `persistentVolumeReclaimPolicy: Retain`
    (option `retain_source_pv`, default `true`) so the CSI **does not delete**

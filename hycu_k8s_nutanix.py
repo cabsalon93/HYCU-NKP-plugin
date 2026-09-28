@@ -327,7 +327,7 @@ def save_config(updates):
 
 # Version horodatée de la build (format AAAAMMJJ-HHMM). À incrémenter à chaque
 # changement notable du programme ; affichée dans l'en-tête de l'interface.
-VERSION = "20260926-1100"
+VERSION = "20260928-1700"
 
 # Jeton anti-CSRF généré au démarrage, injecté dans la page et exigé sur les POST.
 CSRF_TOKEN = secrets.token_urlsafe(32)
@@ -4404,7 +4404,8 @@ def _execute_restore_locked(payload, log=None):
         # Réécrire hypervisorAttachedDiskUUIDs avec le disque du VG cloné (clone) AVANT
         # l'apply : sans lui, le CSI tente l'attach iSCSI et l'attachement échoue.
         if payload.get("mode", "clone") == "clone":
-            disk_ok = _set_clone_disk_uuids(r.get("manifest"), r.get("new_volume_handle"), dry, log)
+            disk_ok = _set_clone_disk_uuids(r.get("manifest"), r.get("new_volume_handle"), dry, log,
+                                            source_had="hypervisorAttachedDiskUUIDs" in (r.get("stripped") or []))
             if not disk_ok and not dry and CONFIG.get("clone_require_disk_uuids", True):
                 aborted = True
                 abort_detail = (("disque introuvable pour le Volume Group de %s : Prism Central n'est pas "
@@ -4575,12 +4576,30 @@ def action_verify(ns):
                             "volume_handle": pv_handle.get(pvn)})
     pod_data, _ = kubectl_json(["get", "pods", "-n", ns])
     if pod_data:
+        # Raison d'un pod bloqué : dernier événement Warning du pod (FailedAttachVolume,
+        # FailedScheduling, FailedMount…) + raison d'attente du conteneur — l'information
+        # qui manque quand l'écran ne montre que « Pending ».
+        events = {}
+        ev_data, _e = kubectl_json(["get", "events", "-n", ns, "--field-selector", "involvedObject.kind=Pod"])
+        for ev in ((ev_data or {}).get("items") or []):
+            if (ev.get("type") or "") != "Warning":
+                continue
+            pod = ((ev.get("involvedObject") or {}).get("name")) or ""
+            when = ev.get("lastTimestamp") or ev.get("eventTime") or ((ev.get("series") or {}).get("lastObservedTime")) or ""
+            cur = events.get(pod)
+            if not cur or str(when) >= str(cur["when"]):
+                events[pod] = {"when": str(when), "reason": ev.get("reason") or "", "count": ev.get("count") or 1,
+                               "message": str(ev.get("message") or "")[:400]}
         for i in pod_data.get("items", []):
             cs = i.get("status", {}).get("containerStatuses", []) or []
             ready = sum(1 for c in cs if c.get("ready"))
-            out["pods"].append({"name": i["metadata"]["name"],
-                                "phase": i.get("status", {}).get("phase"),
-                                "ready": "%d/%d" % (ready, len(cs))})
+            waiting = sorted({((c.get("state") or {}).get("waiting") or {}).get("reason") or "" for c in cs} - {""})
+            entry = {"name": i["metadata"]["name"], "phase": i.get("status", {}).get("phase"),
+                     "ready": "%d/%d" % (ready, len(cs)), "waiting": ", ".join(waiting)}
+            ev = events.get(i["metadata"]["name"])
+            if ev and (i.get("status", {}).get("phase") != "Running" or ready < len(cs)):
+                entry["issue"] = {"reason": ev["reason"], "message": ev["message"], "count": ev["count"]}
+            out["pods"].append(entry)
     return out
 
 
@@ -5666,18 +5685,29 @@ def _clone_vg_disk_uuids(vg_uuid):
     return ",".join(ids) if ids else None
 
 
-def _set_clone_disk_uuids(pv_manifest, new_volume_handle, dry, log):
+def _set_clone_disk_uuids(pv_manifest, new_volume_handle, dry, log, source_had=True):
     """Réécrit `volumeAttributes.hypervisorAttachedDiskUUIDs` du PV cloné avec l'extId
-    du disque du VG CLONÉ (lu via Prism Central v4). C'est ce champ qui fait choisir au
-    CSI l'attach par hyperviseur (qui marche) plutôt que l'attach iSCSI (qui échoue).
-    À appeler AVANT l'apply du PV.
-    Renvoie True s'il faut/peut continuer, False si l'info est INTROUVABLE en mode réel
-    (l'appelant décidera d'abandonner selon `clone_require_disk_uuids`)."""
+    du disque du VG CLONÉ (lu via Prism Central v4) — UNIQUEMENT si le PV SOURCE portait
+    cet attribut (`source_had`). Politique « miroir de la source » : le PV d'origine a
+    été provisionné par le CSI de CE cluster et s'attache ; on reproduit sa forme.
+      - source avec l'attribut : il pointait le disque source -> réécrit avec le disque du
+        VG cloné (sinon le CSI tente l'attach iSCSI, ou attache le mauvais disque) ;
+      - source SANS l'attribut : on n'en ajoute PAS (constaté : l'ajouter fait échouer la
+        tâche d'attachement Nutanix « hypervisor Attach Client failed »).
+    À appeler AVANT l'apply du PV. Renvoie True s'il faut/peut continuer, False si l'info
+    est INTROUVABLE en mode réel (l'appelant décidera selon `clone_require_disk_uuids`)."""
     if not CONFIG.get("clone_fix_disk_uuids", True):
         return True
     vg_uuid = split_volume_handle(new_volume_handle or "")[1]
     csi = (pv_manifest.get("spec") or {}).get("csi") if isinstance(pv_manifest, dict) else None
     if not vg_uuid or not isinstance(csi, dict):
+        return True
+    if not source_had:
+        (csi.get("volumeAttributes") or {}).pop("hypervisorAttachedDiskUUIDs", None)
+        log.append(logentry("hypervisorAttachedDiskUUIDs non ajouté (le PV source ne le porte pas)",
+                            dry=dry, rc=None,
+                            stdout="Le CSI de ce cluster attache le Volume Group sans cet attribut, "
+                                   "comme pour le PV d'origine : forme du PV source reproduite."))
         return True
     if dry:
         log.append(logentry("Renseigner hypervisorAttachedDiskUUIDs (disque du VG cloné %s)" % vg_uuid,
@@ -7399,7 +7429,9 @@ def action_clone_app(payload, log=None):
         pvc_rename[pvc_name] = new_pvc_name
         prepared.append({"pvc": pvc_name, "pv": pv, "pvc_manifest": pvc_manifest,
                          "new_pv_name": clone_pv_name, "new_pvc_name": new_pvc_name,
-                         "orig_pv_name": orig_pv_name})
+                         "orig_pv_name": orig_pv_name,
+                         # le PV SOURCE portait-il hypervisorAttachedDiskUUIDs ? (politique miroir)
+                         "src_disk_attr": "hypervisorAttachedDiskUUIDs" in (built.get("stripped") or [])})
 
     if stateless and live_stateless:
         # Clone STATELESS depuis le cluster : copie des workloads de l'application.
@@ -7596,7 +7628,8 @@ def action_clone_app(payload, log=None):
         # AVANT toute création : si introuvable en réel, on abandonne sans rien créer.
         for p in prepared:
             handle = ((p["pv"].get("spec") or {}).get("csi") or {}).get("volumeHandle")
-            if not _set_clone_disk_uuids(p["pv"], handle, dry, log) and not dry and CONFIG.get("clone_require_disk_uuids", True):
+            if not _set_clone_disk_uuids(p["pv"], handle, dry, log, source_had=p.get("src_disk_attr", True)) \
+                    and not dry and CONFIG.get("clone_require_disk_uuids", True):
                 return {"ok": False, "log": log, "warnings": warnings, "preview": preview,
                         "error": (("Prism Central n'est pas connecté : impossible de renseigner le disque "
                                    "du volume « %s » — rien n'a été créé." if not SESSION_CREDS.get("prismcentral")
@@ -10341,8 +10374,9 @@ async function runVerify(){
   let allReady=r.pods.length>0;
   const pods=r.pods.map(p=>{
     const ok=p.phase==="Running"; if(!ok) allReady=false;
+    const issue = p.issue ? `<div class="hint" style="color:var(--red);margin-top:3px">⚠ ${esc(p.issue.reason)}${p.issue.count>1?' (×'+p.issue.count+')':''} : ${esc(p.issue.message)}</div>` : "";
     return `<li class="logline"><span class="ic ${ok?'ok':'sim'}">${ok?'✓':'○'}</span>
-     <span><b>${esc(p.name)}</b> <span class="hint">${esc(p.phase)} · prêts ${esc(p.ready)}</span></span></li>`;}).join("")
+     <span><b>${esc(p.name)}</b> <span class="hint">${esc(p.phase)}${p.waiting?' · '+esc(p.waiting):''} · prêts ${esc(p.ready)}</span>${issue}</span></li>`;}).join("")
      ||'<div class="hint">Aucun pod.</div>';
   $("#vfOut").innerHTML=`<div style="margin-top:12px"><b style="font-size:13px">PVC</b>
      <ul class="pvc-list">${pvcs}</ul><b style="font-size:13px">Pods</b><ul class="pvc-list">${pods}</ul></div>`;
@@ -12709,6 +12743,10 @@ I18N_EN += [
      "Set hypervisorAttachedDiskUUIDs (cloned VG disk "),
     ("Lu via Prism Central v4 ; sans lui le CSI tente l'attach iSCSI (échec).",
      "Read via Prism Central v4; without it the CSI attempts the iSCSI attach (fails)."),
+    ("hypervisorAttachedDiskUUIDs non ajouté (le PV source ne le porte pas)",
+     "hypervisorAttachedDiskUUIDs not added (the source PV does not carry it)"),
+    ("Le CSI de ce cluster attache le Volume Group sans cet attribut, comme pour le PV d'origine : forme du PV source reproduite.",
+     "This cluster's CSI attaches the Volume Group without this attribute, as for the original PV: the source PV's shape is reproduced."),
     ("hypervisorAttachedDiskUUIDs NON renseigné (Prism Central non connecté)",
      "hypervisorAttachedDiskUUIDs NOT set (Prism Central not connected)"),
     ("Le CSI tentera l'attach iSCSI et l'attachement échouera. Connectez Prism Central.",

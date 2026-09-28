@@ -50,6 +50,49 @@ check(ret3 is False, "retourne False -> l'appelant abandonnera")
 check("hypervisorAttachedDiskUUIDs" not in pv3["spec"]["csi"]["volumeAttributes"], "PV non altéré sans PC")
 check(any(l.get("ok") is False for l in log3), "entrée de log en erreur")
 
+print("\n== 4b. PV SOURCE sans hypervisorAttachedDiskUUIDs -> attribut NON ajouté (miroir de la source) ==")
+H.SESSION_CREDS.pop("prismcentral", None)          # même sans Prism Central : rien à résoudre
+pv5 = fresh_pv(); log5 = []
+ret5 = H._set_clone_disk_uuids(pv5, HANDLE, dry=False, log=log5, source_had=False)
+check(ret5 is True and "hypervisorAttachedDiskUUIDs" not in pv5["spec"]["csi"]["volumeAttributes"],
+      "source sans l'attribut : True, PV cloné sans l'attribut (le CSI s'en passe, comme pour l'original)")
+check(any("non ajouté" in l.get("label", "") for l in log5), "journalisé")
+pv6 = fresh_pv(); pv6["spec"]["csi"]["volumeAttributes"]["hypervisorAttachedDiskUUIDs"] = "residu"; log6 = []
+H._set_clone_disk_uuids(pv6, HANDLE, dry=False, log=log6, source_had=False)
+check("hypervisorAttachedDiskUUIDs" not in pv6["spec"]["csi"]["volumeAttributes"], "un résidu est retiré")
+
+print("\n== 4c. Vérification : raison d'un pod bloqué (événement Warning + attente conteneur) ==")
+s_kj = H.kubectl_json
+def kj_verify(args):
+    if args[:2] == ["get", "pvc"]:
+        return {"items": [{"metadata": {"name": "data"}, "spec": {"volumeName": "pv-1"}, "status": {"phase": "Bound"}}]}, None
+    if args[:2] == ["get", "pv"]:
+        return {"items": [{"metadata": {"name": "pv-1"}, "spec": {"csi": {"volumeHandle": "NutanixVolumes-x"}}}]}, None
+    if args[:2] == ["get", "pods"]:
+        return {"items": [{"metadata": {"name": "db-1"}, "status": {"phase": "Pending", "containerStatuses": [
+                    {"ready": False, "state": {"waiting": {"reason": "ContainerCreating"}}}]}},
+                          {"metadata": {"name": "web-1"}, "status": {"phase": "Running", "containerStatuses": [{"ready": True, "state": {"running": {}}}]}}]}, None
+    if args[:2] == ["get", "events"]:
+        return {"items": [
+            {"type": "Warning", "reason": "FailedScheduling", "message": "old", "lastTimestamp": "2026-09-28T14:20:00Z", "count": 1, "involvedObject": {"kind": "Pod", "name": "db-1"}},
+            {"type": "Warning", "reason": "FailedAttachVolume", "message": "AttachVolume.Attach failed: hypervisor Attach Client failed", "lastTimestamp": "2026-09-28T14:25:00Z", "count": 7, "involvedObject": {"kind": "Pod", "name": "db-1"}},
+            {"type": "Normal", "reason": "Scheduled", "message": "ok", "lastTimestamp": "2026-09-28T14:26:00Z", "involvedObject": {"kind": "Pod", "name": "db-1"}},
+            {"type": "Warning", "reason": "BackOff", "message": "ancien", "lastTimestamp": "2026-09-28T13:00:00Z", "involvedObject": {"kind": "Pod", "name": "web-1"}}]}, None
+    return {"items": []}, None
+H.kubectl_json = kj_verify
+s_allowed = H._namespace_allowed
+H._namespace_allowed = lambda ns: True
+try:
+    v = H.action_verify("ns")
+finally:
+    H.kubectl_json = s_kj
+    H._namespace_allowed = s_allowed
+pods = {p["name"]: p for p in v["pods"]}
+check(v["ok"] and pods["db-1"]["issue"]["reason"] == "FailedAttachVolume" and pods["db-1"]["issue"]["count"] == 7
+      and "Attach Client failed" in pods["db-1"]["issue"]["message"] and pods["db-1"]["waiting"] == "ContainerCreating",
+      "pod bloqué : dernier événement Warning (le plus récent, pas le Normal) + raison d'attente")
+check("issue" not in pods["web-1"], "pod Running et prêt : ancien Warning ignoré")
+
 print("\n== 5. clone_fix_disk_uuids=False -> désactivé, retourne True ==")
 H.SESSION_CREDS["prismcentral"] = {"mode": "basic"}
 H.CONFIG["clone_fix_disk_uuids"] = False
