@@ -4,7 +4,8 @@ Faire tourner l'outil **HYCU / Kubernetes / Nutanix** dans un conteneur Docker, 
 poste ou un serveur. C'est le **même produit** que la version Python, lancé dans une
 image prête à l'emploi.
 
-> Pour un déploiement **dans** un cluster Kubernetes, voir [`docs/docker.md`](docker.md).
+> Pour un déploiement **dans** un cluster Kubernetes, voir
+> [`docs/kubernetes-demarrage.md`](kubernetes-demarrage.md) (pas à pas) et [`docs/docker.md`](docker.md) (référence).
 
 ---
 

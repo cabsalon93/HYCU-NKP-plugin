@@ -84,7 +84,10 @@ docker load -i hycu-nkp.tar.gz
 
 4. **Accès = sécurité.** Aucune authentification applicative : quiconque peut
    `port-forward`/`exec` vers le Pod (ou atteindre `127.0.0.1:8765` sur l'hôte) devient
-   **opérateur complet**. En K8s, la frontière réelle est le **RBAC** du namespace `hycu`.
+   **opérateur complet**. En K8s, les frontières sont la **NetworkPolicy** du manifeste
+   (aucun trafic entrant depuis les pods) et le **RBAC** du namespace `hycu`.
+   Le `HEALTHCHECK` de l'image et les sondes K8s utilisent `GET /healthz`, qui ne touche
+   jamais à la session (sonder `/` évincerait l'opérateur).
 
 ---
 

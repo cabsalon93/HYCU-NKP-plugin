@@ -7,6 +7,11 @@ import os
 import shutil
 import tempfile
 import hycu_k8s_nutanix as H
+# Isolation : aucun kubectl réel (sur un poste avec un kubeconfig, l'appel à un cluster
+# injoignable bloquerait la suite). Les lectures passent par kubectl_json (doublé ci-dessous).
+H.run = lambda cmd, dry=False, label=None, timeout=None, input_text=None: {
+    "ok": False, "dry": False, "cmd": "", "stdout": "", "stderr": "kubectl désactivé (test)", "rc": 1,
+    "label": label or "kubectl"}
 
 passed = failed = 0
 def check(c, m):

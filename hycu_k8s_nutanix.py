@@ -58,6 +58,7 @@ NOTE TECHNIQUE
 ================================================================================
 """
 
+import sys
 import http.server
 import socketserver
 import json
@@ -109,6 +110,12 @@ DEFAULT_CONFIG = {
     "kubeconfig_path": "",          # fichier kubeconfig (vide = résolution par défaut)
     "backup_root": os.path.join(os.getcwd(), "hycu-backups"),
     "allowed_contexts": [],         # [] = tout contexte (mais confirmation demandée)
+    # Noms d'hôte sous lesquels l'interface peut être servie EN PLUS de la boucle locale
+    # (anti-DNS-rebinding : tout autre en-tête Host/Origin est refusé). Permet au client
+    # d'exposer l'outil sous un nom DNS (Ingress, reverse-proxy), ex. ["hycu.interne.fr"].
+    # ⚠ L'outil n'a pas d'authentification applicative : placez une authentification
+    # (oauth2-proxy, SSO, liste d'IP) et TLS devant lui dès qu'il quitte la boucle locale.
+    "allowed_hosts": [],
     "namespace_filter": [],         # [] = tous les namespaces ; sinon liste blanche
     # Filtres de namespaces des clusters AJOUTÉS depuis l'interface (⚙ Sources) :
     # { "<nom du cluster>": ["ns1", "ns2"] }. Le cluster local utilise namespace_filter.
@@ -250,76 +257,298 @@ DEFAULT_CONFIG = {
     # + scellé). La phrase de chiffrement est saisie dans ⚙ Sources (RAM/coffre, jamais
     # ici). Déchiffrement : python3 hycu_k8s_nutanix.py --decrypt <fichier>.zip.enc
     "s3_encrypt": False,
+    # Bundles CA (PEM) pour vérifier les certificats des appliances quand *_verify_tls
+    # est vrai : PKI interne / certificat auto-signé exporté. Vide = magasin système.
+    "hycu_ca_bundle": "",
+    "nutanix_ca_bundle": "",
+    "prismcentral_ca_bundle": "",
+    # Délai max (s) d'attente d'un job HYCU (clone / restore / sauvegarde).
+    "hycu_job_timeout": 1800,
+    # ---- Interface ----
+    # Langue par défaut de l'interface quand le navigateur n'a pas encore choisi
+    # (bouton FR/EN) : "en" ou "fr".
+    "default_lang": "en",
+    # Mode simulation (dry-run) : False = l'interface travaille directement en mode
+    # réel (bandeau et interrupteur masqués, garde-fous de confirmation conservés) ;
+    # True = proposer l'interrupteur « Mode simulation », coché par défaut.
+    "simulation_mode_available": False,
 }
 
+# Schéma de validation : clé -> (type attendu, validateur optionnel).
+# Appliqué au fichier, aux variables d'environnement ET à l'API (/api/config), pour
+# qu'une valeur mal typée ne puisse ni être persistée ni casser le serveur (ex. un
+# wait_timeout en chaîne -> TypeError dans chaque commande kubectl).
+def _is_str_list(v):
+    return all(isinstance(x, str) for x in v)
+
+
+CONFIG_SCHEMA = {
+    "host": (str, None),
+    "port": (int, lambda v: 1 <= v <= 65535),
+    "kubectl_path": (str, lambda v: bool(v.strip())),
+    "kube_context": (str, None),
+    "kubeconfig_path": (str, None),
+    "backup_root": (str, None),
+    "allowed_contexts": (list, _is_str_list),
+    "allowed_hosts": (list, lambda v: _is_str_list(v) and all(re.match(r"^[A-Za-z0-9.\-]+$", x) for x in v)),
+    "namespace_filter": (list, _is_str_list),
+    "cluster_namespace_filters": (dict, lambda v: all(isinstance(x, list) and _is_str_list(x) for x in v.values())),
+    "wait_timeout": (int, lambda v: 1 <= v <= 86400),
+    "subprocess_margin": (int, lambda v: 0 <= v <= 3600),
+    "clone_name_suffix": (str, None),
+    "volume_handle_prefix": (str, None),
+    "strip_claimref": (bool, None),
+    "clone_strip_runtime_attrs": (bool, None),
+    "clone_fix_disk_uuids": (bool, None),
+    "clone_require_disk_uuids": (bool, None),
+    "backup_before_restore": (bool, None),
+    "config_backup_full": (bool, None),
+    "config_backup_kinds": (list, _is_str_list),
+    "config_backup_include_secret_data": (bool, None),
+    "auto_backup_enabled": (bool, None),
+    "auto_backup_interval_hours": (float, lambda v: 0.25 <= v <= 8760),
+    "auto_backup_dest": (str, None),
+    "auto_backup_keep": (int, lambda v: 0 <= v <= 10000),          # 0 = illimité
+    "auto_backup_retention": (str, lambda v: v in ("count", "gfs")),
+    "auto_backup_keep_daily": (int, lambda v: 0 <= v <= 3660),
+    "auto_backup_keep_weekly": (int, lambda v: 0 <= v <= 520),
+    "auto_backup_keep_monthly": (int, lambda v: 0 <= v <= 1200),
+    "cluster_health_minutes": (int, lambda v: 0 <= v <= 1440),
+    "audit_retention_days": (int, lambda v: 0 <= v <= 36500),
+    "storage_min_free_mb": (int, lambda v: 0 <= v <= 10_000_000),
+    "storage_quota_gb": (int, lambda v: 0 <= v <= 10_000_000),
+    "allow_dr_restore": (bool, None),
+    "namespace_label_selector": (str, None),
+    "backup_collect_restore_contract": (bool, None),
+    "recover_restore_deleted_vg": (bool, None),
+    "recover_deleted_vg_mode": (str, lambda v: v in ("restore", "clone")),
+    "backup_secrets": (str, lambda v: v in ("auto", "encrypted", "clear", "redacted")),
+    "apps_fallback_max": (int, lambda v: 0 <= v <= 100000),
+    "apps_cache_ttl_s": (int, lambda v: 0 <= v <= 86400),
+    "backup_parallel": (int, lambda v: 1 <= v <= 64),
+    "backup_pv_prefetch_min": (int, lambda v: 0 <= v <= 100000),
+    "s3_url": (str, None), "s3_bucket": (str, None), "s3_region": (str, None), "s3_prefix": (str, None),
+    "s3_verify_tls": (bool, None), "s3_path_style": (bool, None), "s3_auto_upload": (bool, None),
+    "s3_encrypt": (bool, None),
+    "inplace_refresh_pv_disk": (bool, None),
+    "retain_source_pv": (bool, None),
+    "require_context_confirm": (bool, None),
+    "open_browser": (bool, None),
+    "logo_path": (str, None),
+    "remember_credentials": (bool, None),
+    "pbkdf2_iterations": (int, lambda v: 100000 <= v <= 10000000),
+    "hycu_url": (str, None), "hycu_api_base": (str, None), "hycu_test_path": (str, None),
+    "hycu_verify_tls": (bool, None),
+    "nutanix_url": (str, None), "nutanix_api_base": (str, None), "nutanix_verify_tls": (bool, None),
+    "prismcentral_url": (str, None), "prismcentral_api_base": (str, None),
+    "prismcentral_verify_tls": (bool, None),
+    "hycu_ca_bundle": (str, None), "nutanix_ca_bundle": (str, None), "prismcentral_ca_bundle": (str, None),
+    "hycu_job_timeout": (int, lambda v: 30 <= v <= 86400),
+    "default_lang": (str, lambda v: v in ("fr", "en")),
+    "simulation_mode_available": (bool, None),
+}
+assert set(CONFIG_SCHEMA) == set(DEFAULT_CONFIG), "CONFIG_SCHEMA et DEFAULT_CONFIG divergent"
+
+# Clés de chemins/binaires : modifiables par l'API uniquement hors conteneur. En mode
+# conteneur (une variable HYCU_* posée), elles viennent du fichier ou de l'env ;
+# l'API les refuse (une page web ne doit pas pouvoir changer la commande exécutée).
+_CONTAINER_LOCKED_KEYS = frozenset(("kubectl_path", "kubeconfig_path", "backup_root", "logo_path",
+                                    "host", "port"))
+_ENV_KEYS = ("HYCU_HOST", "HYCU_PORT", "HYCU_OPEN_BROWSER", "HYCU_BACKUP_ROOT", "HYCU_KUBECTL_PATH")
+# Noms de binaires acceptés pour kubectl_path (premier mot ou nom de fichier).
+_KUBECTL_BIN_PREFIXES = ("kubectl", "microk8s", "k3s", "oc", "minikube", "python")
+
+
+def _container_mode():
+    return any(os.environ.get(e) for e in _ENV_KEYS)
+
+
+def _coerce_config_value(key, value):
+    """Valide/convertit une valeur selon CONFIG_SCHEMA. Lève ValueError si invalide.
+    Tolère les formes « texte » courantes (fichier édité à la main) : "true"/"false",
+    "120", liste en chaîne séparée par des virgules."""
+    typ, check = CONFIG_SCHEMA[key]
+    v = value
+    if typ is bool:
+        if isinstance(v, str):
+            s = v.strip().lower()
+            if s in ("1", "true", "yes", "on"):
+                v = True
+            elif s in ("0", "false", "no", "off", ""):
+                v = False
+        if not isinstance(v, bool):
+            raise ValueError("booléen attendu")
+    elif typ is int:
+        if isinstance(v, bool):
+            raise ValueError("entier attendu")
+        if isinstance(v, str) and v.strip().lstrip("-").isdigit():
+            v = int(v.strip())
+        if not isinstance(v, int):
+            raise ValueError("entier attendu")
+    elif typ is float:
+        if isinstance(v, bool):
+            raise ValueError("nombre attendu")
+        if isinstance(v, str):
+            try:
+                v = float(v.strip().replace(",", "."))
+            except ValueError:
+                raise ValueError("nombre attendu")
+        if not isinstance(v, (int, float)):
+            raise ValueError("nombre attendu")
+        if isinstance(v, float) and v.is_integer():
+            v = int(v)
+    elif typ is str:
+        if v is None:
+            v = ""
+        if not isinstance(v, str):
+            raise ValueError("texte attendu")
+    elif typ is list:
+        if isinstance(v, str):
+            v = [x.strip() for x in v.split(",") if x.strip()]
+        if not isinstance(v, list):
+            raise ValueError("liste attendue")
+    elif typ is dict:
+        if not isinstance(v, dict):
+            raise ValueError("objet attendu")
+    if check and not check(v):
+        raise ValueError("valeur hors bornes ou de forme invalide")
+    if key == "kubectl_path":
+        first = v.strip().split()[0] if v.strip() else ""
+        base = os.path.basename(first).lower()
+        if not base.startswith(_KUBECTL_BIN_PREFIXES):
+            raise ValueError("binaire non reconnu (kubectl, microk8s, k3s, oc attendus)")
+    return v
+
+
+def validate_config(updates, source="api"):
+    """Valide un dict de mises à jour. Renvoie (valeurs validées, erreur ou None).
+    Les clés inconnues sont ignorées (compatibilité ascendante du fichier)."""
+    out = {}
+    for k, v in (updates or {}).items():
+        if k not in CONFIG_SCHEMA:
+            continue
+        if source == "api" and k in _CONTAINER_LOCKED_KEYS and _container_mode():
+            return None, "Clé « %s » en lecture seule en mode conteneur (fichier ou variable d'environnement)." % k
+        try:
+            out[k] = _coerce_config_value(k, v)
+        except ValueError as e:
+            return None, "Configuration : clé « %s » invalide (%s)." % (k, e)
+    return out, None
+
+
+# Configuration EFFECTIVE (défauts + fichier + env) ; USER_CONFIG = contenu du fichier
+# seul, de sorte que les surcharges d'environnement ne soient jamais persistées.
 CONFIG = dict(DEFAULT_CONFIG)
 # Sérialise mutation de CONFIG + écriture du fichier : save_config est appelé depuis
 # plusieurs threads (UI, clone asynchrone qui auto-ajoute un namespace au filtre).
+USER_CONFIG = {}
 CONFIG_LOCK = threading.RLock()
 
 
-def _apply_env_overrides():
+def _env_overrides():
     """Surcharges par variables d'environnement (mode conteneur / 12-factor).
-    Priorité : env > hycu_config.json > défauts. Permet une IMAGE mode-agnostique
-    sans modifier le code ni le fichier de config (ex. HYCU_HOST=0.0.0.0,
-    HYCU_OPEN_BROWSER=0, HYCU_BACKUP_ROOT=/data/hycu-backups). En mode « python »
-    direct, aucune de ces variables n'est posée -> comportement par défaut inchangé."""
-    def _b(v):
-        return str(v).strip().lower() in ("1", "true", "yes", "on")
-    mapping = {
-        "HYCU_HOST": ("host", str),
-        "HYCU_PORT": ("port", int),
-        "HYCU_OPEN_BROWSER": ("open_browser", _b),
-        "HYCU_BACKUP_ROOT": ("backup_root", str),
-        "HYCU_KUBECTL_PATH": ("kubectl_path", str),
-    }
-    for env, (key, conv) in mapping.items():
+    Priorité : env > hycu_config.json > défauts (ex. HYCU_HOST=0.0.0.0,
+    HYCU_OPEN_BROWSER=0, HYCU_BACKUP_ROOT=/data/hycu-backups)."""
+    mapping = {"HYCU_HOST": "host", "HYCU_PORT": "port", "HYCU_OPEN_BROWSER": "open_browser",
+               "HYCU_BACKUP_ROOT": "backup_root", "HYCU_KUBECTL_PATH": "kubectl_path",
+               "HYCU_ALLOWED_HOSTS": "allowed_hosts"}   # liste séparée par des virgules
+    out = {}
+    for env, key in mapping.items():
         val = os.environ.get(env)
         if val is None or val == "":
             continue
         try:
-            CONFIG[key] = conv(val)
-        except (ValueError, TypeError):
-            print("Variable d'env %s ignorée (valeur invalide : %r)." % (env, val))
+            out[key] = _coerce_config_value(key, val)
+        except ValueError as e:
+            print("Variable d'env %s ignorée (valeur invalide : %r, %s)." % (env, val, e))
+    return out
 
 
-def load_config():
-    """Charge hycu_config.json par-dessus les valeurs par défaut (clés inconnues ignorées),
-    puis applique les surcharges d'environnement (mode conteneur)."""
-    global CONFIG
-    CONFIG = dict(DEFAULT_CONFIG)
-    if os.path.isfile(CONFIG_PATH):
-        try:
-            with open(CONFIG_PATH, encoding="utf-8") as f:
-                user = json.load(f)
-            for k, v in (user or {}).items():
-                if k in DEFAULT_CONFIG:
-                    CONFIG[k] = v
-        except Exception as e:  # config illisible : on garde les défauts
-            print("Configuration illisible (%s) : valeurs par défaut utilisées." % e)
-    # backup_root vide (ex. laissé "" dans le fichier d'exemple) -> défaut, sinon
-    # os.makedirs("") planterait au démarrage.
-    if not (CONFIG.get("backup_root") or "").strip():
-        CONFIG["backup_root"] = DEFAULT_CONFIG["backup_root"]
-    _apply_env_overrides()
+def _apply_env_overrides():
+    CONFIG.update(_env_overrides())
+
+
+def _rebuild_config():
+    """CONFIG = défauts + USER_CONFIG + env (sans perdre les clés ajoutées à chaud)."""
+    with CONFIG_LOCK:
+        merged = dict(DEFAULT_CONFIG)
+        merged.update(USER_CONFIG)
+        if not (merged.get("backup_root") or "").strip():
+            merged["backup_root"] = DEFAULT_CONFIG["backup_root"]
+        merged.update(_env_overrides())
+        CONFIG.clear()
+        CONFIG.update(merged)
     return CONFIG
 
 
-def save_config(updates):
-    """Met à jour et persiste la configuration (uniquement les clés connues).
-    Sous verrou (écritures concurrentes UI / threads asynchrones) et via un fichier
-    temporaire + os.replace : un arrêt brutal ne laisse jamais un hycu_config.json
-    tronqué (qui serait silencieusement remplacé par les défauts au redémarrage)."""
-    global CONFIG
-    with CONFIG_LOCK:
-        for k, v in (updates or {}).items():
-            if k in DEFAULT_CONFIG:
-                CONFIG[k] = v
+def load_config():
+    """Charge hycu_config.json par-dessus les valeurs par défaut (clés inconnues ignorées,
+    valeurs invalides signalées et ignorées), puis applique les surcharges d'environnement."""
+    global USER_CONFIG
+    user = {}
+    if os.path.isfile(CONFIG_PATH):
         try:
-            tmp = CONFIG_PATH + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(CONFIG, f, indent=2, ensure_ascii=False)
-            os.replace(tmp, CONFIG_PATH)
+            with open(CONFIG_PATH, encoding="utf-8") as f:
+                raw = json.load(f) or {}
+            for k, v in raw.items():
+                if k not in CONFIG_SCHEMA:
+                    continue
+                try:
+                    user[k] = _coerce_config_value(k, v)
+                except ValueError as e:
+                    print("Configuration : clé « %s » ignorée (%s)." % (k, e))
+        except Exception as e:  # config illisible : on garde les défauts
+            print("Configuration illisible (%s) : valeurs par défaut utilisées." % e)
+    with CONFIG_LOCK:
+        USER_CONFIG = user
+        _rebuild_config()
+    return CONFIG
+
+
+def _write_json_atomic(path, obj, mode=0o600):
+    """Écrit un JSON via un fichier temporaire puis os.replace (jamais de fichier
+    tronqué en cas d'arrêt brutal). mode = permissions POSIX du fichier."""
+    d = os.path.dirname(os.path.abspath(path)) or "."
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=d)
+    try:
+        try:
+            os.chmod(tmp, mode)
+        except OSError:
+            pass
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(obj, f, indent=2, ensure_ascii=False)
+        # Windows : un antivirus peut tenir brièvement le fichier tout juste écrit
+        # (PermissionError transitoire sur os.replace) -> quelques tentatives.
+        for attempt in range(5):
+            try:
+                os.replace(tmp, path)
+                break
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def save_config(updates, source="internal"):
+    """Valide, applique et persiste des mises à jour de configuration. Seul le contenu
+    « utilisateur » (fichier) est écrit : les surcharges d'environnement ne sont jamais
+    persistées. Écriture atomique, sous verrou (appelants concurrents : UI, thread
+    d'opération, coffre). Renvoie (ok, erreur)."""
+    vals, err = validate_config(updates, source=source)
+    if err:
+        return False, err
+    with CONFIG_LOCK:
+        USER_CONFIG.update(vals)
+        CONFIG.update(vals)          # effet immédiat ; CONFIG garde ses autres valeurs à chaud
+        try:
+            _write_json_atomic(CONFIG_PATH, USER_CONFIG, mode=0o644)
             return True, None
         except Exception as e:
             return False, str(e)
@@ -327,7 +556,7 @@ def save_config(updates):
 
 # Version horodatée de la build (format AAAAMMJJ-HHMM). À incrémenter à chaque
 # changement notable du programme ; affichée dans l'en-tête de l'interface.
-VERSION = "20260928-2000"
+VERSION = "20261009-2300"
 
 # Jeton anti-CSRF généré au démarrage, injecté dans la page et exigé sur les POST.
 CSRF_TOKEN = secrets.token_urlsafe(32)
@@ -350,9 +579,20 @@ UI_SESSION = {"id": None}
 ALLOWED_HOSTS = ("127.0.0.1", "localhost", "::1")
 
 
+def _host_allowed(name):
+    """Vrai si `name` (nom d'hôte sans port, minuscules) est la boucle locale ou un nom
+    autorisé par la configuration (allowed_hosts : nom DNS d'un Ingress / reverse-proxy)."""
+    if not name:
+        return False
+    n = name.strip().lower().rstrip(".")
+    if n in ALLOWED_HOSTS:
+        return True
+    return any(n == (x or "").strip().lower().rstrip(".") for x in (CONFIG.get("allowed_hosts") or []))
+
+
 def _host_is_local(hostport):
     """Extrait le nom d'hôte d'un en-tête Host (gère « host:port » et « [::1]:port »)
-    et vérifie qu'il désigne la boucle locale."""
+    et vérifie qu'il est autorisé (boucle locale ou allowed_hosts)."""
     if not hostport:
         return False
     h = hostport.strip()
@@ -361,7 +601,7 @@ def _host_is_local(hostport):
         h = h[1:end] if end != -1 else h[1:]
     elif h.count(":") == 1:                     # host:port (IPv4 / nom)
         h = h.rsplit(":", 1)[0]
-    return h in ALLOWED_HOSTS
+    return _host_allowed(h)
 
 # Sérialise les opérations destructives : un seul restore/backup à la fois.
 ACTION_LOCK = threading.Lock()
@@ -435,7 +675,7 @@ def audit(event, **fields):
     """Écrit une ligne JSON horodatée dans backup_root/audit.log."""
     try:
         os.makedirs(CONFIG["backup_root"], exist_ok=True)
-        rec = {"ts": datetime.datetime.now().isoformat(), "event": event}
+        rec = {"ts": datetime.datetime.now().astimezone().isoformat(), "event": event}
         if "cluster" not in fields:             # cluster ciblé (multi-cluster)
             try:
                 rec["cluster"] = _cluster_label()
@@ -499,8 +739,32 @@ def action_lock(skip=False):
 # Opérations longues asynchrones (progression live) — exécutées en thread, suivies
 # par /api/op_status. Le `log` partagé grossit pendant l'exécution ; le client poll.
 # ------------------------------------------------------------------------------
-OPERATIONS = {}                 # op_id -> {"log": [...], "done": bool, "result": dict|None}
+OPERATIONS = {}                 # op_id -> {"log": [...], "done": bool, "result": dict|None, "cancel": Event}
 OP_LOCK = threading.Lock()
+_OP_TL = threading.local()      # op_id de l'opération exécutée par le thread courant
+
+
+def _op_cancel_requested():
+    """Vrai si l'opérateur a demandé l'arrêt coopératif de l'opération en cours
+    (POST /api/op_cancel) : la séquence termine l'étape en cours puis s'arrête."""
+    op_id = getattr(_OP_TL, "op_id", None)
+    if not op_id:
+        return False
+    with OP_LOCK:
+        op = OPERATIONS.get(op_id)
+    return bool(op and op.get("cancel") and op["cancel"].is_set())
+
+
+def action_op_cancel(op_id):
+    with OP_LOCK:
+        op = OPERATIONS.get(op_id or "")
+        if not op:
+            return {"ok": False, "error": "Opération inconnue ou expirée."}
+        if op["done"]:
+            return {"ok": False, "error": "Opération déjà terminée."}
+        op["cancel"].set()
+    audit("op_cancel_requested", op_id=op_id)
+    return {"ok": True}
 
 
 def _run_async(fn, payload):
@@ -514,9 +778,13 @@ def _run_async(fn, payload):
         done_ids = [k for k, v in OPERATIONS.items() if v["done"]]
         for k in done_ids[:-20]:
             OPERATIONS.pop(k, None)
-        OPERATIONS[op_id] = {"log": shared, "done": False, "result": None}
+        OPERATIONS[op_id] = {"log": shared, "done": False, "result": None, "cancel": threading.Event(),
+                             "kind": getattr(fn, "__name__", "").replace("action_", ""),
+                             "ns": (payload or {}).get("namespace") or (payload or {}).get("ns") or "",
+                             "cid": cid, "started": time.time()}
 
     def worker():
+        _OP_TL.op_id = op_id
         try:
             with use_cluster(cid):
                 res = fn(payload, log=shared)
@@ -542,9 +810,39 @@ def action_op_status(op_id):
             "result": op["result"] if op["done"] else None}
 
 
+def _operations_running():
+    """Vrai si au moins une opération longue n'est pas terminée."""
+    with OP_LOCK:
+        return any(not v["done"] for v in OPERATIONS.values())
+
+
+def action_op_list():
+    """Opérations en cours (pour reprendre le suivi après un rechargement de page)."""
+    with OP_LOCK:
+        running = [{"op_id": k, "kind": v.get("kind") or "", "ns": v.get("ns") or "",
+                    "cluster_id": v.get("cid") or "", "cancel_requested": bool(v.get("cancel") and v["cancel"].is_set())}
+                   for k, v in OPERATIONS.items() if not v["done"]]
+    return {"ok": True, "running": running}
+
+
 # ------------------------------------------------------------------------------
 # Exécution de commandes
 # ------------------------------------------------------------------------------
+def _kubectl_argv():
+    """Argv du binaire kubectl : un chemin de fichier (même avec des espaces, ex.
+    « C:\\Program Files\\Kubectl\\kubectl.exe ») reste UN argument ; sinon la valeur
+    est découpée comme une ligne de commande (« microk8s kubectl »)."""
+    s = (CONFIG.get("kubectl_path") or "kubectl").strip()
+    if os.path.isfile(s):
+        return [s]
+    try:
+        import shlex
+        parts = shlex.split(s, posix=(os.name != "nt"))
+    except ValueError:
+        parts = s.split()
+    return parts or ["kubectl"]
+
+
 def run(cmd, dry=False, label=None, timeout=None, input_text=None):
     """Exécute une commande (liste d'arguments). Renvoie un dict de résultat.
     Si dry=True, ne lance rien et renvoie la commande qui aurait été exécutée.
@@ -563,10 +861,12 @@ def run(cmd, dry=False, label=None, timeout=None, input_text=None):
         return {"ok": True, "dry": True, "cmd": pretty, "stdout": "", "stderr": "",
                 "rc": None, "label": label or pretty}
     if timeout is None:
-        timeout = CONFIG["wait_timeout"] + CONFIG["subprocess_margin"]
+        timeout = int(CONFIG["wait_timeout"]) + int(CONFIG["subprocess_margin"])
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
-                           input=input_text)
+        # encoding explicite : sous Windows, text=True décoderait en cp1252 (mojibake /
+        # UnicodeDecodeError sur les sorties kubectl accentuées).
+        p = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="replace",
+                           timeout=timeout, input=input_text)
         return {"ok": p.returncode == 0, "dry": False, "cmd": pretty,
                 "stdout": (p.stdout or "").strip(), "stderr": (p.stderr or "").strip(),
                 "rc": p.returncode, "label": label or pretty}
@@ -762,7 +1062,7 @@ def _kubectl_base():
     """Binaire kubectl (« kubectl », « microk8s kubectl »…) + ciblage explicite du
     cluster ACTIF : --kubeconfig et --context sont ajoutés à TOUTES les commandes,
     pour viser le bon cluster sans dépendre du contexte courant."""
-    base = CONFIG["kubectl_path"].split()
+    base = _kubectl_argv()
     cid = _current_cid()
     if cid == LOCAL_CID:
         kc = (CONFIG.get("kubeconfig_path") or "").strip()
@@ -852,7 +1152,7 @@ def _kc_auth_info(user, cluster, now=None):
 
 def _kc_view(path):
     """Kubeconfig -> dict JSON via kubectl (résout aussi le format YAML). (data, err)."""
-    r = run(CONFIG["kubectl_path"].split() + ["--kubeconfig", path, "config", "view", "--raw", "-o", "json"],
+    r = run(_kubectl_argv() + ["--kubeconfig", path, "config", "view", "--raw", "-o", "json"],
             timeout=30)
     if not r["ok"]:
         return None, (r["stderr"] or "kubectl config view a échoué").replace(path, "<kubeconfig>")
@@ -910,7 +1210,7 @@ def action_clusters_inspect(payload):
 
 def _test_cluster(path, context):
     """Test de connectivité (lecture seule, 10 s max). Renvoie (ok, avertissement|erreur)."""
-    r = run(CONFIG["kubectl_path"].split() + ["--kubeconfig", path, "--context", context,
+    r = run(_kubectl_argv() + ["--kubeconfig", path, "--context", context,
             "--request-timeout=10s", "get", "ns", "-o", "name"], timeout=25)
     if r["ok"]:
         return True, None
@@ -1451,10 +1751,13 @@ def derive_volume_handle(new_ref, old_volume_handle=None):
     Dans tous les cas, on extrait l'UUID 8-4-4-4-12 (le bloc horodaté éventuel
     d'un IQN est ignoré). Le PRÉFIXE est repris du PV existant (auto-détection
     multi-clients), sinon de la config, sinon 'NutanixVolumes-' par défaut."""
-    m = UUID_RE.search(new_ref or "")
-    if not m:
+    ref = (new_ref or "").strip()
+    found = UUID_RE.findall(ref)
+    if not found:
         return None
-    new_uuid = m.group(0)
+    # IQN hérité : « iqn.…:<nom-du-VG>-<uuid-du-VG>-<n>-tgt0 ». Le nom du VG est souvent
+    # « pvc-<uuid-du-PVC> » : l'UUID du VG est donc le DERNIER de la chaîne.
+    new_uuid = found[-1] if ref.lower().startswith("iqn.") else found[0]
     prefix, _ = split_volume_handle(old_volume_handle or "")
     if not prefix:
         prefix = CONFIG.get("volume_handle_prefix") or "NutanixVolumes-"
@@ -1476,10 +1779,10 @@ def analyse_pv(pv_dict):
         # l'IQN — JAMAIS du repli textuel générique, qui matcherait d'abord le NOM du PV
         # « pvc-<uuid-du-PVC> » (metadata sérialisée avant spec) et figerait le mauvais
         # UUID, laissant le nouveau PV pointer vers le VG SOURCE.
-        iqn_uuid = UUID_RE.search(iqn.group(0)) if iqn else None
+        iqn_uuid = (UUID_RE.findall(iqn.group(0)) or [None])[-1] if iqn else None
         if iqn_uuid:
             prefix = CONFIG.get("volume_handle_prefix") or "NutanixVolumes-"
-            vh = prefix + iqn_uuid.group(0)
+            vh = prefix + iqn_uuid
         else:
             m = re.search(r"[A-Za-z0-9_]+-" + UUID_RE.pattern, text)
             vh = m.group(0) if m else None
@@ -1562,7 +1865,7 @@ def build_new_pv(old_pv, new_ref, new_name, mode):
     new_uuid = split_volume_handle(new_vh)[1]
     if old_uuid and new_uuid and old_uuid != new_uuid:
         pairs.append((old_uuid, new_uuid))
-        replacements.append(("UUID du VG", old_uuid, new_uuid))
+        replacements.append(("vg_uuid", old_uuid, new_uuid))
 
     if pairs:
         new_pv = _replace_in_leaves(new_pv, pairs)
@@ -1587,7 +1890,7 @@ def build_new_pv(old_pv, new_ref, new_name, mode):
         if not K8S_NAME_RE.match(new_name):
             return None, "Nom de PV invalide : '%s' (RFC 1123 attendu)." % new_name
         new_pv.setdefault("metadata", {})["name"] = new_name
-        replacements.append(("nom du PV", old_name, new_name))
+        replacements.append(("pv_name", old_name, new_name))
     else:
         new_name = old_name  # inplace : on garde le nom
 
@@ -1754,8 +2057,11 @@ def _scan_backup_dir(base):
                 with open(idx, encoding="utf-8") as f:
                     out.append({"timestamp": ts, "path": os.path.join(base, ts),
                                 "index": json.load(f)})
-            except Exception:
-                pass
+            except Exception as e:
+                print("Sauvegarde %s/%s : index.json illisible (%s) — ignorée." % (ns, ts, e))
+    # Ordre chronologique réel (champ created), pas lexicographique : robuste au
+    # changement d'heure et aux horodatages de fuseaux différents.
+    out.sort(key=lambda b: (_backup_epoch(b) or 0.0, b["timestamp"]), reverse=True)
     return out
 
 
@@ -2007,7 +2313,7 @@ def _kubectl_hint(err):
 def action_contexts(kubeconfig=None):
     """Liste les contextes disponibles dans le kubeconfig (ciblé ou par défaut)."""
     kc = (kubeconfig if kubeconfig is not None else (CONFIG.get("kubeconfig_path") or "")).strip()
-    cmd = CONFIG["kubectl_path"].split()
+    cmd = _kubectl_argv()
     if kc:
         cmd += ["--kubeconfig", kc]
     cmd += ["config", "get-contexts", "-o", "name"]
@@ -2155,16 +2461,29 @@ def action_pvcs(ns):
     return {"ok": True, "pvcs": pvcs, "error": None}
 
 
-def action_backup(ns, dest=None, protect=None, pv_cache=None, defer_quota=False):
+BACKUP_SCHEMA = 2
+BACKUP_KINDS = ("manual", "auto", "pre_restore")
+
+
+def action_backup(ns, dest=None, protect=None, pv_cache=None, defer_quota=False,
+                  kind="manual", internal=False):
     """Exporte + nettoie tous les PV/PVC du namespace (étapes 1-3 du document).
     `dest` (optionnel) = dossier de destination choisi par l'utilisateur (vide = défaut).
     `protect` = chemins de sauvegarde à ne jamais purger par la rétention (ex. la
     sauvegarde SOURCE d'une restauration en cours).
     `pv_cache` = {nom: manifeste PV} lu UNE fois par passage (sauvegarde de tous les
     namespaces) ; un PV absent du cache est relu individuellement. `defer_quota` : le
-    quota global est appliqué par l'appelant en fin de passage (pas par namespace)."""
+    quota global est appliqué par l'appelant en fin de passage (pas par namespace).
+    `kind` = origine de la sauvegarde (manual | auto | pre_restore) : les « pre_restore »
+    (filet de sécurité d'une restauration) ne sont jamais soumises à la rétention. `internal` = appel depuis une opération
+    qui détient déjà le verrou (sauvegarde de sécurité d'une restauration, passage auto)."""
     if not _namespace_allowed(ns):
         return {"ok": False, "error": "Namespace '%s' non autorisé par la configuration." % ns}
+    if not internal and ACTION_LOCK.locked():
+        return {"ok": False, "error": "Une restauration ou un clone est en cours : sauvegarde refusée "
+                                      "(l'état du namespace serait incohérent). Réessayez ensuite."}
+    if kind not in BACKUP_KINDS:
+        kind = "manual"
     root, derr = _resolve_backup_dest(dest)
     if derr:
         return {"ok": False, "error": derr}
@@ -2192,8 +2511,9 @@ def action_backup(ns, dest=None, protect=None, pv_cache=None, defer_quota=False)
         return {"ok": False, "skipped": True, "error": "Aucun PVC trouvé dans le namespace '%s'." % ns}
 
     d = backup_dir(ns, root)
-    index = {"namespace": ns, "created": datetime.datetime.now().isoformat(),
-             "context": action_context().get("context"),
+    index = {"schema": BACKUP_SCHEMA, "tool_version": VERSION, "kind": kind, "complete": False,
+             "namespace": ns, "created": datetime.datetime.now().astimezone().isoformat(),
+             "context": _cluster_label(),
              "cluster": _cluster_label(), "cluster_id": _current_cid(), "volumes": []}
     files = []
     pv_errors = []                    # PV attendus mais illisibles -> sauvegarde PARTIELLE
@@ -2219,6 +2539,8 @@ def action_backup(ns, dest=None, protect=None, pv_cache=None, defer_quota=False)
                 files.append(os.path.basename(pv_path))
                 entry["pv_file"] = os.path.basename(pv_path)
                 entry["analysis"] = analyse_pv(clean_v)
+                entry["storage_class"] = (clean_v.get("spec") or {}).get("storageClassName")
+                entry["capacity"] = ((clean_v.get("spec") or {}).get("capacity") or {}).get("storage")
             else:
                 # Ne JAMAIS avaler l'échec : sans le manifeste du PV, ce volume n'est pas
                 # restaurable ; la sauvegarde est marquée PARTIELLE et n'entraîne aucune
@@ -2232,13 +2554,14 @@ def action_backup(ns, dest=None, protect=None, pv_cache=None, defer_quota=False)
 
     # Instantané de configuration ÉTENDUE (Deployments, Services, Secrets…) — lecture
     # seule, additif, n'échoue jamais la sauvegarde PV/PVC (voir _backup_namespace_resources).
-    resources_count = None
+    resources_count, resources_skipped = None, []
     res_items = []
     secrets_mode = None
     if CONFIG.get("config_backup_full", True):
         try:
-            resources_count, _skipped, res_items, secrets_mode = _backup_namespace_resources(ns, d)
+            resources_count, resources_skipped, res_items, secrets_mode = _backup_namespace_resources(ns, d)
             index["resources_count"] = resources_count
+            index["resources_skipped"] = resources_skipped
             index["secrets"] = secrets_mode
             files.append("resources.json")
             if os.path.isfile(os.path.join(d, SECRETS_FILE)):
@@ -2280,24 +2603,39 @@ def action_backup(ns, dest=None, protect=None, pv_cache=None, defer_quota=False)
         except Exception as e:
             print("Contrat de restauration (%s) ignoré : %s" % (ns, e))
 
+    index["schema"] = BACKUP_SCHEMA
+    index["kind"] = kind
+    index["complete"] = not pv_errors
+    # Empreintes des fichiers : une sauvegarde altérée est détectable avant restauration.
+    index["files"] = []
+    for fn in files:
+        try:
+            fp = os.path.join(d, fn)
+            with open(fp, "rb") as fh:
+                index["files"].append({"name": fn, "size": os.path.getsize(fp),
+                                       "sha256": hashlib.sha256(fh.read()).hexdigest()})
+        except OSError:
+            pass
     # Écriture ATOMIQUE de l'index : un arrêt brutal ne laisse jamais un index tronqué
     # (dossier invisible, non purgeable, non compté).
-    idx_tmp = os.path.join(d, "index.json.tmp")
-    with open(idx_tmp, "w", encoding="utf-8") as f:
-        json.dump(index, f, indent=2)
-    os.replace(idx_tmp, os.path.join(d, "index.json"))
+    _write_json_atomic(os.path.join(d, "index.json"), index, mode=0o644)
     _catalog_forget_path(d)                   # le catalogue rescanne ce namespace
 
+    warning = None
+    if resources_skipped:
+        warning = "Ressources non exportées (droits insuffisants) : %s." % ", ".join(resources_skipped)
     if pv_errors:
         audit("backup", namespace=ns, dir=d, count=len(items), resources=resources_count,
-              partial=True, pv_errors=len(pv_errors))
-        return {"ok": False, "partial": True, "dir": d, "root": root, "count": len(items),
+              kind=kind, partial=True, pv_errors=len(pv_errors))
+        return {"ok": False, "partial": True, "dir": d, "root": root, "count": len(items), "kind": kind,
                 "files": files, "volumes": index["volumes"], "resources_count": resources_count,
+                "warning": warning, "resources_skipped": resources_skipped,
                 "error": "Sauvegarde PARTIELLE de « %s » : manifeste de PV illisible pour %s. Les "
                          "versions précédentes sont conservées (aucune purge)." % (ns, " ; ".join(pv_errors))}
-    audit("backup", namespace=ns, dir=d, count=len(items), resources=resources_count, secrets=secrets_mode)
-    # Garde-fous stockage : la rétention par namespace s'applique aussi aux sauvegardes
-    # MANUELLES (sinon elles s'accumulent sans limite), puis le quota global éventuel.
+    audit("backup", namespace=ns, dir=d, count=len(items), resources=resources_count,
+          secrets=secrets_mode, kind=kind)
+    # Garde-fous stockage : rétention par namespace (jamais les sauvegardes de sécurité
+    # pré-restauration, cf. _prune_backups) puis quota global éventuel.
     pruned = 0
     try:
         pruned = _prune_backups(root, ns, CONFIG.get("auto_backup_keep", 15), protect=protect)
@@ -2307,11 +2645,12 @@ def action_backup(ns, dest=None, protect=None, pv_cache=None, defer_quota=False)
         print("Garde-fou stockage après sauvegarde : %s" % e)
     return _s3_after_backup(
         {"ok": True, "error": None, "dir": d, "root": root, "count": len(items), "pruned": pruned,
+         "kind": kind, "partial": False, "warning": warning, "resources_skipped": resources_skipped,
          "files": files, "volumes": index["volumes"], "resources_count": resources_count,
          "secrets": secrets_mode, "secrets_warning": secrets_warning})
 
 
-def action_backup_all(dest=None):
+def action_backup_all(dest=None, kind="manual", internal=False):
     """Sauvegarde la config (PV/PVC) de TOUS les namespaces autorisés par le filtre
     courant (tous les namespaces du cluster si aucun filtre). Un namespace sans PVC est
     « ignoré » (pas une erreur). Renvoie un récapitulatif par namespace + des totaux.
@@ -2326,6 +2665,9 @@ def action_backup_all(dest=None):
     root, derr = _resolve_backup_dest(dest)        # valide la destination une seule fois
     if derr:
         return {"ok": False, "error": derr, "results": []}
+    if not internal and ACTION_LOCK.locked():
+        return {"ok": False, "error": "Une restauration ou un clone est en cours : sauvegarde refusée.",
+                "results": []}
     # Grands clusters : les PV sont cluster-scoped -> lus UNE fois pour tout le passage
     # (au lieu d'un appel par volume) ; échec -> lecture individuelle comme avant.
     pv_cache = None
@@ -2353,14 +2695,15 @@ def action_backup_all(dest=None):
                 return {"ns": ns, "ok": False, "skipped": True, "count": 0,
                         "error": "Restauration en cours (transaction) : sauvegarde différée."}
             try:
-                b = action_backup(ns, root, pv_cache=pv_cache, defer_quota=True)
+                b = action_backup(ns, root, pv_cache=pv_cache, defer_quota=True, kind=kind, internal=True)
             except Exception as e:                      # un namespace en erreur n'arrête pas le passage
                 b = {"ok": False, "error": "Erreur interne : %s" % e}
             if b.get("ok"):
                 return {"ns": ns, "ok": True, "count": b.get("count", 0), "dir": b.get("dir"),
-                        "pruned": int(b.get("pruned") or 0)}
+                        "pruned": int(b.get("pruned") or 0), "warning": b.get("warning")}
             err = b.get("error") or ""
             return {"ns": ns, "ok": False, "skipped": bool(b.get("skipped")) or "Aucun PVC" in err,
+                    "partial": bool(b.get("partial")), "dir": b.get("dir"),
                     "count": 0, "error": err}
 
     if workers > 1 and len(namespaces) > 1:
@@ -2370,14 +2713,16 @@ def action_backup_all(dest=None):
         results = [one(ns) for ns in namespaces]
     backed_up = sum(1 for r in results if r["ok"])
     vol_total = sum(r["count"] for r in results if r["ok"])
+    partial_ns = [r["ns"] for r in results if r.get("partial")]
     try:
         enforce_storage_quota(root)                     # une fois par passage, pas par namespace
     except Exception as e:
         print("Quota de stockage en fin de passage : %s" % e)
-    audit("backup_all", namespaces=len(namespaces), backed_up=backed_up, volumes=vol_total, root=root)
+    audit("backup_all", namespaces=len(namespaces), backed_up=backed_up, volumes=vol_total, root=root,
+          partial=partial_ns)
     return {"ok": True, "error": None, "results": results, "root": root,
             "namespaces": len(namespaces), "backed_up": backed_up, "volumes": vol_total,
-            "filtered": bool(_ns_filter())}
+            "partial": partial_ns, "filtered": bool(_ns_filter())}
 
 
 # ------------------------------------------------------------------------------
@@ -2406,8 +2751,8 @@ def _load_auto_backup_state():
 
 def _save_auto_backup_state():
     try:
-        with open(_auto_backup_state_path(), "w", encoding="utf-8") as f:
-            json.dump({k: AUTO_BACKUP[k] for k in ("last_run", "last_ok", "last_summary")}, f)
+        _write_json_atomic(_auto_backup_state_path(),
+                           {k: AUTO_BACKUP[k] for k in ("last_run", "last_ok", "last_summary")}, mode=0o644)
     except OSError:
         pass                        # best-effort : l'état vit en mémoire de toute façon
 
@@ -2477,7 +2822,15 @@ def _prune_backups(root, ns, keep, protect=None):
     for p in (protect or []):
         if p:
             protected.add(os.path.realpath(p))
-    backups = list_backups(ns, root)             # liste triée : plus récentes d'abord
+    # Rétention (compteur ou GFS) sur les sauvegardes automatiques ET manuelles (sinon
+    # elles s'accumulent sans limite) — JAMAIS sur une sauvegarde de sécurité prise
+    # avant une restauration (pre_restore : seul filet d'une opération destructive).
+    # Compatibilité : une sauvegarde d'un ancien schéma (sans « kind » ni « schema »)
+    # garde le comportement historique (soumise à la rétention).
+    def _prunable(b):
+        idx = b.get("index") or {}
+        return idx.get("kind") in ("auto", "manual") or ("kind" not in idx and "schema" not in idx)
+    backups = [b for b in list_backups(ns, root) if _prunable(b)]   # triée : plus récentes d'abord
     if mode == "gfs":
         def _n(key, dflt):
             try:
@@ -2518,6 +2871,7 @@ def _auto_backup_run(now=None, runner=None):
     if BULK["running"]:
         return None                              # restauration en masse : passage sauté (retentera)
     if not ACTION_LOCK.acquire(blocking=False):
+        AUTO_BACKUP.update({"last_summary": "report : une opération est en cours"})
         return None
     AUTO_BACKUP["running"] = True
     try:
@@ -2527,12 +2881,13 @@ def _auto_backup_run(now=None, runner=None):
             parts = []
             cids = _cluster_ids()
             for cid in cids:
-                with use_cluster(cid):
+                with use_cluster(cid, req_timeout=60):
                     # Cluster local non configuré (outil utilisé uniquement avec des
                     # clusters ajoutés) : ignoré sans le compter comme un échec.
                     if cid == LOCAL_CID and len(cids) > 1 and not action_context().get("kubectl_ok"):
                         continue
-                    parts.append((_cluster_label(cid),) + _auto_backup_one(action_backup_all, dest))
+                    parts.append((_cluster_label(cid),) + _auto_backup_one(
+                        lambda d: action_backup_all(d, kind="auto", internal=True), dest))
         ok = bool(parts) and all(p[1] for p in parts)
         if len(parts) <= 1:
             summary = parts[0][2] if parts else "aucun cluster disponible"
@@ -2591,7 +2946,16 @@ def _auto_backup_loop():
             if _auto_backup_due(time.time()) and not ACTION_LOCK.locked():
                 _auto_backup_run()
         except Exception as e:
-            print("Sauvegarde auto : erreur inattendue : %s" % e)
+            # Une exception (dossier en lecture seule, disque plein…) compte comme un
+            # passage en échec : last_run est posé pour NE PAS relancer toutes les 30 s.
+            print("Sauvegarde auto : erreur inattendue : %s" % e, flush=True)
+            AUTO_BACKUP.update({"last_run": time.time(), "last_ok": False,
+                                "last_summary": "erreur : %s" % e})
+            _save_auto_backup_state()
+            try:
+                audit("auto_backup", ok=False, summary="erreur : %s" % e)
+            except Exception:
+                pass
         try:
             enforce_storage_quota()
         except Exception as e:
@@ -2652,7 +3016,7 @@ def action_metrics_text():
            "1 si la sauvegarde automatique de configuration est activée.")
     metric("hycu_auto_backup_interval_seconds", int(itv), "Intervalle configuré (s).")
     metric("hycu_auto_backup_last_run_timestamp_seconds", int(last),
-           "Horodatage Unix de la dernière sauvegarde automatique (0 si jamais).", typ="counter")
+           "Horodatage Unix de la dernière sauvegarde automatique (0 si jamais).", typ="gauge")
     metric("hycu_auto_backup_last_success", 1 if AUTO_BACKUP.get("last_ok") else 0,
            "1 si la dernière sauvegarde automatique a réussi.")
     with CLUSTERS_LOCK:
@@ -3574,64 +3938,51 @@ def action_jobs(limit=200):
 # Workloads (scale down/up) et attente active
 # ------------------------------------------------------------------------------
 def _scan_workloads(ns):
-    """Réplicas COURANTS des Deployments et StatefulSets (0 inclus).
-    Renvoie (liste, erreur) : une erreur kubectl ne doit jamais passer pour
-    « aucun workload » (sinon l'app n'est pas arrêtée avant la destruction des
-    PVC, et une reprise après échec ne redémarre rien)."""
+    """Réplicas COURANTS des Deployments et StatefulSets (0 inclus) + propriétaire
+    contrôleur éventuel (opérateur). Renvoie (liste, erreur) : une erreur kubectl
+    (RBAC, réseau) n'est JAMAIS assimilée à « aucun workload »."""
     captured = []
     for kind in ("deployment", "statefulset"):
         data, err = kubectl_json(["get", kind, "-n", ns])
         if err:
-            return captured, "%s : %s" % (kind, err)
+            return [], "lecture des %ss impossible : %s" % (kind, err)
         for i in (data or {}).get("items", []):
+            owners = [o for o in ((i.get("metadata") or {}).get("ownerReferences") or [])
+                      if o.get("controller")]
             captured.append({"kind": kind, "name": i["metadata"]["name"],
-                             "replicas": i.get("spec", {}).get("replicas", 1) or 0})
+                             "replicas": i.get("spec", {}).get("replicas", 1) or 0,
+                             "owner": ("%s/%s" % (owners[0].get("kind"), owners[0].get("name"))) if owners else ""})
     return captured, None
 
 
-def _replica_state_path(ns):
-    return os.path.join(_cluster_root(CONFIG["backup_root"]), ns, "_replica_state.json")
-
-
-def _load_replica_state(ns):
-    try:
-        with open(_replica_state_path(ns), encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-
-def _save_replica_state(ns, desired_map):
-    try:
-        os.makedirs(os.path.dirname(_replica_state_path(ns)), exist_ok=True)
-        with open(_replica_state_path(ns), "w", encoding="utf-8") as f:
-            json.dump(desired_map, f, indent=2)
-    except Exception:
-        pass
-
-
 # --- Transaction de restauration (reprise idempotente après interruption) ---
+# Statuts : in_progress (séquence en cours), restart_failed (volumes restaurés mais
+# scale-up refusé : la reprise ne refait que le redémarrage). La transaction porte TOUT
+# ce qu'il faut pour reprendre sans relire le cluster : manifestes, réplicas cibles,
+# statut par volume. Les réplicas ne sont plus mémorisés dans un fichier global qui
+# survivait aux restaurations (risque de redémarrer un workload volontairement à 0).
 def _txn_path(ns):
     return os.path.join(_cluster_root(CONFIG["backup_root"]), ns, "_restore_txn.json")
 
 
 def _load_txn(ns):
-    """Transaction de restauration en cours pour ce namespace, ou None (fail-safe)."""
+    """Transaction de restauration reprenable pour ce namespace, ou None (fail-safe)."""
     try:
         with open(_txn_path(ns), encoding="utf-8") as f:
             t = json.load(f)
-        return t if t.get("status") == "in_progress" else None
+        return t if t.get("status") in ("in_progress", "restart_failed") else None
     except Exception:
         return None
 
 
 def _save_txn(ns, data):
+    """Persiste la transaction (atomique). Renvoie (ok, erreur) : un échec d'écriture
+    (disque plein, volume en lecture seule) doit INTERDIRE la restauration réelle."""
     try:
-        os.makedirs(os.path.dirname(_txn_path(ns)), exist_ok=True)
-        with open(_txn_path(ns), "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-    except Exception:
-        pass
+        _write_json_atomic(_txn_path(ns), data, mode=0o600)
+        return True, None
+    except Exception as e:
+        return False, str(e)
 
 
 def _clear_txn(ns):
@@ -3639,30 +3990,37 @@ def _clear_txn(ns):
         os.remove(_txn_path(ns))
     except OSError:
         pass
+    try:                                   # ancien fichier de mémoire des réplicas : obsolète
+        os.remove(os.path.join(_cluster_root(CONFIG["backup_root"]), ns, "_replica_state.json"))
+    except OSError:
+        pass
 
 
-def _resolve_workloads(ns):
-    """Renvoie (courants, cible). 'cible' = nombre de réplicas à RESTAURER pour
-    chaque workload : la valeur courante si > 0, sinon la dernière valeur non
-    nulle mémorisée (corrige le piège : après un échec l'app est à 0 ; un nouveau
-    run ne doit JAMAIS 'restaurer' 0 réplica et croire avoir réussi)."""
+def _txn_signature(mode, prepared):
+    return {"mode": mode or "clone",
+            "volumes": sorted([r["pvc"], r["new_pv_name"], r.get("new_volume_handle") or ""] for r in prepared)}
+
+
+def _resolve_workloads(ns, txn=None):
+    """Renvoie (courants, cible, erreur). 'cible' = réplicas à RESTAURER : la valeur
+    courante si > 0 ; sinon (reprise : l'app est déjà à 0) la valeur enregistrée dans
+    la transaction au démarrage de la restauration interrompue. Jamais 0."""
     current, err = _scan_workloads(ns)
     if err:
-        return [], [], err          # inventaire impossible : l'appelant doit avorter
-    prev = _load_replica_state(ns)  # {"kind/name": n}
-    desired_map = dict(prev)
-    for w in current:
-        key = "%s/%s" % (w["kind"], w["name"])
-        if w["replicas"] > 0:
-            desired_map[key] = w["replicas"]   # la réalité courante non nulle fait foi
-    # On ne mémorise que des valeurs strictement positives.
-    desired_map = {k: v for k, v in desired_map.items() if isinstance(v, int) and v > 0}
-    _save_replica_state(ns, desired_map)
+        return [], [], err
+    remembered = {}
+    for w in (txn or {}).get("workloads") or []:
+        try:
+            if int(w.get("replicas") or 0) > 0:
+                remembered["%s/%s" % (w["kind"], w["name"])] = int(w["replicas"])
+        except (TypeError, ValueError, KeyError):
+            pass
     desired = []
     for w in current:
         key = "%s/%s" % (w["kind"], w["name"])
-        if key in desired_map:
-            desired.append({"kind": w["kind"], "name": w["name"], "replicas": desired_map[key]})
+        n = w["replicas"] if w["replicas"] > 0 else remembered.get(key, 0)
+        if n > 0:
+            desired.append({"kind": w["kind"], "name": w["name"], "replicas": n})
     return current, desired, None
 
 
@@ -3692,10 +4050,15 @@ def _restart_workloads(desired, ns, dry, log):
     return (not failed), failed
 
 
+_TERMINAL_POD_PHASES = ("Succeeded", "Failed")
+
+
 def _pods_using_pvcs(ns, pvc_names):
-    """Renvoie (pods montant l'un des PVC visés, erreur). Une erreur kubectl n'est
-    JAMAIS assimilée à « aucun pod » : conclure à tort que les pods sont partis
-    ferait supprimer de force des PVC encore montés (retrait des finalizers)."""
+    """Renvoie (pods ACTIFS montant l'un des PVC visés, erreur). Une erreur kubectl n'est
+    JAMAIS assimilée à « aucun pod » : conclure à tort que les pods sont partis ferait
+    supprimer de force des PVC encore montés (retrait des finalizers). Les pods terminés
+    (Job Succeeded/Failed) sont ignorés : ils ne tiennent plus le volume et le finalizer
+    pvc-protection les ignore aussi."""
     data, err = kubectl_json(["get", "pods", "-n", ns])
     using = []
     if err:
@@ -3704,6 +4067,8 @@ def _pods_using_pvcs(ns, pvc_names):
         return using, None
     wanted = set(pvc_names)
     for pod in data.get("items", []):
+        if (pod.get("status") or {}).get("phase") in _TERMINAL_POD_PHASES:
+            continue
         for vol in pod.get("spec", {}).get("volumes", []) or []:
             claim = (vol.get("persistentVolumeClaim") or {}).get("claimName")
             if claim in wanted:
@@ -3712,8 +4077,45 @@ def _pods_using_pvcs(ns, pvc_names):
     return using, None
 
 
+def _volume_attachments_for_pv(pv_name):
+    """Noms des VolumeAttachment qui référencent ce PV (détachement CSI en cours).
+    Renvoie (liste, erreur). Une erreur = information indisponible (RBAC, API)."""
+    data, err = kubectl_json(["get", "volumeattachments"])
+    if err:
+        return [], err
+    out = []
+    for va in (data or {}).get("items", []):
+        if (((va.get("spec") or {}).get("source") or {}).get("persistentVolumeName")) == pv_name:
+            out.append(va["metadata"]["name"])
+    return out, None
+
+
+def _wait_volume_attachments_gone(pv_name, timeout, log):
+    """Attend que plus aucun VolumeAttachment ne référence le PV (le VG est détaché de
+    la VM worker). Renvoie True si libre, False sinon. Si l'API est inaccessible
+    (RBAC), on l'indique et on considère l'information indisponible (True) : on ne
+    bloque pas, mais on ne forcera JAMAIS le finalizer de l'attacher (cf. _delete_and_unblock)."""
+    deadline = time.time() + timeout
+    last = []
+    while time.time() < deadline:
+        last, err = _volume_attachments_for_pv(pv_name)
+        if err:
+            log.append(logentry("VolumeAttachment non vérifiables (%s)" % err.strip()[:160],
+                                stdout="Droit « get volumeattachments » absent : le détachement du VG n'est pas confirmé."))
+            return True
+        if not last:
+            log.append(logentry("Volume %s détaché (aucun VolumeAttachment)" % pv_name,
+                                cmd="(attente) kubectl get volumeattachments"))
+            return True
+        time.sleep(3)
+    log.append(logentry("Volume %s encore attaché" % pv_name, ok=False, rc=-1,
+                        cmd="(attente) kubectl get volumeattachments",
+                        stderr="Délai dépassé ; VolumeAttachment restant(s) : " + ", ".join(last)))
+    return False
+
+
 def _unmanaged_pods_using_pvcs(ns, pvc_names):
-    """Pods montant les PVC ciblés dont le contrôleur racine N'EST PAS un
+    """Pods ACTIFS montant les PVC ciblés dont le contrôleur racine N'EST PAS un
     Deployment (via ReplicaSet) ni un StatefulSet — donc NON arrêtés par le
     scale-down : DaemonSet, Job, pod nu, Operator/CRD. Renvoie ([(pod, owner_kind)], err)."""
     data, err = kubectl_json(["get", "pods", "-n", ns])
@@ -3724,6 +4126,8 @@ def _unmanaged_pods_using_pvcs(ns, pvc_names):
         return out, None
     wanted = set(pvc_names)
     for pod in data.get("items", []):
+        if (pod.get("status") or {}).get("phase") in _TERMINAL_POD_PHASES:
+            continue
         claims = [(v.get("persistentVolumeClaim") or {}).get("claimName")
                   for v in (pod.get("spec", {}).get("volumes") or [])]
         if not any(c in wanted for c in claims):
@@ -3756,10 +4160,20 @@ def _wait_pods_gone(ns, pvc_names, timeout, log):
     return False
 
 
+def _pv_finalizers(name):
+    data, _ = kubectl_json(["get", "pv", name])
+    return list(((data or {}).get("metadata") or {}).get("finalizers") or [])
+
+
 def _delete_and_unblock(kind, name, ns, log):
-    """Supprime une ressource puis attend sa disparition ; si elle reste bloquée
-    en Terminating (finalizer), retire les finalizers et re-vérifie.
-    S'applique aussi bien au PV qu'au PVC (corrige le PVC laissé Terminating).
+    """Supprime une ressource puis attend sa disparition. Si elle reste bloquée en
+    Terminating, le finalizer n'est retiré QUE si la cause est périmée :
+      - PVC : aucun pod actif ne monte plus le volume (sinon on abandonne : forcer
+        pvc-protection supprimerait un volume monté) ;
+      - PV  : jamais pour le finalizer de l'attacher CSI (external-attacher/...) :
+        on attend le détachement (VolumeAttachment) puis on re-vérifie ; pv-protection
+        n'est retiré qu'une fois le PVC lié disparu.
+    Un échec de `kubectl delete` (RBAC, réseau) interrompt immédiatement.
     Renvoie True si la ressource est bien absente à la fin."""
     state, _ = resource_state(kind, name, ns)
     if state == "absent":
@@ -3770,7 +4184,10 @@ def _delete_and_unblock(kind, name, ns, log):
     args = ["delete", kind, name, "--wait=false", "--ignore-not-found"]
     if ns:
         args += ["-n", ns]
-    log.append(kubectl(args, dry=False, label="Suppression %s %s" % (kind.upper(), name)))
+    rd = kubectl(args, dry=False, label="Suppression %s %s" % (kind.upper(), name))
+    log.append(rd)
+    if not rd["ok"] and "notfound" not in (rd.get("stderr") or "").replace(" ", "").lower():
+        return False
 
     # Attente bornée de la suppression.
     wargs = ["wait", "--for=delete", "%s/%s" % (kind, name), "--timeout=%ss" % CONFIG["wait_timeout"]]
@@ -3780,7 +4197,39 @@ def _delete_and_unblock(kind, name, ns, log):
 
     state, detail = resource_state(kind, name, ns)
     if state == "present":
-        # bloqué en Terminating -> on retire les finalizers
+        if kind == "pvc":
+            # Re-vérifier l'usage AVANT de forcer : un pod (opérateur, Job) a pu revenir.
+            using, uerr = _pods_using_pvcs(ns, [name])
+            if uerr:
+                log.append(logentry("PVC %s : usage invérifiable — finalizer NON forcé" % name, ok=False, rc=-1,
+                                    stderr="Liste des pods indisponible (%s). Dans le doute, le finalizer n'est "
+                                           "pas retiré ; corrigez l'accès kubectl puis relancez." % uerr))
+                return False
+            if using:
+                log.append(logentry("PVC %s encore monté — finalizer NON forcé" % name, ok=False, rc=-1,
+                                    stderr="Pod(s) actif(s) : " + ", ".join(using)
+                                           + ". Arrêtez-les (opérateur / Job / pod nu) puis relancez."))
+                return False
+        else:
+            fins = _pv_finalizers(name)
+            attacher = [f for f in fins if "attacher" in f]
+            if attacher:
+                # Ne jamais retirer le finalizer de l'attacher : attendre le détachement réel.
+                if not _wait_volume_attachments_gone(name, CONFIG["wait_timeout"], log):
+                    log.append(logentry("PV %s : finalizer %s NON forcé (volume encore attaché)"
+                                        % (name, ", ".join(attacher)), ok=False, rc=-1,
+                                        stderr="Forcer ce finalizer laisserait un VolumeAttachment orphelin et "
+                                               "un VG attaché à deux VM. Attendez le détachement puis relancez."))
+                    return False
+                state, detail = resource_state(kind, name, ns)
+                if state == "absent":
+                    return True
+                fins = _pv_finalizers(name)
+                if any("attacher" in f for f in fins):
+                    log.append(logentry("PV %s toujours retenu par l'attacher CSI" % name, ok=False, rc=-1,
+                                        stderr="Finalizers : %s" % ", ".join(fins)))
+                    return False
+        # Finalizer périmé (pvc-protection sans pod, pv-protection sans PVC) -> retrait.
         pargs = ["patch", kind, name, "-p", '{"metadata":{"finalizers":null}}', "--type=merge"]
         if ns:
             pargs += ["-n", ns]
@@ -3879,7 +4328,10 @@ def _load_old_pv(ns, pvc_name, backup_path, backup_root=None, no_live=False):
     if no_live:
         return None, None
     # repli : lecture live
+    # repli : lecture live (une erreur kubectl est remontée, pas assimilée à « introuvable »)
     live = action_pvcs(ns)
+    if live.get("error") and not live.get("pvcs"):
+        raise RuntimeError(live["error"])
     pv_name = None
     for p in live.get("pvcs", []):
         if p["name"] == pvc_name:
@@ -3944,7 +4396,10 @@ def _prepare_one(ns, item, mode, backup_path, backup_root=None):
                 "error": "Référence invalide pour « %s » : aucun UUID détecté. Collez l'UUID du VG "
                          "(8-4-4-4-12), un volumeHandle « NutanixVolumes-<uuid> », ou l'IQN complet." % pvc_name}
 
-    old_pv, pv_name = _load_old_pv(ns, pvc_name, backup_path, backup_root)
+    try:
+        old_pv, pv_name = _load_old_pv(ns, pvc_name, backup_path, backup_root)
+    except RuntimeError as e:
+        return {"ok": False, "pvc": pvc_name, "error": "Lecture du cluster impossible : %s" % e}
     if old_pv is None:
         return {"ok": False, "pvc": pvc_name,
                 "error": "Manifeste du PV introuvable pour « %s ». Sauvegardez d'abord ce namespace, "
@@ -4267,9 +4722,181 @@ def action_execute_restore(payload, log=None):
         return _err(str(e), log=log if log is not None else [])
 
 
+def _kubectl_can_i(verb, resource, ns=None):
+    """kubectl auth can-i <verb> <resource> : True / False / None (indéterminé)."""
+    args = ["auth", "can-i", verb, resource]
+    if ns:
+        args += ["-n", ns]
+    r = run(_kubectl_base() + args, dry=False, timeout=45)
+    out = (r.get("stdout") or "").strip().lower()
+    if out.startswith("yes"):
+        return True
+    if out.startswith("no"):
+        return False
+    return None
+
+
+def _kubectl_client_minor():
+    """Version mineure du client kubectl (int) ou None."""
+    r = run(_kubectl_base() + ["version", "--client", "-o", "json"], dry=False, timeout=45)
+    try:
+        cv = json.loads(r.get("stdout") or "{}").get("clientVersion") or {}
+        return int(re.sub(r"\D", "", str(cv.get("minor") or "")) or 0) or None
+    except Exception:
+        return None
+
+
+def _restore_preflight(ns, prepared, mode, dry, current, log):
+    """Contrôles AVANT tout arrêt de l'application. Renvoie (checks, bloquant) :
+    `checks` = liste [{name, ok, detail}] renvoyée à l'interface (liste ✓/✕),
+    `bloquant` = premier contrôle bloquant en échec (message) ou None. Exécuté en
+    simulation aussi (lectures seules), où il n'est jamais bloquant mais signale."""
+    checks = []
+    blocking = None
+
+    def add(name, ok, detail="", block=True):
+        nonlocal blocking
+        checks.append({"name": name, "ok": ok, "detail": detail})
+        if ok is False and block and blocking is None:
+            blocking = "%s%s" % (name, (" — " + detail) if detail else "")
+
+    # 1) Droits RBAC nécessaires à la séquence.
+    needed = [("delete", "persistentvolumeclaims", ns), ("create", "persistentvolumeclaims", ns),
+              ("patch", "persistentvolumeclaims", ns), ("delete", "persistentvolumes", None),
+              ("create", "persistentvolumes", None), ("patch", "persistentvolumes", None),
+              ("list", "pods", ns), ("patch", "deployments/scale", ns), ("patch", "statefulsets/scale", ns)]
+    denied, unknown = [], []
+    for verb, res, nsx in needed:
+        c = _kubectl_can_i(verb, res, nsx)
+        if c is False:
+            denied.append("%s %s" % (verb, res))
+        elif c is None:
+            unknown.append("%s %s" % (verb, res))
+    if denied:
+        add("Droits RBAC", False, "refusés : " + ", ".join(denied))
+    elif unknown:
+        add("Droits RBAC", None, "indéterminés : " + ", ".join(unknown), block=False)
+    else:
+        add("Droits RBAC", True, "delete/create/patch pv+pvc, scale, list pods")
+    va = _kubectl_can_i("get", "volumeattachments")
+    add("Lecture des VolumeAttachment", va if va is not None else None,
+        "" if va else "sans ce droit, le détachement du VG ne pourra pas être confirmé", block=False)
+
+    # 2) Version du client kubectl (wait --for=jsonpath exige 1.23+).
+    minor = _kubectl_client_minor()
+    if minor is None:
+        add("Version kubectl", None, "non lue", block=False)
+    else:
+        add("Version kubectl", minor >= 23, "1.%d (1.23 minimum)" % minor)
+
+    # 3) Workloads possédés par un opérateur : le scale-down serait annulé par lui.
+    owned = [w for w in current if w.get("owner")]
+    if owned:
+        add("Workloads gérés par un opérateur", False,
+            "; ".join("%s/%s (propriétaire %s)" % (w["kind"], w["name"], w["owner"]) for w in owned)
+            + " — l'opérateur remettrait les réplicas pendant la suppression : mettez-le en pause ou "
+              "restaurez via l'opérateur")
+    else:
+        add("Workloads gérés par un opérateur", True, "aucun")
+
+    # 4) Pods actifs non gérés (DaemonSet / Job / pod nu / CRD) qui montent les volumes.
+    unmanaged, unm_err = _unmanaged_pods_using_pvcs(ns, [r["pvc"] for r in prepared])
+    if unm_err:
+        add("Pods non gérés montant les volumes", None, "liste des pods indisponible : %s" % unm_err)
+    elif unmanaged:
+        add("Pods non gérés montant les volumes", False,
+            "; ".join("%s (contrôleur : %s)" % (p, k) for p, k in unmanaged)
+            + " — le scale-down ne les arrêtera pas : arrêtez-les d'abord")
+    else:
+        add("Pods non gérés montant les volumes", True, "aucun")
+
+    # 5) StorageClass référencée par chaque nouveau PV.
+    scs = sorted({((r.get("manifest") or {}).get("spec") or {}).get("storageClassName") or "" for r in prepared})
+    scs = [s for s in scs if s]
+    missing_sc = []
+    for sc in scs:
+        st, _ = resource_state("storageclass", sc)
+        if st == "absent":
+            missing_sc.append(sc)
+    add("StorageClass", not missing_sc, ("absente(s) : " + ", ".join(missing_sc)) if missing_sc else (", ".join(scs) or "aucune"))
+
+    # 6) Nom du nouveau PV libre (apply modifierait un PV existant : spec.csi est immuable).
+    taken = []
+    for r in prepared:
+        nn = r["new_pv_name"]
+        if nn == r.get("old_pv_name"):
+            continue                     # sur place : même nom, remplacé dans la séquence
+        data, _ = kubectl_json(["get", "pv", nn, "--ignore-not-found"])
+        cref = ((data or {}).get("spec") or {}).get("claimRef") or {}
+        if data and cref and (cref.get("name") != r["pvc"] or cref.get("namespace") != ns):
+            taken.append("%s (lié à %s/%s)" % (nn, cref.get("namespace"), cref.get("name")))
+    add("Nom du nouveau PV disponible", not taken, ", ".join(taken) if taken else "")
+
+    # 7) Clone : disque du VG cloné résolu via Prism Central (sinon attach iSCSI -> échec).
+    if mode == "clone" and CONFIG.get("clone_fix_disk_uuids", True):
+        if not SESSION_CREDS.get("prismcentral"):
+            add("Disque du VG cloné (hypervisorAttachedDiskUUIDs)", False if (not dry and CONFIG.get("clone_require_disk_uuids", True)) else None,
+                "Prism Central non connecté : hypervisorAttachedDiskUUIDs ne sera pas renseigné (attach iSCSI -> échec)",
+                block=not dry and bool(CONFIG.get("clone_require_disk_uuids", True)))
+        else:
+            bad = []
+            for r in prepared:
+                vg_uuid = split_volume_handle(r.get("new_volume_handle") or "")[1]
+                if not vg_uuid:
+                    continue
+                uuids = _clone_vg_disk_uuids(vg_uuid)
+                if uuids:
+                    csi = ((r.get("manifest") or {}).get("spec") or {}).get("csi")
+                    if isinstance(csi, dict):
+                        csi.setdefault("volumeAttributes", {})["hypervisorAttachedDiskUUIDs"] = uuids
+                    r["disk_uuids"] = uuids
+                else:
+                    bad.append(r["pvc"])
+            add("Disque du VG cloné (hypervisorAttachedDiskUUIDs via Prism Central v4)", not bad,
+                ("introuvable pour : " + ", ".join(bad)) if bad else "renseignés dans les PV",
+                block=bool(CONFIG.get("clone_require_disk_uuids", True)))
+
+    # 8) Écriture de la transaction possible (sinon aucune reprise ne serait possible).
+    if not dry:
+        okw, werr = _save_txn(ns, {"status": "preflight", "started": datetime.datetime.now().isoformat()})
+        add("Écriture de la transaction de reprise", okw, werr or _txn_path(ns))
+        if okw:
+            _clear_txn(ns)
+
+    for c in checks:
+        mark = "✓" if c["ok"] else ("?" if c["ok"] is None else "✕")
+        log.append(logentry("Préflight %s %s" % (mark, c["name"]), ok=(c["ok"] is not False), dry=dry,
+                            rc=0 if c["ok"] is not False else -1, cmd="(préflight)",
+                            stdout=c["detail"] if c["ok"] is not False else "",
+                            stderr=c["detail"] if c["ok"] is False else ""))
+    return checks, blocking
+
+
+def _pv_reclaim_policy(pv_name):
+    data, _ = kubectl_json(["get", "pv", pv_name, "--ignore-not-found"])
+    return ((data or {}).get("spec") or {}).get("persistentVolumeReclaimPolicy") if data else None
+
+
+def _set_pv_retain(pv_name, label, log):
+    """Passe un PV en Retain s'il est présent. Renvoie False UNIQUEMENT si le patch
+    a été tenté et refusé (état indéterminé = refus aussi : on ne supprime pas dans le doute)."""
+    st, detail = resource_state("pv", pv_name)
+    if st == "absent":
+        return True
+    if st == "error":
+        log.append(logentry(label, ok=False, rc=-1, stderr="État du PV %s indéterminé : %s" % (pv_name, detail)))
+        return False
+    pr = kubectl(["patch", "pv", pv_name, "--type=merge",
+                  "-p", '{"spec":{"persistentVolumeReclaimPolicy":"Retain"}}'],
+                 dry=False, label=label)
+    log.append(pr)
+    return bool(pr["ok"])
+
+
 def _execute_restore_locked(payload, log=None):
     ns = payload.get("namespace")
     dry = bool(payload.get("dry", True))
+    mode = payload.get("mode", "clone")
     if log is None:
         log = []
 
@@ -4282,20 +4909,27 @@ def _execute_restore_locked(payload, log=None):
         if guard:
             return guard
 
-    # Reprise idempotente : charger une éventuelle transaction en cours AVANT la
-    # préparation. En reprise, le PVC/PV source a déjà été supprimé du cluster — les
-    # manifestes doivent être relus depuis la sauvegarde de sécurité initiale
-    # (txn["backup_dir"]), sinon _prepare_one ne retrouve rien en live et la reprise
-    # échoue définitivement (app laissée à 0 réplica, PV/PVC absents).
-    txn = _load_txn(ns) if not dry else None
+    # Reprise idempotente : transaction en cours chargée AVANT la préparation (aussi en
+    # simulation, pour prévisualiser la reprise). En reprise, les manifestes viennent de
+    # la transaction elle-même (le PVC/PV source a pu être supprimé du cluster).
+    txn = _load_txn(ns)
     backup_path = payload.get("backup_path") or (txn or {}).get("backup_dir")
 
     prep = action_prepare_restore({**payload, "backup_path": backup_path, "dry": dry})
-    if not prep.get("ok"):
-        return {"ok": False, "error": prep.get("error"), "log": [],
+    prepared = [r for r in (prep.get("results") or []) if r.get("ok")]
+    if txn and not prep.get("ok"):
+        # Les manifestes capturés dans la transaction suffisent à reprendre.
+        prepared = []
+        for v in txn.get("volumes") or []:
+            if v.get("manifest"):
+                prepared.append({"ok": True, "pvc": v["pvc"], "old_pv_name": v.get("old_pv"),
+                                 "new_pv_name": v["new_pv"], "new_volume_handle": v.get("new_volume_handle"),
+                                 "manifest": v["manifest"], "pvc_manifest": v.get("pvc_manifest"),
+                                 "pvc_captured": v.get("pvc_manifest") is not None})
+    if not prepared:
+        return {"ok": False, "error": prep.get("error") or "Aucun volume préparé.", "log": [],
                 "results": prep.get("results")}
 
-    prepared = [r for r in prep["results"] if r.get("ok")]
     destructive_started = False      # vrai dès la première suppression réelle
     # Garde AVANT toute destruction (la prévisualisation n'émet qu'un avertissement) :
     # une référence qui est le NOM du VG (« pvc-<uuid-du-PVC> ») ou, en clone, l'UUID du
@@ -4313,27 +4947,52 @@ def _execute_restore_locked(payload, log=None):
                         "error": "Référence identique au VG SOURCE pour %s : un clone doit pointer un "
                                  "NOUVEAU Volume Group (multi-attach sinon). Rien n'a été modifié."
                                  % ", ".join(same)}
+    # Reprise : la demande doit viser les MÊMES volumes que la transaction interrompue.
+    if txn:
+        sig = _txn_signature(mode, prepared)
+        if txn.get("signature") and txn["signature"] != sig:
+            want = ", ".join("%s -> %s" % (v[0], v[1]) for v in (txn["signature"].get("volumes") or []))
+            return _err("Une restauration interrompue est en cours pour ce namespace avec d'autres volumes "
+                        "(%s, mode %s). Relancez-la avec les mêmes volumes pour la terminer, ou supprimez "
+                        "%s si elle est bien abandonnée." % (want, txn["signature"].get("mode"), _txn_path(ns)), log=[])
+        done_pvcs = {v["pvc"] for v in (txn.get("volumes") or []) if v.get("status") == "done"}
+    else:
+        done_pvcs = set()
+
     aborted = False
     abort_detail = ""
 
-    audit("restore_start", namespace=ns, dry=dry, mode=payload.get("mode"),
+    audit("restore_start", namespace=ns, dry=dry, mode=mode, resume=bool(txn),
           volumes=[{"pvc": r["pvc"], "new_pv": r["new_pv_name"],
                     "new_volume_handle": r["new_volume_handle"]} for r in prepared])
 
-    # 0. Filet de sécurité + transaction (reprise idempotente). En réel : on sauvegarde
-    #    les manifestes AVANT toute destruction. Si une transaction précédente est en
-    #    cours (restauration interrompue), c'est une REPRISE : on réutilise la sauvegarde
-    #    initiale (ne pas re-sauvegarder un état à moitié restauré) — les étapes sont
-    #    idempotentes (delete d'un absent = ok, apply = upsert).
+    # 0. Réplicas (courants + cibles) puis PRÉFLIGHT, avant tout arrêt.
+    current, desired, werr = _resolve_workloads(ns, txn)
+    if werr:
+        return _err("Workloads illisibles avant l'arrêt de l'application : %s" % werr, log=log)
+    log.append(logentry("Réplicas cibles", dry=dry, cmd="(lecture) réplicas cibles",
+                        stdout=", ".join("%s/%s=%s" % (w["kind"], w["name"], w["replicas"]) for w in desired) or "aucun"))
+    if txn:
+        log.append(logentry("Reprise d'une restauration interrompue",
+                            stdout="Démarrée %s (mode %s, statut %s). Volumes déjà restaurés : %s."
+                                   % (txn.get("started"), txn.get("mode"), txn.get("status"),
+                                      ", ".join(sorted(done_pvcs)) or "aucun")))
+    checks, blocking = _restore_preflight(ns, prepared, mode, dry, current, log)
+    if blocking and not dry:
+        audit("restore_end", namespace=ns, dry=dry, ok=False, aborted=True, preflight=blocking)
+        return {"ok": False, "error": "Préflight bloquant : %s. Rien n'a été modifié." % blocking,
+                "log": log, "preflight": checks, "aborted": True}
+
+    # 0 bis. Reprise après scale-up refusé : seuls le redémarrage et la vérification restent.
+    restart_only = bool(txn and txn.get("status") == "restart_failed")
+
+    # 1. Filet de sécurité + transaction (réel). En reprise, la sauvegarde initiale est
+    #    réutilisée (ne pas re-sauvegarder un état à moitié restauré).
+    original_policies = {}
     if not dry:
-        if txn:
-            log.append(logentry("Reprise d'une restauration interrompue",
-                                stdout="Démarrée %s (mode %s). Sauvegarde de sécurité initiale réutilisée ; "
-                                       "les étapes déjà faites sont rejouées sans dommage."
-                                       % (txn.get("started"), txn.get("mode"))))
         backup_dir = (txn or {}).get("backup_dir")
         if not txn and CONFIG.get("backup_before_restore", True):
-            b = action_backup(ns, protect=[payload.get("backup_path")])
+            b = action_backup(ns, protect=[payload.get("backup_path")], kind="pre_restore", internal=True)
             log.append(logentry("Sauvegarde de sécurité du namespace avant restauration",
                                 ok=bool(b.get("ok")), rc=0 if b.get("ok") else -1,
                                 stdout=("Manifestes : %s" % b.get("dir")) if b.get("dir") else "",
@@ -4342,68 +5001,66 @@ def _execute_restore_locked(payload, log=None):
                 return _err("Sauvegarde de sécurité impossible (%s) — restauration annulée pour ne pas "
                             "détruire sans filet. Corrigez puis relancez." % b.get("error"), log=log)
             backup_dir = b.get("dir")
-        _save_txn(ns, {"status": "in_progress",
-                       "started": (txn.get("started") if txn else datetime.datetime.now().isoformat()),
-                       "mode": payload.get("mode", "clone"), "backup_dir": backup_dir,
-                       "volumes": [{"pvc": r["pvc"], "new_pv": r["new_pv_name"]} for r in prepared]})
-
-    # 1. Résoudre les réplicas (courants + cibles à restaurer) puis arrêter l'app.
-    #    La cible n'est JAMAIS 0 : si l'app est déjà à 0 (reprise après échec), on
-    #    récupère le compte d'origine mémorisé pour ne pas 'restaurer' un arrêt.
-    current, desired, werr = _resolve_workloads(ns)
-    if werr:
-        log.append(logentry("Inventaire des workloads impossible", ok=False, rc=-1, stderr=werr))
-        if not dry and not txn:
-            _clear_txn(ns)           # rien n'a été détruit : pas de reprise à prévoir
-        return _err("Inventaire des Deployments/StatefulSets impossible (%s) — restauration annulée : "
-                    "sans lui, l'application ne serait ni arrêtée proprement ni redémarrée." % werr, log=log)
-    log.append({"ok": True, "dry": dry, "label": "Réplicas mémorisés", "rc": 0, "stderr": "",
-                "cmd": "(lecture) réplicas cibles",
-                "stdout": ", ".join("%s/%s=%s" % (w["kind"], w["name"], w["replicas"]) for w in desired) or "aucun"})
-
-    # Avertir si un pod montant un volume ciblé n'est PAS géré par un Deployment/
-    # StatefulSet : le scale-down ne l'arrêtera pas et il pourrait recréer le pod /
-    # tenir le PVC pendant la suppression.
-    unmanaged, unm_err = _unmanaged_pods_using_pvcs(ns, [r["pvc"] for r in prepared])
-    if unm_err:
-        log.append(logentry("⚠ Liste des pods indisponible (contrôle des pods non gérés sauté)",
-                            ok=True, stderr=unm_err))
-    if unmanaged:
-        log.append(logentry("⚠ Pod(s) NON géré(s) par un Deployment/StatefulSet montant les volumes ciblés",
-                            stdout="; ".join("%s (contrôleur : %s)" % (p, k) for p, k in unmanaged)
-                                   + ". Le scale-down ne les arrêtera pas — arrêtez-les manuellement "
-                                     "(DaemonSet/Job/Operator/pod nu) avant de continuer."))
-
-    ok_stop, detail_stop = _stop_workloads(current, ns, dry, log)
-    if not ok_stop:
-        aborted = True
-        abort_detail = detail_stop
+        txn_vols = []
+        prev = {v["pvc"]: v for v in ((txn or {}).get("volumes") or [])}
+        for r in prepared:
+            old_pol = (prev.get(r["pvc"]) or {}).get("reclaim_policy")
+            if old_pol is None and r.get("old_pv_name"):
+                old_pol = _pv_reclaim_policy(r["old_pv_name"])
+            original_policies[r["pvc"]] = old_pol
+            txn_vols.append({"pvc": r["pvc"], "new_pv": r["new_pv_name"], "old_pv": r.get("old_pv_name"),
+                             "new_volume_handle": r.get("new_volume_handle"),
+                             "status": "done" if r["pvc"] in done_pvcs else "pending",
+                             "reclaim_policy": old_pol,
+                             "manifest": r.get("manifest"), "pvc_manifest": r.get("pvc_manifest")})
+        txn = {"status": "restart_failed" if restart_only else "in_progress",
+               "started": (txn.get("started") if txn else datetime.datetime.now().isoformat()),
+               "mode": mode, "backup_dir": backup_dir, "signature": _txn_signature(mode, prepared),
+               "workloads": [dict(w) for w in desired], "volumes": txn_vols}
+        okw, werr2 = _save_txn(ns, txn)
+        if not okw:
+            return _err("Écriture de la transaction de reprise impossible (%s) — restauration annulée : "
+                        "sans ce marqueur, une interruption ne pourrait pas être reprise." % werr2, log=log)
 
     pvc_names = [r["pvc"] for r in prepared]
 
-    # 2. Attendre l'arrêt effectif des pods (réel uniquement).
-    if not dry and not aborted:
-        if not _wait_pods_gone(ns, pvc_names, CONFIG["wait_timeout"], log):
+    # 2. Arrêt de l'application puis attente de l'arrêt effectif des pods (réel).
+    if not restart_only:
+        ok_stop, detail_stop = _stop_workloads(current, ns, dry, log)
+        if not ok_stop:
             aborted = True
-            abort_detail = "attente de l'arrêt des pods"
+            abort_detail = detail_stop
+        if not dry and not aborted:
+            if not _wait_pods_gone(ns, pvc_names, CONFIG["wait_timeout"], log):
+                aborted = True
+                abort_detail = "attente de l'arrêt des pods"
 
-    # 3. Pour chaque volume : delete PVC -> delete PV -> apply PV -> apply PVC -> Bound.
+    # 3. Pour chaque volume : Retain (PV source ET PV courant ET nouveau PV) -> delete PVC
+    #    -> attente détachement -> delete PV -> apply PV (Retain) -> apply PVC -> Bound.
     for r in prepared:
-        if aborted:
+        if aborted or restart_only:
+            break
+        if _op_cancel_requested():
+            aborted = True
+            abort_detail = "arrêt demandé par l'opérateur (les volumes déjà restaurés le restent ; relancez pour reprendre)"
+            log.append(logentry("Arrêt demandé par l'opérateur", ok=False, rc=-1,
+                                stderr="Séquence interrompue proprement après l'étape en cours."))
             break
         pvc_name = r["pvc"]
         pv_old = r.get("old_pv_name")
         new_name = r["new_pv_name"]
+        if pvc_name in done_pvcs:
+            log.append(logentry("Volume %s déjà restauré (reprise) — ignoré" % pvc_name))
+            continue
         # Retain TOUJOURS forcé quand le nouveau PV re-pointe le MÊME Volume Group (restore
         # sur place) : avec reclaimPolicy=Delete, supprimer l'ancien PV détruirait le VG
         # sur lequel on s'apprête à redémarrer l'application. La config ne peut pas
-        # désactiver cette protection.
+        # désactiver cette protection (le passage en Retain est de toute façon systématique).
         same_vg = bool(r.get("old_volume_handle")) and r.get("new_volume_handle") == r.get("old_volume_handle")
-        retain = bool(CONFIG.get("retain_source_pv", True)) or same_vg or payload.get("mode") == "inplace"
 
         # Réécrire hypervisorAttachedDiskUUIDs avec le disque du VG cloné (clone) AVANT
         # l'apply : sans lui, le CSI tente l'attach iSCSI et l'attachement échoue.
-        if payload.get("mode", "clone") == "clone":
+        if mode == "clone":
             _fix_clone_iqn(r.get("manifest"), r.get("new_volume_handle"), dry, log)
             disk_ok = _set_clone_disk_uuids(r.get("manifest"), r.get("new_volume_handle"), dry, log,
                                             source_had="hypervisorAttachedDiskUUIDs" in (r.get("stripped") or []))
@@ -4415,58 +5072,68 @@ def _execute_restore_locked(payload, log=None):
                                  "n'existe plus côté Nutanix — restaurez-le dans HYCU puis relancez")
                                 % pvc_name + " — PV non recréé pour éviter un volume non attachable")
                 break
+        manifest = json.loads(json.dumps(r["manifest"]))
+        # Le nouveau PV est TOUJOURS appliqué en Retain : une reprise, un double clic ou
+        # un nettoyage ne doit jamais faire supprimer le VG cloné/restauré par le CSI.
+        manifest.setdefault("spec", {})["persistentVolumeReclaimPolicy"] = "Retain"
 
         if dry:
-            if pv_old and retain:
-                log.append({"ok": True, "dry": True, "label": "Protection du VG source : PV %s -> Retain" % pv_old,
-                            "cmd": 'kubectl patch pv %s -p \'{"spec":{"persistentVolumeReclaimPolicy":"Retain"}}\'' % pv_old,
-                            "stdout": "Évite que la suppression du PV/PVC ne supprime le Volume Group Nutanix "
-                                      "(reclaimPolicy=Delete par défaut).", "stderr": "", "rc": None})
-            log.append({"ok": True, "dry": True, "label": "Suppression PVC %s" % pvc_name,
-                        "cmd": "kubectl delete pvc %s -n %s (+ finalizer si besoin)" % (pvc_name, ns),
-                        "stdout": "", "stderr": "", "rc": None})
+            log.append(logentry("Protection : PV source %s, PV courant du PVC et PV %s -> Retain"
+                                % (pv_old or "—", new_name), dry=True, rc=None,
+                                cmd='kubectl patch pv <pv> -p \'{"spec":{"persistentVolumeReclaimPolicy":"Retain"}}\'',
+                                stdout="Évite que la suppression du PV/PVC ne supprime le Volume Group Nutanix "
+                                       "(reclaimPolicy=Delete par défaut)."))
+            log.append(logentry("Suppression PVC %s" % pvc_name, dry=True, rc=None,
+                                cmd="kubectl delete pvc %s -n %s (finalizer retiré seulement si aucun pod ne le monte)" % (pvc_name, ns)))
             if pv_old:
-                log.append({"ok": True, "dry": True, "label": "Suppression PV %s" % pv_old,
-                            "cmd": "kubectl delete pv %s (+ finalizer si besoin)" % pv_old,
-                            "stdout": "", "stderr": "", "rc": None})
-            log.append(_apply_manifest(r["manifest"], "pv_%s" % new_name, True,
-                                       "Création du nouveau PV %s" % new_name))
+                log.append(logentry("Suppression PV %s (après détachement confirmé : VolumeAttachment)" % pv_old,
+                                    dry=True, rc=None, cmd="kubectl get volumeattachments ; kubectl delete pv %s" % pv_old))
+            log.append(_apply_manifest(manifest, "pv_%s" % new_name, True,
+                                       "Création du nouveau PV %s (Retain)" % new_name))
         else:
-            # 0) Protéger le VG source : passer l'ANCIEN PV en Retain AVANT toute
-            #    suppression. Avec reclaimPolicy=Delete (défaut Nutanix), supprimer le
-            #    PVC/PV déclenche la suppression du Volume Group côté CSI — destruction
-            #    du volume (source du clone, et/ou volume re-pointé si même VG).
-            if pv_old and retain:
-                st_pv, _ = resource_state("pv", pv_old)
-                if st_pv == "present":
-                    pr = kubectl(["patch", "pv", pv_old, "--type=merge",
-                                  "-p", '{"spec":{"persistentVolumeReclaimPolicy":"Retain"}}'],
-                                 dry=False, label="Protection du VG source : PV %s -> Retain" % pv_old)
-                    log.append(pr)
-                    if not pr["ok"]:
-                        aborted = True
-                        abort_detail = "protection (Retain) du PV source %s — suppression annulée pour " \
-                                       "ne pas risquer la perte du Volume Group" % pv_old
-                        break
+            # a) Retain sur tous les PV concernés AVANT toute suppression.
+            cur_pv = None
+            live_pvc, _ = kubectl_json(["get", "pvc", pvc_name, "-n", ns, "--ignore-not-found"])
+            if live_pvc:
+                cur_pv = ((live_pvc.get("spec") or {}).get("volumeName")) or None
+            targets = [p for p in dict.fromkeys([pv_old, cur_pv, new_name]) if p]
+            for p in targets:
+                if not _set_pv_retain(p, "Protection du Volume Group : PV %s -> Retain" % p, log):
+                    aborted = True
+                    abort_detail = ("protection (Retain) du PV %s — suppression annulée pour ne pas risquer "
+                                    "la perte du Volume Group" % p)
+                    break
+            if aborted:
+                break
             destructive_started = True
+            # b) Suppression du PVC puis du PV (finalizers retirés seulement si périmés).
             if not _delete_and_unblock("pvc", pvc_name, ns, log):
                 aborted = True
                 abort_detail = "suppression du PVC %s" % pvc_name
                 break
-            if pv_old and not _delete_and_unblock("pv", pv_old, None, log):
-                aborted = True
-                abort_detail = "suppression du PV %s (volume %s)" % (pv_old, pvc_name)
+            for p in [x for x in dict.fromkeys([pv_old, cur_pv]) if x and x != new_name]:
+                if not _wait_volume_attachments_gone(p, CONFIG["wait_timeout"], log):
+                    aborted = True
+                    abort_detail = "détachement du volume %s (VolumeAttachment encore présent)" % p
+                    break
+                if not _delete_and_unblock("pv", p, None, log):
+                    aborted = True
+                    abort_detail = "suppression du PV %s (volume %s)" % (p, pvc_name)
+                    break
+            if aborted:
                 break
-            ra = _apply_manifest(r["manifest"], "pv_%s" % new_name, False,
-                                 "Création du nouveau PV %s" % new_name)
+            if pv_old == new_name or cur_pv == new_name:
+                # Sur place avec le même nom : le PV a été supprimé ci-dessus et sera recréé.
+                pass
+            ra = _apply_manifest(manifest, "pv_%s" % new_name, False,
+                                 "Création du nouveau PV %s (Retain)" % new_name)
             log.append(ra)
             if not ra["ok"]:
                 aborted = True
                 abort_detail = "création du nouveau PV %s (volume %s)" % (new_name, pvc_name)
                 break
 
-        # Recréer le PVC à partir du manifeste CAPTURÉ à la préparation (sauvegarde ou
-        # live), pointé vers le nouveau PV. Disponible même sans export préalable.
+        # c) Recréer le PVC à partir du manifeste CAPTURÉ à la préparation.
         pvc_manifest = r.get("pvc_manifest")
         if pvc_manifest is not None:
             pvc_manifest = json.loads(json.dumps(pvc_manifest))   # copie défensive
@@ -4483,33 +5150,45 @@ def _execute_restore_locked(payload, log=None):
                 abort_detail = "liaison (Bound) du PVC %s" % pvc_name
                 break
         else:
-            log.append({"ok": True, "dry": dry, "label": "PVC %s non recréé" % pvc_name, "rc": 0,
-                        "cmd": "", "stderr": "",
-                        "stdout": "Manifeste du PVC introuvable (ni sauvegarde ni live) : le PVC sera recréé "
-                                  "par votre déploiement applicatif (vérifiez ensuite qu'il devient Bound)."})
+            log.append(logentry("PVC %s non recréé" % pvc_name, dry=dry,
+                                stdout="Manifeste du PVC introuvable (ni sauvegarde ni live) : le PVC sera recréé "
+                                       "par votre déploiement applicatif (vérifiez ensuite qu'il devient Bound)."))
+        # d) Volume terminé : statut persisté (une reprise l'ignorera).
+        if not dry:
+            for v in txn["volumes"]:
+                if v["pvc"] == pvc_name:
+                    v["status"] = "done"
+            _save_txn(ns, txn)
 
-    # 4. Redémarrer l'application — UNIQUEMENT si rien n'a échoué.
+    # 4. Redémarrer l'application — UNIQUEMENT si rien n'a échoué, en contrôlant chaque scale-up.
     restart_failed = []
     if not aborted:
         ok_restart, restart_failed = _restart_workloads(desired, ns, dry, log)
         if not ok_restart:
+            aborted = True
+            abort_detail = "redémarrage de l'application (" + "; ".join(restart_failed) + ")"
+            if not dry and txn:
+                txn["status"] = "restart_failed"
+                _save_txn(ns, txn)
             log.append({"ok": False, "dry": dry, "label": "REDÉMARRAGE INCOMPLET", "rc": -1, "stdout": "",
                         "cmd": "", "stderr": "Les volumes sont restaurés mais un scale-up a échoué : "
-                        "l'application est (partiellement) ARRÊTÉE. Relancez à la main : " + "; ".join(restart_failed)})
-    else:
-        log.append({"ok": False, "dry": dry, "label": "SÉQUENCE INTERROMPUE", "rc": -1, "stdout": "",
-                    "cmd": "", "stderr": ("Échec à l'étape : %s. " % (abort_detail or "inconnue")) +
-                    "L'application reste ARRÊTÉE (réplicas à 0) pour éviter de redémarrer sur des "
-                    "volumes incohérents. Corrigez la cause, puis relancez la restauration (les "
-                    "réplicas d'origine sont mémorisés), ou redémarrez manuellement : " +
-                    "; ".join("kubectl scale %s %s -n %s --replicas=%s" % (w["kind"], w["name"], ns, w["replicas"]) for w in desired)})
+                        "l'application est (partiellement) ARRÊTÉE. Relancez la restauration (reprise : seul le "
+                        "redémarrage sera rejoué) ou à la main : " + "; ".join(restart_failed)})
+    if aborted:
+        log.append(logentry("SÉQUENCE INTERROMPUE", ok=False, dry=dry, rc=-1,
+                            stderr=("Échec à l'étape : %s. " % (abort_detail or "inconnue")) +
+                            "L'application reste ARRÊTÉE (réplicas à 0) pour éviter de redémarrer sur des "
+                            "volumes incohérents. Corrigez la cause, puis relancez la restauration avec les mêmes "
+                            "volumes (reprise : les volumes déjà restaurés sont ignorés, les réplicas d'origine "
+                            "sont mémorisés), ou redémarrez manuellement : " +
+                            "; ".join("kubectl scale %s %s -n %s --replicas=%s" % (w["kind"], w["name"], ns, w["replicas"]) for w in desired)))
 
-    # 5. Vérification finale (réelle si non-dry) — dont contrôle anti mauvais-volume :
-    #    le PVC doit être lié au PV portant le volumeHandle ATTENDU (VG cible).
+    # 5. Vérification finale (réelle) — contrôle anti mauvais-volume : le PVC doit être
+    #    lié au PV portant le volumeHandle ATTENDU. Une incohérence est un ÉCHEC.
+    mism = []
     if not dry and not aborted:
         v = action_verify(ns)
         vh_by_pvc = {p["name"]: p.get("volume_handle") for p in v.get("pvcs", [])}
-        mism = []
         for r in prepared:
             got, exp = vh_by_pvc.get(r["pvc"]), r["new_volume_handle"]
             if exp and not got:
@@ -4517,36 +5196,42 @@ def _execute_restore_locked(payload, log=None):
             elif got and exp and got != exp:
                 mism.append("%s lié à %s au lieu de %s" % (r["pvc"], got, exp))
         if mism:
-            log.append(logentry("⚠ volumeHandle INATTENDU — vérifiez le volume réellement monté",
-                                stdout="Incohérence(s) : " + " ; ".join(mism)
-                                       + ". Le pod tourne peut-être sur le mauvais Volume Group."))
+            log.append(logentry("volumeHandle INATTENDU — le pod tourne peut-être sur le mauvais Volume Group",
+                                ok=False, rc=-1, stderr="Incohérence(s) : " + " ; ".join(mism)))
         else:
             log.append(logentry("volumeHandle conforme au VG attendu pour tous les volumes"))
         log.append(logentry("Vérification finale", cmd="kubectl get pvc/pv/pods",
                             stdout=json.dumps(v, indent=2)))
+        # 6. Politique de récupération : remettre celle d'origine du PV source (souvent
+        #    Delete) sur le nouveau PV, pour retrouver le comportement Kubernetes attendu.
+        for r in prepared:
+            pol = original_policies.get(r["pvc"])
+            if pol and pol != "Retain":
+                pr = kubectl(["patch", "pv", r["new_pv_name"], "--type=merge",
+                              "-p", json.dumps({"spec": {"persistentVolumeReclaimPolicy": pol}})],
+                             dry=False, label="PV %s : politique de récupération d'origine (%s) rétablie" % (r["new_pv_name"], pol))
+                log.append(pr)
 
-    ok_all = (not aborted) and not restart_failed and all(r["ok"] or r.get("dry") for r in log)
-    # Transaction : effacée si la restauration s'est terminée sans interruption (réel),
-    # y compris quand seul le redémarrage a échoué (PV/PVC cohérents : rejouer la
-    # séquence serait inutile et destructif ; le scale-up manquant est indiqué).
+    ok_all = (not aborted) and not mism and all(r["ok"] or r.get("dry") for r in log)
+    # Transaction : effacée si la restauration s'est terminée sans interruption (réel).
     # Interrompue AVANT toute suppression (inventaire, arrêt, attente des pods) : le
     # marqueur est aussi effacé — rien n'est à reprendre, et le laisser bloquerait la
-    # sauvegarde automatique du namespace.
+    # sauvegarde automatique du namespace. Un redémarrage refusé GARDE la transaction
+    # (statut restart_failed : la reprise ne rejoue que le scale-up).
     if not dry and (not aborted or not destructive_started):
         _clear_txn(ns)
-    # Rappel : un VG CLONÉ tout neuf n'est pas protégé dans HYCU -> le signaler.
     reprotect = []
-    if payload.get("mode", "clone") == "clone" and not dry and not aborted:
+    if mode == "clone" and not dry and not aborted:
         reprotect = [{"pvc": r["pvc"], "new_pv_name": r["new_pv_name"],
                       "new_volume_handle": r["new_volume_handle"]} for r in prepared]
     audit("restore_end", namespace=ns, dry=dry, ok=ok_all, aborted=aborted,
           restart_failed=bool(restart_failed))
     err = None
     if restart_failed:
-        err = ("Volumes restaurés mais redémarrage incomplet — relancez à la main : "
+        err = ("Volumes restaurés mais redémarrage incomplet — relancez la restauration (reprise) ou à la main : "
                + "; ".join(restart_failed))
     return {"ok": ok_all, "error": err, "dry": dry, "aborted": aborted, "log": log,
-            "reprotect": reprotect}
+            "preflight": checks, "reprotect": reprotect}
 
 
 def action_verify(ns):
@@ -4619,7 +5304,7 @@ def action_get_config():
 
 
 def action_set_config(payload):
-    ok, err = save_config(payload.get("config") or {})
+    ok, err = save_config(payload.get("config") or {}, source="api")
     _LOCAL_CTX["at"] = 0.0          # contexte local peut-être changé : relire
     return {"ok": ok, "error": err, "config": CONFIG}
 
@@ -4628,6 +5313,11 @@ def action_set_config(payload):
 # Connecteurs HYCU / Nutanix (REST, stdlib uniquement, identifiants en RAM)
 # ------------------------------------------------------------------------------
 def _ssl_ctx(verify):
+    """verify : False = pas de vérification ; True = magasin système ; chaîne = chemin
+    d'un bundle CA (PEM) pour une PKI interne ou un certificat auto-signé exporté."""
+    if isinstance(verify, str) and verify.strip():
+        ctx = ssl.create_default_context(cafile=verify.strip())
+        return ctx
     ctx = ssl.create_default_context()
     if not verify:
         ctx.check_hostname = False
@@ -4711,9 +5401,15 @@ def _http_json(method, url, auth, verify, body=None, timeout=30):
 
 
 def _system_cfg(system):
+    """(url de base, base API, vérification TLS). La vérification vaut False, True
+    (magasin système) ou le chemin du bundle CA configuré (*_ca_bundle)."""
+    verify = bool(CONFIG.get("%s_verify_tls" % system, False))
+    bundle = (CONFIG.get("%s_ca_bundle" % system) or "").strip()
+    if verify and bundle:
+        verify = bundle
     return (CONFIG.get("%s_url" % system, "").rstrip("/"),
             CONFIG.get("%s_api_base" % system, ""),
-            bool(CONFIG.get("%s_verify_tls" % system, False)))
+            verify)
 
 
 def _rest(system, method, path, body=None, timeout=30):
@@ -5215,6 +5911,12 @@ def check_ui_session(cookie_header):
         cur = UI_SESSION["id"]
         if tok and cur and hmac.compare_digest(tok, cur):
             return None
+        # Jamais d'éviction pendant une opération en cours (restauration, clone,
+        # protection HYCU…) : les identifiants seraient effacés sous les pieds du
+        # thread et l'application resterait arrêtée. La page est servie sans changer
+        # de session ; le nouveau visiteur devra recharger une fois l'opération finie.
+        if cur and (ACTION_LOCK.locked() or _operations_running()):
+            return None
         UI_SESSION["id"] = secrets.token_urlsafe(24)
         locked = [k for k, v in SESSION_CREDS.items() if v]
         for k in SESSION_CREDS:
@@ -5238,7 +5940,8 @@ def action_conn_status():
     for s in ("hycu", "nutanix", "prismcentral"):
         base, api, verify = _system_cfg(s)
         out[s] = {"configured": bool(base), "url": base, "api_base": api,
-                  "verify_tls": verify, "connected": SESSION_CREDS.get(s) is not None}
+                  "verify_tls": bool(verify), "ca_bundle": verify if isinstance(verify, str) else "",
+                  "connected": SESSION_CREDS.get(s) is not None}
     out["s3"] = {"configured": bool((CONFIG.get("s3_url") or "").strip() and (CONFIG.get("s3_bucket") or "").strip()),
                  "url": (CONFIG.get("s3_url") or "").strip(), "bucket": CONFIG.get("s3_bucket") or "",
                  "region": CONFIG.get("s3_region") or "us-east-1",
@@ -5383,6 +6086,31 @@ def cli_decrypt(path):
         f.write(data)
     print("Déchiffré -> %s" % out)
     return 0
+def _write_text_private(path, text):
+    """Écrit un fichier texte en 0600 de façon atomique (coffre)."""
+    d = os.path.dirname(os.path.abspath(path)) or "."
+    fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=d)
+    try:
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        for attempt in range(5):
+            try:
+                os.replace(tmp, path)
+                break
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def action_save_credentials(payload):
@@ -5405,12 +6133,7 @@ def action_save_credentials(payload):
         creds = dict(creds, _clusters=clusters)
     try:
         blob = encrypt_secret(json.dumps(creds).encode("utf-8"), pw)
-        with open(SECRETS_PATH, "w", encoding="utf-8") as f:
-            f.write(blob)
-        try:
-            os.chmod(SECRETS_PATH, 0o600)   # coffre lisible/écrit par le seul propriétaire
-        except OSError:
-            pass                            # best-effort (Windows / FS sans POSIX perms)
+        _write_text_private(SECRETS_PATH, blob)   # 0600 + atomique
     except Exception as e:
         return {"ok": False, "error": "Écriture du coffre impossible : %s" % e}
     global _VAULT_PW
@@ -6007,12 +6730,27 @@ def action_hycu_restore_points(source_uuid):
     """Liste les points de restauration (backups) d'un Volume Group HYCU."""
     if not source_uuid:
         return {"ok": False, "error": "Volume Group requis.", "points": []}
-    r = _rest("hycu", "GET", "/volumegroups/%s/backups?pageSize=500&pageNumber=1"
-              % urllib.parse.quote(str(source_uuid)))
-    if not r["ok"]:
-        return {"ok": False, "error": r.get("error"), "points": []}
+    items_all, page, guard, total = [], 1, 0, None
+    while guard < 40:
+        guard += 1
+        r = _rest("hycu", "GET", "/volumegroups/%s/backups?pageSize=500&pageNumber=%d"
+                  % (urllib.parse.quote(str(source_uuid)), page))
+        if not r["ok"]:
+            return {"ok": False, "error": r.get("error"), "points": []}
+        data = r.get("json") or {}
+        items = _hycu_items(data)
+        if not items:
+            break
+        items_all.extend(items)
+        total = (data.get("metadata") or {}).get("totalEntityCount", total)
+        if total is not None:
+            if len(items_all) >= int(total):
+                break
+        elif len(items) < 500:
+            break
+        page += 1
     out = []
-    for it in _hycu_items(r.get("json")):
+    for it in items_all:
         ms = it.get("restorePointInMillis")
         when = ""
         if ms:
@@ -6041,6 +6779,11 @@ def action_hycu_restore(payload):
     if not rp:
         return {"ok": False, "error": "Point de restauration requis."}
     mode = payload.get("mode", "clone")
+    if mode != "clone":
+        # L'écrasement SUR PLACE du VG live passe exclusivement par l'orchestrateur
+        # (arrêt de l'app, attente du détachement, garde contexte, suivi du job).
+        return {"ok": False, "error": "Seul le mode « clone » est accepté ici ; la restauration sur place "
+                                      "passe par l'orchestrateur (Restaurer le stockage sur place)."}
     new_name = (payload.get("new_name") or "").strip()
     src = payload.get("source_uuid")
     ns = payload.get("namespace")
@@ -6474,7 +7217,7 @@ def action_hycu_match(ns):
     return {"ok": True, "namespace": ns, "matches": matches}
 
 
-def _reject_stale_vgs(ns, uuids):
+def _reject_stale_vgs(ns, uuids, confirmed_by_name=None):
     """Re-vérifie côté serveur que tous les `uuids` (VG HYCU) appartiennent à la
     correspondance COURANTE du namespace (anti-stale / anti mauvais-volume). Renvoie
     un message d'erreur si l'un est hors-correspondance, sinon None."""
@@ -6487,9 +7230,18 @@ def _reject_stale_vgs(ns, uuids):
     # un match « par nom » n'est qu'une suggestion (cf. action_hycu_match) et ne doit
     # jamais suffire à restaurer/protéger un volume.
     allowed = {m["hycu_vg_uuid"] for m in match.get("matches", [])
-               if m.get("matched") and m.get("trusted") and m.get("hycu_vg_uuid")}
+               if m.get("matched") and m.get("hycu_vg_uuid") and m.get("trusted")}
+    by_name = {m["hycu_vg_uuid"] for m in match.get("matches", [])
+               if m.get("matched") and m.get("hycu_vg_uuid") and not m.get("trusted")}
+    if confirmed_by_name:
+        allowed |= (by_name & set(confirmed_by_name))
     bad = [u for u in uuids if u and u not in allowed]
     if bad:
+        unconfirmed = [u for u in bad if u in by_name]
+        if unconfirmed:
+            return ("Volume Group(s) associé(s) seulement PAR NOM (externalId différent du volumeHandle) : %s. "
+                    "Confirmez explicitement chaque volume « par nom » avant une opération destructive."
+                    % ", ".join(unconfirmed))
         return ("Volume Group(s) hors de la correspondance actuelle du namespace « %s » : %s. "
                 "Relancez l'analyse." % (ns, ", ".join(bad)))
     return None
@@ -6607,7 +7359,7 @@ def action_hycu_protect(payload):
                 "(correspondance introuvable — voir l'analyse)."}
 
     if ns:
-        stale = _reject_stale_vgs(ns, vg_uuids)
+        stale = _reject_stale_vgs(ns, vg_uuids, confirmed_by_name=payload.get("confirm_name_uuids") or [])
         if stale:
             return _err(stale)
 
@@ -6653,29 +7405,52 @@ def action_hycu_protect(payload):
             ACTION_LOCK.release()
 
 
-def _wait_hycu_job(job_id, log, timeout=1800, label="Job HYCU"):
-    """Attend la fin d'un job HYCU (poll /jobs/{uuid}). Renvoie True si succès."""
+
+
+def _wait_hycu_job(job_id, log, timeout=None, label="Job HYCU"):
+    """Attend la fin d'un job HYCU (poll /jobs/{uuid}). Renvoie True si succès.
+    - les erreurs de poll sont comptées : abandon après 5 échecs consécutifs, et
+      immédiatement si la session HYCU a disparu (« Non connecté ») ;
+    - WARNING = terminé avec avertissements (succès, signalé) ; tout statut inconnu
+      est journalisé à la fin pour diagnostic ;
+    - délai = CONFIG["hycu_job_timeout"] (1800 s par défaut)."""
+    if timeout is None:
+        timeout = int(CONFIG.get("hycu_job_timeout") or 1800)
     if not job_id:
         log.append({"ok": False, "dry": False, "label": label, "rc": -1, "stdout": "",
                     "stderr": "Job HYCU non identifié — fin non confirmable."})
         return False
     deadline = time.time() + timeout
+    errors, last_status, last_error = 0, "", ""
     while time.time() < deadline:
         r = _rest("hycu", "GET", "/jobs/%s" % urllib.parse.quote(str(job_id)))
         if r["ok"]:
+            errors = 0
             job = _hycu_first(r.get("json") or {})
             status = str((job or {}).get("status") or "").upper()
+            last_status = status or last_status
             if status in _JOB_OK:
                 log.append({"ok": True, "dry": False, "label": "%s terminé" % label, "rc": 0,
-                            "stdout": status, "stderr": ""})
+                            "stdout": status + (" (avec avertissements côté HYCU)" if "WARN" in status else ""),
+                            "stderr": ""})
                 return True
             if status in _JOB_KO:
                 log.append({"ok": False, "dry": False, "label": "%s en échec" % label, "rc": -1,
                             "stdout": "", "stderr": status})
                 return False
+        else:
+            errors += 1
+            last_error = r.get("error") or ""
+            if last_error.startswith("Non connecté") or errors >= 5:
+                log.append({"ok": False, "dry": False, "label": label, "rc": -1, "stdout": "",
+                            "stderr": "Suivi du job HYCU interrompu (%s) — dernier statut vu : %s. "
+                                      "Le job continue peut-être côté HYCU : vérifiez-le avant de relancer."
+                                      % (last_error, last_status or "aucun")})
+                return False
         time.sleep(3)
     log.append({"ok": False, "dry": False, "label": label, "rc": -1, "stdout": "",
-                "stderr": "Délai dépassé (%ss) — le job continue côté HYCU." % timeout})
+                "stderr": "Délai dépassé (%ss) — dernier statut vu : %s. Le job continue côté HYCU."
+                          % (timeout, last_status or "aucun")})
     return False
 
 
@@ -6699,7 +7474,8 @@ def action_orchestrate_inplace(payload, log=None):
         return {"ok": False, "error": "Aucun volume avec un point de restauration sélectionné.", "log": []}
 
     # Garde anti-stale : les VG source doivent appartenir à la correspondance courante.
-    stale = _reject_stale_vgs(ns, [it["source_vg_uuid"] for it in items])
+    stale = _reject_stale_vgs(ns, [it["source_vg_uuid"] for it in items],
+                              confirmed_by_name=[it["source_vg_uuid"] for it in items if it.get("confirm_name_match")])
     if stale:
         return _err(stale, log=[])
 
@@ -6722,8 +7498,22 @@ def action_orchestrate_inplace(payload, log=None):
 
         current, desired, werr = _resolve_workloads(ns)
         if werr:
-            return _err("Inventaire des Deployments/StatefulSets impossible (%s) — séquence annulée." % werr,
-                        log=log, aborted=False)
+            return _err("Workloads illisibles : %s" % werr, log=log)
+        # Pré-vol : HYCU joignable (et Prism Central si le rafraîchissement du disque est
+        # actif) AVANT d'arrêter l'application. Un workload géré par un opérateur bloque.
+        if not dry:
+            pf = _rest("hycu", "GET", "/jobs?pageSize=1&pageNumber=1")
+            if not pf.get("ok"):
+                return _err("Pré-vol : HYCU injoignable (%s) — application non arrêtée." % pf.get("error"), log=log)
+            log.append(logentry("Pré-vol ✓ HYCU joignable", cmd="GET /jobs"))
+            if CONFIG.get("inplace_refresh_pv_disk", True) and not SESSION_CREDS.get("prismcentral"):
+                log.append(logentry("Pré-vol ? Prism Central non connecté : le disque du PV ne pourra pas être "
+                                    "rafraîchi après le restore (FailedMount possible)", ok=True))
+            owned = [w for w in current if w.get("owner")]
+            if owned:
+                return _err("Pré-vol : workload(s) géré(s) par un opérateur (%s) — le scale-down serait annulé "
+                            "pendant le restore. Mettez l'opérateur en pause." %
+                            "; ".join("%s/%s <- %s" % (w["kind"], w["name"], w["owner"]) for w in owned), log=log)
         log.append({"ok": True, "dry": dry, "label": "Réplicas mémorisés", "rc": 0, "stderr": "", "cmd": "(lecture)",
                     "stdout": ", ".join("%s/%s=%s" % (w["kind"], w["name"], w["replicas"]) for w in desired) or "aucun"})
         if not _stop_workloads(current, ns, dry, log)[0]:
@@ -6732,6 +7522,15 @@ def action_orchestrate_inplace(payload, log=None):
         if not dry and not aborted:
             if not _wait_pods_gone(ns, pvc_names, CONFIG["wait_timeout"], log):
                 aborted = True
+            # Le VG doit être DÉTACHÉ de la VM worker avant que HYCU ne le restaure
+            # (ControllerUnpublish est asynchrone et postérieur à la disparition du pod).
+            if not aborted:
+                for it in items:
+                    pvc_live, _ = kubectl_json(["get", "pvc", it["pvc"], "-n", ns, "--ignore-not-found"])
+                    pvn = ((pvc_live or {}).get("spec") or {}).get("volumeName")
+                    if pvn and not _wait_volume_attachments_gone(pvn, CONFIG["wait_timeout"], log):
+                        aborted = True
+                        break
 
         for it in items:
             if aborted:
@@ -6764,8 +7563,9 @@ def action_orchestrate_inplace(payload, log=None):
                     break
 
         if not aborted:
-            _restart_workloads(desired, ns, dry, log)
-        else:
+            if _restart_workloads(desired, ns, dry, log):
+                aborted = True
+        if aborted:
             log.append({"ok": False, "dry": dry, "label": "SÉQUENCE INTERROMPUE", "rc": -1, "stdout": "", "cmd": "",
                         "stderr": "Une étape a échoué. L'application reste ARRÊTÉE pour éviter de redémarrer sur "
                         "des données incohérentes. Corrigez puis relancez, ou redémarrez : " +
@@ -6804,8 +7604,16 @@ def _find_workloads_using_pvcs(ns, pvc_names):
     return out
 
 
-CLONE_LABEL = "app.kubernetes.io/managed-by"
-CLONE_LABEL_VAL = "hycu-clone"
+CLONE_LABEL = "hycu.io/clone"              # label dédié : n'écrase pas app.kubernetes.io/managed-by (Helm, Argo)
+CLONE_LABEL_VAL = "true"
+# Suffixe de clone : RFC 1123 (minuscules, chiffres, tirets), 30 caractères max.
+CLONE_SUFFIX_RE = re.compile(r"^-?[a-z0-9]([-a-z0-9]{0,28}[a-z0-9])?$")
+
+
+def _suffix_selectors(sel_or_labels, suffix, keys):
+    for k in keys:
+        if k in sel_or_labels:
+            sel_or_labels[k] = str(sel_or_labels[k]) + suffix
 
 
 def _clone_pvc_manifest(src_pvc, target_ns, same_ns, suffix, new_pv_name):
@@ -6841,12 +7649,25 @@ def _clone_workload_manifest(w, target_ns, same_ns, suffix, pvc_rename):
         # template, PLUS un label d'isolation unique (qu'aucun Service/contrôleur
         # d'origine ne sélectionne) -> le clone n'adopte jamais les pods d'origine.
         iso = (suffix.lstrip("-") or "clone")
-        for k in list(sel.keys()):
+        keys = list(sel.keys())
+        for k in keys:
             sel[k] = str(sel[k]) + suffix
             if k in tmpl_labels:
                 tmpl_labels[k] = str(tmpl_labels[k]) + suffix
         sel["hycu-clone"] = iso
         tmpl_labels["hycu-clone"] = iso
+        # Les sélecteurs d'affinité / anti-affinité / topologySpread du template doivent
+        # suivre le même suffixe, sinon le clone s'exclut des nœuds des pods d'origine.
+        pspec = spec.setdefault("template", {}).setdefault("spec", {})
+        aff = pspec.get("affinity") or {}
+        for kind_aff in ("podAffinity", "podAntiAffinity"):
+            block = aff.get(kind_aff) or {}
+            for term in (block.get("requiredDuringSchedulingIgnoredDuringExecution") or []):
+                _suffix_selectors(((term.get("labelSelector") or {}).get("matchLabels") or {}), suffix, keys)
+            for wt in (block.get("preferredDuringSchedulingIgnoredDuringExecution") or []):
+                _suffix_selectors((((wt.get("podAffinityTerm") or {}).get("labelSelector") or {}).get("matchLabels") or {}), suffix, keys)
+        for tsc in (pspec.get("topologySpreadConstraints") or []):
+            _suffix_selectors(((tsc.get("labelSelector") or {}).get("matchLabels") or {}), suffix, keys)
     else:
         meta["namespace"] = target_ns
     vols = ((w.get("spec") or {}).get("template", {}).get("spec", {}).get("volumes")) or []
@@ -6908,8 +7729,11 @@ def _prepare_cloned_object(obj, target_ns):
     kind = o.get("kind")
     if kind == "Service":
         spec = o.setdefault("spec", {})
+        headless = (spec.get("clusterIP") == "None")
         for k in ("clusterIP", "clusterIPs", "externalIPs", "loadBalancerIP", "healthCheckNodePort"):
             spec.pop(k, None)
+        if headless:                       # Service headless (StatefulSet) : DNS par pod à conserver
+            spec["clusterIP"] = "None"
         for p in (spec.get("ports") or []):
             p.pop("nodePort", None)        # laisser le cluster réattribuer
     elif kind == "ServiceAccount":
@@ -7351,6 +8175,9 @@ def action_clone_app(payload, log=None):
     # sources). On valide seulement son nom (RFC 1123) ; il est créé s'il n'existe pas.
     if same_ns and not suffix:
         return {"ok": False, "error": "Un suffixe est requis pour cloner dans le même namespace.", "log": []}
+    if suffix and not CLONE_SUFFIX_RE.match(suffix):
+        return {"ok": False, "error": "Suffixe invalide « %s » : minuscules, chiffres et tirets uniquement "
+                                      "(ex. -clone, -test2)." % suffix, "log": []}
     if not K8S_NAME_RE.match(target_ns):
         return {"ok": False, "error": "Nom de namespace cible invalide : '%s'." % target_ns, "log": []}
     # Sans volume : clone d'une application STATELESS (`app` : workloads live du
@@ -7596,6 +8423,22 @@ def action_clone_app(payload, log=None):
             warnings.append("StatefulSet « %s » utilise des volumeClaimTemplates : son clone provisionnera de "
                             "NOUVEAUX volumes (pas le VG cloné). À adapter manuellement." % wname)
     cloned_workloads = [_clone_workload_manifest(w, target_ns, same_ns, suffix, pvc_rename) for w in workloads]
+    # Tous les noms produits doivent rester valides (RFC 1123) : refus AVANT toute création.
+    bad_names = [n for n in ([p["new_pv_name"] for p in prepared] + [p["new_pvc_name"] for p in prepared]
+                             + [w["metadata"]["name"] for w in cloned_workloads])
+                 if not K8S_NAME_RE.match(n or "") or len(n) > 253]
+    if bad_names:
+        return {"ok": False, "error": "Nom(s) invalide(s) après application du suffixe : %s." % ", ".join(bad_names),
+                "log": []}
+    if same_ns:
+        long_labels = []
+        for w in cloned_workloads:
+            for v in (((w.get("spec") or {}).get("selector") or {}).get("matchLabels") or {}).values():
+                if len(str(v)) > 63:
+                    long_labels.append(str(v))
+        if long_labels:
+            return {"ok": False, "error": "Valeur(s) de label trop longue(s) (> 63) après suffixe : %s. "
+                                          "Choisissez un suffixe plus court." % ", ".join(long_labels), "log": []}
 
     # Dépendances namespacées : en clone CROSS-namespace, recréer dans le namespace
     # cible les Secrets / ConfigMaps / ServiceAccount référencés + les Services qui
@@ -7761,14 +8604,56 @@ def action_clone_app(payload, log=None):
                     continue
             log.append(_apply_manifest(o, "clonedep_%s_%s" % (k, nm), dry,
                                        "Dépendance clonée %s %s/%s" % (o.get("kind"), target_ns, nm)))
+        created = []                     # (kind, name, ns) dans l'ordre de création -> rollback inverse
+        failed_step = None
         for p in prepared:  # hypervisorAttachedDiskUUIDs déjà renseigné dans la pré-passe ci-dessus
-            log.append(_apply_manifest(p["pv"], "clonepv_%s" % p["new_pv_name"], dry,
-                                       "PV cloné %s" % p["new_pv_name"]))
-            log.append(_apply_manifest(p["pvc_manifest"], "clonepvc_%s" % p["new_pvc_name"], dry,
-                                       "PVC cloné %s (ns %s)" % (p["new_pvc_name"], target_ns)))
-        for w in cloned_workloads:
-            log.append(_apply_manifest(w, "clonewl_%s" % w["metadata"]["name"], dry,
-                                       "Application clonée %s/%s (ns %s)" % (w["kind"], w["metadata"]["name"], target_ns)))
+            # Le PV cloné est TOUJOURS créé en Retain : une suppression ultérieure du PVC/PV
+            # (nettoyage, échec partiel) ne doit jamais détruire le VG cloné via le CSI.
+            p["pv"].setdefault("spec", {})["persistentVolumeReclaimPolicy"] = "Retain"
+            # claimRef toujours posé (même avec strip_claimref) : jamais de PV « Available »
+            # qu'un PVC Pending étranger pourrait capturer entre les deux applies.
+            p["pv"]["spec"]["claimRef"] = {"kind": "PersistentVolumeClaim", "apiVersion": "v1",
+                                           "name": p["new_pvc_name"], "namespace": target_ns}
+            ra = _apply_manifest(p["pv"], "clonepv_%s" % p["new_pv_name"], dry, "PV cloné %s (Retain)" % p["new_pv_name"])
+            log.append(ra)
+            if not (ra["ok"] or ra["dry"]):
+                failed_step = "PV %s" % p["new_pv_name"]
+                break
+            created.append(("pv", p["new_pv_name"], None))
+            ra = _apply_manifest(p["pvc_manifest"], "clonepvc_%s" % p["new_pvc_name"], dry,
+                                 "PVC cloné %s (ns %s)" % (p["new_pvc_name"], target_ns))
+            log.append(ra)
+            if not (ra["ok"] or ra["dry"]):
+                failed_step = "PVC %s" % p["new_pvc_name"]
+                break
+            created.append(("pvc", p["new_pvc_name"], target_ns))
+        if failed_step is None:
+            for w in cloned_workloads:
+                ra = _apply_manifest(w, "clonewl_%s" % w["metadata"]["name"], dry,
+                                     "Application clonée %s/%s (ns %s)" % (w["kind"], w["metadata"]["name"], target_ns))
+                log.append(ra)
+                if not (ra["ok"] or ra["dry"]):
+                    failed_step = "%s %s" % (w["kind"], w["metadata"]["name"])
+                    break
+                created.append((w["kind"].lower(), w["metadata"]["name"], target_ns))
+        if failed_step and not dry:
+            # Nettoyage INVERSE des objets créés par cette tentative (les PV sont en
+            # Retain : leur suppression ne touche pas le VG cloné). Les dépendances
+            # clonées (Secrets/ConfigMaps/SA/Services) sont laissées en place (idempotentes).
+            log.append(logentry("Échec sur %s — nettoyage des objets créés par ce clone" % failed_step,
+                                ok=False, rc=-1, stderr="Aucune application clonée n'est laissée à moitié créée."))
+            for kind_c, name_c, ns_c in reversed(created):
+                args = ["delete", kind_c, name_c, "--ignore-not-found", "--wait=false"]
+                if ns_c:
+                    args += ["-n", ns_c]
+                log.append(kubectl(args, dry=False, label="Nettoyage %s %s" % (kind_c.upper(), name_c)))
+        elif not dry and prepared:
+            # Attendre que les PVC clonés soient liés : un FailedAttach / mauvais disque
+            # doit apparaître ici et non après le clic suivant de l'opérateur.
+            for p in prepared:
+                if not _wait_pvc_bound(p["new_pvc_name"], target_ns, log):
+                    warnings.append("Le PVC cloné « %s » n'est pas Bound : vérifiez le VG cloné et les "
+                                    "hypervisorAttachedDiskUUIDs." % p["new_pvc_name"])
         ok_all = all(x["ok"] or x.get("dry") for x in log)
         audit("clone_app", namespace=ns, target_namespace=target_ns, dry=dry, ok=ok_all,
               items=[it["pvc"] for it in items],
@@ -7823,10 +8708,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             pass
 
     def _lang(self):
-        """Langue de l'interface : cookie « hycu_lang » posé par le bouton FR/EN.
-        Défaut : français (langue canonique du code)."""
+        """Langue de l'interface : cookie « hycu_lang » posé par le bouton FR/EN ;
+        sans cookie, la langue par défaut de la configuration (default_lang, « en »)."""
         m = re.search(r"(?:^|;\s*)hycu_lang=(\w+)", self.headers.get("Cookie") or "")
-        return "en" if (m and m.group(1) == "en") else "fr"
+        if m and m.group(1) in ("en", "fr"):
+            return m.group(1)
+        return "en" if (CONFIG.get("default_lang") or "en") == "en" else "fr"
 
     def _json(self, obj, code=200):
         if self._lang() == "en":
@@ -7880,7 +8767,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     name = urllib.parse.urlparse(val).hostname
                 except Exception:
                     return False
-                if name not in ALLOWED_HOSTS:
+                if not _host_allowed(name):
                     return False
         if require_origin and not seen:
             return False
@@ -7916,8 +8803,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         qs = {k: v[0] for k, v in urllib.parse.parse_qs(parsed.query).items()}
+        if path in ("/healthz", "/readyz"):
+            # Sonde de santé (Docker HEALTHCHECK, sondes K8s) : AUCUNE logique de
+            # session ici — charger « / » sans cookie tournerait la session et
+            # effacerait les identifiants.
+            return self._send(200, "ok", "text/plain")
         if path == "/":
-            set_cookie = check_ui_session(self.headers.get("Cookie"))
+            # La rotation de session n'a de sens que pour un navigateur (Accept: text/html) ;
+            # un outil ou une sonde qui touche « / » ne doit pas évincer l'opérateur.
+            accept = self.headers.get("Accept") or ""
+            browser = ("text/html" in accept) or ("*/*" in accept and "Mozilla" in (self.headers.get("User-Agent") or ""))
+            set_cookie = check_ui_session(self.headers.get("Cookie")) if browser else None
             page = _html_for_lang(self._lang())
             return self._send(200, page.replace("__CSRF_TOKEN__", CSRF_TOKEN)
                               .replace("__VERSION__", VERSION).replace("__LOGO__", _logo_markup()),
@@ -7980,6 +8876,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                   "text/html",
                                   {"Content-Disposition": 'attachment; filename="rapport_hycu_%s.html"' % today})
             if path == "/api/op_status":
+                if not qs.get("id"):
+                    return self._json(action_op_list())
                 return self._json(action_op_status(qs.get("id", "")))
             if path == "/api/nutanix/vgs":
                 return self._json(action_nutanix_vgs(qs.get("q", "")))
@@ -8001,7 +8899,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _do_POST(self):
         if not self._origin_ok(require_origin=True):
             return self._send(403, "Forbidden", "text/plain")
-        if self.headers.get("X-CSRF-Token") != CSRF_TOKEN:
+        if not hmac.compare_digest(str(self.headers.get("X-CSRF-Token") or ""), CSRF_TOKEN):
             return self._json({"error": "Jeton anti-CSRF invalide ou absent."}, 403)
         try:
             length = int(self.headers.get("Content-Length", 0) or 0)
@@ -8016,10 +8914,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._json({"error": "JSON invalide"}, 400)
         path = urllib.parse.urlparse(self.path).path
         try:
+            if path == "/api/op_cancel":
+                return self._json(action_op_cancel(payload.get("id", "")))
             if path == "/api/backup":
-                return self._json(action_backup(payload.get("ns", ""), payload.get("dest")))
+                return self._json(action_backup(payload.get("ns", ""), payload.get("dest"), kind="manual"))
             if path == "/api/backup_all":
-                return self._json(action_backup_all(payload.get("dest")))
+                return self._json(action_backup_all(payload.get("dest"), kind="manual"))
             if path == "/api/prepare_restore":
                 return self._json(action_prepare_restore(payload))
             if path == "/api/execute_restore":
@@ -8170,6 +9070,7 @@ def _logo_markup():
 # ------------------------------------------------------------------------------
 # Interface (HTML + CSS + JS, un seul bloc, vanilla)
 # ------------------------------------------------------------------------------
+# >>> UI-BEGIN — région GÉNÉRÉE par build.py depuis ui/ (ne pas éditer à la main)
 HTML = r"""<!DOCTYPE html>
 <html lang="fr">
 <head>
@@ -8188,7 +9089,9 @@ HTML = r"""<!DOCTYPE html>
   :root{
     --top:#41327C; --purple:#7530F0; --purple-d:#5F22D6; --purple-t:#EFE8FD;
     --bg:#F3F4F9; --card:#FFFFFF; --title:#4B5274; --text:#3D4464; --strong:#2A2E44;
-    --muted:#6B7089; --grey:#A5A8B9; --rule:#AFC2D6; --line:#E3E7EE;
+    --muted:#6B7089; --grey:#8A8FA3; --rule:#8A9BB0; --line:#E3E7EE;
+  /* variantes « texte » conformes aux contrastes (≥ 4.5:1 sur blanc) */
+  --green-t:#047857; --red-t:#C53030; --orange-t:#9A6B1E;
     --green:#05A274; --green-l:#9BDAC7; --red:#E9605A; --orange:#CA923E; --blue:#6688FF;
     /* alias historiques (utilisés par du HTML/JS existant) */
     --ink:var(--strong); --paper:var(--bg); --teal:var(--purple); --teal-d:var(--top);
@@ -8220,7 +9123,7 @@ HTML = r"""<!DOCTYPE html>
   .tb-ico{background:none;border:none;color:#fff;cursor:pointer;padding:0;display:flex;align-items:center}
   .tb-ico svg,.tb-link svg{display:block}
   .tb-ico:hover,.tb-link:hover{opacity:.8}
-  .tb-lang{background:none;border:1px solid rgba(255,255,255,.55);color:#fff;border-radius:4px;
+  .tb-lang{background:none;border:1px solid rgba(255,255,255,.55);color:#fff;border-radius:4px;min-height:32px;min-width:40px;
            padding:2px 9px;font-size:12px;font-weight:700;cursor:pointer;font-family:inherit}
   .hdrconn{display:flex;gap:10px;cursor:pointer}
   .hdrconn .hc{font-size:11px;font-weight:700;color:#fff;letter-spacing:.3px;display:flex;align-items:center}
@@ -8294,7 +9197,7 @@ HTML = r"""<!DOCTYPE html>
   select{appearance:none;-webkit-appearance:none;padding-right:34px;cursor:pointer;
         background:#fff url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'><path d='M1 1.5l5 5 5-5' fill='none' stroke='%2341327C' stroke-width='1.8'/></svg>") no-repeat right 12px center}
   select:focus,input:focus,textarea:focus{outline:none;border-color:var(--purple);box-shadow:0 0 0 2px var(--purple-t)}
-  input[type=checkbox]{accent-color:var(--purple);width:15px;height:15px;vertical-align:-2px}
+  input[type=checkbox]{accent-color:var(--purple);width:18px;height:18px;vertical-align:-3px}
   textarea{resize:vertical;min-height:46px;font-size:12.5px}
   .row{display:flex;gap:12px;flex-wrap:wrap}
   .row > div{flex:1;min-width:180px}
@@ -8302,12 +9205,13 @@ HTML = r"""<!DOCTYPE html>
        font-size:14px;cursor:pointer;font-weight:500;font-family:inherit;min-height:38px;
        display:inline-flex;align-items:center;justify-content:center;gap:6px}
   .btn:hover{background:var(--purple-d);border-color:var(--purple-d)}
-  .btn:disabled{opacity:.45;cursor:not-allowed}
+  .btn:disabled{background:#E9E6F3;border-color:#E9E6F3;color:#6B7089;cursor:not-allowed}
+  .btn.ghost:disabled{background:#F3F4F9;border-color:#C9CDD9;color:#6B7089}
   .btn.ghost{background:#fff;color:var(--top);border:1px solid var(--top)}
   .btn.ghost:hover{background:var(--purple-t)}
   .btn.danger{background:var(--red);border-color:var(--red)}
   .btn.danger:hover{background:#D64B45;border-color:#D64B45}
-  .lnk{background:none;border:none;padding:6px 4px;color:var(--strong);text-decoration:underline;
+  .lnk{background:none;border:none;padding:8px 10px;min-height:36px;color:var(--strong);text-decoration:underline;
        text-underline-offset:3px;cursor:pointer;font-size:14px;font-family:inherit}
   .lnk:hover{color:var(--purple)}
   .seg{display:inline-flex;border:1px solid var(--rule);border-radius:4px;overflow:hidden}
@@ -8332,7 +9236,8 @@ HTML = r"""<!DOCTYPE html>
   .switch.onoff input:checked + .slider:before{background:#fff}
 
   /* ---------- Tableaux « entités » (Applications, Tâches, Sources, Politiques) ---------- */
-  .tcard{background:#fff;border-radius:6px;box-shadow:0 1px 2px rgba(65,50,124,.06);overflow:hidden}
+  .tcard{background:#fff;border-radius:6px;box-shadow:0 1px 2px rgba(65,50,124,.06);overflow:hidden;overflow-x:auto}
+  .tcard table.ht{min-width:900px}
   .tbar{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:12px 16px;flex-wrap:wrap}
   .tbar input[type=text]{width:230px;min-height:36px}
   .tbar .tinfo{font-size:13px;color:var(--text)}
@@ -8422,13 +9327,14 @@ HTML = r"""<!DOCTYPE html>
   .hm-head h2 .sep{color:var(--title);margin:0 6px}
   .hm-ico{display:flex;gap:14px;align-items:center}
   .hm-ico button{background:none;border:none;cursor:pointer;color:var(--top);padding:0;font-size:22px;line-height:1;
+                 width:40px;height:40px;display:inline-flex;align-items:center;justify-content:center;border-radius:6px;
                  font-family:inherit;font-weight:700}
   .hm-body,.wiz-body{padding:16px 18px;overflow:auto}
   .hm-foot,.wiz-foot{display:flex;align-items:center;justify-content:flex-end;gap:14px;padding:12px 18px;
        border-top:1px solid var(--rule)}
   .wiz-foot{justify-content:space-between}
   .hm-foot .btn,.wiz-foot .btn:not(.ghost){min-width:92px}
-  .wiz-foot .btn.ghost,.modal-actions .btn.ghost{background:none;border:none;color:var(--strong);
+  .modal-actions .btn.ghost{background:none;border:none;color:var(--strong);
        text-decoration:underline;text-underline-offset:3px;min-height:0;padding:6px 4px}
   .wiz-brand{display:none}
   .wiz-head{flex-direction:column;align-items:stretch}
@@ -8520,8 +9426,35 @@ HTML = r"""<!DOCTYPE html>
   @keyframes pulseRing{0%{box-shadow:0 0 0 0 rgba(117,48,240,.55)}100%{box-shadow:0 0 0 12px rgba(117,48,240,0)}}
   .pulse{animation:pulseRing 1s ease-out 3}
   /* Anciens éléments de navigation du parcours Restaurer : remplacés par l'assistant */
-  .stepper,#rsNextBar{display:none !important}
+  #rsNextBar{display:none !important}
   .step-no{display:none}
+  /* ---------- Assistant de restauration : étapes visibles ---------- */
+  .stepper{display:flex;gap:0;margin:0 0 16px;border:1px solid var(--line);border-radius:6px;overflow:hidden;background:#fff}
+  /* (la classe .st est aussi celle des pastilles d'état, qui masque le texte en !important) */
+  .stepper .st{flex:1;padding:10px 12px;font-size:13px !important;color:var(--muted) !important;background:#fff;
+               background-image:none !important;border-right:1px solid var(--line);border-radius:0 !important;
+               display:flex;align-items:center;gap:8px;width:auto !important;height:auto !important;cursor:default}
+  .stepper .st:last-child{border-right:none}
+  .stepper .st.on{color:#fff !important;background:var(--purple);font-weight:700}
+  .stepper .st.done{color:var(--green-t) !important;background:#F0FAF6}
+  .progress{margin-top:14px;border:1px solid var(--line);border-radius:6px;padding:10px 12px;background:#fff}
+  .progress-head{display:flex;justify-content:space-between;align-items:center;gap:12px;font-size:13px;color:var(--strong);margin-bottom:8px}
+  .progress-track{height:8px;background:#EEF0F5;border-radius:4px;overflow:hidden}
+  .progress-bar{height:100%;width:0;background:var(--purple);transition:width .4s}
+  body.realmode .progress-bar{background:var(--red)}
+  ol.plan li.danger{color:var(--red-t)}
+  ol.plan li.danger::marker{color:var(--red-t);font-weight:700}
+  .preflight{margin:10px 0}
+  .preflight summary{cursor:pointer;font-size:13px}
+  /* ---------- Mode réel : indicateur permanent dans la barre du haut ---------- */
+  .tb-real{display:none;align-items:center;font-size:12px;font-weight:700;letter-spacing:.4px;color:#fff;background:var(--red);
+           border-radius:4px;padding:4px 10px}
+  body.realmode .tb-real{display:inline-flex}
+  body.realmode .topbar{box-shadow:inset 0 -6px 0 var(--red)}
+  body.realmode .realbar{height:6px}
+  #netBanner{margin-bottom:12px}
+  .dq{display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;border:1.5px solid var(--muted);
+      border-radius:50%;font-size:11px;font-weight:700;color:var(--grey);cursor:help;vertical-align:middle}
   /* Superposition : filtre / assistant / déverrouillage au-dessus des modales HYCU,
      confirmation destructive au-dessus de tout. */
   .wiz{z-index:1050} .modal-bg{z-index:1100}
@@ -8676,6 +9609,7 @@ HTML = r"""<!DOCTYPE html>
 <header class="topbar">
   <a class="tb-brand" id="tbHome" href="#" title="Tableau de bord">__LOGO__<span class="tb-word">HYCU<sup>®</sup></span><span class="tb-prod">Kubernetes · Nutanix</span></a>
   <div class="tb-right">
+    <span id="tbReal" class="tb-real" role="status">MODE RÉEL</span>
     <span id="hdrConn" class="hdrconn" title="État des sources — cliquer pour ouvrir les Sources"></span>
     <button class="tb-link" id="ctxLink" type="button" title="Cluster Kubernetes actif — cliquer pour en choisir un autre"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="16" height="6.5" rx="1.3"/><rect x="4" y="13.5" width="16" height="6.5" rx="1.3"/><path d="M7.6 7.25h.01M7.6 16.75h.01"/></svg><u id="ctx">…</u><span id="ctxWarn"></span><svg class="caret" width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M2.5 4.5l3.5 3.5 3.5-3.5" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round"/></svg></button>
     <button class="tb-ico" id="srcBtn" type="button" title="Sources & Réglages"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></button>
@@ -8705,9 +9639,11 @@ HTML = r"""<!DOCTYPE html>
   <div class="sb-foot"><button class="sb-col" id="sbCol" type="button" title="Réduire / déployer le menu"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg></button><span class="ver">v__VERSION__</span></div>
 </nav>
 <main class="wrap">
+  <div id="netBanner" class="err" style="display:none" role="alert">Serveur injoignable — vérifiez que l'outil tourne (ou le port-forward), puis rechargez.</div>
+  <div id="opBanner" style="display:none"></div>
   <div id="kubeBanner"></div>
   <div class="dry" id="dryBar">
-    <label class="switch"><input type="checkbox" id="dry" checked><span class="slider"></span></label>
+    <label class="switch"><input type="checkbox" id="dry" checked role="switch" aria-checked="true" aria-labelledby="dryLabel"><span class="slider"></span></label>
     <div><b id="dryLabel">Mode simulation activé</b> — aucune commande destructive n'est exécutée.
       Désactivez-le seulement quand vous êtes prêt à agir réellement.</div>
   </div>
@@ -8715,6 +9651,7 @@ HTML = r"""<!DOCTYPE html>
 
   <!-- ===================== TABLEAU DE BORD ===================== -->
   <section id="tab-dashboard">
+    <div class="pagehead"><h1 class="ptitle">Tableau de bord</h1></div>
     <div class="dgrid">
       <div><h2 class="dtitle">Applications</h2><div class="dcard" id="dbApps"></div></div>
       <div><h2 class="dtitle">Politique</h2><div class="dcard" id="dbPolicy"></div></div>
@@ -8864,6 +9801,8 @@ HTML = r"""<!DOCTYPE html>
       <div class="row">
         <div><label class="fld"><input type="checkbox" id="cfgDr" style="width:auto"> <b>Autoriser la restauration DR</b> (inter-cluster / inter-contexte)</label>
         <div class="hint">À activer le temps d'un exercice ou d'un sinistre. Chaque restauration DR reste explicite : sources lues depuis la seule sauvegarde, avertissement, re-saisie du cluster cible, audit dédié.</div></div>
+        <div><label class="fld">Noms d'hôte autorisés pour accéder à l'interface (vide = boucle locale uniquement)</label><input type="text" id="cfgHosts" placeholder="hycu.interne.exemple.fr">
+          <div class="hint" style="margin-top:4px">Nom DNS d'un Ingress ou d'un reverse-proxy. L'outil n'a pas d'authentification : placez une authentification (SSO, oauth2-proxy, liste d'IP) et TLS devant lui dès qu'il quitte la boucle locale.</div></div>
       </div>
       <div class="row">
         <div><label class="fld">Timeout d'attente (s)</label><input type="text" id="cfgWait" placeholder="120"></div>
@@ -8871,6 +9810,11 @@ HTML = r"""<!DOCTYPE html>
       </div>
       <label class="fld" style="margin-top:14px"><input type="checkbox" id="cfgConfirm" style="width:auto"> Exiger la confirmation du contexte avant toute action réelle</label>
       <label class="fld"><input type="checkbox" id="cfgStrip" style="width:auto"> Retirer entièrement claimRef du PV (laisser le PVC rebinder)</label>
+      <label class="fld"><input type="checkbox" id="cfgSim" style="width:auto"> Proposer le mode simulation (interrupteur dans le bandeau ; sinon l'outil travaille en mode réel)</label>
+      <div class="row" style="margin-top:6px">
+        <div style="flex:none;width:260px"><label class="fld">Langue par défaut de l'interface</label>
+          <select id="cfgLang"><option value="en">English</option><option value="fr">Français</option></select></div>
+      </div>
       <div style="margin-top:14px"><button class="btn" id="cfgSave">Enregistrer les réglages</button> <span class="hint" id="cfgMsg"></span></div>
     </div>
   </section>
@@ -8959,10 +9903,11 @@ HTML = r"""<!DOCTYPE html>
     <div class="hm-body">
   <!-- ===================== RESTAURATION ===================== -->
   <section id="tab-restore">
-    <div class="stepper" id="rsStepper">
-      <span class="st on" data-st="1">1 · Volumes</span>
-      <span class="st" data-st="2">2 · Configurer</span>
-      <span class="st" data-st="3">3 · Lancer</span>
+    <div class="stepper" id="rsStepper" aria-label="Étapes de la restauration">
+      <span class="st on" data-st="1">1 · Type</span>
+      <span class="st" data-st="2">2 · Options</span>
+      <span class="st" data-st="3">3 · Vérifier &amp; lancer</span>
+      <span class="st" data-st="4">4 · Suivi</span>
     </div>
     <div id="rsPgType">
       <div class="note" id="rsAppNote" style="display:none;margin-bottom:10px"></div>
@@ -9090,7 +10035,7 @@ HTML = r"""<!DOCTYPE html>
         <p class="sub" style="margin:4px 0 8px"><b>Arrêt de l'application → restore in-place HYCU → redémarrage.</b> Aucune référence à saisir.</p>
         <button class="btn" id="rsInplaceRun" disabled>Lancer la restauration sur place</button>
         <span class="hint" id="rsInplaceHint" style="margin:0"></span>
-        <div id="rsInplaceLog"></div>
+        <div aria-live="polite" id="rsInplaceLog"></div>
       </div>
       <div id="rsContinueWrap" style="margin-top:14px">
         <button class="btn" id="rsPreview">Continuer : vérifier et lancer →</button>
@@ -9114,14 +10059,18 @@ HTML = r"""<!DOCTYPE html>
         <button class="btn" id="rsGo">Lancer la restauration</button>
         <span class="hint" id="rsGoHint"></span>
       </div>
-      <div id="rsLog"></div>
+      <div id="rsProgress" class="progress" style="display:none">
+        <div class="progress-head"><span id="rsProgressTxt"></span><button class="btn ghost" type="button" id="rsCancel" style="display:none">Arrêter après l'étape en cours</button></div>
+        <div class="progress-track"><div class="progress-bar" id="rsProgressBar"></div></div>
+      </div>
+      <div id="rsLog" aria-live="polite"></div>
     </div>
     </div>
     <div class="nextbar" id="rsNextBar"><span id="rsNextTxt"></span><button class="btn" id="rsNextBtn"></button></div>
   </section>
 
     </div>
-    <div class="hm-foot" id="mRestoreFoot"><span id="rsWizMode" class="badge" style="margin-right:auto"></span><button class="lnk" type="button" data-close="mRestore">Fermer</button><button class="lnk" type="button" id="rsWizBack">Retour</button><button class="btn" type="button" id="rsWizGo">Suivant</button></div>
+    <div class="hm-foot" id="mRestoreFoot"><span id="rsWizMode" class="badge" style="margin-right:auto"></span><button class="lnk" type="button" data-close="mRestore">Fermer</button><button class="btn ghost" type="button" id="rsWizBack">Retour</button><button class="btn" type="button" id="rsWizGo">Suivant</button></div>
   </div>
 </div>
 <div id="mSources" class="hmodal-bg" style="display:none">
@@ -9342,20 +10291,34 @@ function esc(s){return (s==null?"":String(s)).replace(/[&<>"]/g,c=>({"&":"&amp;"
 // Cluster Kubernetes ACTIF : chaque requête le désigne (en-tête X-HYCU-Cluster) ;
 // le serveur route kubectl vers ce cluster. « local » = cluster de la configuration.
 let ACTIVE_CID="local", CLUSTERS=[{id:"local", name:"local", local:true}];
-// Toute panne (serveur arrêté, réseau, réponse non-JSON comme un 403 texte) devient
-// une réponse {ok:false,error:…} : jamais d'exception non rattrapée qui laisserait
-// un bouton désactivé avec son spinner.
-async function _req(u, opts){
-  try{
-    const r=await fetch(u, opts);
-    try{ return await r.json(); }
-    catch(e){ return {ok:false, error:"Réponse inattendue du serveur ("+r.status+") — rechargez la page (Ctrl+Shift+R)."}; }
-  }catch(e){ return {ok:false, error:"Serveur injoignable : "+(e && e.message || e)+". L'outil est-il toujours lancé ?"}; }
+// Couche API unique : ne lève JAMAIS vers les handlers (une coupure réseau ou une
+// réponse non-JSON renvoie {ok:false, error, status}), délai borné, bandeau hors-ligne.
+let NET_DOWN=false;
+function setNet(down){
+  if(down===NET_DOWN) return; NET_DOWN=down;
+  const b=$("#netBanner"); if(b) b.style.display = down ? "block" : "none";
 }
-async function get(u, cid){return _req(u,{headers:{"X-HYCU-Cluster":cid||ACTIVE_CID}});}
-async function post(u,b,cid){return _req(u,{method:"POST",
-  headers:{"Content-Type":"application/json","X-CSRF-Token":CSRF,"X-HYCU-Cluster":cid||ACTIVE_CID},
-  body:JSON.stringify(b)});}
+async function api(u, opts){
+  const ctrl=new AbortController(); const t=setTimeout(()=>ctrl.abort(), (opts&&opts.timeout)||45000);
+  try{
+    const r=await fetch(u, Object.assign({signal:ctrl.signal}, opts||{}, {headers:Object.assign(
+      {"X-HYCU-Cluster":(opts&&opts.cid)||ACTIVE_CID}, (opts&&opts.headers)||{})}));
+    setNet(false);
+    const txt=await r.text();
+    let j=null; try{ j=txt?JSON.parse(txt):{}; }catch(e){ j=null; }
+    if(j===null) return {ok:false, status:r.status, error:(r.status>=400?("HTTP "+r.status+" — "):"")+(txt||"réponse illisible").slice(0,200)};
+    if(j && typeof j==="object" && j.ok===undefined && j.error && r.status>=400) j.ok=false;
+    if(j && typeof j==="object") j.status=r.status;
+    return j;
+  }catch(e){
+    const aborted = e && e.name==="AbortError";
+    if(!aborted) setNet(true);
+    return {ok:false, status:0, error: aborted ? "Délai dépassé : le serveur ne répond pas." : "Serveur injoignable (réseau ou outil arrêté)."};
+  }finally{ clearTimeout(t); }
+}
+async function get(u, cid){ return api(u, {cid}); }
+async function post(u,b,cid){ return api(u, {method:"POST", cid, headers:{"Content-Type":"application/json","X-CSRF-Token":CSRF}, body:JSON.stringify(b)}); }
+window.addEventListener("unhandledrejection", e=>{ console.warn("Promesse non gérée :", e.reason); });
 
 // Erreurs actionnables : reconnaît les causes courantes (HYCU/Nutanix/kubectl/HTTP)
 // et préfixe un conseil concret, en gardant le détail brut en dessous.
@@ -9382,7 +10345,7 @@ function errBox(raw){
 // Préférences mémorisées PAR NAVIGATEUR (localStorage) : namespace, type d'opération,
 // dossiers. Confort uniquement — jamais d'identifiant ni de secret ici.
 const PREFS_KEY="hycu_prefs";
-function prefs(){ try{ return JSON.parse(localStorage.getItem(PREFS_KEY)||"{}"); }catch(e){ return {}; } }
+function prefs(){ try{ const p=JSON.parse(localStorage.getItem(PREFS_KEY)||"{}"); return (p && typeof p==="object" && !Array.isArray(p)) ? p : {}; }catch(e){ return {}; } }
 function savePref(k,v){ try{ const p=prefs(); p[k]=v; localStorage.setItem(PREFS_KEY,JSON.stringify(p)); }catch(e){} }
 function applyPrefs(){
   const p=prefs();
@@ -9419,6 +10382,7 @@ function switchTab(tab){
   if(tab==="restore") return openRestoreModal(state.ns);
   if(tab==="backup") return openBackupModal(state.ns?[state.ns]:[]);
   closeAllModals();
+  if(tab!=="verify" && vfTrack) vfStop();           // le suivi auto ne survit pas à un changement de page
   const navTab = tab==="verify" ? "apps" : tab;     // Vérification = sous-page d'Applications
   navBtns.forEach(x=>{ const on=x.dataset.tab===navTab; x.classList.toggle("on",on); x.setAttribute("aria-selected",on?"true":"false"); });
   PAGES.forEach(t=>$("#tab-"+t).style.display="none");
@@ -9507,11 +10471,24 @@ document.querySelector("nav").addEventListener("keydown",e=>{
 });
 
 // Bandeau simulation (source de vérité unique : #dry)
+// E1 : le mode simulation n'est proposé que si la configuration l'active
+// (simulation_mode_available). Sinon l'interface travaille en mode réel, bandeau et
+// interrupteur masqués ; les garde-fous (confirmation du cluster, préflight) restent.
+let SIM_AVAILABLE=false;
+function applySimAvailability(avail){
+  const was=SIM_AVAILABLE; SIM_AVAILABLE=!!avail;
+  $("#dryBar").style.display = SIM_AVAILABLE ? "" : "none";
+  if(!SIM_AVAILABLE) $("#dry").checked=false;
+  else if(!was) $("#dry").checked=true;          // simulation cochée par défaut quand elle est proposée
+  refreshDry();
+}
 function refreshDry(){
   const live=!dry();
   $("#dryBar").classList.toggle("live",live);
-  document.body.classList.toggle("realmode",live);   // barre rouge fixe + en-tête souligné
+  document.body.classList.toggle("realmode",live);   // barre rouge fixe + indicateur en-tête
   $("#dryLabel").textContent = live? "MODE RÉEL — les commandes seront exécutées" : "Mode simulation activé";
+  $("#dry").setAttribute("aria-checked", dry() ? "true" : "false");
+  const tb=$("#tbReal"); if(tb) tb.textContent = "MODE RÉEL · " + (ctxInfo.context || clById(ACTIVE_CID)&&clById(ACTIVE_CID).name || "cluster");
 }
 $("#dry").onchange=refreshDry;
 
@@ -9519,6 +10496,8 @@ $("#dry").onchange=refreshDry;
 //  - false si annulé ;  - true (ou le texte retapé) si confirmé.
 // opts = { title, lines:[html…], requireText:(string|null) }
 function confirmDanger(opts){
+  const bgx=$("#dangerModal");
+  if(bgx.style.display!=="none") return Promise.resolve(false);     // déjà ouverte : ignorer le double appel
   return new Promise(resolve=>{
     const bg=$("#dangerModal"), ok=$("#dmOk"), cancel=$("#dmCancel"), inp=$("#dmInput");
     $("#dmTitle").textContent=opts.title||"Confirmer l'action réelle";
@@ -9552,17 +10531,58 @@ function renderLog(log){
 
 // Lance une opération longue côté serveur et suit sa progression (polling), en
 // rafraîchissant l'affichage à chaque tick. Renvoie le résultat final.
+let CURRENT_OP=null;                 // {id, url, cid, ns} de l'opération suivie (persisté : reprise après F5)
+const OP_KEY="hycu_op";
+function rememberOp(o){ CURRENT_OP=o; try{ if(o) sessionStorage.setItem(OP_KEY, JSON.stringify(o)); else sessionStorage.removeItem(OP_KEY); }catch(e){} }
+async function followOp(opId, onProgress){
+  let errors=0;
+  for(let i=0;i<6000;i++){            // garde-fou : ~90 min à 0,9 s
+    const st = await get("/api/op_status?id="+encodeURIComponent(opId));
+    if(!st.ok){
+      if(st.status===0 || st.status>=500){      // coupure réseau / serveur : on réessaie (borné)
+        if(++errors<=20){ await sleep(2000); continue; }
+      }
+      rememberOp(null);
+      return {ok:false, error:st.error||"Suivi de l'opération interrompu (l'opération continue peut-être côté serveur)."};
+    }
+    errors=0;
+    if(onProgress) onProgress(st.log||[], st.done);
+    if(st.done){ rememberOp(null); return st.result || {ok:false, error:"Opération terminée sans résultat."}; }
+    await sleep(900);
+  }
+  rememberOp(null);
+  return {ok:false, error:"Délai de suivi dépassé (l'opération continue peut-être côté serveur)."};
+}
 async function runOp(url, body, onProgress){
   const start = await post(url, body);
   if(!start || !start.op_id){ return start || {ok:false, error:"Démarrage de l'opération impossible."}; }
-  for(let i=0;i<6000;i++){            // garde-fou : ~90 min à 0,9 s
-    const st = await get("/api/op_status?id="+encodeURIComponent(start.op_id));
-    if(!st.ok){ return {ok:false, error:st.error||"Suivi de l'opération interrompu."}; }
-    if(onProgress) onProgress(st.log||[], st.done);
-    if(st.done) return st.result || {ok:false, error:"Opération terminée sans résultat."};
-    await sleep(900);
-  }
-  return {ok:false, error:"Délai de suivi dépassé (l'opération continue peut-être côté serveur)."};
+  rememberOp({id:start.op_id, url, cid:ACTIVE_CID, ns:body&&body.namespace});
+  return followOp(start.op_id, onProgress);
+}
+// Demande d'arrêt coopératif : le serveur termine l'étape (volume) en cours puis s'arrête proprement.
+async function cancelCurrentOp(){
+  if(!CURRENT_OP) return;
+  const r=await post("/api/op_cancel",{id:CURRENT_OP.id});
+  const el=$("#rsProgressTxt"); if(el) el.textContent = r.ok ? "Arrêt demandé — fin de l'étape en cours…" : (r.error||"Arrêt impossible");
+}
+// Reprise du suivi après rechargement : une opération encore en cours côté serveur est proposée.
+async function resumeOps(){
+  let saved=null; try{ saved=JSON.parse(sessionStorage.getItem(OP_KEY)||"null"); }catch(e){}
+  const l=await get("/api/op_status");
+  const running=(l&&l.running)||[];
+  if(!running.length){ rememberOp(null); return; }
+  const op = (saved && running.find(o=>o.op_id===saved.id)) || running[0];
+  const banner=$("#opBanner"); if(!banner) return;
+  banner.style.display="block";
+  banner.innerHTML=`<div class="warnbox" style="display:flex;gap:12px;align-items:center;flex-wrap:wrap"><span class="spin"></span>
+    <b>Une opération est en cours</b> (${esc(op.kind||"opération")}${op.ns?(" · "+esc(op.ns)):""}).
+    <button class="btn ghost" id="opFollow">Suivre</button></div><div id="opBannerLog"></div>`;
+  $("#opFollow").onclick=async()=>{
+    $("#opFollow").disabled=true;
+    const r=await followOp(op.op_id, log=>{ $("#opBannerLog").innerHTML=renderLog(log); });
+    $("#opBannerLog").innerHTML=(r.ok?'<div class="note">Opération terminée.</div>':errBox(r.error||"Opération terminée avec des erreurs."))+renderLog(r.log);
+    banner.querySelector(".spin").style.display="none";
+  };
 }
 
 // Init : contexte + namespaces + config
@@ -9576,12 +10596,27 @@ async function initApp(){
   ["#bkNs","#rsNs","#vfNs"].forEach(id=>$(id).innerHTML = opts || "<option>—</option>");
   if(n.error){["#bkNs","#rsNs","#vfNs"].forEach(id=>$(id).innerHTML="<option>kubectl ?</option>");}
   applyPrefs();                               // derniers choix de CE navigateur (ns, mode, dossiers)
-  loadConfig();
+  await loadConfig();
   loadAutoBackup();
   await loadConnStatus();                     // ATTENDRE que `conn` soit prêt (sinon la popup
   maybePromptUnlock();                        // de déverrouillage ne s'affichait jamais)
   onPageShown(curPage);                       // (re)charge les données de la page affichée
+  resumeOps();                                // opération encore en cours côté serveur ?
 }
+// Accessibilité : associe chaque <label class="fld"> sans `for` au champ qui le suit
+// (HTML statique et blocs rendus dynamiquement : observateur du DOM, débounce).
+let _lblN=0, _lblT=null;
+function linkLabels(){
+  document.querySelectorAll("label.fld").forEach(l=>{
+    if(l.getAttribute("for") || l.querySelector("input,select,textarea")) return;
+    const el=l.nextElementSibling && (l.nextElementSibling.matches("input,select,textarea") ? l.nextElementSibling : l.nextElementSibling.querySelector("input,select,textarea"));
+    if(!el) return;
+    if(!el.id) el.id="fld-"+(++_lblN);
+    l.setAttribute("for", el.id);
+  });
+}
+linkLabels();
+new MutationObserver(()=>{ clearTimeout(_lblT); _lblT=setTimeout(linkLabels, 150); }).observe(document.body, {childList:true, subtree:true});
 (async()=>{
   ACTIVE_CID = prefs().cluster || "local";
   const cfg = await get("/api/config");
@@ -9597,7 +10632,7 @@ function maybePromptUnlock(){
   $("#unlock").style.display="flex";
   setTimeout(()=>$("#unlockPass").focus(),60);
 }
-$("#unlockSkip").onclick=()=>{ $("#unlock").style.display="none"; };
+$("#unlockSkip").onclick=()=>{ $("#unlockPass").value=""; $("#unlock").style.display="none"; };
 $("#unlockPass").onkeydown=(e)=>{ if(e.key==="Enter") $("#unlockGo").click(); };
 $("#unlockGo").onclick=async()=>{
   $("#unlockErr").innerHTML="";
@@ -9889,7 +10924,8 @@ $("#bkProtect").onclick=async()=>{
      (pol?"Assigner la politique puis <b>sauvegarder</b>":"<b>Sauvegarder</b>")+" ces Volume Groups :",
      "<b>"+names.map(esc).join("</b>, <b>")+"</b>"]}))) return;
   const b=$("#bkProtect"); b.disabled=true; b.innerHTML='<span class="spin"></span>…';
-  const r=await post("/api/hycu/protect",{namespace:bkMatchNs, vg_uuids, policy_uuid:pol, force_full:$("#bkForceFull").checked, dry:dry()});
+  const byName=sel.filter(c=>c.dataset.kind==="name").map(c=>c.dataset.uuid);   // cochés = confirmés par l'opérateur
+  const r=await post("/api/hycu/protect",{namespace:bkMatchNs, vg_uuids, policy_uuid:pol, force_full:$("#bkForceFull").checked, dry:dry(), confirm_name_uuids:byName});
   b.disabled=false; b.textContent="Assigner + sauvegarder maintenant";
   if(!r.ok && !(r.steps&&r.steps.length)){ $("#bkProtectLog").innerHTML=errBox(r.error); return; }
   const lines=(r.steps||[]).map(s=> s.dry
@@ -9911,13 +10947,14 @@ let rsBackups = [];   // sauvegardes de config du namespace courant (la plus ré
 let loadPvcsSeq=0;     // jeton anti-course : un fetch dépassé (autre namespace/cluster) est ignoré
 async function loadPvcs(){
   const sel=$("#rsNs"); if(!sel.value) return;
-  const ns=sel.value; state.ns=ns; state.pvcNs=ns; rsHyMatch=null; rsInplaceSel={};
+  const ns=sel.value; state.ns=ns; state.pvcNs=ns; rsHyMatch=null; rsInplaceSel={}; invalidatePlan();
   if(state.app && state.app.ns!==ns){ state.app=null; $("#rsWizApp").innerHTML=rsAppLabel(); }   // autre namespace choisi : plus d'application ciblée
   const seq=++loadPvcsSeq;
   const customRoot = $("#rsCustomDir").checked ? $("#rsBackupRoot").value.trim() : "";
   state.backup_root = customRoot || null;
   const bk=await get("/api/backups?ns="+encodeURIComponent(ns)+(customRoot?("&root="+encodeURIComponent(customRoot)):""));
   if(seq!==loadPvcsSeq || state.ns!==ns) return;   // périmé : une autre application a été ouverte entre-temps
+  if(bk.error && !bk.backups){ $("#rsPvcs").innerHTML=errBox(bk.error); return; }
   rsBackups = bk.backups || [];
   const wrap=$("#rsBackupSelWrap"), selEl=$("#rsBackupSel");
   if(rsBackups.length){
@@ -10032,7 +11069,8 @@ function rebuildVolCfgs(){
   }
   $("#rsFlowGuide").innerHTML = guide;
   // Barre « action suivante » + état des références en direct.
-  document.querySelectorAll(".rsRef").forEach(t=>t.addEventListener("input",()=>{ refreshRefStats(); syncContinueVisibility(); updateNextBar(); }));
+  document.querySelectorAll(".rsRef").forEach(t=>t.addEventListener("input",()=>{ invalidatePlan(); refreshRefStats(); syncContinueVisibility(); updateNextBar(); }));
+  document.querySelectorAll(".rsName").forEach(t=>t.addEventListener("input",invalidatePlan));
   refreshRefStats();
   rsFullOrch=false;     // recalculé par buildHyPanel selon la couverture HYCU
   buildHyPanel();       // remplit les points de restauration (asynchrone) — rien si HYCU non connecté
@@ -10298,7 +11336,8 @@ function renderCloneAppPlan(r){
   $("#rsSteps").innerHTML='<li>Créer le namespace cible (si « autre »)</li>'+(rsStatelessClone()?'':'<li>Créer les PV/PVC clonés (sur le VG cloné)</li>')+'<li>Créer les applications clonées (elles démarrent automatiquement)</li><li>L\'application d\'origine n\'est PAS modifiée ni arrêtée</li>';
   $("#rsPlan").style.display="block"; setRsStep(3);
   updateGoButton(r.ok);
-  $("#rsPlan").scrollIntoView({behavior:"smooth",block:"start"});   // amener l'étape 3 sous les yeux
+  if($("#mRestore").style.display!=="none") rsShowPage("plan");
+  else $("#rsPlan").scrollIntoView({behavior:"smooth",block:"start"});
 }
 
 function collectItems(){
@@ -10330,7 +11369,8 @@ $("#rsPreview").onclick=async()=>{
   let html="";
   (r.results||[]).forEach(res=>{
     if(!res.ok){html+=`<div class="err"><b>${esc(res.pvc)}</b> : ${esc(res.error)}</div>`;return;}
-    const repl=(res.replacements||[]).map(([k,o,n])=>`<div><span class="k">${esc(k)}</span> :
+    const REPL_LABEL={vg_uuid:"UUID du VG", pv_name:"nom du PV", volumeHandle:"volumeHandle"};   // clés stables -> libellés
+    const repl=(res.replacements||[]).map(([k,o,n])=>`<div><span class="k">${esc(REPL_LABEL[k]||k)}</span> :
        <span class="old">${esc(o)}</span> → <span class="new">${esc(n)}</span></div>`).join("")||
        '<div class="hint">Aucun changement de chaîne.</div>';
     const warn = res.warn? `<div class="warnbox">⚠ ${esc(res.warn)}</div>` : "";
@@ -10340,13 +11380,29 @@ $("#rsPreview").onclick=async()=>{
        <pre class="box">${esc(res.manifest_preview)}</pre></details></div>`;
   });
   $("#rsRepl").innerHTML=html;
-  $("#rsSteps").innerHTML=(r.planned_steps||[]).map(s=>`<li>${esc(s)}</li>`).join("");
+  $("#rsSteps").innerHTML=(r.planned_steps||[]).map(s=>`<li class="${/^(Supprimer|Arrêter|Delete|Stop)/.test(s)?'danger':''}">${esc(s)}</li>`).join("");
   $("#rsPlan").style.display="block"; setRsStep(3);
   if(!r.ok){$("#rsErr").innerHTML='<div class="err">Corrigez les volumes en erreur avant de lancer.</div>';}
   updateGoButton(r.ok);
-  $("#rsPlan").scrollIntoView({behavior:"smooth",block:"start"});   // amener l'étape 3 sous les yeux
+  if($("#mRestore").style.display!=="none") rsShowPage("plan");       // page 3 de l'assistant
+  else $("#rsPlan").scrollIntoView({behavior:"smooth",block:"start"});
 };
+// Toute modification des références/noms rend le plan périmé : il faut re-prévisualiser.
+function invalidatePlan(){
+  if(!state.preview) return;
+  state.preview=null; $("#rsPlan").style.display="none"; $("#rsLog").innerHTML="";
+  if(typeof rsWizPage!=="undefined" && rsWizPage==="plan") rsShowPage("form");
+  setRsStep(2);
+}
 
+let rsRunning=false;
+$("#rsCancel").onclick=()=>{ $("#rsCancel").disabled=true; cancelCurrentOp(); };
+// Liste ✓/✕ du préflight renvoyée par le serveur (contrôles AVANT tout arrêt de l'application).
+function renderPreflight(checks){
+  if(!checks || !checks.length) return "";
+  return `<details class="preflight" ${checks.some(c=>c.ok===false)?"open":""}><summary><b>Préflight</b> — ${checks.filter(c=>c.ok!==false).length}/${checks.length} contrôles passés</summary>
+    <ul class="pvc-list">${checks.map(c=>`<li class="logline">${stIc(c.ok===false?"ko":(c.ok===null?"na":"ok"), c.ok===false?"Échec":"OK")}<span><b>${esc(c.name)}</b>${c.detail?(' — <span class="hint">'+esc(c.detail)+'</span>'):''}</span></li>`).join("")}</ul></details>`;
+}
 function updateGoButton(ready){
   refreshDry();
   const live=!dry();
@@ -10416,11 +11472,20 @@ $("#rsGo").onclick=async()=>{
   const b=$("#rsGo"); b.disabled=true; b.innerHTML='<span class="spin"></span>Exécution…';
   const body={...state.preview,dry:dry()};
   if(live && ctxInfo.require_confirm) body.confirm_context=confirmedCtx || $("#rsCtxInput").value.trim();
+  setRsStep(4); rsRunning=true;
+  const total=($("#rsSteps").children.length||1)+8;              // étapes prévues + préflight/réplicas/vérif
+  $("#rsProgress").style.display="block"; $("#rsProgressBar").style.width="2%";
+  $("#rsProgressTxt").textContent="Démarrage…"; $("#rsCancel").style.display = live ? "" : "none"; $("#rsCancel").disabled=false;
   $("#rsLog").innerHTML='<div class="hint"><span class="spin"></span> Démarrage…</div>';
   const r=await runOp("/api/execute_restore", body, log=>{
+    const done=log.length, last=log[log.length-1];
+    $("#rsProgressBar").style.width=Math.min(96, Math.round(100*done/total))+"%";
+    $("#rsProgressTxt").textContent="Étape "+done+" · "+((last&&last.label)||"…");
     $("#rsLog").innerHTML='<div class="hint"><span class="spin"></span> Exécution en cours…</div>'+renderLog(log); });
+  rsRunning=false; $("#rsCancel").style.display="none";
+  $("#rsProgressBar").style.width="100%"; $("#rsProgressTxt").textContent = r.aborted ? "Interrompue" : (r.ok ? "Terminée" : "Terminée avec erreurs");
   b.disabled=false; updateGoButton(true);
-  if(r.error && !(r.log&&r.log.length)){$("#rsLog").innerHTML=errBox(r.error);return;}
+  if(r.error && !(r.log&&r.log.length)){$("#rsLog").innerHTML=errBox(r.error)+renderPreflight(r.preflight);return;}
   const lines=renderLog(r.log);
   let head;
   if(r.dry) head='<div class="note">Simulation terminée — voici ce qui serait exécuté en mode réel.</div>';
@@ -10435,7 +11500,7 @@ $("#rsGo").onclick=async()=>{
        <ul class="pvc-list" style="margin-top:8px">${items}</ul>
        <button class="btn" id="rsReprotectBtn" style="margin-top:6px">Re-protéger maintenant dans HYCU</button></div>`;
   }
-  $("#rsLog").innerHTML = head + lines + reprot;
+  $("#rsLog").innerHTML = head + renderPreflight(r.preflight) + lines + reprot;
   const rb=$("#rsReprotectBtn"); if(rb) rb.onclick=()=>goReprotect($("#rsNs").value);
   if(!r.dry && r.ok && !r.aborted){
     if(reprot){   // ne pas quitter la page tant que la re-protection HYCU n'est pas traitée
@@ -10488,17 +11553,19 @@ async function runVerify(){
 $("#vfRun").onclick=runVerify;
 // Suivi auto CONTINU : rafraîchit toutes les ~3 s jusqu'à l'état stable (tous les PVC
 // Bound + pods Running), avec plafond de sécurité ~10 min. Re-cliquer arrête le suivi.
-let vfTrack=false;
+let vfTrack=false, vfSeq=0;
 function vfSetBtn(){ $("#vfAuto").textContent = vfTrack? "■ Arrêter le suivi" : "Suivi auto (jusqu'à stable)"; }
+function vfStop(){ vfSeq++; vfTrack=false; vfSetBtn(); }
 async function vfAutoTrack(){
-  if(vfTrack){ vfTrack=false; return; }          // stop demandé : la boucle en cours s'arrête
-  vfTrack=true; vfSetBtn();
-  for(let i=0;i<200 && vfTrack;i++){             // ~10 min à 3 s
+  if(vfTrack){ vfStop(); return; }               // stop demandé : la boucle en cours s'arrête
+  const my=++vfSeq; vfTrack=true; vfSetBtn();
+  for(let i=0;i<200 && vfTrack && vfSeq===my;i++){   // ~10 min à 3 s ; une seule boucle à la fois
     const done=await runVerify();
+    if(vfSeq!==my) return;
     if(done){ $("#vfOut").insertAdjacentHTML("afterbegin",'<div class="note">État stable : tous les PVC sont Bound et les pods Running.</div>'); break; }
     await sleep(3000);
   }
-  vfTrack=false; vfSetBtn();
+  if(vfSeq===my){ vfTrack=false; vfSetBtn(); }
 }
 $("#vfAuto").onclick=vfAutoTrack;
 // Ouvre l'onglet Vérifier sur un namespace donné (après une restauration réelle) et
@@ -10524,8 +11591,11 @@ async function loadConfig(){
   $("#cfgMinFree").value=(c.storage_min_free_mb??500);
   $("#cfgQuota").value=(c.storage_quota_gb??0);
   $("#cfgDr").checked=!!c.allow_dr_restore;
+  $("#cfgHosts").value=(c.allowed_hosts||[]).join(", ");
   $("#cfgWait").value=c.wait_timeout; $("#cfgSuffix").value=c.clone_name_suffix||"";
   $("#cfgConfirm").checked=!!c.require_context_confirm; $("#cfgStrip").checked=!!c.strip_claimref;
+  $("#cfgSim").checked=!!c.simulation_mode_available; $("#cfgLang").value=c.default_lang||"en";
+  applySimAvailability(c.simulation_mode_available);
   $("#cfgKubeconfig").value=c.kubeconfig_path||"";
   $("#cfgContext").innerHTML=`<option value="${esc(c.kube_context||'')}">${esc(c.kube_context||'(contexte courant du kubeconfig)')}</option>`;
 }
@@ -10550,16 +11620,18 @@ function csv(s){return (s||"").split(",").map(x=>x.trim()).filter(Boolean);}
 $("#cfgSave").onclick=async()=>{
   const cfg={kubectl_path:$("#cfgKubectl").value.trim()||"kubectl",
     volume_handle_prefix:$("#cfgVhPrefix").value.trim(),
-    allowed_contexts:csv($("#cfgCtx").value), namespace_filter:csv($("#cfgNs").value),
+    allowed_contexts:csv($("#cfgCtx").value), namespace_filter:csv($("#cfgNs").value), allowed_hosts:csv($("#cfgHosts").value),
     namespace_label_selector:$("#cfgLabelSel").value.trim(),
     audit_retention_days:Math.max(0,parseInt($("#cfgAuditDays").value)||0),
     storage_min_free_mb:Math.max(0,parseInt($("#cfgMinFree").value)||0),
     storage_quota_gb:Math.max(0,parseInt($("#cfgQuota").value)||0),
     allow_dr_restore:$("#cfgDr").checked,
     wait_timeout:parseInt($("#cfgWait").value)||120, clone_name_suffix:$("#cfgSuffix").value.trim()||"0000",
-    require_context_confirm:$("#cfgConfirm").checked, strip_claimref:$("#cfgStrip").checked};
+    require_context_confirm:$("#cfgConfirm").checked, strip_claimref:$("#cfgStrip").checked,
+    simulation_mode_available:$("#cfgSim").checked, default_lang:$("#cfgLang").value};
   const r=await post("/api/config",{config:cfg});
   $("#cfgMsg").textContent = r.ok? "Enregistré." : ("Erreur : "+(r.error||""));
+  if(r.ok) applySimAvailability(cfg.simulation_mode_available);   // bandeau simulation affiché/masqué sans rechargement
   ctxInfo=await get("/api/context");
 };
 
@@ -10854,13 +11926,37 @@ refreshDry();
 var rsAutoCheck=false;            // assistant ouvert : volumes présélectionnés (cf. renderRsPvcs)
 var pageTimer=null;
 const MODALS=["mBackup","mPolicy","mRestore","mSources"];
-function openModal(id){ $("#"+id).style.display="flex"; }
+const FOCUSABLE='a[href],button:not([disabled]),input:not([disabled]):not([type=hidden]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])';
+let modalReturnFocus={};
+function openModal(id){
+  const m=$("#"+id); if(!m) return;
+  const box=m.querySelector(".hmodal")||m;
+  box.setAttribute("role","dialog"); box.setAttribute("aria-modal","true");
+  const h=box.querySelector("h2,h3"); if(h){ if(!h.id) h.id=id+"-title"; box.setAttribute("aria-labelledby",h.id); }
+  modalReturnFocus[id]=document.activeElement;
+  m.style.display="flex";
+  const first=box.querySelector(FOCUSABLE); if(first) setTimeout(()=>first.focus(),30);
+}
 function closeModal(id){
   const m=$("#"+id); if(!m || m.style.display==="none") return;
+  if(id==="mRestore" && rsRunning){
+    $("#rsLog").insertAdjacentHTML("afterbegin",'<div class="warnbox">Opération en cours : elle continue côté serveur. Vous pourrez reprendre le suivi depuis le bandeau en haut de page.</div>');
+  }
   m.style.display="none";
   if(id==="mRestore") rsAutoCheck=false;
+  if(id==="mSources"){ const k=$("#clKc"); if(k) k.value=""; const n=$("#clName"); if(n) n.value=""; }   // kubeconfig = secret
+  const rf=modalReturnFocus[id]; if(rf && rf.focus) try{ rf.focus(); }catch(e){}
   if(id!=="mSources") onPageShown(curPage);        // l'opération a pu changer l'état affiché
 }
+// Piège de focus : Tab reste dans la modale ouverte la plus haute.
+document.addEventListener("keydown", e=>{
+  if(e.key!=="Tab") return;
+  const open=MODALS.map(id=>$("#"+id)).filter(m=>m && m.style.display!=="none");
+  const m=open[open.length-1]; if(!m) return;
+  const f=[...m.querySelectorAll(FOCUSABLE)].filter(el=>el.offsetParent!==null); if(!f.length) return;
+  if(e.shiftKey && document.activeElement===f[0]){ e.preventDefault(); f[f.length-1].focus(); }
+  else if(!e.shiftKey && document.activeElement===f[f.length-1]){ e.preventDefault(); f[0].focus(); }
+});
 function closeAllModals(){ MODALS.forEach(closeModal); }
 document.querySelectorAll("[data-close]").forEach(b=>b.onclick=()=>closeModal(b.dataset.close));
 document.addEventListener("keydown",e=>{
@@ -10904,10 +12000,17 @@ function fmtAgo(ts){
   if(s<86400) return AGO.h.replace("%d", Math.round(s/3600));
   return AGO.d.replace("%d", Math.round(s/86400));
 }
-function fmtTs(iso){ if(!iso) return "—"; const d=new Date(iso); return isNaN(d)? String(iso) : d.toLocaleString(); }
+let DATE_FMT=null;   // créé à la première utilisation (PAGE_LANG est déclarée en fin de script)
+function fmtTs(iso){
+  if(!iso) return "—"; const d=new Date(iso); if(isNaN(d)) return String(iso);
+  if(!DATE_FMT) DATE_FMT=new Intl.DateTimeFormat(document.documentElement.lang==="en" ? "en-GB" : "fr-FR", {dateStyle:"short", timeStyle:"medium"});
+  return DATE_FMT.format(d);
+}
+const ST_LABEL={ok:"OK", ko:"Échec", wn:"Avertissement", na:"Inconnu", sim:"Simulation", run:"En cours"};
 function stIc(kind, title){
   const g={ok:"✓", ko:"✕", wn:"!", na:"?", sim:"○", run:"▸"}[kind]||"?";
-  return `<span class="st ${kind}" title="${esc(title||"")}">${g}</span>`;
+  const lab=title||ST_LABEL[kind]||"";
+  return `<span class="st ${kind}" role="img" aria-label="${esc(lab)}" title="${esc(lab)}">${g}</span>`;
 }
 function dnums(l1, v1, l2, v2){
   return `<div class="dnums"><div><div class="l">${l1}</div><div class="v">${v1}</div></div>`+
@@ -11362,6 +12465,7 @@ document.addEventListener("click",()=>{ ["clMenu","gearMenu","helpMenu"].forEach
 async function setActiveCluster(cid){
   if(!clById(cid)) return;
   ACTIVE_CID=cid; savePref("cluster", cid);
+  if(vfTrack) vfStop();                             // ni à un changement de cluster
   ["mBackup","mPolicy","mRestore"].forEach(closeModal);
   if(appsScope!=="all") appsSel.clear();
   state.ns=null;
@@ -11607,7 +12711,8 @@ function storageBar(pct){
     <div style="width:${Math.min(100,pct)}%;height:100%;background:${col}"></div></div>`;
 }
 async function loadDashboard(){
-  const [a, j, ab, st]=await Promise.all([get("/api/applications"), get("/api/jobs"), get("/api/auto_backup"), get("/api/storage")]);
+  const [a, j, ab, st]=(await Promise.allSettled([get("/api/applications"), get("/api/jobs"), get("/api/auto_backup"), get("/api/storage")]))
+    .map(x=>x.status==="fulfilled" ? x.value : {ok:false, error:String(x.reason||"erreur")});
   const alive=(a.apps||[]).filter(x=>!x.missing), n=alive.length;
   const prot=n ? Math.round(100*alive.filter(x=>x.protected).length/n) : 0;
   const comp=n ? Math.round(100*alive.filter(x=>x.compliant).length/n) : 0;
@@ -11720,6 +12825,7 @@ document.querySelectorAll("#rsPgTarget .opt").forEach(o=>{
 function rsShowPage(p){
   rsWizPage=p;
   if(p==="target"){ rsTgtMode=state.cloneNsMode||"same"; rsSyncTgtOpts(); }
+  setRsStep(p==="type" ? 1 : p==="form" ? 2 : 3);
   $("#rsPgType").style.display = p==="type" ? "block" : "none";
   $("#rsPgTarget").style.display = p==="target" ? "block" : "none";
   $("#rsPgObjects").style.display = p==="objects" ? "block" : "none";
@@ -11809,10 +12915,6 @@ async function rsToForm(){
   await loadPvcs();
   rsWizSync();
 }
-// Le récapitulatif s'affiche (plan construit) -> page 3 de l'assistant.
-new MutationObserver(()=>{
-  if($("#mRestore").style.display!=="none" && rsWizPage==="form" && $("#rsPlan").style.display!=="none") rsShowPage("plan");
-}).observe($("#rsPlan"), {attributes:true, attributeFilter:["style"]});
 // UNE action principale dans le pied de modale, qui relaie le bouton d'origine adapté
 // à l'étape (clone HYCU groupé, restauration sur place, construction du plan, lancement).
 function rsWizSync(){
@@ -12129,974 +13231,4883 @@ $("#langBtn").onclick=()=>{
 };
 </script>
 </body>
-</html>
-"""
+</html>"""
+HTML_EN = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="csrf-token" content="__CSRF_TOKEN__">
+<title>HYCU · Kubernetes on Nutanix</title>
+<style>
+  /* ==========================================================================
+     Charte « HYCU Enterprise Cloud » — couleurs PRÉLEVÉES sur l'interface HYCU
+     (aucune autre teinte : pas d'accent fluo, pas de dégradé).
+       barre du haut #41327C · action/sélection #7530F0 · fond #F3F4F9
+       titres #4B5274 · texte #3D4464 / #2A2E44 · gris #A5A8B9 · filets #AFC2D6
+       succès #05A274 (anneau clair #9BDAC7) · échec #E9605A · avertissement #CA923E
+     ========================================================================== */
+  :root{
+    --top:#41327C; --purple:#7530F0; --purple-d:#5F22D6; --purple-t:#EFE8FD;
+    --bg:#F3F4F9; --card:#FFFFFF; --title:#4B5274; --text:#3D4464; --strong:#2A2E44;
+    --muted:#6B7089; --grey:#8A8FA3; --rule:#8A9BB0; --line:#E3E7EE;
+  /* variantes « texte » conformes aux contrastes (≥ 4.5:1 sur blanc) */
+  --green-t:#047857; --red-t:#C53030; --orange-t:#9A6B1E;
+    --green:#05A274; --green-l:#9BDAC7; --red:#E9605A; --orange:#CA923E; --blue:#6688FF;
+    /* alias historiques (utilisés par du HTML/JS existant) */
+    --ink:var(--strong); --paper:var(--bg); --teal:var(--purple); --teal-d:var(--top);
+    --accent:var(--purple); --amber:var(--orange); --good:var(--green); --warn:var(--orange);
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{margin:0;font-family:Ubuntu,"Segoe UI",system-ui,-apple-system,Roboto,Arial,sans-serif;
+       background:var(--bg);color:var(--text);font-size:14px;line-height:1.45}
+  .mono,code,pre,textarea,.tag{font-family:"Ubuntu Mono",Consolas,"SF Mono",Menlo,monospace}
+  code{font-size:12.5px}
+  a{color:var(--purple)}
+  button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible,[tabindex]:focus-visible{
+    outline:2px solid var(--purple);outline-offset:2px}
 
-# Édition assistée en dev : si un fichier `ui.html` est présent à côté du programme,
-# il REMPLACE l'UI embarquée (coloration/lint/autocomplétion dans l'éditeur). Le `.py`
-# reste 100 % autonome : sans `ui.html`, l'UI embarquée ci-dessus est utilisée.
-# (Pour créer le point de départ : dumper la constante HTML dans ui.html.)
-# Interface de développement : un ui.html À CÔTÉ DU PROGRAMME remplace l'interface
-# embarquée — uniquement si HYCU_DEV_UI=1 (jamais en production : un fichier déposé dans
-# le répertoire courant d'un conteneur ne doit pas substituer l'UI).
-_UI_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui.html")
-if os.environ.get("HYCU_DEV_UI") == "1" and os.path.isfile(_UI_PATH):
+  /* ---------- Barre du haut ---------- */
+  .topbar{position:sticky;top:0;z-index:70;height:64px;background:var(--top);color:#fff;
+          display:flex;align-items:center;justify-content:space-between;padding:0 22px}
+  .tb-brand{display:flex;align-items:center;gap:10px;color:#fff;text-decoration:none}
+  .tb-brand .logo{height:30px;width:auto;display:block}
+  .tb-word{font-size:27px;font-weight:700;letter-spacing:.5px}
+  .tb-word sup{font-size:9px;font-weight:400;margin-left:1px}
+  .tb-prod{font-size:13px;color:#fff;opacity:.85;border-left:1px solid rgba(255,255,255,.35);
+           padding-left:12px;margin-left:4px}
+  .tb-right{display:flex;align-items:center;gap:20px}
+  .tb-link{display:flex;align-items:center;gap:8px;color:#fff;font-size:14px;cursor:pointer;
+           background:none;border:none;padding:0;font-family:inherit}
+  .tb-link u{text-underline-offset:3px}
+  .tb-ico{background:none;border:none;color:#fff;cursor:pointer;padding:0;display:flex;align-items:center}
+  .tb-ico svg,.tb-link svg{display:block}
+  .tb-ico:hover,.tb-link:hover{opacity:.8}
+  .tb-lang{background:none;border:1px solid rgba(255,255,255,.55);color:#fff;border-radius:4px;min-height:32px;min-width:40px;
+           padding:2px 9px;font-size:12px;font-weight:700;cursor:pointer;font-family:inherit}
+  .hdrconn{display:flex;gap:10px;cursor:pointer}
+  .hdrconn .hc{font-size:11px;font-weight:700;color:#fff;letter-spacing:.3px;display:flex;align-items:center}
+  .ctx{display:none}
+  #ctxWarn .bad{color:#fff;background:var(--red);border-radius:3px;padding:0 6px;font-size:11px;margin-left:6px}
+
+  /* ---------- Coquille : barre latérale + contenu ---------- */
+  .shell{display:flex;align-items:flex-start;min-height:calc(100vh - 64px)}
+  nav.sidebar{position:sticky;top:64px;flex:none;width:204px;height:calc(100vh - 64px);background:#fff;
+              display:flex;flex-direction:column;padding:12px 0 10px;border-right:1px solid var(--line);
+              border-radius:0 10px 0 0;margin-top:0}
+  nav.sidebar button{display:flex;align-items:center;gap:13px;width:calc(100% - 16px);margin:2px 8px;
+              background:none;border:none;border-radius:6px;padding:9px 12px;font-size:14px;color:var(--strong);
+              cursor:pointer;text-align:left;font-family:inherit}
+  nav.sidebar button svg{flex:none;width:24px;height:24px;color:var(--top)}
+  nav.sidebar button:hover{background:var(--purple-t)}
+  nav.sidebar button.on{background:var(--purple);color:#fff}
+  nav.sidebar button.on svg{color:#fff}
+  nav.sidebar .sb-sep{height:1px;background:var(--grey);opacity:.5;margin:10px 22px}
+  nav.sidebar .sb-foot{margin-top:auto;text-align:center;color:var(--grey);font-size:12px}
+  nav.sidebar .sb-col{background:none;border:none;color:var(--top);cursor:pointer;width:auto;margin:0 auto 6px;
+              display:block;padding:4px 10px}
+  nav.sidebar .sb-col svg{width:20px;height:20px}
+  nav.sidebar .sb-col:hover{background:none;opacity:.7}
+  body.sb-min nav.sidebar{width:64px}
+  body.sb-min nav.sidebar button .nl{display:none}
+  body.sb-min nav.sidebar button{justify-content:center;padding:9px 0}
+  body.sb-min nav.sidebar .sb-col svg{transform:rotate(180deg)}
+  body.sb-min nav.sidebar .ver{display:none}
+  main.wrap{flex:1;min-width:0;padding:18px 26px 40px}
+
+  /* ---------- En-tête de page (titre + actions à droite) ---------- */
+  .pagehead{display:flex;align-items:center;justify-content:space-between;gap:16px;margin:2px 0 14px;flex-wrap:wrap}
+  .ptitle{margin:0;font-size:27px;font-weight:500;color:var(--title);display:flex;align-items:center;gap:10px}
+  .ptitle .crumb{color:var(--title);cursor:pointer;text-decoration:none}
+  .ptitle .crumb:hover{text-decoration:underline}
+  .ptitle .sep{font-size:22px;color:var(--grey)}
+  .pacts{display:flex;gap:22px;align-items:center;flex-wrap:wrap}
+  .pact{display:flex;align-items:center;gap:7px;background:none;border:none;padding:4px 0;cursor:pointer;
+        font-size:14px;color:var(--text);font-family:inherit}
+  .pact svg{width:22px;height:22px;color:var(--top);flex:none}
+  .pact:hover:not(:disabled){color:var(--purple)}
+  .pact:disabled{color:var(--grey);cursor:not-allowed}
+  .pact:disabled svg{color:var(--grey)}
+  .refresh{background:none;border:none;cursor:pointer;color:var(--top);padding:0;display:flex}
+  .refresh svg{width:22px;height:22px}
+  .refresh.busy svg{animation:sp .9s linear infinite}
+
+  /* ---------- Bandeau simulation / mode réel ---------- */
+  .dry{display:flex;align-items:center;gap:12px;background:#fff;border:1px solid var(--line);
+       border-left:4px solid var(--purple);border-radius:4px;padding:8px 14px;font-size:13px;margin-bottom:16px;
+       color:var(--text)}
+  .dry b{color:var(--strong)}
+  .dry.live{border-left-color:var(--red);background:#FDF0EF}
+  .dry.live b{color:var(--red)}
+  .realbar{position:fixed;top:0;left:0;right:0;height:4px;background:var(--red);z-index:200;display:none}
+  body.realmode .realbar{display:block}
+
+  /* ---------- Cartes, champs, boutons ---------- */
+  .card{background:var(--card);border-radius:6px;padding:18px 20px;margin-bottom:16px;
+        box-shadow:0 1px 2px rgba(65,50,124,.06)}
+  .card h3{margin:0 0 4px;font-size:17px;font-weight:500;color:var(--title);display:flex;align-items:center}
+  .card p.sub{margin:0 0 12px;color:var(--muted);font-size:13px}
+  .step-no{display:inline-flex;align-items:center;justify-content:center;min-width:24px;height:24px;padding:0 5px;
+           border-radius:12px;background:var(--purple-t);color:var(--top);font-size:12px;font-weight:700;
+           margin-right:9px;flex:none}
+  label.fld{display:block;font-size:13px;color:var(--text);margin:12px 0 5px}
+  select,input[type=text],input[type=password],input[type=number],textarea{width:100%;padding:8px 11px;
+        border:1px solid var(--rule);border-radius:4px;background:#fff;font-size:14px;color:var(--strong);
+        font-family:inherit;min-height:38px}
+  select{appearance:none;-webkit-appearance:none;padding-right:34px;cursor:pointer;
+        background:#fff url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'><path d='M1 1.5l5 5 5-5' fill='none' stroke='%2341327C' stroke-width='1.8'/></svg>") no-repeat right 12px center}
+  select:focus,input:focus,textarea:focus{outline:none;border-color:var(--purple);box-shadow:0 0 0 2px var(--purple-t)}
+  input[type=checkbox]{accent-color:var(--purple);width:18px;height:18px;vertical-align:-3px}
+  textarea{resize:vertical;min-height:46px;font-size:12.5px}
+  .row{display:flex;gap:12px;flex-wrap:wrap}
+  .row > div{flex:1;min-width:180px}
+  .btn{background:var(--purple);color:#fff;border:1px solid var(--purple);border-radius:4px;padding:8px 20px;
+       font-size:14px;cursor:pointer;font-weight:500;font-family:inherit;min-height:38px;
+       display:inline-flex;align-items:center;justify-content:center;gap:6px}
+  .btn:hover{background:var(--purple-d);border-color:var(--purple-d)}
+  .btn:disabled{background:#E9E6F3;border-color:#E9E6F3;color:#6B7089;cursor:not-allowed}
+  .btn.ghost:disabled{background:#F3F4F9;border-color:#C9CDD9;color:#6B7089}
+  .btn.ghost{background:#fff;color:var(--top);border:1px solid var(--top)}
+  .btn.ghost:hover{background:var(--purple-t)}
+  .btn.danger{background:var(--red);border-color:var(--red)}
+  .btn.danger:hover{background:#D64B45;border-color:#D64B45}
+  .lnk{background:none;border:none;padding:8px 10px;min-height:36px;color:var(--strong);text-decoration:underline;
+       text-underline-offset:3px;cursor:pointer;font-size:14px;font-family:inherit}
+  .lnk:hover{color:var(--purple)}
+  .seg{display:inline-flex;border:1px solid var(--rule);border-radius:4px;overflow:hidden}
+  .seg button{background:#fff;border:none;border-right:1px solid var(--rule);padding:8px 16px;font-size:13px;
+              cursor:pointer;color:var(--text);font-family:inherit}
+  .seg button:last-child{border-right:none}
+  .seg button.on{background:var(--top);color:#fff}
+  .conn-dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:var(--grey);margin-right:6px;vertical-align:0}
+  .conn-dot.on{background:var(--green)}
+  .topbar .conn-dot{background:rgba(255,255,255,.45)}
+  .topbar .conn-dot.on{background:#fff}
+  .switch{position:relative;display:inline-block;width:38px;height:20px;flex:none}
+  .switch input{opacity:0;width:0;height:0}
+  .slider{position:absolute;inset:0;background:var(--red);border-radius:20px;cursor:pointer;transition:.2s}
+  .slider:before{content:"";position:absolute;height:14px;width:14px;left:3px;top:3px;background:#fff;
+                 border-radius:50%;transition:.2s}
+  input:checked + .slider{background:var(--purple)}
+  input:checked + .slider:before{transform:translateX(18px)}
+  .switch.onoff .slider{background:#fff;border:1px solid var(--rule)}
+  .switch.onoff .slider:before{background:#C9B8F7;top:2px;left:2px}
+  .switch.onoff input:checked + .slider{background:var(--purple);border-color:var(--purple)}
+  .switch.onoff input:checked + .slider:before{background:#fff}
+
+  /* ---------- Tableaux « entités » (Applications, Tâches, Sources, Politiques) ---------- */
+  .tcard{background:#fff;border-radius:6px;box-shadow:0 1px 2px rgba(65,50,124,.06);overflow:hidden;overflow-x:auto}
+  .tcard table.ht{min-width:900px}
+  .tbar{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:12px 16px;flex-wrap:wrap}
+  .tbar input[type=text]{width:230px;min-height:36px}
+  .tbar .tinfo{font-size:13px;color:var(--text)}
+  table.ht{width:100%;border-collapse:collapse;font-size:14px}
+  table.ht th{text-align:left;font-size:11.5px;font-weight:700;letter-spacing:.4px;text-transform:uppercase;
+              color:var(--top);padding:10px 12px;border-bottom:1px solid var(--rule);white-space:nowrap;
+              border-right:1px solid var(--line)}
+  table.ht th:last-child{border-right:none}
+  table.ht td{padding:11px 12px;color:var(--text);border-bottom:1px solid #F0F2F6;vertical-align:middle}
+  table.ht tr:last-child td{border-bottom:none}
+  table.ht tbody tr:hover td{background:#FAF8FF}
+  table.ht tbody tr.sel td{background:var(--purple-t)}
+  table.ht tbody tr.clk{cursor:pointer}
+  table.ht .cb{width:36px;text-align:center}
+  table.ht .ctr{text-align:center}
+  .tempty{padding:26px;text-align:center;color:var(--muted);font-size:14px}
+  /* ---------- Multi-cluster : sélecteur (barre du haut), groupes, Sources ---------- */
+  .tb-link .caret{opacity:.8}
+  .clmenu{position:fixed;top:58px;z-index:90;background:#fff;border-radius:6px;min-width:290px;max-width:400px;
+          box-shadow:0 6px 24px rgba(42,46,68,.18);padding:6px 0;display:none;max-height:70vh;overflow:auto}
+  .clmenu .cli{display:flex;align-items:center;gap:10px;padding:9px 14px;cursor:pointer;font-size:14px;color:var(--strong)}
+  .clmenu .cli:hover{background:var(--purple-t)}
+  .clmenu .cli.on{font-weight:700}
+  .clmenu .cli .ws{color:var(--muted);font-size:12px;margin-left:auto;padding-left:12px;white-space:nowrap;font-weight:400}
+  .clmenu .chk{width:16px;flex:none;color:var(--purple);display:flex}
+  .clmenu .msep{height:1px;background:var(--line);margin:6px 0}
+  .clmenu .act{color:var(--top)}
+  table.ht .mc{display:none}
+  table.ht.multi .mc{display:table-cell}
+  table.ht tr.grp td{background:#F6F7FB;color:var(--title);font-size:12.5px;font-weight:700;padding:7px 12px}
+  table.ht tbody tr.grp:hover td{background:#F6F7FB}
+  table.ht tr.grp .gs{color:var(--grey);margin:0 7px;font-weight:400}
+  table.ht tr.grp .ge{color:var(--red);font-weight:400;margin-left:10px}
+  table.ht tr.srcsec td{background:#F6F7FB;color:var(--title);font-size:11.5px;font-weight:700;text-transform:uppercase;
+               letter-spacing:.4px;padding:7px 12px}
+  table.ht tbody tr.srcsec:hover td{background:#F6F7FB}
+  .srctools{display:flex;gap:22px;margin:0 0 10px;flex-wrap:wrap}
+  .tag{display:inline-block;font-size:11px;font-weight:700;color:var(--top);border:1px solid var(--rule);border-radius:3px;
+       padding:0 6px;margin-left:8px;vertical-align:middle}
+  textarea.kc{width:100%;min-height:120px;font-family:ui-monospace,Consolas,monospace;font-size:12px;box-sizing:border-box;
+       border:1px solid var(--rule);border-radius:4px;padding:8px 10px;color:var(--strong);resize:vertical}
+  ul.wl{margin:6px 0 0;padding-left:18px;font-size:13px;color:var(--text)}
+  /* Icônes d'état HYCU : pastille pleine, symbole blanc */
+  .st,.ic.ok,.ic.ko,.ic.sim{display:inline-flex;width:18px;height:18px;border-radius:50%;flex:none;
+      color:transparent !important;font-size:0 !important;vertical-align:middle;
+      background-repeat:no-repeat;background-position:center;background-size:18px 18px}
+  .st.ok,.ic.ok{background-color:var(--green);background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'><path d='M5.2 9.3l2.5 2.5 5-5.3' stroke='white' stroke-width='1.9' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>")}
+  .st.ko,.ic.ko{background-color:var(--red);background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'><path d='M6 6l6 6M12 6l-6 6' stroke='white' stroke-width='1.9' stroke-linecap='round'/></svg>")}
+  .st.wn{background-color:var(--orange);background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'><path d='M9 4.8v5.2' stroke='white' stroke-width='2' stroke-linecap='round'/><circle cx='9' cy='13' r='1.15' fill='white'/></svg>")}
+  .st.na{background-color:#8C91A5;background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'><path d='M7 7.1a2.1 2.1 0 1 1 3 1.9c-.7.4-1 .8-1 1.6' stroke='white' stroke-width='1.7' fill='none' stroke-linecap='round'/><circle cx='9' cy='13.2' r='1.05' fill='white'/></svg>")}
+  .st.sim,.ic.sim{background-color:var(--blue);background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'><circle cx='9' cy='9' r='3.3' stroke='white' stroke-width='1.7' fill='none'/></svg>")}
+  .st.run{background-color:var(--purple);background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'><path d='M7.3 5.8v6.4l5-3.2z' fill='white'/></svg>")}
+
+  /* ---------- Tableau de bord ---------- */
+  .dgrid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:18px}
+  .dgrid .span2{grid-column:span 2}
+  .span3{grid-column:span 3}
+  .span4{grid-column:1/-1}
+  .dtitle{margin:0 0 8px;font-size:26px;font-weight:500;color:var(--title);display:flex;align-items:center;gap:8px}
+  .dgrid > div{display:flex;flex-direction:column}
+  .dcard{flex:1;background:#fff;border-radius:6px;padding:18px;min-height:250px;box-shadow:0 1px 2px rgba(65,50,124,.06)}
+  .donut{display:block;margin:4px auto 10px}
+  .dnums{display:grid;grid-template-columns:1fr 1fr;text-align:center}
+  .dnums > div + div{border-left:1px solid var(--line)}
+  .dnums .l{font-size:14px;color:var(--text)}
+  .dnums .v{font-size:32px;font-weight:300;color:var(--title)}
+  .dnums .v.bad{color:var(--red)}
+  .dlist{list-style:none;margin:0;padding:0}
+  .dlist li{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:9px 0;
+            border-bottom:1px solid #F0F2F6;font-size:14px}
+  .dlist li:last-child{border-bottom:none}
+  .dlist .k{color:var(--text)} .dlist .v{color:var(--strong);font-weight:500;text-align:right}
+  .dbig{font-size:30px;font-weight:300;color:var(--title);margin:6px 0 2px}
+  .jcounts{display:grid;grid-template-columns:repeat(4,1fr);text-align:center;margin-top:10px}
+  .jcounts .n{font-size:15px;color:var(--strong)} .jcounts .l{font-size:13px;color:var(--text)}
+  .jcounts .st{width:20px;height:20px;margin:3px 0}
+
+  /* ---------- Modales HYCU (assistants) ---------- */
+  .hmodal-bg,.wiz,.modal-bg{position:fixed;inset:0;background:rgba(42,46,68,.45);display:flex;align-items:center;
+       justify-content:center;z-index:1000;padding:18px}
+  .hmodal,.wiz-card,.modal{background:#fff;border-radius:4px;width:100%;max-width:620px;max-height:94vh;
+       display:flex;flex-direction:column;box-shadow:0 12px 40px rgba(42,46,68,.35)}
+  .hm-head,.wiz-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 18px;
+       border-bottom:1px solid var(--rule);color:var(--title);background:#fff;border-radius:4px 4px 0 0}
+  .hm-head h2{flex:1;min-width:0;line-height:1.25}
+  .hm-head h2,.wiz-head h2{margin:0;font-size:22px;font-weight:500;color:var(--title)}
+  .hm-head h2 .sep{color:var(--title);margin:0 6px}
+  .hm-ico{display:flex;gap:14px;align-items:center}
+  .hm-ico button{background:none;border:none;cursor:pointer;color:var(--top);padding:0;font-size:22px;line-height:1;
+                 width:40px;height:40px;display:inline-flex;align-items:center;justify-content:center;border-radius:6px;
+                 font-family:inherit;font-weight:700}
+  .hm-body,.wiz-body{padding:16px 18px;overflow:auto}
+  .hm-foot,.wiz-foot{display:flex;align-items:center;justify-content:flex-end;gap:14px;padding:12px 18px;
+       border-top:1px solid var(--rule)}
+  .wiz-foot{justify-content:space-between}
+  .hm-foot .btn,.wiz-foot .btn:not(.ghost){min-width:92px}
+  .modal-actions .btn.ghost{background:none;border:none;color:var(--strong);
+       text-decoration:underline;text-underline-offset:3px;min-height:0;padding:6px 4px}
+  .wiz-brand{display:none}
+  .wiz-head{flex-direction:column;align-items:stretch}
+  .wiz-bar{height:4px;background:var(--line);border-radius:4px;overflow:hidden;margin-top:10px}
+  .wiz-bar span{display:block;height:100%;width:0;background:var(--purple);transition:width .3s}
+  .wiz-body h3{margin:0 0 6px;font-size:17px;font-weight:500;color:var(--title)}
+  .wiz-body p.q{color:var(--muted);font-size:13px;margin:0 0 14px}
+  .wiz-opt{display:block;border:1px solid var(--rule);border-radius:4px;padding:12px 14px;margin:8px 0;cursor:pointer}
+  .wiz-opt.sel{border-color:var(--purple);box-shadow:0 0 0 1px var(--purple)}
+  .wiz-opt b{font-size:14px;color:var(--strong)} .wiz-opt .d{font-size:13px;color:var(--text);margin-top:2px}
+  .wiz-recap{background:var(--strong);color:#E6E8F0;border-radius:4px;padding:14px;font-size:12px;white-space:pre-wrap;
+             font-family:"Ubuntu Mono",Consolas,monospace}
+  .chip{display:inline-block;border:1px solid var(--rule);border-radius:4px;padding:6px 13px;margin:4px 6px 4px 0;
+        font-size:13px;cursor:pointer;background:#fff;color:var(--text)}
+  .chip.sel{background:var(--purple);color:#fff;border-color:var(--purple)}
+  /* « À propos » : en-tête sombre (logo blanc) */
+  .wiz-head.dark{background:var(--top);color:#fff;border-bottom:none}
+  .wiz-head.dark h2{color:#fff}
+  .wiz-head.dark .wiz-brand{display:block}
+  .wiz-head.dark .logo{height:34px;width:auto}
+  /* Modale de confirmation (actions destructives) */
+  .modal{max-width:540px;padding:0}
+  .modal h3{margin:0;padding:14px 18px;border-bottom:1px solid var(--rule);color:var(--red);font-size:20px;font-weight:500}
+  .modal #dmBody,.modal .dm-need{padding:0 18px}
+  .modal #dmBody{padding-top:12px}
+  .modal .dm-line{font-size:14px;margin:6px 0;line-height:1.5}
+  .modal .dm-need{margin:10px 0 4px}
+  .modal-actions{margin-top:14px;display:flex;gap:14px;justify-content:flex-end;padding:12px 18px;border-top:1px solid var(--rule)}
+  /* Cartes d'option (choix du type de restauration) */
+  .opt{display:flex;gap:18px;align-items:flex-start;border:1px solid var(--rule);border-radius:4px;padding:16px 18px;
+       margin-bottom:12px;cursor:pointer;background:#fff}
+  .opt:hover{border-color:var(--top)}
+  .opt.sel{border-color:var(--purple);box-shadow:0 0 0 1px var(--purple)}
+  .opt svg{flex:none;width:52px;height:52px;color:var(--top)}
+  .opt b{display:block;font-size:15px;color:var(--strong);margin-bottom:4px;font-weight:700}
+  .opt span{font-size:14px;color:var(--text)}
+  .fbox{border:1px solid var(--rule);border-radius:4px;padding:8px 11px;min-height:38px;display:flex;align-items:center;
+        gap:8px;background:#fff;color:var(--strong)}
+  .fbox .dim{color:var(--muted)}
+
+  /* ---------- Listes, états, journaux (contenus générés par le JS) ---------- */
+  .pvc-list{list-style:none;padding:0;margin:0;border:1px solid var(--rule);border-radius:4px;overflow:hidden}
+  .pvc-list:empty{display:none}
+  .pvc-list li{display:flex;align-items:center;gap:12px;padding:10px 12px;border-bottom:1px solid #F0F2F6;background:#fff}
+  .pvc-list li:last-child{border-bottom:none}
+  .pvc-list li.sel{background:var(--purple-t)}
+  .pvc-list .nm{font-weight:500;font-size:14px;color:var(--strong)}
+  .pvc-list .meta{font-size:12px;color:var(--muted)}
+  .pvc-list > .hint{padding:10px 12px;margin:0}
+  .vol-cfg{border:1px solid var(--rule);border-radius:4px;padding:12px 14px;margin:10px 0;background:#fff}
+  .vol-cfg > .nm{font-weight:500;color:var(--strong)}
+  .vol-cfg.disabled{opacity:.5}
+  .rsAdv{margin-top:10px;border:1px solid var(--line);border-radius:4px;background:#FAFBFD;padding:6px 10px}
+  .rsAdvSum{cursor:pointer;font-weight:500;font-size:13px;color:var(--top);user-select:none}
+  .rsAdv[open] .rsAdvSum{margin-bottom:8px}
+  .rsManualPlain{border:none;background:none;padding:0}
+  .rsManualPlain > .rsAdvSum{display:none}
+  .rsGuide{margin:0 0 12px;padding:9px 12px;border-left:3px solid var(--purple);background:#F7F5FD;border-radius:0 4px 4px 0;
+           font-size:13px;color:var(--text)}
+  .badge{font-size:11px;padding:2px 8px;border-radius:10px;font-weight:500}
+  .b-bound{background:#E1F4EE;color:var(--green)} .b-lost{background:#FCE9E8;color:var(--red)}
+  .b-pending{background:#F8EFE0;color:var(--orange)} .b-na{background:#EEF0F5;color:var(--muted)}
+  pre.box{background:var(--strong);color:#E6E8F0;border-radius:4px;padding:12px 14px;font-size:12px;
+          overflow:auto;max-height:340px;white-space:pre-wrap;word-break:break-word}
+  .drVol{display:flex;align-items:center;gap:12px;margin:7px 0}
+  .drVol .drVolNm{flex:none;width:180px;font-weight:600;font-size:13px;color:var(--ink);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .drVol .drRef{flex:1;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px}
+  .repl{font-size:13px;border:1px solid var(--line);border-radius:4px;padding:10px 12px;margin:10px 0;background:#FAFBFD}
+  .repl div{margin:4px 0} .repl .k{color:var(--top);font-weight:500}
+  .repl .old{color:var(--red);text-decoration:line-through} .repl .new{color:var(--green)}
+  ol.plan{margin:6px 0 0;padding-left:20px;font-size:13px}
+  ol.plan li{margin:3px 0}
+  .logline{display:flex;gap:8px;align-items:flex-start;font-size:13px;padding:7px 0;border-bottom:1px solid #F0F2F6}
+  .logline .ic{margin-top:1px}
+  .ok{color:var(--green)} .ko{color:var(--red)} .sim{color:var(--orange)}
+  .hint{font-size:12.5px;color:var(--muted);margin-top:8px}
+  .note{background:#F7F5FD;border-left:3px solid var(--purple);padding:10px 14px;border-radius:0 4px 4px 0;
+        font-size:13px;margin-top:12px;color:var(--text)}
+  .warnbox{background:#FBF5EB;border-left:3px solid var(--orange);padding:10px 14px;border-radius:0 4px 4px 0;
+        font-size:13px;margin-top:10px;color:#6E4E17}
+  .err{background:#FDF0EF;border-left:3px solid var(--red);padding:10px 14px;border-radius:0 4px 4px 0;
+       font-size:13px;color:#8E2F2A;margin-top:10px}
+  .spin{display:inline-block;width:14px;height:14px;border:2px solid rgba(255,255,255,.5);border-top-color:#fff;
+        border-radius:50%;animation:sp .7s linear infinite;vertical-align:-2px;margin-right:6px}
+  .hint .spin,.note .spin,.tempty .spin,td .spin,.dcard .spin{border-color:var(--purple-t);border-top-color:var(--purple)}
+  @keyframes sp{to{transform:rotate(360deg)}}
+  .jbar{height:6px;background:var(--line);border-radius:3px;overflow:hidden;margin-top:6px}
+  .jbar span{display:block;height:100%;width:0;background:var(--purple);transition:width .4s}
+  @keyframes pulseRing{0%{box-shadow:0 0 0 0 rgba(117,48,240,.55)}100%{box-shadow:0 0 0 12px rgba(117,48,240,0)}}
+  .pulse{animation:pulseRing 1s ease-out 3}
+  /* Anciens éléments de navigation du parcours Restaurer : remplacés par l'assistant */
+  #rsNextBar{display:none !important}
+  .step-no{display:none}
+  /* ---------- Assistant de restauration : étapes visibles ---------- */
+  .stepper{display:flex;gap:0;margin:0 0 16px;border:1px solid var(--line);border-radius:6px;overflow:hidden;background:#fff}
+  /* (la classe .st est aussi celle des pastilles d'état, qui masque le texte en !important) */
+  .stepper .st{flex:1;padding:10px 12px;font-size:13px !important;color:var(--muted) !important;background:#fff;
+               background-image:none !important;border-right:1px solid var(--line);border-radius:0 !important;
+               display:flex;align-items:center;gap:8px;width:auto !important;height:auto !important;cursor:default}
+  .stepper .st:last-child{border-right:none}
+  .stepper .st.on{color:#fff !important;background:var(--purple);font-weight:700}
+  .stepper .st.done{color:var(--green-t) !important;background:#F0FAF6}
+  .progress{margin-top:14px;border:1px solid var(--line);border-radius:6px;padding:10px 12px;background:#fff}
+  .progress-head{display:flex;justify-content:space-between;align-items:center;gap:12px;font-size:13px;color:var(--strong);margin-bottom:8px}
+  .progress-track{height:8px;background:#EEF0F5;border-radius:4px;overflow:hidden}
+  .progress-bar{height:100%;width:0;background:var(--purple);transition:width .4s}
+  body.realmode .progress-bar{background:var(--red)}
+  ol.plan li.danger{color:var(--red-t)}
+  ol.plan li.danger::marker{color:var(--red-t);font-weight:700}
+  .preflight{margin:10px 0}
+  .preflight summary{cursor:pointer;font-size:13px}
+  /* ---------- Mode réel : indicateur permanent dans la barre du haut ---------- */
+  .tb-real{display:none;align-items:center;font-size:12px;font-weight:700;letter-spacing:.4px;color:#fff;background:var(--red);
+           border-radius:4px;padding:4px 10px}
+  body.realmode .tb-real{display:inline-flex}
+  body.realmode .topbar{box-shadow:inset 0 -6px 0 var(--red)}
+  body.realmode .realbar{height:6px}
+  #netBanner{margin-bottom:12px}
+  .dq{display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;border:1.5px solid var(--muted);
+      border-radius:50%;font-size:11px;font-weight:700;color:var(--grey);cursor:help;vertical-align:middle}
+  /* Superposition : filtre / assistant / déverrouillage au-dessus des modales HYCU,
+     confirmation destructive au-dessus de tout. */
+  .wiz{z-index:1050} .modal-bg{z-index:1100}
+  /* Contenus existants hébergés dans les modales HYCU : sans cadre de carte, sans
+     titre (le titre est dans l'en-tête de la modale). */
+  .hm-body .card{box-shadow:none;padding:0;margin:0 0 14px;border-radius:0}
+  .hm-body .card > h3{display:none}
+  .hm-body .card > p.sub:first-of-type{margin-top:0}
+  /* Assistant de restauration : une seule action principale, dans le pied de modale. */
+  #mRestore #hyBatchGo,#mRestore #rsInplaceRun,#mRestore #rsContinueWrap,#mRestore #rsGo,
+  #mRestore #rsFlowGuide{display:none !important}
+  #mRestore #rsPlan > p.sub,#mRestore .card > p.sub{display:none}
+  #rsVolCfgs .vol-cfg > .nm > span:first-of-type{display:none}   /* « (PV …) » : déjà dans la liste */
+  #mRestore #rsInplaceRunWrap{border-top:none !important;padding-top:0 !important}
+  #rsWizMode.sim{background:var(--purple-t);color:var(--top)} #rsWizMode.live{background:#FCE9E8;color:var(--red)}
+  /* Cible du clone : choisie sur la page 2 de l'assistant -> la bascule du formulaire est masquée */
+  #mRestore #rsCloneAppWrap > label.fld:first-child,#mRestore #rsCloneNsMode{display:none}
+  /* Sources : une fiche de connexion à la fois (choisie dans le tableau) */
+  #tab-connect > .card{border:1px solid var(--rule);box-shadow:none;padding:14px 18px 16px;border-radius:4px}
+  #tab-connect > .card > h3{display:flex;margin-bottom:8px;font-size:16px}
+  #srcBody tr.clk td:first-child{font-weight:500;color:var(--strong)}
+
+  @media(max-width:1100px){.dgrid{grid-template-columns:repeat(2,minmax(0,1fr))}.span2,.span3{grid-column:1/-1}}
+  @media(max-width:900px){
+    body:not(.sb-open) nav.sidebar{width:64px}
+    body:not(.sb-open) nav.sidebar button .nl,body:not(.sb-open) nav.sidebar .ver{display:none}
+    body:not(.sb-open) nav.sidebar button{justify-content:center;padding:9px 0}
+    .tb-prod,.hdrconn{display:none}
+  }
+  @media(max-width:600px){main.wrap{padding:14px}.dgrid{grid-template-columns:1fr}.dgrid .span2{grid-column:auto}
+    .tb-link u{display:none}}
+</style>
+</head>
+<body>
+<div class="realbar"></div>
+<!-- ===================== MODALE DE CONFIRMATION (actions destructives) ===================== -->
+<div id="dangerModal" class="modal-bg" style="display:none">
+  <div class="modal">
+    <h3 id="dmTitle">Confirm the real action</h3>
+    <div id="dmBody"></div>
+    <div id="dmConfirmWrap" class="dm-need" style="display:none">
+      <label class="fld">To confirm, retype <b id="dmWord"></b></label>
+      <input type="text" id="dmInput" autocomplete="off">
+    </div>
+    <div class="modal-actions">
+      <button class="btn ghost" id="dmCancel">Cancel</button>
+      <button class="btn danger" id="dmOk">Confirm in real mode</button>
+    </div>
+  </div>
+</div>
+<!-- ===================== ASSISTANT (1er lancement) ===================== -->
+<div id="wizard" class="wiz" style="display:none">
+  <div class="wiz-card">
+    <div class="wiz-head">
+      <div class="wiz-brand"><svg width="22" height="22" viewBox="0 0 38 38" aria-hidden="true" style="vertical-align:-5px;margin-right:8px">
+        <rect x="1" y="1" width="36" height="36" rx="9" fill="#5B18C0"></rect>
+        <path d="M19 8 L28 11 V19 C28 24.5 24 28.5 19 30.5 C14 28.5 10 24.5 10 19 V11 Z" fill="#ADFF00"></path>
+        <path d="M14.7 18.6 l3 3 l6.6 -7.6" fill="none" stroke="#1B0C33" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"></path>
+      </svg>HYCU</div>
+      <h2 id="wizTitle">Initial setup</h2>
+      <div class="wiz-bar"><span id="wizBar"></span></div>
+    </div>
+    <div class="wiz-body" id="wizBody"></div>
+    <div class="wiz-foot">
+      <button class="btn ghost" id="wizBack">Back</button>
+      <span class="hint" id="wizStep" style="margin:0"></span>
+      <button class="btn" id="wizNext">Next</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===================== DÉVERROUILLAGE (coffre présent) ===================== -->
+<div id="unlock" class="wiz" style="display:none">
+  <div class="wiz-card">
+    <div class="wiz-head">
+      <div class="wiz-brand"><svg width="22" height="22" viewBox="0 0 38 38" aria-hidden="true" style="vertical-align:-5px;margin-right:8px">
+        <rect x="1" y="1" width="36" height="36" rx="9" fill="#5B18C0"></rect>
+        <path d="M19 8 L28 11 V19 C28 24.5 24 28.5 19 30.5 C14 28.5 10 24.5 10 19 V11 Z" fill="#ADFF00"></path>
+        <path d="M14.7 18.6 l3 3 l6.6 -7.6" fill="none" stroke="#1B0C33" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"></path>
+      </svg>HYCU</div>
+      <h2>Unlock saved connections</h2>
+    </div>
+    <div class="wiz-body">
+      <p class="q">An encrypted credentials vault was found. Enter the master passphrase
+        to reconnect HYCU / Nutanix automatically.</p>
+      <label class="fld">Passphrase</label>
+      <input type="password" id="unlockPass" autocomplete="off">
+      <div id="unlockErr"></div>
+    </div>
+    <div class="wiz-foot">
+      <button class="btn ghost" id="unlockSkip">Later</button>
+      <button class="btn" id="unlockGo">Unlock</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===================== À PROPOS ===================== -->
+<div id="aboutModal" class="wiz" style="display:none">
+  <div class="wiz-card" style="max-width:560px">
+    <div class="wiz-head dark">
+      <div class="wiz-brand">__LOGO__</div>
+      <h2 style="margin-top:10px">Kubernetes Protection on Nutanix</h2>
+      <div style="color:#B8B4FC;font-weight:700;font-size:13px;margin-top:2px">Plugin for HYCU Enterprise Cloud</div>
+      <div style="font-style:italic;margin-top:6px;font-size:12px;color:#fff">This is a free plugin, provided as-is, without any warranty or engagement from HYCU.</div>
+    </div>
+    <div class="wiz-body" style="font-size:13px">
+      <div style="display:grid;grid-template-columns:auto 1fr;gap:6px 14px;align-items:baseline">
+        <b>Version:</b><code>__VERSION__</code>
+        <b>Audit log:</b><code id="aboutAudit" style="word-break:break-all">…</code>
+        <b>Configuration:</b><code id="aboutCfg" style="word-break:break-all">…</code>
+        <b>Backups:</b><code id="aboutBk" style="word-break:break-all">…</code>
+      </div>
+    </div>
+    <div class="wiz-foot">
+      <span></span>
+      <button class="btn" id="aboutClose">Close</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===================== FILTRE DES NAMESPACES ===================== -->
+<div id="nsFilter" class="wiz" style="display:none">
+  <div class="wiz-card">
+    <div class="wiz-head">
+      <div class="wiz-brand">HYCU</div>
+      <h2>Filter namespaces</h2>
+    </div>
+    <div class="wiz-body">
+      <label class="wiz-opt" id="nsAllOpt" style="cursor:pointer">
+        <input type="checkbox" id="nsAll" style="width:auto;margin-right:8px">
+        <b>All namespaces (no filter)</b>
+        <div class="d">Shows every namespace, including ones created later.</div>
+      </label>
+      <div id="nsPick">
+        <input type="text" id="nsSearch" placeholder="search for a namespace…">
+        <div style="display:flex;gap:8px;margin:8px 0">
+          <button class="btn ghost" id="nsCheckAll" type="button">Check all (visible)</button>
+          <button class="btn ghost" id="nsUncheckAll" type="button">Uncheck all (visible)</button>
+        </div>
+        <div id="nsList" style="max-height:260px;overflow:auto"></div>
+      </div>
+      <div id="nsFilterErr"></div>
+    </div>
+    <div class="wiz-foot">
+      <button class="btn ghost" id="nsCancel">Cancel</button>
+      <span class="hint" id="nsCount" style="margin:0"></span>
+      <button class="btn" id="nsSave">Save filter</button>
+    </div>
+  </div>
+</div>
+
+<header class="topbar">
+  <a class="tb-brand" id="tbHome" href="#" title="Dashboard">__LOGO__<span class="tb-word">HYCU<sup>®</sup></span><span class="tb-prod">Kubernetes · Nutanix</span></a>
+  <div class="tb-right">
+    <span id="tbReal" class="tb-real" role="status">LIVE MODE</span>
+    <span id="hdrConn" class="hdrconn" title="Source status — click to open Sources"></span>
+    <button class="tb-link" id="ctxLink" type="button" title="Active Kubernetes cluster — click to choose another one"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="16" height="6.5" rx="1.3"/><rect x="4" y="13.5" width="16" height="6.5" rx="1.3"/><path d="M7.6 7.25h.01M7.6 16.75h.01"/></svg><u id="ctx">…</u><span id="ctxWarn"></span><svg class="caret" width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M2.5 4.5l3.5 3.5 3.5-3.5" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round"/></svg></button>
+    <button class="tb-ico" id="srcBtn" type="button" title="Sources & Settings"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></button>
+    <button class="tb-ico" id="aboutBtn" type="button" title="Help &amp; About"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9.4"/><path d="M9.6 9.4a2.5 2.5 0 0 1 4.9.8c0 1.7-2.5 2.1-2.5 3.8"/><circle cx="12" cy="17.1" r=".7" fill="currentColor" stroke="none"/></svg></button>
+    <button id="langBtn" class="tb-lang" type="button" title="Passer en français / Switch to French">FR</button>
+  </div>
+</header>
+<div id="clMenu" class="clmenu" role="menu"></div>
+<div id="helpMenu" class="clmenu" role="menu" style="min-width:210px">
+  <a class="cli" href="/help" target="_blank" rel="noopener" role="menuitem" style="text-decoration:none"><span class="chk"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 4.5h6a2.5 2.5 0 0 1 2.5 2.5v12.5a2 2 0 0 0-2-2H5z"/><path d="M19 4.5h-5.5A2.5 2.5 0 0 0 11 7v12.5a2 2 0 0 1 2-2h6z" transform="scale(-1,1) translate(-24,0)" display="none"/><path d="M19 4.5h-6v13h6z" display="none"/></svg></span><span>Help (guide)</span></a>
+  <div class="cli" data-act="about" role="menuitem"><span class="chk"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 11v6"/><circle cx="12" cy="7.6" r=".8" fill="currentColor" stroke="none"/></svg></span><span>About</span></div>
+</div>
+<div id="gearMenu" class="clmenu" role="menu" style="min-width:210px">
+  <div class="cli" data-act="sources" role="menuitem"><span class="chk"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></svg></span><span>Sources</span></div>
+  <div class="cli" data-act="settings" role="menuitem"><span class="chk"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 20v-5M5 11V4M12 20v-8M12 8V4M19 20v-3M19 13V4"/><path d="M3 15h4M10 8h4M17 17h4"/></svg></span><span>Settings</span></div>
+</div>
+
+<div class="shell">
+<nav class="sidebar" role="tablist" aria-label="Tool sections">
+  <button class="on" role="tab" aria-selected="true" data-tab="dashboard"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4.2 17.5a8.6 8.6 0 1 1 15.6 0"/><path d="M12 13.4l4.2-4.2"/><circle cx="12" cy="13.6" r="1.4"/></svg><span class="nl">Dashboard</span></button>
+  <div class="sb-sep"></div>
+  <button role="tab" aria-selected="false" data-tab="apps"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3.5" y="3.5" width="7" height="7" rx="1.2"/><rect x="13.5" y="3.5" width="7" height="7" rx="1.2"/><rect x="3.5" y="13.5" width="7" height="7" rx="1.2"/><circle cx="17" cy="17" r="3.6"/></svg><span class="nl">Applications</span></button>
+  <div class="sb-sep"></div>
+  <button role="tab" aria-selected="false" data-tab="policies"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l7.5 3v5.4c0 4.6-3.2 8.3-7.5 9.6-4.3-1.3-7.5-5-7.5-9.6V6z"/><path d="M8.6 12.1l2.4 2.4 4.4-4.8"/></svg><span class="nl">Policies</span></button>
+  <div class="sb-sep"></div>
+  <button role="tab" aria-selected="false" data-tab="jobs"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4.5" y="3.5" width="15" height="17" rx="1.6"/><path d="M8 8.5h8M8 12h8M8 15.5h5"/></svg><span class="nl">Jobs</span></button>
+  <div class="sb-foot"><button class="sb-col" id="sbCol" type="button" title="Collapse / expand the menu"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg></button><span class="ver">v__VERSION__</span></div>
+</nav>
+<main class="wrap">
+  <div id="netBanner" class="err" style="display:none" role="alert">Server unreachable — check the tool is running (or the port-forward), then reload.</div>
+  <div id="opBanner" style="display:none"></div>
+  <div id="kubeBanner"></div>
+  <div class="dry" id="dryBar">
+    <label class="switch"><input type="checkbox" id="dry" checked role="switch" aria-checked="true" aria-labelledby="dryLabel"><span class="slider"></span></label>
+    <div><b id="dryLabel">Simulation mode on</b> — no destructive command is executed.
+      Turn it off only when you are ready to act for real.</div>
+  </div>
+
+
+  <!-- ===================== TABLEAU DE BORD ===================== -->
+  <section id="tab-dashboard">
+    <div class="pagehead"><h1 class="ptitle">Dashboard</h1></div>
+    <div class="dgrid">
+      <div><h2 class="dtitle">Applications</h2><div class="dcard" id="dbApps"></div></div>
+      <div><h2 class="dtitle">Policy</h2><div class="dcard" id="dbPolicy"></div></div>
+      <div><h2 class="dtitle">Sources</h2><div class="dcard" id="dbSources"></div></div>
+      <div><h2 class="dtitle">Cluster</h2><div class="dcard" id="dbCluster"></div></div>
+      <div><h2 class="dtitle">Storage</h2><div class="dcard" id="dbStorage"></div></div>
+      <div><h2 class="dtitle">Jobs</h2><div class="dcard" id="dbJobs"></div></div>
+      <div><h2 class="dtitle">Recent jobs</h2><div class="dcard" id="dbLast"></div></div>
+      <div><h2 class="dtitle">Cluster health</h2><div class="dcard" id="dbHealth"></div></div>
+    </div>
+  </section>
+  <!-- ===================== APPLICATIONS ===================== -->
+  <section id="tab-apps" style="display:none">
+    <div class="pagehead"><h1 class="ptitle">Applications <button class="refresh" id="appsRefresh" type="button" title="Refresh"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19.4 12.6a7.5 7.5 0 1 1-2.3-5.9"/><path d="M19.6 4.4v4h-4"/></svg></button></h1>
+      <div class="pacts">
+        <button class="pact" id="actBackup" type="button" disabled><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19.6 12.5a7.6 7.6 0 1 1-2.1-5.8"/><path d="M19.8 4.3v3.9h-3.9"/><path d="M12 8.3v4l2.6 1.9"/></svg><span>Back up</span></button>
+        <button class="pact" id="actRestore" type="button" disabled><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4.4 12.5a7.6 7.6 0 1 0 2.1-5.8"/><path d="M4.2 4.3v3.9h3.9"/><path d="M12 8.3v4l2.6 1.9"/></svg><span>Restore</span></button>
+        <button class="pact" id="actPolicy" type="button" disabled><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l7.5 3v5.4c0 4.6-3.2 8.3-7.5 9.6-4.3-1.3-7.5-5-7.5-9.6V6z"/><path d="M12 8.8v6.4M8.8 12h6.4"/></svg><span>Set Policy</span></button>
+        <button class="pact" id="actVerify" type="button" disabled><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="8.6"/><path d="M8.3 12.2l2.5 2.5 5-5.3"/></svg><span>Verify</span></button>
+        <button class="pact" id="actBulk" type="button" title="Recreate every deleted namespace of the active cluster from its backups"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3.5" y="4" width="17" height="5" rx="1.2"/><rect x="3.5" y="11" width="17" height="5" rx="1.2"/><path d="M6 18.5h12M4.4 21a7 7 0 0 0 1.9-5.3"/><path d="M4.2 13.2v3.6h3.6"/></svg><span>Bulk restore</span></button>
+      </div></div>
+    <div class="tcard">
+      <div class="tbar"><div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap"><input type="text" id="appsSearch" placeholder="Search" autocomplete="off">
+        <div class="seg" id="appsScope" style="display:none"><button class="on" type="button" data-scope="one">Active cluster</button><button type="button" data-scope="all">All clusters</button></div></div>
+        <div style="display:flex;align-items:center;gap:14px"><span class="tinfo" id="appsInfo"></span><span class="tinfo" id="appsPager" style="display:none"></span>
+          <button class="pact nsEdit" type="button" title="Filter the namespace list"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5h16l-6.2 7.4V19l-3.6-1.8v-4.8z"/></svg></button></div></div>
+      <table class="ht" id="appsTable"><thead><tr><th class="cb"><input type="checkbox" id="appsAll" title="Select all"></th>
+        <th>Name</th><th>Namespace</th><th class="mc">Workspace</th><th class="mc">Cluster</th><th>Type</th><th>Policy</th><th class="ctr">Compliance</th><th class="ctr">Protection</th>
+        <th>Last backup</th><th class="ctr">Versions</th></tr></thead>
+        <tbody id="appsBody"><tr><td colspan="11" class="tempty"><span class="spin"></span></td></tr></tbody></table>
+    </div>
+  </section>
+  <!-- ===================== POLITIQUES ===================== -->
+  <section id="tab-policies" style="display:none">
+    <div class="pagehead"><h1 class="ptitle">Policies</h1></div>
+    <div class="tcard" style="margin-bottom:16px">
+      <table class="ht"><thead><tr><th>Name</th><th>Protected object</th><th>Frequency</th><th>Retention</th><th>Target</th><th class="ctr">Status</th></tr></thead>
+        <tbody id="polBody"></tbody></table>
+    </div>
+    <div class="card">
+      <h3><span class="step-no">⏱</span>Automatic configuration backup (PV/PVC manifests)</h3>
+      <p class="sub">Regularly backs up the <b>PV/PVC manifests</b> (the restore “recipe”) of all
+        namespaces allowed by the filter — while the tool is running. <b>Not the data</b> of the volumes:
+        they are protected by HYCU (<b>Applications → Set Policy</b>).</p>
+      <div class="row">
+        <div style="flex:none"><label class="fld">Automatic backup</label>
+          <div style="display:flex;align-items:center;gap:10px;min-height:38px">
+            <label class="switch onoff"><input type="checkbox" id="abEnabled"><span class="slider"></span></label>
+            <b id="abEnabledLbl" style="font-size:13px;color:var(--muted)">Disabled</b>
+          </div></div>
+        <div style="flex:none;width:140px"><label class="fld">Interval (hours)</label>
+          <input type="number" id="abInterval" min="1" step="1" value="24"></div>
+        <div style="flex:none;width:150px"><label class="fld">Retention</label>
+          <select id="abRet"><option value="count">N versions</option><option value="gfs">GFS (d/wk/mo)</option></select></div>
+        <div style="flex:none;width:150px" id="abKeepWrap"><label class="fld">Versions to keep</label>
+          <input type="number" id="abKeep" min="1" step="1" value="15"></div>
+        <div style="flex:none;display:none;gap:8px" id="abGfsWrap">
+          <div style="width:86px"><label class="fld">Days</label><input type="number" id="abGfsD" min="0" value="7"></div>
+          <div style="width:86px"><label class="fld">Weeks</label><input type="number" id="abGfsW" min="0" value="4"></div>
+          <div style="width:86px"><label class="fld">Months</label><input type="number" id="abGfsM" min="0" value="12"></div>
+        </div>
+        <div><label class="fld">Destination folder (optional)</label>
+          <input type="text" id="abDest" placeholder="Vide = hycu-backups/"></div>
+        <div style="flex:none;align-self:flex-end"><button class="btn" id="abSave">Save</button></div>
+      </div>
+      <div class="hint" id="abStatus" style="margin-top:8px"></div>
+    </div>
+
+    <div class="card" id="polHycuCard">
+      <h3>HYCU policies (volume data)</h3>
+      <p class="sub">Policies defined in HYCU, assignable to an application's Volume Groups via
+        <b>Applications → Set Policy</b>.</p>
+      <div id="polHycu"></div>
+    </div>
+  </section>
+  <!-- ===================== TÂCHES ===================== -->
+  <section id="tab-jobs" style="display:none">
+    <div class="pagehead"><h1 class="ptitle">Jobs <button class="refresh" id="jobsRefresh" type="button" title="Refresh"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19.4 12.6a7.5 7.5 0 1 1-2.3-5.9"/><path d="M19.6 4.4v4h-4"/></svg></button></h1>
+      <div class="pacts">
+        <a class="pact" href="/api/report?format=html" download title="Compliance report (standalone HTML): applications, RPO, cluster health, jobs"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 3.5h9l4 4V20.5H6z"/><path d="M14.5 3.5v4.5H19"/><path d="M9 13h7M9 16.5h5"/></svg><span>HTML report</span></a>
+        <a class="pact" href="/api/report?format=csv" download title="CSV export of applications (Excel)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 3.5h9l4 4V20.5H6z"/><path d="M14.5 3.5v4.5H19"/><path d="M9 12.5l2.2 5M11.2 12.5L9 17.5M14 12.5v5h2.6"/></svg><span>CSV</span></a>
+      </div></div>
+    <div class="tcard" style="margin-bottom:16px;padding:14px 16px"><div class="jcounts" id="jobsCounts" style="margin-top:0"></div></div>
+    <div class="tcard">
+      <div class="tbar"><input type="text" id="jobsSearch" placeholder="Search" autocomplete="off"><span class="tinfo" id="jobsInfo"></span></div>
+      <table class="ht"><thead><tr><th>Job</th><th>Application</th><th>Cluster</th><th>Details</th><th>Started</th><th class="ctr">Status</th></tr></thead>
+        <tbody id="jobsBody"><tr><td colspan="6" class="tempty"><span class="spin"></span></td></tr></tbody></table>
+    </div>
+  </section>
+
+  <!-- ===================== VÉRIFICATION ===================== -->
+  <section id="tab-verify" style="display:none">
+    <div class="pagehead"><h1 class="ptitle"><a class="crumb" data-go="apps">Applications</a><span class="sep">›</span>Verification</h1></div>
+    <div class="card">
+      <h3><span class="step-no">3</span>Verify a namespace's state</h3>
+      <p class="sub">Confirms that the PVCs are Bound and the pods are running.</p>
+      <label class="fld">Namespace</label>
+      <div class="row">
+        <div><select id="vfNs"></select></div>
+        <div style="flex:none"><button class="btn ghost nsEdit" title="Filter the namespace list">✎ Filter</button></div>
+        <div style="flex:none"><button class="btn" id="vfRun">Verify</button></div>
+        <div style="flex:none"><button class="btn ghost" id="vfAuto" title="Re-runs the check every ~3 s and stops as soon as all PVCs are Bound and pods are Running (10 min max); click again to stop">Auto-track (until stable)</button></div>
+      </div>
+      <div id="vfOut"></div>
+    </div>
+  </section>
+
+  <!-- ===================== RÉGLAGES ===================== -->
+  <section id="tab-settings" style="display:none">
+    <div class="pagehead"><h1 class="ptitle">Settings</h1></div>
+    <div class="card">
+      <h3><span class="step-no">⎈</span>Local cluster (kubectl context)</h3>
+      <p class="sub">Choose the cluster explicitly instead of following the current context.
+        The tool adds <code>--context</code> (and <code>--kubeconfig</code>) to every kubectl command.
+        <b>Additional</b> clusters (imported kubeconfig, NKP workspaces) are managed from <b>⚙ Sources</b>.</p>
+      <label class="fld">kubeconfig file (empty = default ~/.kube/config)</label>
+      <input type="text" id="cfgKubeconfig" placeholder="%USERPROFILE%\.kube\config">
+      <div class="row" style="margin-top:6px">
+        <div><label class="fld">Context</label><select id="cfgContext"></select></div>
+        <div style="flex:none;align-self:flex-end"><button class="btn ghost" id="ctxList">List contexts</button></div>
+      </div>
+      <div style="margin-top:12px"><button class="btn" id="ctxApply">Use this context</button>
+        <span class="hint" id="ctxMsg" style="margin:0"></span></div>
+    </div>
+
+    <div class="card">
+      <h3><span class="step-no">⚙</span>Settings (per-customer adaptation)</h3>
+      <p class="sub">These settings are saved in <code>hycu_config.json</code> next to the program.
+        Leave blank anything you don't want to constrain.</p>
+      <div class="row">
+        <div><label class="fld">kubectl binary</label><input type="text" id="cfgKubectl" placeholder="kubectl"></div>
+        <div><label class="fld">volumeHandle prefix (empty = auto)</label><input type="text" id="cfgVhPrefix" placeholder="auto-detected"></div>
+      </div>
+      <div class="row">
+        <div><label class="fld">Allowed contexts / clusters (comma-separated; empty = all)</label><input type="text" id="cfgCtx" placeholder="prod-cluster, dr-cluster"></div>
+        <div><label class="fld">Allowed namespaces — local cluster (empty = all)</label><input type="text" id="cfgNs" placeholder="wordpress, bo-dev"></div>
+      </div>
+      <div class="row">
+        <div><label class="fld">Namespace label selector (empty = inactive; applies to all clusters)</label><input type="text" id="cfgLabelSel" placeholder="hycu.io/backup=true  or  env in (prod,preprod)"></div>
+        <div style="flex:none;width:230px"><label class="fld">Job history (days; 0 = unlimited)</label><input type="number" id="cfgAuditDays" min="0" step="1" placeholder="31"></div>
+      </div>
+      <div class="row">
+        <div style="flex:none;width:250px"><label class="fld">Free-space floor (MB; 0 = disabled)</label><input type="number" id="cfgMinFree" min="0" step="100" placeholder="500"></div>
+        <div style="flex:none;width:280px"><label class="fld">Backup quota (GB; 0 = unlimited)</label><input type="number" id="cfgQuota" min="0" step="1" placeholder="0"></div>
+        <div style="align-self:flex-end" class="hint">Below the floor, every backup is refused; above the quota, the oldest are pruned (the most recent of each application is always kept).</div>
+      </div>
+      <div class="row">
+        <div><label class="fld"><input type="checkbox" id="cfgDr" style="width:auto"> <b>Allow DR restore</b> (cross-cluster / cross-context)</label>
+        <div class="hint">Enable it for the duration of a drill or a disaster. Each DR restore stays explicit: sources read from the backup alone, warning, target cluster retyped, dedicated audit.</div></div>
+        <div><label class="fld">Host names allowed to reach the interface (empty = loopback only)</label><input type="text" id="cfgHosts" placeholder="hycu.interne.exemple.fr">
+          <div class="hint" style="margin-top:4px">DNS name of an Ingress or reverse proxy. The tool has no authentication: put authentication (SSO, oauth2-proxy, IP allowlist) and TLS in front of it as soon as it leaves the loopback.</div></div>
+      </div>
+      <div class="row">
+        <div><label class="fld">Wait timeout (s)</label><input type="text" id="cfgWait" placeholder="120"></div>
+        <div><label class="fld">Clone name suffix</label><input type="text" id="cfgSuffix" placeholder="0000"></div>
+      </div>
+      <label class="fld" style="margin-top:14px"><input type="checkbox" id="cfgConfirm" style="width:auto"> Require context confirmation before any real action</label>
+      <label class="fld"><input type="checkbox" id="cfgStrip" style="width:auto"> Strip claimRef entirely from the PV (let the PVC rebind)</label>
+      <label class="fld"><input type="checkbox" id="cfgSim" style="width:auto"> Offer the simulation mode (switch in the banner; otherwise the tool works in live mode)</label>
+      <div class="row" style="margin-top:6px">
+        <div style="flex:none;width:260px"><label class="fld">Default interface language</label>
+          <select id="cfgLang"><option value="en">English</option><option value="fr">French</option></select></div>
+      </div>
+      <div style="margin-top:14px"><button class="btn" id="cfgSave">Save settings</button> <span class="hint" id="cfgMsg"></span></div>
+    </div>
+  </section>
+</main>
+</div>
+
+<div id="mBackup" class="hmodal-bg" style="display:none">
+  <div class="hmodal" style="max-width:640px">
+    <div class="hm-head"><h2 id="mBackupTitle">Configuration backup</h2><div class="hm-ico"><button type="button" data-close="mBackup" title="Close">✕</button></div></div>
+    <div class="hm-body">
+    <div class="card">
+      <h3><span class="step-no">1</span>Back up a namespace's volumes</h3>
+      <p class="sub">Automatically exports and cleans all PVs and PVCs in the namespace.
+        Equivalent to the kubectl loops + manual manifest cleanup.</p>
+      <div id="bkNsRow"><label class="fld">Namespace</label>
+      <div class="row">
+        <div><select id="bkNs"></select></div>
+        <div style="flex:none"><button class="btn ghost nsEdit" title="Filter the namespace list">✎ Filter</button></div>
+        <div style="flex:none"><button class="btn" id="bkRun">Back up this namespace</button></div>
+        <div style="flex:none"><button class="btn ghost" id="bkRunAll" title="Back up all namespaces allowed by the filter (all if no filter)">Back up all (filtered)</button></div>
+      </div></div>
+      <div id="bkSelInfo" style="display:none"><label class="fld">Selected namespaces</label><div class="fbox" id="bkSelList"></div></div>
+      <label class="fld" style="margin-top:10px">Destination folder (optional)</label>
+      <input type="text" id="bkDest" placeholder="Empty = hycu-backups/ (next to the program). E.g. D:\backups\hycu  or  /mnt/backups">
+      <div class="hint" style="margin-top:4px">Path on the machine running the tool. The &lt;namespace&gt;/&lt;timestamp&gt; subfolder is created automatically.</div>
+      <div id="bkOut"></div>
+    </div>
+
+    </div>
+    <div class="hm-foot" id="mBackupFoot"><button class="lnk" type="button" data-close="mBackup">Close</button><button class="btn" id="bkRunSel" type="button" style="display:none">Back up the selection</button></div>
+  </div>
+</div>
+<div id="mBulk" class="hmodal-bg" style="display:none">
+  <div class="hmodal" style="max-width:860px">
+    <div class="hm-head"><h2>Bulk restore</h2><div class="hm-ico"><button type="button" data-close="mBulk" title="Close">✕</button></div></div>
+    <div class="hm-body">
+      <div class="note">Recreates <b>every deleted namespace</b> of the active cluster (<b id="bulkCluster"></b>) from its latest backup prior to the reference time: namespace, PV/PVC, workloads, dependencies, Secrets (vault unlocked), Volume Groups restored by HYCU if they are gone, stateless applications. Namespaces <b>still present</b> are skipped: a live application is restored from its own row. Sequential, journaled, resumable; <b>simulation is mandatory</b> before the real run.</div>
+      <div class="row" style="margin-top:10px">
+        <div style="flex:none;width:230px"><label class="fld">Reference time</label><input type="datetime-local" id="bulkAsOf"></div>
+        <div><label class="fld">Namespaces to exclude (comma-separated, optional)</label><input type="text" id="bulkExclude" placeholder="kube-system, monitoring" autocomplete="off"></div>
+        <div style="flex:none;align-self:flex-end"><button class="btn ghost" id="bulkPlanBtn" type="button">Prepare the plan</button></div>
+      </div>
+      <div id="bulkPlanOut" style="margin-top:10px"></div>
+      <div id="bulkRunOut" style="margin-top:10px"></div>
+    </div>
+    <div class="hm-foot"><button class="lnk" type="button" data-close="mBulk">Close</button>
+      <button class="btn ghost" id="bulkStop" type="button" style="display:none">Stop</button>
+      <button class="btn ghost" id="bulkResume" type="button" style="display:none">Resume</button>
+      <button class="btn" id="bulkSim" type="button" disabled>Simulate</button>
+      <button class="btn danger" id="bulkReal" type="button" disabled>Start (real)</button></div>
+  </div>
+</div>
+<div id="mPolicy" class="hmodal-bg" style="display:none">
+  <div class="hmodal" style="max-width:700px">
+    <div class="hm-head"><h2 id="mPolicyTitle">Set Policy</h2><div class="hm-ico"><button type="button" data-close="mPolicy" title="Close">✕</button></div></div>
+    <div class="hm-body">
+    <div class="card" id="bkProtectCard">
+      <h3><span class="step-no">2</span>Protect the data in HYCU</h3>
+      <p class="sub">The export above only saves the <b>manifests</b> (the restore “recipe”).
+        The <b>data</b> lives in Nutanix Volume Groups: only HYCU actually backs it up.
+        Here we match the namespace's PVCs to HYCU Volume Groups, assign a policy, and trigger
+        a backup.</p>
+      <div id="bkProtectOff" class="warnbox">Register the HYCU source (⚙ at the top right) to enable this section.</div>
+      <div id="bkProtectOn" style="display:none">
+        <button class="btn ghost" id="bkMatch">Analyze the PVC ↔ HYCU Volume Group mapping</button>
+        <div id="bkMatchOut"></div>
+        <div id="bkProtectForm" style="display:none">
+          <label class="fld">HYCU policy to assign (optional)</label>
+          <select id="bkPolicy"></select>
+          <label class="fld" style="margin-top:10px"><input type="checkbox" id="bkForceFull" style="width:auto"> Full backup (forceFull)</label>
+          <div style="margin-top:12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+            <button class="btn" id="bkProtect">Assign + back up now</button>
+            <span class="hint" id="bkProtectHint" style="margin:0"></span>
+          </div>
+          <div id="bkProtectLog"></div>
+        </div>
+      </div>
+    </div>
+    </div>
+    <div class="hm-foot" id="mPolicyFoot"><button class="lnk" type="button" data-close="mPolicy">Close</button></div>
+  </div>
+</div>
+<div id="mRestore" class="hmodal-bg" style="display:none">
+  <div class="hmodal" style="max-width:760px">
+    <div class="hm-head"><h2 id="mRestoreTitle">Application restore</h2><div class="hm-ico"><button type="button" data-close="mRestore" title="Close">✕</button></div></div>
+    <div class="hm-body">
+  <!-- ===================== RESTAURATION ===================== -->
+  <section id="tab-restore">
+    <div class="stepper" id="rsStepper" aria-label="Restore steps">
+      <span class="st on" data-st="1">1 · Type</span>
+      <span class="st" data-st="2">2 · Options</span>
+      <span class="st" data-st="3">3 · Verify &amp; run</span>
+      <span class="st" data-st="4">4 · Follow-up</span>
+    </div>
+    <div id="rsPgType">
+      <div class="note" id="rsAppNote" style="display:none;margin-bottom:10px"></div>
+      <div class="opt" data-kind="cloneapp"><svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="4" y="27" width="16" height="16" rx="2"/><circle cx="35.5" cy="35" r="8.5"/><path d="M27.5 12.5a8.3 8.3 0 1 1 3 6.3"/><path d="M27 6.8v5.4h5.4"/></svg><div><b>Restore the whole application (copy)</b><span>Restores the application storage and objects (workloads, dependencies) into the same namespace (suffix) or another one. The original is not modified.</span></div></div>
+      <div class="opt" data-kind="inplace"><svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="19" cy="10.5" rx="12" ry="4.5"/><path d="M7 10.5v25c0 2.5 5.4 4.5 12 4.5"/><path d="M31 10.5v10"/><path d="M7 23c0 2.5 5.4 4.5 12 4.5"/><path d="M27.3 36.3a8.2 8.2 0 1 0 2.4-5.8"/><path d="M27 26.6v4.9h4.9"/></svg><div><b>Restore storage in place</b><span>Restores the data into the original volumes. The application is stopped, then restarted.</span></div></div>
+      <div class="opt" data-kind="reattach"><svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="16" cy="10.5" rx="11" ry="4.3"/><path d="M5 10.5v25c0 2.4 4.9 4.3 11 4.3s11-1.9 11-4.3v-25"/><path d="M5 23c0 2.4 4.9 4.3 11 4.3s11-1.9 11-4.3"/><path d="M32 23.5h11M38.5 18.5l5 5-5 5"/></svg><div><b>Restore storage to new volumes</b><span>Restores to new Volume Groups and attaches the application to them. The original volumes are kept.</span></div></div>
+      <div class="opt" data-kind="dr"><svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M24 5l17 8v10c0 10.5-7.2 18.6-17 21-9.8-2.4-17-10.5-17-21V13z"/><path d="M24 15v10M24 30.5h.01"/></svg><div><b>DR restore (another cluster / context)</b><span>Disaster recovery: recreates an application on THIS cluster from a backup of a lost cluster (or imported from the S3 bucket). Sources read from the backup alone. Requires the “Allow DR restore” setting.</span></div></div>
+      <div class="opt" data-kind="objects"><svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="6" width="26" height="34" rx="3"/><path d="M11 14h14M11 20h14M11 26h9"/><path d="M28.5 36.5a8.2 8.2 0 1 0 2.4-5.8"/><path d="M28.2 26.8v4.9h4.9"/></svg><div><b>Restore configuration objects</b><span>Re-applies selected objects (Deployments, Services, ConfigMaps…) from a backup's snapshot, with a diff preview. Volumes and data are untouched.</span></div></div>
+    </div>
+    <div id="rsPgDr" style="display:none">
+      <div id="drGate" style="display:none"><div class="warnbox"><b>DR restore</b> is disabled. Enable “<b>Allow DR restore</b>” in ⚙ → Settings (for the duration of the drill or disaster), then come back here.</div>
+        <div style="margin-top:10px"><button class="btn ghost" id="drOpenCfg" type="button">Ouvrir les réglages</button></div></div>
+      <div id="drForm" style="display:none">
+        <div class="warnbox" id="drWarnDr"><b>Disaster recovery</b> mode: the cross-cluster guard is lifted for THIS operation. Every source comes from the selected backup; the target is the <b>active cluster</b> (<b id="drCluster"></b>). First restore the Volume Groups in HYCU to the target site, then paste their UUIDs.</div>
+        <div class="note" id="drWarnRec" style="display:none">This namespace no longer exists on cluster <b id="drClusterRec"></b>: the application will be <b>recreated from its backup</b> (namespace, PV/PVC, workloads, non-redacted dependencies), reusing its original volumes — or, if they were deleted with the namespace, restoring them automatically from HYCU (“Protected deleted”). In the common case, nothing to enter: check the backup and start the restore.</div>
+        <div class="row" style="margin-top:10px">
+          <div><label class="fld">Source backup (all clusters / S3 imports)</label><select id="drBackupSel"></select></div>
+          <div style="flex:none;width:220px"><label class="fld">Target namespace</label><input type="text" id="drTargetNs" autocomplete="off"></div>
+        </div>
+        <div class="row">
+          <div style="flex:none;width:260px"><label class="fld">Target StorageClass (empty = unchanged)</label><input type="text" id="drSc" placeholder="nutanix-volume" autocomplete="off"></div>
+          <div style="align-self:flex-end"><label class="fld"><input type="checkbox" id="drRefs" checked style="width:auto"> Recreate dependencies from the backup (non-redacted Secrets, ConfigMaps, ServiceAccounts, Services)</label></div>
+        </div>
+        <div class="note" id="drSecretsNote" style="display:none;margin:8px 0"></div>
+        <div class="note" id="drNoRes" style="display:none;margin:8px 0">This backup contains <b>only the volumes</b> (no snapshot of workloads/dependencies): it predates this feature, or extended config backup was disabled. The restore will recreate <b>the volumes (PV/PVC)</b>; recreate the workloads from a more recent backup or manually.</div>
+        <div id="drReuseWrap" style="display:none;margin:6px 0 4px">
+          <label class="fld" style="display:flex;gap:9px;align-items:flex-start;cursor:pointer;font-weight:600">
+            <input type="checkbox" id="drReuse" checked style="width:auto;margin-top:2px">
+            <span>Reuse the application's original volumes <span class="badge sim">recommended</span>
+            <span class="hint" style="display:block;font-weight:400;margin-top:3px">Nothing to enter: the application is reconnected to its original Nutanix volumes (their IDs are in the backup). Only untick if you restored the data onto <b>new</b> volumes in HYCU.</span></span>
+          </label>
+        </div>
+        <label class="fld" id="drVolsLabel">Volumes — paste the UUID of the VG restored/cloned on the target site</label>
+        <div id="drVols"></div>
+        <div id="drAutoWrap" style="display:none;margin:8px 0 2px">
+          <button class="btn ghost" id="drAuto" type="button">Create the volumes automatically via HYCU</button>
+          <span class="hint" style="margin-left:8px">HYCU clones the Volume Groups and the tool retrieves the new IDs — nothing to enter. In simulation, only the plan is shown.</span>
+        </div>
+        <div id="drLog" style="margin-top:10px"></div>
+        <div id="drErr"></div>
+      </div>
+    </div>
+    <div id="rsPgObjects" style="display:none">
+      <div class="row" style="margin-bottom:4px">
+        <div><label class="fld" style="margin-top:0">Application</label><div class="fbox" id="objApp"></div></div>
+        <div><label class="fld" style="margin-top:0">Backup (config snapshot)</label><select id="objBackupSel"></select></div>
+      </div>
+      <div id="objPick">
+        <label class="fld" style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">Objects to restore <span class="hint" id="objInfo"></span>
+          <span id="objOnlyAppWrap" style="display:none;font-weight:400;margin-left:auto"><input type="checkbox" id="objOnlyApp" checked style="width:auto"> Only the application's objects</span></label>
+        <div class="tcard" style="box-shadow:none;border:1px solid var(--rule)">
+          <table class="ht"><thead><tr><th class="cb"><input type="checkbox" id="objAll"></th><th>Kind</th><th>Name</th><th>Note</th></tr></thead>
+          <tbody id="objBody"></tbody></table></div>
+      </div>
+      <div id="objDiffWrap" style="display:none">
+        <label class="fld">Diff preview (live → backup)</label>
+        <div id="objDiff"></div>
+      </div>
+      <div id="objLog" style="margin-top:10px"></div>
+      <div id="objErr"></div>
+    </div>
+    <div id="rsPgTarget" style="display:none">
+      <div class="opt" data-nsmode="same"><svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="6" y="6" width="24" height="24" rx="3"/><rect x="18" y="18" width="24" height="24" rx="3"/><path d="M25 30h10M30 25v10"/></svg><div><b>Into the same namespace (suffix)</b><span>The copy is created next to the original application: every object gets a suffix (e.g. <code>-clone</code>). Handy to verify a restore without moving anything.</span></div></div>
+      <div class="opt" data-nsmode="other"><svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="12" width="17" height="24" rx="3"/><rect x="30" y="12" width="14" height="24" rx="3" stroke-dasharray="4 3"/><path d="M21 24h11M27.5 19.5l4.5 4.5-4.5 4.5"/></svg><div><b>Into another namespace</b><span>The copy is created in a target namespace (created if missing), with its dependencies (Secrets, ConfigMaps, ServiceAccount, Services). Original names are kept.</span></div></div>
+    </div>
+    <div id="rsPgForm" style="display:none">
+      <div class="row" style="margin-bottom:4px">
+        <div><label class="fld" style="margin-top:0">Application</label><div class="fbox" id="rsWizApp"></div></div>
+        <div><label class="fld" style="margin-top:0">Target cluster</label><div class="fbox" id="rsWizCluster"></div></div>
+      </div>
+    <div class="card">
+      <h3><span class="step-no">1</span>Choose the namespace and volumes</h3>
+      <p class="sub">Tick the volume(s) to restore — several volumes = a single transaction.</p>
+      <div id="rsNsRow" style="display:none"><label class="fld">Namespace</label>
+      <div class="row">
+        <div><select id="rsNs"></select></div>
+        <div style="flex:none;align-self:flex-end"><button class="btn ghost nsEdit" title="Filter the namespace list">✎ Filter</button></div>
+      </div></div>
+      <label class="fld" id="rsCustomDirLbl" style="margin-top:8px"><input type="checkbox" id="rsCustomDir" style="width:auto"> Read backups from a custom folder</label>
+      <div id="rsCustomDirWrap" style="display:none;margin-top:4px">
+        <input type="text" id="rsBackupRoot" placeholder="E.g. D:\backups\hycu  or  /mnt/backups  (folder containing &lt;namespace&gt;/&lt;timestamp&gt;/)">
+        <div class="hint" style="margin-top:4px">Backups will be read (and used for the restore) from here instead of <code>hycu-backups/</code>.</div>
+      </div>
+      <div id="rsBackupSelWrap" style="display:none;margin-top:8px">
+        <label class="fld">Configuration backup to restore</label>
+        <select id="rsBackupSel"></select>
+        <div class="hint" style="margin-top:4px">PV/PVC manifests (the “skeleton”) — independent from the HYCU restore point of the <b>data</b>.<a id="rsBackupDl" href="#" download style="display:none;margin-left:6px;text-decoration:none">⬇ Download (.zip)</a></div>
+      </div>
+      <div id="rsModeRow" style="display:none"><label class="fld">Operation type</label>
+      <div class="seg" id="rsMode">
+        <button class="on" data-mode="clone">Clone (new VG)</button>
+        <button data-mode="inplace">Restore in place</button>
+      </div></div>
+      <div id="rsCloneSubWrap">
+        <label class="fld" style="display:none">What to do with the clone?</label>
+        <div class="seg" id="rsCloneSub" style="display:none">
+          <button class="on" data-sub="reattach">Reattach to the existing app</button>
+          <button data-sub="cloneapp">Clone the application</button>
+        </div>
+        <div id="rsCloneAppWrap" style="display:none">
+          <label class="fld">Application clone target</label>
+          <div class="seg" id="rsCloneNsMode">
+            <button class="on" data-nsmode="same">Same namespace (suffix)</button>
+            <button data-nsmode="other">Other namespace</button>
+          </div>
+          <div class="row" style="margin-top:6px">
+            <div id="rsCloneSuffixWrap"><label class="fld">Suffix applied to the copies</label><input type="text" id="rsCloneSuffix" value="-clone"></div>
+            <div id="rsCloneTargetWrap" style="display:none"><label class="fld">Target namespace</label><input type="text" id="rsCloneTargetNs" placeholder="bo-dev-restore"></div>
+          </div>
+          <label class="fld" id="rsCloneRefsWrap" style="margin-top:8px;display:none"><input type="checkbox" id="rsCloneRefs" checked style="width:auto">
+            Also clone the dependencies (Secrets, ConfigMaps, ServiceAccount, Services targeting the app)
+            <span class="hint">— required for the pods to start in the other namespace</span></label>
+        </div>
+      </div>
+      <label class="fld">Volumes to restore</label>
+      <ul class="pvc-list" id="rsPvcs" style="margin-top:12px"></ul>
+    </div>
+
+    <div class="card" id="rsConfig" style="display:none">
+      <h3><span class="step-no">2</span>Restore the data (Volume Groups)</h3>
+      <div id="rsFlowGuide" class="rsGuide"></div>
+      <div id="rsVolCfgs"></div>
+      <div id="rsHyActions"></div>
+      <div id="rsInplaceRunWrap" style="display:none;margin-top:14px;border-top:1px solid var(--line);padding-top:12px">
+        <p class="sub" style="margin:4px 0 8px"><b>Stop the application → HYCU in-place restore → restart.</b> No reference to enter.</p>
+        <button class="btn" id="rsInplaceRun" disabled>Launch the in-place restore</button>
+        <span class="hint" id="rsInplaceHint" style="margin:0"></span>
+        <div aria-live="polite" id="rsInplaceLog"></div>
+      </div>
+      <div id="rsContinueWrap" style="margin-top:14px">
+        <button class="btn" id="rsPreview">Continue: review and launch →</button>
+      </div>
+      <div id="rsErr"></div>
+    </div>
+
+    <details class="rsAdv" id="rsAdvWrap"><summary class="rsAdvSum">Advanced — custom backup folder</summary><div id="rsAdvBody"></div></details>
+    </div>
+    <div id="rsPgPlan" style="display:none">
+    <div class="card" id="rsPlan" style="display:none">
+      <h3><span class="step-no">3</span>Review then launch</h3>
+      <p class="sub">Review the derived replacements and the sequence, then launch.</p>
+      <div id="rsRepl"></div>
+      <div><b style="font-size:13px">Planned sequence</b><ol class="plan" id="rsSteps"></ol></div>
+      <div id="rsCtxConfirm" style="display:none;margin-top:14px">
+        <label class="fld">Target context confirmation (real mode)</label>
+        <input type="text" id="rsCtxInput" placeholder="retype the kubectl context name">
+      </div>
+      <div style="margin-top:16px;display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+        <button class="btn" id="rsGo">Launch the restore</button>
+        <span class="hint" id="rsGoHint"></span>
+      </div>
+      <div id="rsProgress" class="progress" style="display:none">
+        <div class="progress-head"><span id="rsProgressTxt"></span><button class="btn ghost" type="button" id="rsCancel" style="display:none">Stop after the current step</button></div>
+        <div class="progress-track"><div class="progress-bar" id="rsProgressBar"></div></div>
+      </div>
+      <div id="rsLog" aria-live="polite"></div>
+    </div>
+    </div>
+    <div class="nextbar" id="rsNextBar"><span id="rsNextTxt"></span><button class="btn" id="rsNextBtn"></button></div>
+  </section>
+
+    </div>
+    <div class="hm-foot" id="mRestoreFoot"><span id="rsWizMode" class="badge" style="margin-right:auto"></span><button class="lnk" type="button" data-close="mRestore">Close</button><button class="btn ghost" type="button" id="rsWizBack">Back</button><button class="btn" type="button" id="rsWizGo">Next</button></div>
+  </div>
+</div>
+<div id="mSources" class="hmodal-bg" style="display:none">
+  <div class="hmodal" style="max-width:860px">
+    <div class="hm-head"><h2 id="mSourcesTitle">Sources</h2><div class="hm-ico"><button type="button" data-close="mSources" title="Close">✕</button></div></div>
+    <div class="hm-body">
+      <p class="hint" style="margin:0 0 12px">Register here the systems used by the tool — HYCU, Nutanix and your Kubernetes clusters. Credentials and kubeconfigs stay in memory for the session (or in the encrypted vault if you choose so).</p>
+      <div class="srctools">
+        <button class="pact" id="clAddBtn" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="16" height="6.5" rx="1.3"/><rect x="4" y="13.5" width="10" height="6.5" rx="1.3"/><path d="M18.5 14.5v5M16 17h5"/></svg><span>Add a Kubernetes cluster</span></button>
+        <button class="pact" id="nkpBtn" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3.5" y="3.5" width="7" height="7" rx="1.2"/><rect x="13.5" y="3.5" width="7" height="7" rx="1.2"/><rect x="3.5" y="13.5" width="7" height="7" rx="1.2"/><circle cx="16.6" cy="16.6" r="3"/><path d="M18.8 18.8l2 2"/></svg><span>Discover NKP workspaces</span></button>
+      </div>
+      <div class="tcard" style="box-shadow:none;border:1px solid var(--rule);margin-bottom:14px">
+        <table class="ht"><thead><tr><th>Name</th><th>Type</th><th>URL / server</th><th class="ctr">Status</th></tr></thead><tbody id="srcBody"></tbody></table>
+      </div>
+  <!-- ===================== CONNEXIONS ===================== -->
+  <section id="tab-connect">
+    <div class="card" data-card="hycu">
+      <h3><span class="step-no">H</span>HYCU — connection</h3>
+      <p class="sub">To list restore points and orchestrate the clone/restore of a Volume Group
+        from the restore wizard (<b>Applications → Restore</b>). Credentials stay <b>in memory</b> for the session — never written to disk.</p>
+      <label class="fld">HYCU URL (port 8443)</label>
+      <input type="text" id="hyUrl" placeholder="https://hycu.example.com:8443">
+      <label class="fld">Authentication</label>
+      <div class="seg" id="hyAuthMode">
+        <button class="on" data-mode="basic">Basic (user)</button>
+        <button data-mode="apikey">API key</button>
+      </div>
+      <div id="hyBasicFields" class="row">
+        <div><label class="fld">Username</label><input type="text" id="hyUser" autocomplete="off"></div>
+        <div><label class="fld">Password</label><input type="password" id="hyPass" autocomplete="off"></div>
+      </div>
+      <div id="hyApiField" style="display:none">
+        <label class="fld">API key <span class="hint">(HYCU: Help → API Keys)</span></label>
+        <input type="password" id="hyApiKey" autocomplete="off">
+      </div>
+      <label class="fld" style="margin-top:10px"><input type="checkbox" id="hyTls" style="width:auto"> Verify the TLS certificate (unchecked = self-signed accepted)</label>
+      <div style="margin-top:12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <button class="btn" id="hyConnect">Test &amp; connect</button>
+        <button class="btn ghost" id="hyDisconnect">Disconnect</button>
+        <span class="hint" id="hyStatus" style="margin:0"><span class="conn-dot"></span>not connected</span>
+      </div>
+      <div id="hyErr"></div>
+    </div>
+
+    <div class="card" data-card="nutanix">
+      <h3><span class="step-no">N</span>Nutanix Prism Element — connection</h3>
+      <p class="sub">Automatically fetches the cloned Volume Group's reference (UUID) (read-only, API v2)
+        in the restore wizard. Credentials kept in session memory only.</p>
+      <label class="fld">Prism Element URL</label>
+      <input type="text" id="ntUrl" placeholder="https://prism-element.example.com:9440">
+      <div class="row">
+        <div><label class="fld">Username</label><input type="text" id="ntUser" autocomplete="off"></div>
+        <div><label class="fld">Password</label><input type="password" id="ntPass" autocomplete="off"></div>
+      </div>
+      <label class="fld" style="margin-top:10px"><input type="checkbox" id="ntTls" style="width:auto"> Verify the TLS certificate</label>
+      <div style="margin-top:12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <button class="btn" id="ntConnect">Test &amp; connect</button>
+        <button class="btn ghost" id="ntDisconnect">Disconnect</button>
+        <span class="hint" id="ntStatus" style="margin:0"><span class="conn-dot"></span>not connected</span>
+      </div>
+      <div id="ntErr"></div>
+    </div>
+
+    <div class="card" data-card="prismcentral">
+      <h3><span class="step-no">PC</span>Nutanix Prism Central — connection</h3>
+      <p class="sub">Multi-cluster alternative (API v3). Also used to fetch the reference (UUID) of the Volume Group
+        cloned if you do not use Prism Element. Credentials kept in session memory only.</p>
+      <label class="fld">Prism Central URL</label>
+      <input type="text" id="pcUrl" placeholder="https://prism-central.example.com:9440">
+      <div class="row">
+        <div><label class="fld">Username</label><input type="text" id="pcUser" autocomplete="off"></div>
+        <div><label class="fld">Password</label><input type="password" id="pcPass" autocomplete="off"></div>
+      </div>
+      <label class="fld" style="margin-top:10px"><input type="checkbox" id="pcTls" style="width:auto"> Verify the TLS certificate</label>
+      <div style="margin-top:12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <button class="btn" id="pcConnect">Test &amp; connect</button>
+        <button class="btn ghost" id="pcDisconnect">Disconnect</button>
+        <span class="hint" id="pcStatus" style="margin:0"><span class="conn-dot"></span>not connected</span>
+      </div>
+      <div id="pcErr"></div>
+    </div>
+
+    <div class="card" data-card="s3">
+      <h3><span class="step-no">S3</span>S3 object storage — backup export (optional)</h3>
+      <p class="sub">Copies every configuration backup (<code>.zip</code>) to an <b>S3-compatible</b> bucket
+        (Nutanix Objects, MinIO, AWS S3…): the safety net then lives <b>outside the cluster</b> it protects.
+        Access keys stay <b>in memory</b> for the session (encrypted vault optional).</p>
+      <div class="row">
+        <div><label class="fld">S3 endpoint</label><input type="text" id="s3Url" placeholder="https://objects.exemple.com"></div>
+        <div><label class="fld">Bucket</label><input type="text" id="s3Bucket" placeholder="hycu-backups" autocomplete="off"></div>
+      </div>
+      <div class="row">
+        <div><label class="fld">Access key</label><input type="text" id="s3Access" autocomplete="off"></div>
+        <div><label class="fld">Secret key</label><input type="password" id="s3Secret" autocomplete="off"></div>
+      </div>
+      <div class="row">
+        <div><label class="fld">Region (signing)</label><input type="text" id="s3Region" placeholder="us-east-1"></div>
+        <div style="align-self:flex-end">
+          <label class="fld"><input type="checkbox" id="s3PathStyle" checked style="width:auto"> Path-style URL (Objects / MinIO)</label>
+          <label class="fld"><input type="checkbox" id="s3Tls" style="width:auto"> Verify the TLS certificate</label>
+        </div>
+      </div>
+      <label class="fld" style="margin-top:10px"><input type="checkbox" id="s3Auto" style="width:auto">
+        <b>Automatic export</b>: send every successful backup (manual and scheduled) to the bucket</label>
+      <label class="fld"><input type="checkbox" id="s3Enc" style="width:auto">
+        <b>Encrypt exports</b> (optional): uploaded objects are encrypted — the bucket can be untrusted storage</label>
+      <div id="s3EncWrap" style="display:none"><label class="fld">Export encryption passphrase (keep it: it is needed for decryption)</label>
+        <input type="password" id="s3EncPass" autocomplete="off">
+        <div class="hint" style="margin-top:4px">Decryption outside the UI: <code>python3 hycu_k8s_nutanix.py --decrypt fichier.zip.enc</code></div></div>
+      <div style="margin-top:12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <button class="btn" id="s3Connect">Test &amp; connect</button>
+        <button class="btn ghost" id="s3Disconnect">Disconnect</button>
+        <span class="hint" id="s3Status" style="margin:0"><span class="conn-dot"></span>not connected</span>
+      </div>
+      <div class="hint" style="margin-top:8px">Read-only test (bucket listing, 1 object). Objects created:
+        <code>&lt;préfixe&gt;/&lt;cluster&gt;/&lt;namespace&gt;/&lt;horodatage&gt;.zip</code>. L'échec d'un export
+        n'échoue jamais la sauvegarde locale (visible dans les Tâches).</div>
+      <div id="s3Err"></div>
+      <div style="margin-top:14px;border-top:1px solid var(--line);padding-top:12px">
+        <button class="pact" id="s3ListBtn" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12M7.5 10.5L12 15l4.5-4.5"/><path d="M4 17v2.5h16V17"/></svg><span>Import from the bucket (recovery / DR)</span></button>
+        <div id="s3ImportWrap" style="display:none;margin-top:10px">
+          <div id="s3ListOut"></div>
+          <div class="row" style="margin-top:8px">
+            <div><label class="fld">Decryption passphrase (.enc objects only)</label><input type="password" id="s3ImpPass" autocomplete="off"></div>
+            <div style="flex:none;align-self:flex-end"><button class="btn" id="s3ImportBtn" type="button" disabled>Import selection</button></div>
+          </div>
+          <div class="hint" style="margin-top:4px">Repatriated exports go to <code>hycu-backups/_imports/…</code>; they are restored through the wizard's <b>DR restore</b> (or on their source cluster).</div>
+          <div id="s3ImpRes"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card" data-card="vault">
+      <h3><span class="step-no">🔒</span>Remember connections (encrypted)</h3>
+      <p class="sub">Optional: store the credentials entered (and the kubeconfigs of added clusters) in an <b>encrypted</b> vault
+        (<code>hycu_secrets.enc</code>), protected by a <b>master passphrase</b> — never stored.
+        By default nothing is written (RAM only), the safest choice.</p>
+      <label class="fld">Passphrase (≥ 8 characters)</label>
+      <input type="password" id="vaultPass" autocomplete="off">
+      <div style="margin-top:12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <button class="btn" id="vaultSave">Save (encrypt)</button>
+        <button class="btn ghost" id="vaultLoad">Load (decrypt)</button>
+        <button class="btn danger" id="vaultForget">Forget</button>
+        <span class="hint" id="vaultStatus" style="margin:0"><span class="conn-dot"></span>no vault</span>
+      </div>
+      <div class="hint" style="margin-top:8px">The vault uses passphrase-based encryption
+        (PBKDF2-HMAC-SHA256 + integrity seal).</div>
+      <div id="vaultErr"></div>
+    </div>
+
+    <div class="card" data-card="cluster-add">
+      <h3><span class="step-no">K</span>Add a Kubernetes cluster</h3>
+      <p class="sub">Load the cluster <b>kubeconfig</b> (file or copy-paste). Like a password, it stays
+        <b>in memory</b> for the session, and is only written to disk <b>encrypted</b> if you use the vault.
+        Each cluster's backups are stored separately.</p>
+      <div class="row">
+        <div><label class="fld">Cluster name</label><input type="text" id="clName" placeholder="prod-paris" autocomplete="off"></div>
+        <div><label class="fld">Kubeconfig file</label><input type="file" id="clFile"></div>
+      </div>
+      <label class="fld">…or paste its content (YAML or JSON)</label>
+      <textarea id="clKc" class="kc" spellcheck="false" autocomplete="off" placeholder="apiVersion: v1&#10;kind: Config&#10;clusters: …"></textarea>
+      <div id="clCtxWrap" style="display:none"><label class="fld">Context</label><select id="clCtx"></select><div id="clCtxInfo"></div></div>
+      <div style="margin-top:12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <button class="btn" id="clAdd" type="button">Test &amp; add</button>
+        <span class="hint" style="margin:0">Read-only connection test (namespace list, 10 s max).</span>
+      </div>
+      <div id="clErr"></div>
+    </div>
+
+    <div class="card" data-card="cluster">
+      <h3><span class="step-no">K</span><span id="clDTitle">Cluster</span></h3>
+      <div id="clDBody"></div>
+      <div style="margin-top:12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <button class="btn" id="clUse" type="button">Set as active cluster</button>
+        <button class="btn ghost" id="clLocalCfg" type="button">Open settings</button>
+        <button class="btn danger" id="clRemove" type="button">Remove</button>
+      </div>
+      <div id="clDErr"></div>
+    </div>
+
+    <div class="card" data-card="nkp">
+      <h3><span class="step-no">W</span>NKP workspace discovery (optional)</h3>
+      <p class="sub">From the NKP <b>management cluster</b>, lists the <b>workspaces</b> and their clusters, then imports
+        their kubeconfigs. Queried cluster: <b id="nkpMgmt">—</b> (the active cluster — choose the management cluster
+        in the top bar).</p>
+      <div class="warnbox">⚠ <b>Elevated rights required</b> on the management cluster: read access to Workspaces,
+        KommanderClusters and kubeconfig <b>Secrets</b> in workspace namespaces. Imported kubeconfigs often grant
+        <b>administrator</b> access to the clusters: they stay in memory (optional encrypted vault), never in clear text on disk.</div>
+      <div style="margin-top:12px"><button class="btn" id="nkpDiscover" type="button">Discover</button></div>
+      <div id="nkpOut"></div>
+      <div id="nkpImportWrap" style="display:none;margin-top:10px">
+        <label class="fld"><input type="checkbox" id="nkpAck" style="width:auto"> I understand: import the kubeconfigs of the checked clusters</label>
+        <button class="btn" id="nkpImport" type="button" disabled>Import selection</button>
+      </div>
+      <div id="nkpRes"></div>
+    </div>
+  </section>
+
+    </div>
+    <div class="hm-foot" id="mSourcesFoot"><button class="lnk" type="button" data-close="mSources">Close</button></div>
+  </div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const CSRF = document.querySelector('meta[name=csrf-token]').content;
+const dry = () => $("#dry").checked;
+let state = {selected:{}, mode:"clone", cloneSub:"reattach", cloneNsMode:"same", backup_path:null, backup_root:null, preview:null, ns:null, app:null};
+let ctxInfo = {};
+function isCloneApp(){ return state.mode==="clone" && state.cloneSub==="cloneapp"; }
+
+function badge(phase){
+  const p=(phase||"").toLowerCase();
+  const c = p==="bound"?"b-bound":p==="lost"?"b-lost":p==="pending"?"b-pending":"b-na";
+  return `<span class="badge ${c}">${esc(phase||"—")}</span>`;
+}
+function esc(s){return (s==null?"":String(s)).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
+// Cluster Kubernetes ACTIF : chaque requête le désigne (en-tête X-HYCU-Cluster) ;
+// le serveur route kubectl vers ce cluster. « local » = cluster de la configuration.
+let ACTIVE_CID="local", CLUSTERS=[{id:"local", name:"local", local:true}];
+// Couche API unique : ne lève JAMAIS vers les handlers (une coupure réseau ou une
+// réponse non-JSON renvoie {ok:false, error, status}), délai borné, bandeau hors-ligne.
+let NET_DOWN=false;
+function setNet(down){
+  if(down===NET_DOWN) return; NET_DOWN=down;
+  const b=$("#netBanner"); if(b) b.style.display = down ? "block" : "none";
+}
+async function api(u, opts){
+  const ctrl=new AbortController(); const t=setTimeout(()=>ctrl.abort(), (opts&&opts.timeout)||45000);
+  try{
+    const r=await fetch(u, Object.assign({signal:ctrl.signal}, opts||{}, {headers:Object.assign(
+      {"X-HYCU-Cluster":(opts&&opts.cid)||ACTIVE_CID}, (opts&&opts.headers)||{})}));
+    setNet(false);
+    const txt=await r.text();
+    let j=null; try{ j=txt?JSON.parse(txt):{}; }catch(e){ j=null; }
+    if(j===null) return {ok:false, status:r.status, error:(r.status>=400?("HTTP "+r.status+" — "):"")+(txt||"unreadable response").slice(0,200)};
+    if(j && typeof j==="object" && j.ok===undefined && j.error && r.status>=400) j.ok=false;
+    if(j && typeof j==="object") j.status=r.status;
+    return j;
+  }catch(e){
+    const aborted = e && e.name==="AbortError";
+    if(!aborted) setNet(true);
+    return {ok:false, status:0, error: aborted ? "Timeout: the server is not responding." : "Server unreachable (network or tool stopped)."};
+  }finally{ clearTimeout(t); }
+}
+async function get(u, cid){ return api(u, {cid}); }
+async function post(u,b,cid){ return api(u, {method:"POST", cid, headers:{"Content-Type":"application/json","X-CSRF-Token":CSRF}, body:JSON.stringify(b)}); }
+window.addEventListener("unhandledrejection", e=>{ console.warn("Promesse non gérée :", e.reason); });
+
+// Erreurs actionnables : reconnaît les causes courantes (HYCU/Nutanix/kubectl/HTTP)
+// et préfixe un conseil concret, en gardant le détail brut en dessous.
+function errHint(raw){
+  const e=(raw||"").toLowerCase();
+  if(/401|unauthorized|identifiant|mot de passe|password|invalid cred/.test(e)) return "Credentials rejected — check the username/password, or the HYCU API key (Help → API Keys, required with 2FA).";
+  if(/\b403\b|forbidden|interdit|rbac/.test(e)) return "Access denied — insufficient rights (RBAC / API role).";
+  if(/\b404\b|api-docs|endpoint.*not found/.test(e)) return "Endpoint not found — check the base URL and the API version (⚙ Settings).";
+  if(/certificat|certificate|ssl|tls|self.?signed/.test(e)) return "TLS certificate — tick/untick “Verify the TLS certificate” in Connections to match your PKI.";
+  if(/stockage objet|object storage/.test(e)) return "S3 endpoint unreachable — check the PORT (MinIO: 9000 = S3 API, not the 9001 console; Nutanix Objects: 443), the http/https scheme, and that the machine running the tool (the Pod, not your workstation) can reach that host.";
+  if(/timeout|timed out|délai|connexion impossible|connection failed|refused|unreachable|injoignable|getaddrinfo|name or service|errno|10061|10060/.test(e)) return "Host unreachable — check the URL:port (HYCU 8443, Prism 9440), the network and the firewall.";
+  if(/non connecté|connectez-vous|not connected|connect to at least|connect to hycu/.test(e)) return "Register the source first (⚙ at the top right).";
+  if(/namespace.*(non autorisé|autorisé|not allowed)|(non autorisé).*namespace/.test(e)) return "Namespace not in the allowed list — see ⚙ Settings → allowed namespaces.";
+  if(/contexte.*non autorisé|context.*not allowed|allowed_contexts/.test(e)) return "kubectl context not in the allowed list — see ⚙ Settings.";
+  if(/confirmation du contexte|context confirmation/.test(e)) return "Retype the exact target context name to confirm (real mode).";
+  if(/jeton anti-csrf|csrf token/.test(e)) return "Reload the page (Ctrl+Shift+R): the security token has expired.";
+  return "";
+}
+function errBox(raw){
+  const h=errHint(raw);
+  return `<div class="err">${h?`<b>${esc(h)}</b><div class="hint" style="margin-top:4px">${esc(raw||"")}</div>`:esc(raw||"erreur")}</div>`;
+}
+
+// Préférences mémorisées PAR NAVIGATEUR (localStorage) : namespace, type d'opération,
+// dossiers. Confort uniquement — jamais d'identifiant ni de secret ici.
+const PREFS_KEY="hycu_prefs";
+function prefs(){ try{ const p=JSON.parse(localStorage.getItem(PREFS_KEY)||"{}"); return (p && typeof p==="object" && !Array.isArray(p)) ? p : {}; }catch(e){ return {}; } }
+function savePref(k,v){ try{ const p=prefs(); p[k]=v; localStorage.setItem(PREFS_KEY,JSON.stringify(p)); }catch(e){} }
+function applyPrefs(){
+  const p=prefs();
+  if(p.bkDest) $("#bkDest").value=p.bkDest;
+  if(p.backupRoot) $("#rsBackupRoot").value=p.backupRoot;
+  if(p.customDir){ $("#rsCustomDir").checked=true; $("#rsCustomDirWrap").style.display="block"; }
+  if(p.mode==="inplace"){ state.mode="inplace";
+    document.querySelectorAll("#rsMode button").forEach(x=>x.classList.toggle("on",x.dataset.mode==="inplace"));
+    $("#rsCloneSubWrap").style.display="none"; }
+  if(p.ns && [...$("#bkNs").options].some(o=>o.value===p.ns)){ state.ns=p.ns; applyGlobalNs(); }
+}
+
+// Onglets
+// Namespace GLOBAL synchronisé entre les 3 onglets (fluidité : un seul choix).
+function applyGlobalNs(){ if(!state.ns) return; ["#bkNs","#rsNs","#vfNs"].forEach(id=>{ const e=$(id); if(e && e.value!==state.ns) e.value=state.ns; }); }
+// Stepper du parcours Restaurer : surligne l'étape courante (1 Volumes, 2 Configurer, 3 Lancer).
+function setRsStep(n){ document.querySelectorAll("#rsStepper .st").forEach(e=>{ const k=+e.dataset.st;
+  e.classList.toggle("on",k===n); e.classList.toggle("done",k<n); }); }
+// Pastilles cliquables du stepper : faire défiler vers la carte de l'étape (si affichée).
+document.querySelectorAll("#rsStepper .st").forEach(s=>s.onclick=()=>{
+  const n=+s.dataset.st;
+  const el = n===1? document.querySelector("#tab-restore .card") : (n===2? $("#rsConfig") : $("#rsPlan"));
+  if(el && el.style.display!=="none") el.scrollIntoView({behavior:"smooth",block:"start"});
+});
+const navBtns=[...document.querySelectorAll("nav button[data-tab]")];
+// Pages (barre latérale) — navigation « à la HYCU ». Les opérations (sauvegarde,
+// restauration, politique, sources) s'ouvrent en MODALES depuis une page, comme dans
+// HYCU. switchTab() accepte encore les anciens noms d'onglet (backup/restore/connect)
+// pour les appels programmés existants, et les redirige vers la modale correspondante.
+const PAGES=["dashboard","apps","policies","jobs","verify","settings"];
+let curPage="dashboard";
+function switchTab(tab){
+  if(tab==="connect") return openSources();
+  if(tab==="restore") return openRestoreModal(state.ns);
+  if(tab==="backup") return openBackupModal(state.ns?[state.ns]:[]);
+  closeAllModals();
+  if(tab!=="verify" && vfTrack) vfStop();           // le suivi auto ne survit pas à un changement de page
+  const navTab = tab==="verify" ? "apps" : tab;     // Vérification = sous-page d'Applications
+  navBtns.forEach(x=>{ const on=x.dataset.tab===navTab; x.classList.toggle("on",on); x.setAttribute("aria-selected",on?"true":"false"); });
+  PAGES.forEach(t=>$("#tab-"+t).style.display="none");
+  $("#tab-"+tab).style.display="block";
+  applyGlobalNs();                                   // la page ouverte reflète le namespace courant
+  curPage=tab; onPageShown(tab);
+  window.scrollTo({top:0});
+}
+navBtns.forEach(b=>b.onclick=()=>switchTab(b.dataset.tab));
+$("#hdrConn").onclick=()=>openSources();
+
+// ----- Fenêtre « À propos » (bouton ? de l'en-tête) -----
+// « ? » : menu Aide (guide dans un nouvel onglet) / À propos (modale existante).
+async function openAbout(){
+  const r=await get("/api/config");
+  $("#aboutAudit").textContent=r.audit_log||"—";
+  $("#aboutCfg").textContent=r.config_path||"—";
+  $("#aboutBk").textContent=r.backup_root||"—";
+  $("#aboutModal").style.display="flex";
+}
+function toggleHelpMenu(){
+  const m=$("#helpMenu");
+  if(m.style.display==="block"){ m.style.display="none"; return; }
+  $("#clMenu").style.display="none"; $("#gearMenu").style.display="none";
+  const r=$("#aboutBtn").getBoundingClientRect();
+  m.style.right=Math.max(8, window.innerWidth-r.right-10)+"px";
+  m.style.display="block";
+}
+$("#aboutBtn").onclick=e=>{ e.stopPropagation(); toggleHelpMenu(); };
+document.querySelectorAll("#helpMenu .cli").forEach(el=>el.onclick=e=>{
+  e.stopPropagation(); $("#helpMenu").style.display="none";
+  if(el.dataset.act==="about") openAbout();
+});
+$("#aboutClose").onclick=()=>{ $("#aboutModal").style.display="none"; };
+
+// ----- Barre « action suivante » du parcours Restaurer (anti-scroll) -----
+// La page Restaurer est longue : cette barre flottante rend l'étape suivante
+// visible en permanence (références à remplir -> prévisualiser -> lancer),
+// sans que l'opérateur ait à chercher le bouton en bas de page.
+function rsNext(txt, btnLabel, fn){
+  $("#rsNextTxt").innerHTML=txt;
+  const b=$("#rsNextBtn"); b.textContent=btnLabel; b.onclick=fn;
+  $("#rsNextBar").classList.add("show");
+}
+function hideNextBar(){ $("#rsNextBar").classList.remove("show"); }
+function scrollPulse(el){ if(!el) return; el.scrollIntoView({behavior:"smooth",block:"center"});
+  el.classList.remove("pulse"); void el.offsetWidth; el.classList.add("pulse"); }
+function updateNextBar(){
+  if($("#tab-restore").style.display==="none") return hideNextBar();
+  const chks=[...document.querySelectorAll(".rsChk:checked")];
+  const slClone = typeof rsStatelessClone==="function" && rsStatelessClone();
+  if(!chks.length && !slClone) return hideNextBar();
+  if(slClone && $("#rsPlan").style.display==="none")
+    return rsNext("Stateless application: no volume to choose.","Check the copy",()=>$("#rsPreview").click());
+  const hyOn = conn.hycu && conn.hycu.connected;
+  // Étape 3 : plan affiché et lancement possible -> guider vers le bouton Lancer.
+  if($("#rsPlan").style.display!=="none" && !$("#rsGo").disabled){
+    return rsNext("Plan ready — final step:", $("#rsGo").textContent, ()=>scrollPulse($("#rsGo")));
+  }
+  // Orchestrated in-place restore : compte des points sélectionnés.
+  if(state.mode==="inplace" && hyOn){
+    const ready=chks.map(c=>c.dataset.pvc).filter(p=>rsInplaceSel[p]).length;
+    if(ready===chks.length)
+      return rsNext("All restore points are selected.","Go to launch",()=>scrollPulse($("#rsInplaceRun")));
+    return rsNext(ready+" / "+chks.length+" restore point(s) selected.","Show the volumes",()=>scrollPulse($("#rsVolCfgs")));
+  }
+  // Clone / flux manuel : compte des références VG remplies.
+  const items=collectItems();
+  const filled=items.filter(i=>(i.new_ref||"").trim()).length;
+  if(filled===items.length)
+    return rsNext("All VG references are filled.","Continue: review and launch",()=>$("#rsPreview").click());
+  const batch=$("#hyBatchGo");   // panneau HYCU groupé disponible -> c'est l'action naturelle
+  if(batch && !batch.disabled)
+    return rsNext(filled+" / "+items.length+" VG reference(s) filled.","Restore the VGs from HYCU",()=>scrollPulse(batch));
+  return rsNext(filled+" / "+items.length+" VG reference(s) filled.","Show the volumes",()=>scrollPulse($("#rsVolCfgs")));
+}
+// Navigation clavier des onglets (flèches gauche/droite + Home/Fin).
+document.querySelector("nav").addEventListener("keydown",e=>{
+  const i=navBtns.indexOf(document.activeElement); if(i<0) return;
+  let j=-1;
+  if(e.key==="ArrowRight") j=(i+1)%navBtns.length;
+  else if(e.key==="ArrowLeft") j=(i-1+navBtns.length)%navBtns.length;
+  else if(e.key==="Home") j=0;
+  else if(e.key==="End") j=navBtns.length-1;
+  if(j>=0){ e.preventDefault(); navBtns[j].focus(); navBtns[j].click(); }
+});
+
+// Bandeau simulation (source de vérité unique : #dry)
+// E1 : le mode simulation n'est proposé que si la configuration l'active
+// (simulation_mode_available). Sinon l'interface travaille en mode réel, bandeau et
+// interrupteur masqués ; les garde-fous (confirmation du cluster, préflight) restent.
+let SIM_AVAILABLE=false;
+function applySimAvailability(avail){
+  const was=SIM_AVAILABLE; SIM_AVAILABLE=!!avail;
+  $("#dryBar").style.display = SIM_AVAILABLE ? "" : "none";
+  if(!SIM_AVAILABLE) $("#dry").checked=false;
+  else if(!was) $("#dry").checked=true;          // simulation cochée par défaut quand elle est proposée
+  refreshDry();
+}
+function refreshDry(){
+  const live=!dry();
+  $("#dryBar").classList.toggle("live",live);
+  document.body.classList.toggle("realmode",live);   // barre rouge fixe + indicateur en-tête
+  $("#dryLabel").textContent = live? "REAL MODE — commands will be executed" : "Simulation mode on";
+  $("#dry").setAttribute("aria-checked", dry() ? "true" : "false");
+  const tb=$("#tbReal"); if(tb) tb.textContent = "LIVE MODE · " + (ctxInfo.context || clById(ACTIVE_CID)&&clById(ACTIVE_CID).name || "cluster");
+}
+$("#dry").onchange=refreshDry;
+
+// Modale de confirmation pour les actions destructives. Renvoie une Promise :
+//  - false si annulé ;  - true (ou le texte retapé) si confirmé.
+// opts = { title, lines:[html…], requireText:(string|null) }
+function confirmDanger(opts){
+  const bgx=$("#dangerModal");
+  if(bgx.style.display!=="none") return Promise.resolve(false);     // déjà ouverte : ignorer le double appel
+  return new Promise(resolve=>{
+    const bg=$("#dangerModal"), ok=$("#dmOk"), cancel=$("#dmCancel"), inp=$("#dmInput");
+    $("#dmTitle").textContent=opts.title||"Confirm the real action";
+    $("#dmBody").innerHTML=(opts.lines||[]).map(l=>`<div class="dm-line">${l}</div>`).join("");
+    const need=opts.requireText||"";
+    $("#dmConfirmWrap").style.display=need?"block":"none";
+    $("#dmWord").textContent=need; inp.value="";
+    function sync(){ ok.disabled = need ? (inp.value.trim()!==need) : false; }
+    sync(); inp.oninput=sync;
+    bg.style.display="flex"; if(need) setTimeout(()=>inp.focus(),30);
+    function close(val){ bg.style.display="none"; inp.oninput=null; ok.onclick=null; cancel.onclick=null; resolve(val); }
+    ok.onclick=()=>close(need?inp.value.trim():true);
+    cancel.onclick=()=>close(false);
+  });
+}
+
+function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
+
+// Rendu HTML d'un log d'étapes (UNIFIE les 4 rendus dupliqués : restore, in-place,
+// clone-app, protect). Une entrée = {ok,dry,label,cmd,stdout,stderr,planned,job_id}.
+function renderLog(log){
+  return (log||[]).map(l=>{
+    const ic = l.dry? '<span class="ic sim">○</span>' : (l.ok?'<span class="ic ok">✓</span>':'<span class="ic ko">✕</span>');
+    const planned = l.planned? ` <code style="font-size:11px;color:#888">${esc(JSON.stringify(l.planned.body||l.planned))}</code>`:'';
+    const cmd = l.cmd? ` <code style="font-size:11px;color:#888">${esc(l.cmd)}</code>`:'';
+    const detail = (l.stderr&&!l.ok)? ` — <span class="ko">${esc(l.stderr)}</span>` :
+       (l.stdout? ` <span class="hint">${esc(l.stdout.length>200?l.stdout.slice(0,200)+'…':l.stdout)}</span>`:'');
+    return `<div class="logline">${ic}<span><b>${esc(l.label||'')}</b>${l.job_id?(' · job '+esc(l.job_id)):''}${cmd}${planned}${detail}</span></div>`;
+  }).join("");
+}
+
+// Lance une opération longue côté serveur et suit sa progression (polling), en
+// rafraîchissant l'affichage à chaque tick. Renvoie le résultat final.
+let CURRENT_OP=null;                 // {id, url, cid, ns} de l'opération suivie (persisté : reprise après F5)
+const OP_KEY="hycu_op";
+function rememberOp(o){ CURRENT_OP=o; try{ if(o) sessionStorage.setItem(OP_KEY, JSON.stringify(o)); else sessionStorage.removeItem(OP_KEY); }catch(e){} }
+async function followOp(opId, onProgress){
+  let errors=0;
+  for(let i=0;i<6000;i++){            // garde-fou : ~90 min à 0,9 s
+    const st = await get("/api/op_status?id="+encodeURIComponent(opId));
+    if(!st.ok){
+      if(st.status===0 || st.status>=500){      // coupure réseau / serveur : on réessaie (borné)
+        if(++errors<=20){ await sleep(2000); continue; }
+      }
+      rememberOp(null);
+      return {ok:false, error:st.error||"Operation tracking interrupted (the operation may still be running server-side)."};
+    }
+    errors=0;
+    if(onProgress) onProgress(st.log||[], st.done);
+    if(st.done){ rememberOp(null); return st.result || {ok:false, error:"Operation finished with no result."}; }
+    await sleep(900);
+  }
+  rememberOp(null);
+  return {ok:false, error:"Tracking timed out (the operation may still be running server-side)."};
+}
+async function runOp(url, body, onProgress){
+  const start = await post(url, body);
+  if(!start || !start.op_id){ return start || {ok:false, error:"Could not start the operation."}; }
+  rememberOp({id:start.op_id, url, cid:ACTIVE_CID, ns:body&&body.namespace});
+  return followOp(start.op_id, onProgress);
+}
+// Demande d'arrêt coopératif : le serveur termine l'étape (volume) en cours puis s'arrête proprement.
+async function cancelCurrentOp(){
+  if(!CURRENT_OP) return;
+  const r=await post("/api/op_cancel",{id:CURRENT_OP.id});
+  const el=$("#rsProgressTxt"); if(el) el.textContent = r.ok ? "Stop requested — finishing the current step…" : (r.error||"Cannot stop");
+}
+// Reprise du suivi après rechargement : une opération encore en cours côté serveur est proposée.
+async function resumeOps(){
+  let saved=null; try{ saved=JSON.parse(sessionStorage.getItem(OP_KEY)||"null"); }catch(e){}
+  const l=await get("/api/op_status");
+  const running=(l&&l.running)||[];
+  if(!running.length){ rememberOp(null); return; }
+  const op = (saved && running.find(o=>o.op_id===saved.id)) || running[0];
+  const banner=$("#opBanner"); if(!banner) return;
+  banner.style.display="block";
+  banner.innerHTML=`<div class="warnbox" style="display:flex;gap:12px;align-items:center;flex-wrap:wrap"><span class="spin"></span>
+    <b>An operation is running</b> (${esc(op.kind||"opération")}${op.ns?(" · "+esc(op.ns)):""}).
+    <button class="btn ghost" id="opFollow">Follow</button></div><div id="opBannerLog"></div>`;
+  $("#opFollow").onclick=async()=>{
+    $("#opFollow").disabled=true;
+    const r=await followOp(op.op_id, log=>{ $("#opBannerLog").innerHTML=renderLog(log); });
+    $("#opBannerLog").innerHTML=(r.ok?'<div class="note">Operation finished.</div>':errBox(r.error||"Operation finished with errors."))+renderLog(r.log);
+    banner.querySelector(".spin").style.display="none";
+  };
+}
+
+// Init : contexte + namespaces + config
+async function initApp(){
+  await loadClusters();
+  ctxInfo = await get("/api/context");
+  renderCtx();
+  renderKubeBanner();
+  const n=await get("/api/namespaces");
+  const opts = (n.namespaces||[]).map(x=>`<option>${esc(x)}</option>`).join("");
+  ["#bkNs","#rsNs","#vfNs"].forEach(id=>$(id).innerHTML = opts || "<option>—</option>");
+  if(n.error){["#bkNs","#rsNs","#vfNs"].forEach(id=>$(id).innerHTML="<option>kubectl ?</option>");}
+  applyPrefs();                               // derniers choix de CE navigateur (ns, mode, dossiers)
+  await loadConfig();
+  loadAutoBackup();
+  await loadConnStatus();                     // ATTENDRE que `conn` soit prêt (sinon la popup
+  maybePromptUnlock();                        // de déverrouillage ne s'affichait jamais)
+  onPageShown(curPage);                       // (re)charge les données de la page affichée
+  resumeOps();                                // opération encore en cours côté serveur ?
+}
+// Accessibilité : associe chaque <label class="fld"> sans `for` au champ qui le suit
+// (HTML statique et blocs rendus dynamiquement : observateur du DOM, débounce).
+let _lblN=0, _lblT=null;
+function linkLabels(){
+  document.querySelectorAll("label.fld").forEach(l=>{
+    if(l.getAttribute("for") || l.querySelector("input,select,textarea")) return;
+    const el=l.nextElementSibling && (l.nextElementSibling.matches("input,select,textarea") ? l.nextElementSibling : l.nextElementSibling.querySelector("input,select,textarea"));
+    if(!el) return;
+    if(!el.id) el.id="fld-"+(++_lblN);
+    l.setAttribute("for", el.id);
+  });
+}
+linkLabels();
+new MutationObserver(()=>{ clearTimeout(_lblT); _lblT=setTimeout(linkLabels, 150); }).observe(document.body, {childList:true, subtree:true});
+(async()=>{
+  ACTIVE_CID = prefs().cluster || "local";
+  const cfg = await get("/api/config");
+  ctxInfo = await get("/api/context");      // utilisé comme suggestion par l'assistant
+  if(cfg && cfg.exists===false){ startWizard(); }
+  await initApp();
+})();
+function maybePromptUnlock(){
+  if(!conn || !conn.vault || !conn.vault.present) return;           // pas de coffre -> rien
+  const anyConn = conn.hycu.connected || conn.nutanix.connected || conn.prismcentral.connected;
+  if(anyConn) return;                                               // déjà connecté -> inutile
+  if($("#wizard") && $("#wizard").style.display!=="none") return;   // l'assistant 1er lancement prime
+  $("#unlock").style.display="flex";
+  setTimeout(()=>$("#unlockPass").focus(),60);
+}
+$("#unlockSkip").onclick=()=>{ $("#unlockPass").value=""; $("#unlock").style.display="none"; };
+$("#unlockPass").onkeydown=(e)=>{ if(e.key==="Enter") $("#unlockGo").click(); };
+$("#unlockGo").onclick=async()=>{
+  $("#unlockErr").innerHTML="";
+  const b=$("#unlockGo"); b.disabled=true; b.innerHTML='<span class="spin"></span>…';
+  const r=await post("/api/creds/load",{passphrase:$("#unlockPass").value});
+  $("#unlockPass").value=""; b.disabled=false; b.textContent="Unlock";
+  if(!r.ok){ $("#unlockErr").innerHTML=errBox(r.error);
+    setTimeout(()=>$("#unlockPass").focus(),30); return; }
+  const names={hycu:"HYCU", nutanix:"Prism Element", prismcentral:"Prism Central", s3:"S3 object storage"};
+  const lst=(r.loaded||[]).map(s=>names[s]||s).join(", ");
+  const cls=(r.clusters||[]).join(", ");
+  $("#unlockErr").innerHTML=`<div class="note">Connections reloaded: ${esc(lst||"none")}.`+
+    (cls?`<br>Kubernetes clusters reloaded: ${esc(cls)}.`:"")+`</div>`;
+  await loadConnStatus();
+  await afterVaultLoad();
+  setTimeout(()=>{ $("#unlock").style.display="none"; $("#unlockErr").innerHTML=""; }, 900);
+};
+
+// ----- Assistant de configuration (affiché si hycu_config.json est absent) -----
+const wcfg = {kubectl_path:"kubectl", allowed_contexts:[], namespace_filter:[],
+  require_context_confirm:true, wait_timeout:120, clone_name_suffix:"0000", volume_handle_prefix:""};
+let wizStep=0, wizSteps=[];
+
+function wizFinalConfig(){
+  return {kubectl_path:wcfg.kubectl_path, allowed_contexts:wcfg.allowed_contexts,
+    namespace_filter:wcfg.namespace_filter, require_context_confirm:wcfg.require_context_confirm,
+    wait_timeout:wcfg.wait_timeout, clone_name_suffix:wcfg.clone_name_suffix,
+    volume_handle_prefix:wcfg.volume_handle_prefix};
+}
+function buildWizSteps(){
+  const ctx = ctxInfo.context || "";
+  wizSteps = [
+    {render:()=>`<h3>First-time setup</h3>
+      <p class="q">No <code>hycu_config.json</code> file was found. A few questions
+      to generate it — you can change everything later in the Settings page.</p>
+      <label class="fld">Interface language</label>
+      <div id="wLang">${[["fr","Français"],["en","English"]].map(([code,lbl])=>
+        `<span class="chip ${PAGE_LANG===code?'sel':''}" data-lang="${code}">${lbl}</span>`).join("")}</div>
+      <div class="note" style="margin-top:14px">Detected kubectl context: <b>${esc(ctx||"unavailable")}</b></div>`,
+     enter:()=>{ document.querySelectorAll("#wLang .chip").forEach(c=>c.onclick=()=>{
+        const l=c.dataset.lang; if(l===PAGE_LANG) return;              // déjà dans cette langue
+        // Change la langue et recharge : le coffre de config n'existe pas encore,
+        // l'assistant se rouvre entièrement dans la langue choisie.
+        document.cookie="hycu_lang="+l+";path=/;max-age=31536000;SameSite=Lax"; location.reload(); }); },
+     commit:()=>{}},
+
+    {render:()=>`<h3>Which kubectl binary should be used?</h3>
+      <p class="q">Pick the distribution, or enter a custom command / path.</p>
+      <div id="wKChips">${["kubectl","microk8s kubectl","k3s kubectl"].map(v=>
+        `<span class="chip ${wcfg.kubectl_path===v?'sel':''}" data-v="${v}">${v}</span>`).join("")}</div>
+      <label class="fld">kubectl command</label>
+      <input type="text" id="wK" value="${esc(wcfg.kubectl_path)}">`,
+     enter:()=>{document.querySelectorAll("#wKChips .chip").forEach(c=>c.onclick=()=>{
+        $("#wK").value=c.dataset.v;
+        document.querySelectorAll("#wKChips .chip").forEach(x=>x.classList.remove("sel")); c.classList.add("sel");});},
+     commit:()=>{ wcfg.kubectl_path=($("#wK").value.trim()||"kubectl"); }},
+
+    {render:()=>{const r=wcfg.allowed_contexts.length>0;
+      return `<h3>Lock down the cluster(s)?</h3>
+      <p class="q">Restricting the tool to specific kubectl contexts avoids acting on the wrong cluster by mistake.</p>
+      <div class="wiz-opt ${!r?'sel':''}" data-mode="all"><b>All contexts</b><div class="d">No restriction.</div></div>
+      <div class="wiz-opt ${r?'sel':''}" data-mode="restrict"><b>Restrict</b><div class="d">Allow only the listed contexts.</div></div>
+      <div id="wCtxWrap" style="${r?'':'display:none'}"><label class="fld">Allowed contexts (commas)</label>
+        <input type="text" id="wCtx" value="${esc(wcfg.allowed_contexts.join(', ')||ctx)}"></div>`;},
+     enter:()=>{document.querySelectorAll('.wiz-opt[data-mode]').forEach(o=>o.onclick=()=>{
+        document.querySelectorAll('.wiz-opt[data-mode]').forEach(x=>x.classList.remove('sel')); o.classList.add('sel');
+        $("#wCtxWrap").style.display=o.dataset.mode==='restrict'?'block':'none';});},
+     commit:()=>{ wcfg.allowed_contexts = document.querySelector('.wiz-opt[data-mode=restrict].sel')? csv($("#wCtx").value):[]; }},
+
+    {render:()=>{const r=wcfg.namespace_filter.length>0;
+      return `<h3>Limit to the relevant namespaces?</h3>
+      <p class="q">You can expose only the application namespaces protected by HYCU.</p>
+      <div class="wiz-opt ${!r?'sel':''}" data-mode="all"><b>All namespaces</b><div class="d">List every namespace in the cluster.</div></div>
+      <div class="wiz-opt ${r?'sel':''}" data-mode="restrict"><b>Restrict</b><div class="d">Show only the listed namespaces.</div></div>
+      <div id="wNsWrap" style="${r?'':'display:none'}"><label class="fld">Allowed namespaces (commas)</label>
+        <input type="text" id="wNs" value="${esc(wcfg.namespace_filter.join(', '))}" placeholder="wordpress, bo-dev"></div>`;},
+     enter:()=>{document.querySelectorAll('.wiz-opt[data-mode]').forEach(o=>o.onclick=()=>{
+        document.querySelectorAll('.wiz-opt[data-mode]').forEach(x=>x.classList.remove('sel')); o.classList.add('sel');
+        $("#wNsWrap").style.display=o.dataset.mode==='restrict'?'block':'none';});},
+     commit:()=>{ wcfg.namespace_filter = document.querySelector('.wiz-opt[data-mode=restrict].sel')? csv($("#wNs").value):[]; }},
+
+    {render:()=>`<h3>Safety check before real actions</h3>
+      <p class="q">Recommended: require retyping the context name before any real restore.</p>
+      <label class="wiz-opt ${wcfg.require_context_confirm?'sel':''}" id="wConfirmOpt">
+        <input type="checkbox" id="wConfirm" ${wcfg.require_context_confirm?'checked':''} style="width:auto;margin-right:8px">
+        <b>Require context confirmation</b><div class="d">The operator retypes the target context before acting.</div></label>`,
+     enter:()=>{ $("#wConfirm").onchange=()=>$("#wConfirmOpt").classList.toggle('sel',$("#wConfirm").checked); },
+     commit:()=>{ wcfg.require_context_confirm=$("#wConfirm").checked; }},
+
+    {render:()=>`<h3>Advanced settings (optional)</h3>
+      <p class="q">The defaults suit most environments.</p>
+      <div class="row">
+        <div><label class="fld">Wait timeout (s)</label><input type="text" id="wWait" value="${wcfg.wait_timeout}"></div>
+        <div><label class="fld">Clone name suffix</label><input type="text" id="wSuf" value="${esc(wcfg.clone_name_suffix)}"></div>
+      </div>
+      <label class="fld">volumeHandle prefix (empty = auto-detected)</label>
+      <input type="text" id="wVh" value="${esc(wcfg.volume_handle_prefix)}" placeholder="auto-detected from the existing PV">`,
+     commit:()=>{ wcfg.wait_timeout=parseInt($("#wWait").value)||120;
+        wcfg.clone_name_suffix=$("#wSuf").value.trim()||"0000"; wcfg.volume_handle_prefix=$("#wVh").value.trim(); }},
+
+    {final:true, render:()=>`<h3>Create the configuration</h3>
+      <p class="q">Review then create <code>hycu_config.json</code> (editable later in ⚙ Settings).</p>
+      <div class="wiz-recap">${esc(JSON.stringify(wizFinalConfig(),null,2))}</div>`,
+     commit:()=>{}},
+  ];
+}
+function startWizard(){ buildWizSteps(); wizStep=0; $("#wizard").style.display="flex"; renderWiz(); }
+function renderWiz(){
+  const s=wizSteps[wizStep];
+  $("#wizBody").innerHTML=s.render();
+  if(s.enter) s.enter();
+  $("#wizBar").style.width=Math.round(wizStep/(wizSteps.length-1)*100)+"%";
+  $("#wizStep").textContent=`Step ${wizStep+1} / ${wizSteps.length}`;
+  $("#wizBack").style.visibility=wizStep===0?"hidden":"visible";
+  $("#wizNext").textContent=s.final?"Create the configuration":"Next";
+}
+$("#wizBack").onclick=()=>{ if(wizStep>0){ wizSteps[wizStep].commit&&wizSteps[wizStep].commit(); wizStep--; renderWiz(); } };
+$("#wizNext").onclick=async()=>{
+  const s=wizSteps[wizStep]; if(s.commit) s.commit();
+  if(s.final){
+    const b=$("#wizNext"); b.disabled=true; b.innerHTML='<span class="spin"></span>Creating…';
+    const r=await post("/api/config",{config:wizFinalConfig()});
+    b.disabled=false; b.textContent="Create the configuration";
+    if(!r.ok){ $("#wizBody").innerHTML+=`<div class="err">Failed: ${esc(r.error||'')}</div>`; return; }
+    $("#wizard").style.display="none"; initApp(); return;
+  }
+  if(wizStep<wizSteps.length-1){ wizStep++; renderWiz(); }
+};
+
+// --------- Sauvegarde ---------
+// Lien de téléchargement (.zip) d'un dossier de sauvegarde — permet de SORTIR une
+// sauvegarde du conteneur/Pod vers le poste de l'opérateur (indispensable en Docker/K8s,
+// où le serveur ne peut pas écrire sur le disque du client).
+function dlBackupLink(dir, root, label){
+  if(!dir) return "";
+  const u="/api/backup/download?path="+encodeURIComponent(dir)+(root?("&root="+encodeURIComponent(root)):"")+"&cluster="+encodeURIComponent(ACTIVE_CID);
+  return `<a class="btn ghost" href="${u}" download style="padding:2px 8px;font-size:12px;text-decoration:none;margin-left:6px">⬇ ${esc(label||'Download (.zip)')}</a>`;
+}
+// ----- Sauvegarde automatique de la configuration (onglet 1) -----
+function abSyncLbl(){
+  const on=$("#abEnabled").checked, l=$("#abEnabledLbl");
+  l.textContent = on? "Enabled" : "Disabled";
+  l.style.color = on? "var(--good)" : "var(--muted)";
+}
+$("#abEnabled").onchange=abSyncLbl;
+function abRetSync(){
+  const gfs=$("#abRet").value==="gfs";
+  $("#abKeepWrap").style.display=gfs?"none":"";
+  $("#abGfsWrap").style.display=gfs?"flex":"none";
+}
+$("#abRet").onchange=abRetSync;
+function abRetLabel(s){
+  return s.retention==="gfs"
+    ? "GFS "+((s.gfs||{}).daily??7)+" d / "+((s.gfs||{}).weekly??4)+" wk / "+((s.gfs||{}).monthly??12)+" mo"
+    : (s.keep===0 ? "unlimited (no counter)" : (s.keep||15)+" versions");
+}
+async function loadAutoBackup(){
+  const s=await get("/api/auto_backup");
+  if(!s || !s.ok) return;
+  $("#abEnabled").checked=!!s.enabled; abSyncLbl();
+  $("#abInterval").value=Math.round(s.interval_hours||24);
+  $("#abKeep").value=s.keep||15;
+  $("#abRet").value=(s.retention==="gfs")?"gfs":"count";
+  const g=s.gfs||{}; $("#abGfsD").value=g.daily??7; $("#abGfsW").value=g.weekly??4; $("#abGfsM").value=g.monthly??12;
+  abRetSync();
+  if(!$("#abDest").value) $("#abDest").value=s.dest||"";
+  let txt = s.enabled? ("Every "+Math.round(s.interval_hours||24)+" h · retention: "+abRetLabel(s)+" per namespace.") : "";
+  if(s.running) txt+=" Backup in progress…";
+  if(s.last_run) txt+=" Last: "+new Date(s.last_run*1000).toLocaleString()+" "+(s.last_ok?"✓":"✕")+" "+(s.last_summary||"");
+  if(s.enabled) txt+= s.next_due? (" · Next: "+new Date(s.next_due*1000).toLocaleString()) : " · First run in less than a minute.";
+  $("#abStatus").textContent=txt;
+}
+$("#abSave").onclick=async()=>{
+  const cfg={auto_backup_enabled:$("#abEnabled").checked,
+    auto_backup_interval_hours:Math.max(1,parseInt($("#abInterval").value)||24),
+    auto_backup_keep:Math.max(1,parseInt($("#abKeep").value)||15),
+    auto_backup_retention:$("#abRet").value,
+    auto_backup_keep_daily:Math.max(0,parseInt($("#abGfsD").value)||0),
+    auto_backup_keep_weekly:Math.max(0,parseInt($("#abGfsW").value)||0),
+    auto_backup_keep_monthly:Math.max(0,parseInt($("#abGfsM").value)||0),
+    auto_backup_dest:$("#abDest").value.trim()};
+  const r=await post("/api/config",{config:cfg});
+  $("#abStatus").textContent = r.ok? "Saved." : ("Error: "+(r.error||""));
+  setTimeout(loadAutoBackup, 700);
+};
+$("#bkRun").onclick=async()=>{
+  const ns=$("#bkNs").value, b=$("#bkRun"), dest=$("#bkDest").value.trim();
+  b.disabled=true; b.innerHTML='<span class="spin"></span>Backing up…';
+  const r=await post("/api/backup",{ns, dest});
+  b.disabled=false; b.textContent="Back up this namespace";
+  if(!r.ok){$("#bkOut").innerHTML=errBox(r.error);return;}
+  const rows=r.volumes.map(v=>{
+    const vh=v.analysis&&v.analysis.old_volume_handle;
+    const vgUuid=vh?(String(vh).match(/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/)||[null])[0]:null;
+    const tag=vgUuid?`<span class="hint">(VG ${esc(vgUuid)})</span>`:(v.analysis&&v.analysis.old_iqn?'<span class="hint">(IQN detected)</span>':'');
+    return `<li class="logline"><span class="ic ok">✓</span>
+     <span><b>${esc(v.pvc)}</b> → PV ${esc(v.pv||"—")} ${tag}</span></li>`;
+  }).join("");
+  const resLine = (r.resources_count!=null)
+    ? ` <span class="hint">+ ${r.resources_count} config resource(s) (Deployments, Services, Secrets…)${r.secrets==="encrypted"?" · Secrets chiffrés":r.secrets==="redacted"?" · Secrets masqués":""}</span>` : "";
+  const secWarn = r.secrets_warning ? `<div class="warnbox">⚠ ${esc(r.secrets_warning)}</div>` : "";
+  $("#bkOut").innerHTML=`<div class="note">${r.count} volume(s) backed up to
+     <code>${esc(r.dir)}</code>${resLine}${dlBackupLink(r.dir, r.root)}</div>${secWarn}<ul class="pvc-list" style="margin-top:10px">${rows}</ul>
+     <div class="warnbox">⚠ Get this backup <b>off the cluster</b> via ⬇ Download (.zip) — or copy the folder to other storage: it is your safety net in a disaster.</div>`;
+};
+$("#bkRunAll").onclick=async()=>{
+  const b=$("#bkRunAll"), dest=$("#bkDest").value.trim();
+  b.disabled=true; b.innerHTML='<span class="spin"></span>Backing up…';
+  const r=await post("/api/backup_all",{dest});
+  b.disabled=false; b.textContent="Back up all (filtered)";
+  if(!r.ok){$("#bkOut").innerHTML=errBox(r.error);return;}
+  const rows=(r.results||[]).map(x=>{
+    if(x.ok) return `<li class="logline"><span class="ic ok">✓</span><span><b>${esc(x.ns)}</b> — ${x.count} volume(s) → <code>${esc(x.dir)}</code>${dlBackupLink(x.dir, r.root, 'Download')}</span></li>`;
+    if(x.skipped) return `<li class="logline"><span class="ic sim">○</span><span><b>${esc(x.ns)}</b> — no PVC (skipped)</span></li>`;
+    return `<li class="logline"><span class="ic ko">✕</span><span><b>${esc(x.ns)}</b> — ${esc(x.error||'failed')}</span></li>`;
+  }).join("");
+  const scope = r.filtered? "namespaces in the filter" : "all cluster namespaces";
+  $("#bkOut").innerHTML=`<div class="note">${r.backed_up}/${r.namespaces} namespace(s) backed up · ${r.volumes} volume(s) in total <span class="hint">(${scope})</span>.${dlBackupLink(r.root, r.root, 'Download all (.zip)')}</div>
+     <ul class="pvc-list" style="margin-top:10px">${rows}</ul>
+     <div class="warnbox">⚠ Get these backups <b>off the cluster</b> via ⬇ Download — or copy the folders to other storage: it is your safety net in a disaster.</div>`;
+};
+
+// --------- Protection HYCU (assigner politique + sauvegarder) ---------
+let bkMatches=[], bkMatchNs=null;
+function clearBkProtect(){ bkMatches=[]; bkMatchNs=null; $("#bkMatchOut").innerHTML=""; $("#bkProtectForm").style.display="none"; $("#bkProtectLog").innerHTML=""; }
+
+// Re-protection HYCU après un clone : bascule sur l'onglet Back up, cible le bon
+// namespace et lance l'analyse de correspondance (puis l'utilisateur choisit la politique).
+function goReprotect(ns){
+  openPolicyModal(ns || $("#bkNs").value);      // HYCU : « Set Policy » (analyse lancée d'office)
+}
+$("#bkNs").onchange=()=>{ state.ns=$("#bkNs").value; savePref("ns",state.ns); applyGlobalNs(); clearBkProtect(); };  // ns global + invalide l'analyse
+$("#vfNs").onchange=()=>{ state.ns=$("#vfNs").value; savePref("ns",state.ns); applyGlobalNs(); };
+$("#bkDest").addEventListener("change",()=>savePref("bkDest",$("#bkDest").value.trim()));
+$("#bkMatch").onclick=async()=>{
+  const ns=$("#bkNs").value; clearBkProtect();
+  $("#bkMatchOut").innerHTML='<div class="hint">Analyzing…</div>';
+  const r=await get("/api/hycu/match?ns="+encodeURIComponent(ns));
+  if(!r.ok){ $("#bkMatchOut").innerHTML=errBox(r.error); return; }
+  bkMatches=r.matches||[]; bkMatchNs=r.namespace||ns;
+  const rows=bkMatches.map(m=>{
+    let chk="", label="";
+    if(m.match_kind==="exact"){
+      chk=`<input type="checkbox" class="bkMchk" data-uuid="${esc(m.hycu_vg_uuid)}" data-name="${esc(m.hycu_vg_name||'')}" data-ext="${esc(m.hycu_external_id||'')}" checked style="width:auto;margin-right:8px">`;
+      label=`→ VG <b>${esc(m.hycu_vg_name||m.hycu_vg_uuid)}</b> <span class="hint">(externalId ${esc(m.hycu_external_id||'')})</span>`;
+    } else if(m.match_kind==="name"){
+      chk=`<input type="checkbox" class="bkMchk" data-uuid="${esc(m.hycu_vg_uuid)}" data-name="${esc(m.hycu_vg_name||'')}" data-ext="${esc(m.hycu_external_id||'')}" style="width:auto;margin-right:8px">`;
+      label=`→ VG <b>${esc(m.hycu_vg_name||m.hycu_vg_uuid)}</b> <span class="sim">by name — to be confirmed</span>`;
+    } else if(m.match_kind==="ambiguous"){
+      chk=`<span class="ic ko" style="width:18px;display:inline-block;text-align:center;margin-right:8px">⚠</span>`;
+      label=`<span class="ko">ambiguous: several Volume Groups match — check in HYCU</span>`;
+    } else {
+      chk=`<span class="ic ko" style="width:18px;display:inline-block;text-align:center;margin-right:8px">✕</span>`;
+      label=`<span class="ko">no HYCU Volume Group found</span>`;
+    }
+    let prot="";
+    if(m.matched){
+      const cs=(m.compliancy||"").toUpperCase();
+      const cb = cs==="GREEN"? '<span class="badge b-bound">compliant</span>'
+               : cs==="RED"? '<span class="badge b-lost">non-compliant</span>'
+               : '<span class="badge b-pending">to back up</span>';
+      const unp = (m.protected && m.protected!=="PROTECTED")? ' <span class="badge b-pending">not protected</span>':'';
+      prot=`<div class="meta">${cb}${unp} · policy: <b>${esc(m.policy||'none')}</b> · backups: ${m.has_backups?'yes':'no'}</div>`;
+    }
+    return `<li class="logline">${chk}<span style="flex:1"><b>${esc(m.pvc)}</b> ${label}${prot}</span></li>`;
+  }).join("") || '<div class="hint">No PVC in this namespace.</div>';
+  const nx=bkMatches.filter(m=>m.match_kind==="exact").length, nn=bkMatches.filter(m=>m.match_kind==="name").length,
+        na=bkMatches.filter(m=>m.match_kind==="ambiguous").length, n0=bkMatches.filter(m=>m.match_kind==="none").length;
+  $("#bkMatchOut").innerHTML=`<ul class="pvc-list" style="margin-top:10px">${rows}</ul>
+     <div class="hint">${nx} exact(s) · ${nn} by name (to confirm) · ${na} ambiguous · ${n0} not found</div>`;
+  if(nx+nn>0){ $("#bkProtectForm").style.display="block"; loadBkPolicies(); updateBkHint(); }
+};
+// Liste des politiques HYCU de la modale « Set Policy ». NB : nom distinct de
+// loadPolicies() (page Politiques) — deux déclarations homonymes se masqueraient.
+async function loadBkPolicies(){
+  const r=await get("/api/hycu/policies");
+  $("#bkPolicy").innerHTML=`<option value="">(do not change the policy)</option>`+
+    (r.ok? (r.policies||[]).map(p=>`<option value="${esc(p.uuid)}">${esc(p.name||p.uuid)}</option>`).join("") : "");
+}
+function updateBkHint(){ $("#bkProtectHint").textContent = dry()? "Simulation mode (banner at top): shows the HYCU calls." : "Real mode: executes on HYCU."; }
+$("#dry").addEventListener("change",()=>{ if($("#bkProtectForm").style.display!=="none") updateBkHint(); });
+$("#bkProtect").onclick=async()=>{
+  const sel=[...document.querySelectorAll(".bkMchk:checked")];
+  const vg_uuids=sel.map(c=>c.dataset.uuid);
+  if(!vg_uuids.length){ $("#bkProtectLog").innerHTML='<div class="err">Check at least one Volume Group (“by name” matches must be confirmed).</div>'; return; }
+  const live=!dry(), pol=$("#bkPolicy").value;
+  const names=sel.map(c=>"• "+(c.dataset.name||c.dataset.uuid)+(c.dataset.ext?(" ("+c.dataset.ext+")"):""));
+  if(live && !(await confirmDanger({title:"REAL HYCU protection", lines:[
+     (pol?"Assign the policy then <b>back up</b>":"<b>Back up</b>")+" these Volume Groups:",
+     "<b>"+names.map(esc).join("</b>, <b>")+"</b>"]}))) return;
+  const b=$("#bkProtect"); b.disabled=true; b.innerHTML='<span class="spin"></span>…';
+  const byName=sel.filter(c=>c.dataset.kind==="name").map(c=>c.dataset.uuid);   // cochés = confirmés par l'opérateur
+  const r=await post("/api/hycu/protect",{namespace:bkMatchNs, vg_uuids, policy_uuid:pol, force_full:$("#bkForceFull").checked, dry:dry(), confirm_name_uuids:byName});
+  b.disabled=false; b.textContent="Assign + back up now";
+  if(!r.ok && !(r.steps&&r.steps.length)){ $("#bkProtectLog").innerHTML=errBox(r.error); return; }
+  const lines=(r.steps||[]).map(s=> s.dry
+    ? `<div class="logline"><span class="ic sim">○</span><span><b>${esc(s.label)}</b><pre class="box" style="margin-top:4px">${esc(JSON.stringify(s.planned,null,2))}</pre></span></div>`
+    : `<div class="logline"><span class="ic ${s.ok?'ok':'ko'}">${s.ok?'✓':'✕'}</span><span><b>${esc(s.label)}</b>${s.job_id?(' · job '+esc(s.job_id)):''}${(s.error&&!s.ok)?(' — <span class="ko">'+esc(s.error)+'</span>'):''}</span></div>`
+  ).join("");
+  const head = r.dry? '<div class="warnbox">Simulation — calls that would be sent to HYCU:</div>'
+     : (r.ok? '<div class="note">Policy assigned / HYCU backup triggered.</div>' : '<div class="err">Failed — see details.</div>');
+  $("#bkProtectLog").innerHTML=head+lines;
+  if(!r.dry && r.ok && r.job_id){ $("#bkProtectLog").innerHTML+='<div id="bkJobProgress"></div>'; pollJobBar(r.job_id,"#bkJobProgress"); }
+};
+
+// --------- Restauration ---------
+$("#rsNs").onchange=()=>{ state.ns=$("#rsNs").value; savePref("ns",state.ns); applyGlobalNs(); loadPvcs(); };
+$("#rsCustomDir").onchange=()=>{ savePref("customDir",$("#rsCustomDir").checked); $("#rsCustomDirWrap").style.display=$("#rsCustomDir").checked?"block":"none"; if($("#rsNs").value) loadPvcs(); };
+$("#rsBackupRoot").addEventListener("change",()=>{ savePref("backupRoot",$("#rsBackupRoot").value.trim()); if($("#rsCustomDir").checked && $("#rsNs").value) loadPvcs(); });
+$("#rsBackupSel").onchange=applyBackupSelection;   // changer de sauvegarde de config sans re-fetch
+let rsBackups = [];   // sauvegardes de config du namespace courant (la plus récente en premier)
+let loadPvcsSeq=0;     // jeton anti-course : un fetch dépassé (autre namespace/cluster) est ignoré
+async function loadPvcs(){
+  const sel=$("#rsNs"); if(!sel.value) return;
+  const ns=sel.value; state.ns=ns; state.pvcNs=ns; rsHyMatch=null; rsInplaceSel={}; invalidatePlan();
+  if(state.app && state.app.ns!==ns){ state.app=null; $("#rsWizApp").innerHTML=rsAppLabel(); }   // autre namespace choisi : plus d'application ciblée
+  const seq=++loadPvcsSeq;
+  const customRoot = $("#rsCustomDir").checked ? $("#rsBackupRoot").value.trim() : "";
+  state.backup_root = customRoot || null;
+  const bk=await get("/api/backups?ns="+encodeURIComponent(ns)+(customRoot?("&root="+encodeURIComponent(customRoot)):""));
+  if(seq!==loadPvcsSeq || state.ns!==ns) return;   // périmé : une autre application a été ouverte entre-temps
+  if(bk.error && !bk.backups){ $("#rsPvcs").innerHTML=errBox(bk.error); return; }
+  rsBackups = bk.backups || [];
+  const wrap=$("#rsBackupSelWrap"), selEl=$("#rsBackupSel");
+  if(rsBackups.length){
+    selEl.innerHTML = rsBackups.map((b,i)=>{
+      const idx=b.index||{}; const n=(idx.volumes||[]).length;
+      const created=((idx.created||b.timestamp||"")+"").replace("T"," ").slice(0,19);
+      const ctx=idx.context?(" · ctx "+idx.context):"";
+      return `<option value="${i}">${esc(created)} — ${n} volume(s)${esc(ctx)}${i===0?" (most recent)":""}</option>`;
+    }).join("");
+    selEl.value="0"; wrap.style.display="block";
+  }else{ selEl.innerHTML=""; wrap.style.display="none"; }
+  await applyBackupSelection();
+}
+async function applyBackupSelection(){
+  const ns=state.ns; state.selected={};
+  const customRoot=state.backup_root, i=$("#rsBackupSel").value;
+  let pvcs=[], src=customRoot?"custom folder":"cluster";
+  if(rsBackups.length && i!=="" && rsBackups[i*1]){
+    const b=rsBackups[i*1];
+    state.backup_path=b.path;
+    pvcs=((b.index||{}).volumes||[]).map(v=>({name:v.pvc,pv:v.pv,phase:"backed up"}));
+    src=customRoot?"backup (custom folder)":(i==="0"?"latest backup":"selected backup");
+    const _dl=$("#rsBackupDl"); if(_dl){ _dl.href="/api/backup/download?path="+encodeURIComponent(b.path)+(customRoot?("&root="+encodeURIComponent(customRoot)):"")+"&cluster="+encodeURIComponent(ACTIVE_CID); _dl.style.display="inline"; }
+  }else{
+    state.backup_path=null;   // aucune sauvegarde -> repli live (vide si namespace détruit)
+    const _dl=$("#rsBackupDl"); if(_dl) _dl.style.display="none";
+    const live=await get("/api/pvcs?ns="+encodeURIComponent(ns));
+    pvcs=live.pvcs||[];
+  }
+  renderRsPvcs(pvcs, src);
+}
+function renderRsPvcs(pvcs, src){
+  $("#rsPvcs").innerHTML = pvcs.length? pvcs.map(p=>`
+     <li><input type="checkbox" style="width:auto" class="rsChk" data-pvc="${esc(p.name)}" data-pv="${esc(p.pv||'')}">
+       <div style="flex:1"><div class="nm">${esc(p.name)}</div>
+       <div class="meta">PV ${esc(p.pv||'—')} · source: ${src}</div></div>${badge(p.phase)}</li>`).join("")
+     : `<div class="hint">No volume. First back up this application's configuration (Applications → Back up).</div>`;
+  document.querySelectorAll(".rsChk").forEach(c=>c.onchange=rebuildVolCfgs);
+  $("#rsConfig").style.display="none"; $("#rsPlan").style.display="none"; setRsStep(1);
+  // Assistant de restauration : comme dans HYCU, TOUS les volumes de l'application
+  // sont présélectionnés (l'opérateur peut en décocher). Application ciblée (page
+  // Applications) : seuls SES volumes le sont — les autres applications du namespace
+  // ne sont pas touchées par défaut.
+  if(rsAutoCheck && pvcs.length){
+    const only = state.app && state.app.pvcs && state.app.pvcs.length ? new Set(state.app.pvcs) : null;
+    document.querySelectorAll(".rsChk").forEach(c=>c.checked = !only || only.has(c.dataset.pvc));
+    if(only && ![...document.querySelectorAll(".rsChk")].some(c=>c.checked)) document.querySelectorAll(".rsChk").forEach(c=>c.checked=true);
+    rebuildVolCfgs();
+  }
+  updateNextBar();
+}
+// Horodatage epoch en secondes (≈ `date -u +%s`) : sert de suffixe UNIQUE à chaque clone,
+// pour ne JAMAIS réutiliser un nom déjà créé (sinon : « le PVC/VG …-0000 existe déjà » au
+// 2ᵉ clone de la même application). L'utilisateur peut éditer le champ ensuite.
+function cloneStamp(){ return Math.floor(Date.now()/1000); }
+function suggestName(pv){
+  if(!pv) return "";
+  return pv + "-" + cloneStamp();   // suffixe horodaté -> nom toujours unique et ≠ source
+}
+function rebuildVolCfgs(){
+  const chks=[...document.querySelectorAll(".rsChk:checked")];
+  if(!chks.length){$("#rsConfig").style.display="none";setRsStep(1);updateNextBar();return;}
+  $("#rsConfig").style.display="block"; $("#rsPlan").style.display="none"; setRsStep(2);
+  const ntOn = (conn.nutanix && conn.nutanix.connected) || (conn.prismcentral && conn.prismcentral.connected);
+  const hyOn = conn.hycu && conn.hycu.connected;
+  const inplaceOrch = hyOn && state.mode==="inplace";
+  // Une carte ÉPURÉE par volume : à l'écran, seulement « volume → VG HYCU » et le
+  // point de restauration (rempli en asynchrone par buildHyPanel). Tout le reste —
+  // noms générés (VG cloné, nouveau PV) et saisie manuelle de la référence — vit
+  // dans UN SEUL volet « Avancé » replié : ce sont des valeurs par défaut correctes.
+  $("#rsVolCfgs").innerHTML = chks.map(c=>{
+    const pvc=c.dataset.pvc, pv=c.dataset.pv;
+    const vgNameRow = (hyOn && state.mode==="clone")
+      ? `<label class="fld">Cloned VG name</label>
+         <input type="text" class="hyVgName" data-pvc="${esc(pvc)}" value="${esc(pvc+'-'+cloneStamp())}">` : "";
+    const nameRow = state.mode==="clone"
+      ? `<label class="fld">New PV name</label>
+         <input type="text" class="rsName" data-pvc="${esc(pvc)}" value="${esc(suggestName(pv))}">` : "";
+    const ntRow = ntOn
+      ? `<button class="btn ghost ntRefBtn" data-pvc="${esc(pvc)}" style="margin-top:6px">Search for the VG in Prism</button>
+         <div class="ntpick" data-pvc="${esc(pvc)}"></div>` : "";
+    const advOpen = hyOn ? "" : "open";   // sans HYCU, la saisie manuelle est la seule voie -> volet ouvert
+    const advSum = hyOn ? "Advanced (optional) — generated names, manual entry"
+                        : "VG reference (required) & generated names";
+    return `<div class="vol-cfg" data-pvc="${esc(pvc)}">
+      <div class="nm">${esc(pvc)} <span class="hint">(PV ${esc(pv||'—')})</span> <span class="hint vgLabel" data-pvc="${esc(pvc)}" style="margin:0"></span> <span class="refStat hint" data-pvc="${esc(pvc)}" style="margin:0"></span></div>
+      <div class="hySlot" data-pvc="${esc(pvc)}"></div>
+      <details class="rsAdv" ${advOpen}>
+        <summary class="rsAdvSum">${advSum}</summary>
+        ${vgNameRow}${nameRow}
+        <textarea class="rsRef" data-pvc="${esc(pvc)}" placeholder="5b4d284b-7109-4e82-4c71-7d0e36ecb5ab  (VG UUID, or NutanixVolumes-&lt;uuid&gt;, or legacy IQN)"></textarea>${ntRow}
+      </details></div>`;
+  }).join("");
+  document.querySelectorAll(".ntRefBtn").forEach(b=>b.onclick=()=>ntFindRef(b.dataset.pvc));
+  // Bouton global d'orchestration sur place (mode inplace + HYCU)
+  $("#rsInplaceRunWrap").style.display = inplaceOrch? "block":"none";
+  if(inplaceOrch) updateInplaceRunBtn();
+  // « Continuer » (construit le plan) : voie principale, sauf en sur-place orchestré
+  // où le lancement se fait par le bouton dédié ci-dessus.
+  $("#rsContinueWrap").style.display = inplaceOrch? "none":"block";
+
+  // Guide en UNE ligne, adapté au cas (type d'opération + HYCU connecté ou non).
+  let guide;
+  if(state.mode==="inplace"){
+    guide = hyOn
+      ? "Choose a <b>restore point</b> per volume (the most recent is pre-selected), then <b>Launch the in-place restore</b>."
+      : "Restore the VG in HYCU, paste its UUID per volume (<b>Advanced</b> section), then <b>Continue: review and launch</b>. <span class='hint'>Connect HYCU to automate.</span>";
+  } else {
+    guide = hyOn
+      ? "Choose a <b>restore point</b> per volume (the most recent is pre-selected), then click <b>Restore the VGs from HYCU</b> — references and plan follow automatically."
+      : "Clone each VG in HYCU, paste its UUID per volume (<b>Advanced</b> section), then <b>Continue: review and launch</b>. <span class='hint'>Connect HYCU to automate.</span>";
+  }
+  $("#rsFlowGuide").innerHTML = guide;
+  // Barre « action suivante » + état des références en direct.
+  document.querySelectorAll(".rsRef").forEach(t=>t.addEventListener("input",()=>{ invalidatePlan(); refreshRefStats(); syncContinueVisibility(); updateNextBar(); }));
+  document.querySelectorAll(".rsName").forEach(t=>t.addEventListener("input",invalidatePlan));
+  refreshRefStats();
+  rsFullOrch=false;     // recalculé par buildHyPanel selon la couverture HYCU
+  buildHyPanel();       // remplit les points de restauration (asynchrone) — rien si HYCU non connecté
+  updateNextBar();
+}
+// « Continue: review and launch » n'est utile que pour le flux manuel : quand
+// TOUS les volumes passent par le bouton HYCU groupé (plan automatique), on le
+// masque pour ne laisser qu'UNE action à l'écran. Il réapparaît si l'utilisateur
+// remplit les références à la main (volet Avancé).
+let rsFullOrch=false;
+function syncContinueVisibility(){
+  const hyOn = conn.hycu && conn.hycu.connected;
+  if(state.mode==="inplace" && hyOn){ $("#rsContinueWrap").style.display="none"; return; }
+  const items=collectItems();
+  const allFilled=items.length && items.every(i=>(i.new_ref||"").trim());
+  $("#rsContinueWrap").style.display = (rsFullOrch && !allFilled)? "none":"block";
+}
+// État « référence remplie / à remplir » affiché à côté de chaque volume.
+// En sur-place orchestré la référence n'est pas requise -> pas d'état.
+function refreshRefStats(){
+  const inplaceOrch = state.mode==="inplace" && conn.hycu && conn.hycu.connected;
+  document.querySelectorAll(".refStat").forEach(el=>{
+    const ta=document.querySelector(`.rsRef[data-pvc="${CSS.escape(el.dataset.pvc)}"]`);
+    el.innerHTML = inplaceOrch? "" :
+      ((ta && ta.value.trim())? '<span class="ok">✓ reference filled</span>' : '<span class="sim">— reference to fill</span>');
+  });
+}
+let rsHyMatch=null;   // cache de la correspondance PVC↔VG HYCU pour le namespace courant
+let hyPanelSeq=0;     // jeton anti-rendu périmé (la sélection peut changer pendant les fetch)
+// --------- Panneau HYCU groupé : TOUS les volumes cochés en un seul geste ---------
+// Remplit le point de restauration DANS la carte de chaque volume (.hySlot), puis
+// rend l'action globale (#rsHyActions). Clone : UN SEUL bouton « Restaurer les VG
+// depuis HYCU » qui clone tout et remplit les références. Sur place : le point le
+// plus récent est pré-sélectionné -> le lancement est prêt d'emblée.
+async function buildHyPanel(){
+  const actions=$("#rsHyActions");
+  const hyOn = conn.hycu && conn.hycu.connected;
+  const chks=[...document.querySelectorAll(".rsChk:checked")].map(c=>c.dataset.pvc);
+  actions.innerHTML="";
+  if(!hyOn || !chks.length) return;
+  const seq=++hyPanelSeq;
+  document.querySelectorAll("#rsVolCfgs .hySlot").forEach(s=>
+    s.innerHTML='<div class="hint" style="margin-top:4px"><span class="spin"></span> Searching for the HYCU Volume Group…</div>');
+  const ns=$("#rsNs").value;
+  if(!rsHyMatch || rsHyMatch.ns!==ns){
+    const r=await get("/api/hycu/match?ns="+encodeURIComponent(ns));
+    if(seq!==hyPanelSeq) return;
+    if(!r.ok){ document.querySelectorAll("#rsVolCfgs .hySlot").forEach(s=>s.innerHTML=errBox(r.error)); return; }
+    rsHyMatch={ns, matches:r.matches||[]};
+  }
+  const rows=await Promise.all(chks.map(async pvc=>{
+    const m=(rsHyMatch.matches||[]).find(x=>x.pvc===pvc);
+    if(!m || !m.matched) return {pvc, matched:false};
+    const rp=await get("/api/hycu/restorepoints?source="+encodeURIComponent(m.hycu_vg_uuid));
+    return {pvc, matched:true, vg:m.hycu_vg_uuid, vgName:m.hycu_vg_name||"", kind:m.match_kind,
+            points:(rp.ok?(rp.points||[]):[]), rpErr:(rp.ok?null:(rp.error||"restore points unavailable"))};
+  }));
+  if(seq!==hyPanelSeq) return;
+  const isClone = state.mode==="clone";
+  rows.forEach(r=>{
+    const slot=document.querySelector(`#rsVolCfgs .hySlot[data-pvc="${CSS.escape(r.pvc)}"]`);
+    if(!slot) return;
+    const card=slot.closest(".vol-cfg");
+    if(!r.matched){
+      slot.innerHTML='<div class="warnbox" style="margin-top:6px">No HYCU Volume Group matched — paste the reference under “Advanced”.</div>';
+      const d=card&&card.querySelector("details.rsAdv"); if(d) d.open=true;
+      return;
+    }
+    const lbl=card&&card.querySelector(".vgLabel");
+    if(lbl) lbl.innerHTML='→ HYCU VG <b>'+esc(r.vgName||r.vg)+'</b>'+(r.kind!=='exact'?' <span class="sim">(match '+esc(r.kind)+' — to verify)</span>':'');
+    if(r.rpErr){ slot.innerHTML=`<div class="warnbox" style="margin-top:6px">${esc(r.rpErr)}</div>`; return; }
+    if(!(r.points||[]).length){ slot.innerHTML='<div class="warnbox" style="margin-top:6px">No restore point for this VG.</div>'; return; }
+    const opts=r.points.map((p,i)=>`<option value="${esc(p.id)}"${i===0?' selected':''}>${esc(p.time||p.id)}${p.status?(' · '+esc(p.status)):''}${i===0?' (most recent)':''}</option>`).join("");
+    slot.innerHTML=`<label class="fld">Restore point</label>
+      <select class="hyRp" data-pvc="${esc(r.pvc)}" data-vg="${esc(r.vg)}" data-name="${esc(r.vgName)}">${opts}</select>
+      <div class="hyStat" data-pvc="${esc(r.pvc)}"></div>`;
+    // Cloned VG name (volet Avancé) : basé sur le VG source dès qu'on le connaît,
+    // sauf si l'utilisateur a déjà touché au champ.
+    const nameEl=card&&card.querySelector(".hyVgName");
+    if(nameEl && !nameEl.dataset.touched && r.vgName) nameEl.value=r.vgName+"-"+cloneStamp();
+  });
+  document.querySelectorAll(".hyVgName").forEach(i=>i.oninput=()=>{ i.dataset.touched="1"; });
+  const ready=rows.filter(r=>r.matched && !r.rpErr && (r.points||[]).length);
+  if(isClone){
+    if(ready.length){
+      actions.innerHTML=
+        `<div style="margin-top:12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+           <button class="btn" id="hyBatchGo">Restore the VGs from HYCU (${ready.length} volume(s))</button>
+           <span class="hint" style="margin:0">Clones the VGs at the chosen point and fills the references — no data overwritten.</span>
+         </div>`;
+      $("#hyBatchGo").onclick=hyBatchRun;
+    }
+    rsFullOrch = ready.length===chks.length && ready.length>0;
+    syncContinueVisibility();
+  } else {
+    // Sur place : pré-sélectionner le point le plus récent de chaque volume.
+    rsInplaceSel={};
+    ready.forEach(r=>{ rsInplaceSel[r.pvc]={source_vg_uuid:r.vg, restore_point_id:r.points[0].id, vg_name:r.vgName}; });
+    document.querySelectorAll("#rsVolCfgs .hyRp").forEach(sel=>sel.onchange=()=>{
+      rsInplaceSel[sel.dataset.pvc]={source_vg_uuid:sel.dataset.vg, restore_point_id:sel.value, vg_name:sel.dataset.name};
+      updateInplaceRunBtn();
+    });
+    updateInplaceRunBtn();
+  }
+  updateNextBar();
+}
+// Remplit la référence d'un volume (textarea du volet Avancé) et rafraîchit les états.
+function setRef(pvc, val){
+  const ta=document.querySelector(`.rsRef[data-pvc="${CSS.escape(pvc)}"]`);
+  if(ta) ta.value=val;
+  refreshRefStats(); updateNextBar();
+}
+// VG UUID cloné, retrouvé côté Nutanix par nom EXACT (ne jamais deviner :
+// un mauvais VG = un mauvais volume attaché).
+async function lookupVgUuid(vgName){
+  if(!((conn.nutanix&&conn.nutanix.connected)||(conn.prismcentral&&conn.prismcentral.connected)))
+    return {ok:false, err:"Connect Nutanix (Prism) to fetch the reference automatically, or use the Advanced section."};
+  const r=await get("/api/nutanix/vgs?q="+encodeURIComponent(vgName||""));
+  if(!r.ok || !(r.vgs||[]).length) return {ok:false, err:"VG « "+vgName+" » not found on the Nutanix side — use the Advanced section."};
+  const exact=r.vgs.filter(v=>(v.name||"")===vgName);
+  if(exact.length!==1) return {ok:false, err:(exact.length===0?"No":"Multiple")+" VG named exactly « "+vgName+" » — use the Advanced section to pick the right one."};
+  if(!exact[0].uuid) return {ok:false, err:"VG found but UUID not exposed — use the Advanced section."};
+  return {ok:true, uuid:exact[0].uuid, name:exact[0].name};
+}
+// Clone TOUS les volumes prêts dans HYCU (séquentiel : suivi lisible ligne par ligne),
+// remplit les références, puis construit le plan automatiquement.
+async function hyBatchRun(){
+  const rows=[...document.querySelectorAll("#rsVolCfgs .vol-cfg")].map(div=>{
+    const sel=div.querySelector(".hyRp"); if(!sel || !sel.value) return null;
+    const nameEl=div.querySelector(".hyVgName");
+    const newName=(nameEl&&nameEl.value.trim()) || ((sel.dataset.name||div.dataset.pvc)+"-"+cloneStamp());
+    return {pvc:div.dataset.pvc, vg:sel.dataset.vg, rp:sel.value,
+            newName, stat:div.querySelector(".hyStat")};
+  }).filter(Boolean);
+  if(!rows.length) return;
+  const live=!dry();
+  if(live && !(await confirmDanger({title:"REAL HYCU clones", lines:[
+     "Trigger in HYCU the <b>clone</b> of <b>"+rows.length+"</b> Volume Group(s) at the chosen point?",
+     "The source VGs are <b>not</b> modified — <b>new</b> VGs are created."]}))) return;
+  const b=$("#hyBatchGo"); b.disabled=true; b.innerHTML='<span class="spin"></span>HYCU clones in progress…';
+  hideNextBar();
+  let failed=0;
+  for(const row of rows){
+    row.stat.innerHTML='<div class="hint" style="margin-top:6px"><span class="spin"></span> HYCU clone…</div>';
+    const body={namespace:rsHyMatch.ns, source_uuid:row.vg, restore_point_id:row.rp,
+                mode:"clone", new_name:row.newName, dry:dry()};
+    const r=await post("/api/hycu/restore",body);
+    if(!r.ok){ row.stat.innerHTML=errBox(r.error); failed++; continue; }
+    if(r.dry){
+      row.stat.innerHTML=`<div class="warnbox" style="margin-top:6px">Simulation — HYCU call that would be sent:</div><pre class="box">${esc(JSON.stringify(r.planned,null,2))}</pre>`;
+      // En simulation aucun VG n'est créé : on inscrit une référence PROVISOIRE (le VG
+      // source) pour pouvoir dérouler l'aperçu du plan ; en réel elle sera remplacée
+      // par l'VG UUID cloné découvert.
+      const m=((rsHyMatch&&rsHyMatch.matches)||[]).find(x=>x.pvc===row.pvc);
+      if(m && m.nutanix_uuid){ setRef(row.pvc, m.nutanix_uuid);
+        row.stat.innerHTML+='<div class="hint">Provisional reference (source VG) filled in for the simulation — replaced by the cloned VG in real mode.</div>'; }
+      continue; }
+    if(!r.job_id){ row.stat.innerHTML='<div class="warnbox" style="margin-top:6px">HYCU job not identified — fetch the reference via the Advanced section once the clone completes.</div>'; failed++; continue; }
+    const ok=await pollJobBar(r.job_id, row.stat);
+    if(!ok){ failed++; continue; }
+    const lu=await lookupVgUuid(row.newName);
+    if(!lu.ok){ row.stat.innerHTML+=`<div class="warnbox">${esc(lu.err)}</div>`; failed++; continue; }
+    setRef(row.pvc, lu.uuid);
+    row.stat.innerHTML=`<div class="note" style="margin-top:6px">✓ VG cloned — reference <code>${esc(lu.uuid)}</code> filled.</div>`;
+  }
+  b.disabled=false; b.textContent="Restore the VGs from HYCU ("+rows.length+" volume(s))";
+  if(dry()) return;                          // simulation : rien à préparer
+  const items=collectItems();
+  const allFilled=items.length && items.every(i=>(i.new_ref||"").trim());
+  if(!failed && allFilled){
+    // Enchaîner directement : construire le plan et amener l'opérateur au lancement.
+    $("#rsPreview").click();
+  } else {
+    updateNextBar();
+  }
+}
+// --------- Orchestration RESTAURATION SUR PLACE (arrêt -> restore in-place -> redémarrage) ---------
+let rsInplaceSel={};   // {pvc: {source_vg_uuid, restore_point_id, vg_name}}
+function updateInplaceRunBtn(){
+  const chosen=[...document.querySelectorAll(".rsChk:checked")].map(c=>c.dataset.pvc);
+  const ready=chosen.filter(p=>rsInplaceSel[p]);
+  if(!$("#rsInplaceRun")) return;
+  $("#rsInplaceRun").disabled = ready.length===0;
+  $("#rsInplaceHint").textContent = ready.length
+    ? (ready.length+" / "+chosen.length+" volume(s) ready"+(dry()?" · simulation":" · REAL MODE"))
+    : "Select a restore point for each volume.";
+  updateNextBar();
+}
+$("#dry").addEventListener("change",()=>{ if($("#rsInplaceRunWrap").style.display!=="none") updateInplaceRunBtn(); });
+$("#rsInplaceRun").onclick=async()=>{
+  const chosen=[...document.querySelectorAll(".rsChk:checked")].map(c=>c.dataset.pvc);
+  const items=chosen.filter(p=>rsInplaceSel[p]).map(p=>({pvc:p, source_vg_uuid:rsInplaceSel[p].source_vg_uuid, restore_point_id:rsInplaceSel[p].restore_point_id}));
+  if(!items.length) return;
+  const live=!dry();
+  let confirmedCtx="";
+  if(live){
+    const needCtx = ctxInfo.require_confirm ? (ctxInfo.context||"") : null;
+    const res = await confirmDanger({title:"REAL IN-PLACE restore", requireText:needCtx, lines:[
+       "Namespace: <b>"+esc((rsHyMatch?rsHyMatch.ns:$("#rsNs").value)||"?")+"</b>",
+       "Target cluster: <b>"+esc(ctxInfo.context||"?")+"</b>",
+       "The application will be <b>STOPPED</b>, the volumes restored <b>in-place</b> in HYCU (data overwritten by the chosen point), then the application <b>RESTARTED</b>."]});
+    if(!res) return;
+    if(typeof res==="string") confirmedCtx=res;
+  }
+  hideNextBar();   // pas de « prochaine action » pendant l'exécution
+  const b=$("#rsInplaceRun"); b.disabled=true; b.innerHTML='<span class="spin"></span>Orchestrating…';
+  $("#rsInplaceLog").innerHTML='<div class="hint"><span class="spin"></span> Starting…</div>';
+  const ipBody={namespace:(rsHyMatch?rsHyMatch.ns:$("#rsNs").value), items, dry:dry()};
+  if(live && ctxInfo.require_confirm) ipBody.confirm_context=confirmedCtx;
+  const r=await runOp("/api/orchestrate/inplace", ipBody,
+    log=>{ $("#rsInplaceLog").innerHTML='<div class="hint"><span class="spin"></span> Orchestration in progress…</div>'+renderLog(log); });
+  b.disabled=false; b.textContent="Launch the in-place restore";
+  if(r.error && !(r.log&&r.log.length)){ $("#rsInplaceLog").innerHTML=errBox(r.error); return; }
+  const lines=renderLog(r.log);
+  const head=r.dry?'<div class="warnbox">Simulation — sequence and HYCU calls that would be executed.</div>'
+    :(r.aborted?'<div class="err"><b>Sequence aborted</b> — the application was left stopped. See details.</div>'
+      :(r.ok?'<div class="note">In-place restore complete.</div>':'<div class="err">Some steps failed.</div>'));
+  $("#rsInplaceLog").innerHTML=head+lines;
+  if(!r.dry && r.ok && !r.aborted){
+    $("#rsInplaceLog").insertAdjacentHTML("afterbegin",'<div class="note">Opening the verification…</div>');
+    setTimeout(()=>gotoVerify(ipBody.namespace,true),1200);
+  }
+};
+document.querySelectorAll("#rsMode button").forEach(b=>b.onclick=()=>{
+  document.querySelectorAll("#rsMode button").forEach(x=>x.classList.remove("on"));
+  b.classList.add("on"); state.mode=b.dataset.mode; savePref("mode",state.mode);
+  $("#rsCloneSubWrap").style.display = state.mode==="clone"?"block":"none";
+  rebuildVolCfgs();
+});
+document.querySelectorAll("#rsCloneSub button").forEach(b=>b.onclick=()=>{
+  document.querySelectorAll("#rsCloneSub button").forEach(x=>x.classList.remove("on"));
+  b.classList.add("on"); state.cloneSub=b.dataset.sub;
+  $("#rsCloneAppWrap").style.display = state.cloneSub==="cloneapp"?"block":"none";
+  $("#rsPlan").style.display="none";
+});
+document.querySelectorAll("#rsCloneNsMode button").forEach(b=>b.onclick=()=>{
+  document.querySelectorAll("#rsCloneNsMode button").forEach(x=>x.classList.remove("on"));
+  b.classList.add("on"); state.cloneNsMode=b.dataset.nsmode;
+  $("#rsCloneSuffixWrap").style.display = state.cloneNsMode==="same"?"block":"none";
+  $("#rsCloneTargetWrap").style.display = state.cloneNsMode==="other"?"block":"none";
+  $("#rsCloneRefsWrap").style.display = state.cloneNsMode==="other"?"block":"none";
+});
+function cloneAppBody(){
+  const same = state.cloneNsMode==="same";
+  return {namespace:$("#rsNs").value, items:collectItems(), backup_path:state.backup_path, backup_root:state.backup_root,
+          app: (state.app && !state.app.unassigned) ? state.app.name : undefined,   // application ciblée : tous ses workloads
+          target_namespace: same? "" : $("#rsCloneTargetNs").value.trim(),
+          suffix: same? ($("#rsCloneSuffix").value.trim()||"-clone") : "",
+          clone_refs: same? false : !!($("#rsCloneRefs")&&$("#rsCloneRefs").checked)};
+}
+function renderCloneAppPlan(r){
+  if(!r.ok && !r.preview){ $("#rsErr").innerHTML=errBox(r.error); return; }
+  const p=r.preview||{};
+  let html=`<div class="note">Preview ready. Review below, then click “<b>Launch the application clone (real)</b>” at the bottom to create the copy. <span class="hint">The original application is untouched.</span></div>
+     <div class="repl"><div class="nm">Application clone → namespace <b>${esc(p.target_namespace)}</b> ${p.same_namespace?'(same namespace, suffix)':'(other namespace)'}</div>
+     <div><span class="k">PVs created</span> : ${esc((p.pvs||[]).join(', ')||'—')}</div>
+     <div><span class="k">PVCs created</span> : ${esc((p.pvcs||[]).join(', ')||'—')}</div>
+     <div><span class="k">Cloned applications</span> : ${esc((p.workloads||[]).join(', ')||'none')}</div>
+     ${(p.dependencies&&p.dependencies.length)?`<div><span class="k">Cloned dependencies</span> : ${esc(p.dependencies.join(', '))}</div>`:''}</div>`;
+  (r.warnings||[]).forEach(w=>html+=`<div class="warnbox">⚠ ${esc(w)}</div>`);
+  if(r.manifests_preview){ html+=`<details style="margin-top:6px"><summary class="hint">View the cloned applications' manifests</summary><pre class="box">${esc(r.manifests_preview)}</pre></details>`; }
+  $("#rsRepl").innerHTML=html;
+  $("#rsSteps").innerHTML='<li>Créer le namespace cible (si « autre »)</li>'+(rsStatelessClone()?'':'<li>Créer les PV/PVC clonés (sur le VG cloné)</li>')+'<li>Créer les applications clonées (elles démarrent automatiquement)</li><li>L\'application d\'origine n\'est PAS modifiée ni arrêtée</li>';
+  $("#rsPlan").style.display="block"; setRsStep(3);
+  updateGoButton(r.ok);
+  if($("#mRestore").style.display!=="none") rsShowPage("plan");
+  else $("#rsPlan").scrollIntoView({behavior:"smooth",block:"start"});
+}
+
+function collectItems(){
+  const items=[];
+  document.querySelectorAll(".rsChk:checked").forEach(c=>{
+    const pvc=c.dataset.pvc;
+    const ref=(document.querySelector(`.rsRef[data-pvc="${CSS.escape(pvc)}"]`)||{}).value||"";
+    const nameEl=document.querySelector(`.rsName[data-pvc="${CSS.escape(pvc)}"]`);
+    items.push({pvc, new_ref:ref, new_name:nameEl?nameEl.value:""});
+  });
+  return items;
+}
+
+$("#rsPreview").onclick=async()=>{
+  $("#rsErr").innerHTML="";
+  const items=collectItems();
+  if(!items.length && !rsStatelessClone()){$("#rsErr").innerHTML='<div class="err">Tick at least one PVC.</div>';return;}
+  if(isCloneApp()){
+    if(state.cloneNsMode==="other" && !$("#rsCloneTargetNs").value.trim()){ $("#rsErr").innerHTML='<div class="err">Provide the target namespace.</div>'; return; }
+    const cb=cloneAppBody(); cb.dry=true;
+    const r=await runOp("/api/clone_app",cb);
+    state.preview={_cloneapp:true};
+    renderCloneAppPlan(r);
+    return;
+  }
+  const body={namespace:$("#rsNs").value,mode:state.mode,items,backup_path:state.backup_path,backup_root:state.backup_root,dry:dry()};
+  const r=await post("/api/prepare_restore",body);
+  state.preview=body;
+  let html="";
+  (r.results||[]).forEach(res=>{
+    if(!res.ok){html+=`<div class="err"><b>${esc(res.pvc)}</b> : ${esc(res.error)}</div>`;return;}
+    const REPL_LABEL={vg_uuid:"VG UUID", pv_name:"PV name", volumeHandle:"volumeHandle"};   // clés stables -> libellés
+    const repl=(res.replacements||[]).map(([k,o,n])=>`<div><span class="k">${esc(REPL_LABEL[k]||k)}</span> :
+       <span class="old">${esc(o)}</span> → <span class="new">${esc(n)}</span></div>`).join("")||
+       '<div class="hint">No string change.</div>';
+    const warn = res.warn? `<div class="warnbox">⚠ ${esc(res.warn)}</div>` : "";
+    html+=`<div class="repl"><div class="nm">${esc(res.pvc)} → PV ${esc(res.new_pv_name)}</div>${repl}
+       <div><span class="k">derived volumeHandle</span> : <span class="new">${esc(res.new_volume_handle)}</span></div>${warn}
+       <details style="margin-top:6px"><summary class="hint">View the full manifest of the new PV</summary>
+       <pre class="box">${esc(res.manifest_preview)}</pre></details></div>`;
+  });
+  $("#rsRepl").innerHTML=html;
+  $("#rsSteps").innerHTML=(r.planned_steps||[]).map(s=>`<li class="${/^(Supprimer|Arrêter|Delete|Stop)/.test(s)?'danger':''}">${esc(s)}</li>`).join("");
+  $("#rsPlan").style.display="block"; setRsStep(3);
+  if(!r.ok){$("#rsErr").innerHTML='<div class="err">Fix the volumes in error before launching.</div>';}
+  updateGoButton(r.ok);
+  if($("#mRestore").style.display!=="none") rsShowPage("plan");       // page 3 de l'assistant
+  else $("#rsPlan").scrollIntoView({behavior:"smooth",block:"start"});
+};
+// Toute modification des références/noms rend le plan périmé : il faut re-prévisualiser.
+function invalidatePlan(){
+  if(!state.preview) return;
+  state.preview=null; $("#rsPlan").style.display="none"; $("#rsLog").innerHTML="";
+  if(typeof rsWizPage!=="undefined" && rsWizPage==="plan") rsShowPage("form");
+  setRsStep(2);
+}
+
+let rsRunning=false;
+$("#rsCancel").onclick=()=>{ $("#rsCancel").disabled=true; cancelCurrentOp(); };
+// Liste ✓/✕ du préflight renvoyée par le serveur (contrôles AVANT tout stopping of l'application).
+function renderPreflight(checks){
+  if(!checks || !checks.length) return "";
+  return `<details class="preflight" ${checks.some(c=>c.ok===false)?"open":""}><summary><b>Preflight</b> — ${checks.filter(c=>c.ok!==false).length}/${checks.length} checks passed</summary>
+    <ul class="pvc-list">${checks.map(c=>`<li class="logline">${stIc(c.ok===false?"ko":(c.ok===null?"na":"ok"), c.ok===false?"Failed":"OK")}<span><b>${esc(c.name)}</b>${c.detail?(' — <span class="hint">'+esc(c.detail)+'</span>'):''}</span></li>`).join("")}</ul></details>`;
+}
+function updateGoButton(ready){
+  refreshDry();
+  const live=!dry();
+  const needConfirm = live && ctxInfo.require_confirm;
+  $("#rsCtxConfirm").style.display = needConfirm? "block":"none";
+  $("#rsGoHint").textContent = live? "Real mode: these operations will be executed on the cluster."
+     : "Simulation mode: nothing will be changed.";
+  $("#rsGo").className = live? "btn danger" : "btn";
+  let act;
+  if(state.mode!=="clone") act = "the in-place restore (manual flow)";
+  else if(isCloneApp()) act = "the application clone";
+  else act = "the clone";
+  $("#rsGo").textContent = (live? "Launch " : "Simulate ") + act + (live? " (real)" : "");
+  $("#rsGo").disabled = !ready;
+  updateNextBar();
+}
+$("#dry").addEventListener("change",()=>{ if($("#rsPlan").style.display!=="none") updateGoButton(!$("#rsGo").disabled); });
+
+$("#rsGo").onclick=async()=>{
+  hideNextBar();   // pas de « prochaine action » pendant l'exécution
+  const live=!dry();
+  if(state.preview && state.preview._cloneapp){
+    let confirmedCtxCA="";
+    if(live){
+      const needCtx = ctxInfo.require_confirm ? (ctxInfo.context||"") : null;
+      const res = await confirmDanger({title:"REAL application clone", requireText:needCtx, lines:[
+         "A <b>COPY</b> of the application will be created"+(state.cloneNsMode==="same"?" in the <b>same namespace</b> (with a suffix)":" in the target namespace <b>"+esc($("#rsCloneTargetNs").value||"?")+"</b>")+".",
+         "Target cluster: <b>"+esc(ctxInfo.context||"?")+"</b>",
+         "The original application is <b>NOT</b> modified or stopped."]});
+      if(!res) return;
+      if(typeof res==="string") confirmedCtxCA=res;
+    }
+    const bb=$("#rsGo"); bb.disabled=true; bb.innerHTML='<span class="spin"></span>…';
+    $("#rsLog").innerHTML='<div class="hint"><span class="spin"></span> Starting…</div>';
+    const caBody={...cloneAppBody(), dry:dry()};
+    if(live && ctxInfo.require_confirm) caBody.confirm_context=confirmedCtxCA;
+    const r=await runOp("/api/clone_app", caBody,
+      log=>{ $("#rsLog").innerHTML='<div class="hint"><span class="spin"></span> Cloning in progress…</div>'+renderLog(log); });
+    bb.disabled=false; updateGoButton(true);
+    if(r.error && !(r.log&&r.log.length)){ $("#rsLog").innerHTML=errBox(r.error); return; }
+    const lns=renderLog(r.log);
+    const hd=r.dry?'<div class="warnbox">Simulation — resources that would be created (the original app stays intact).</div>'
+      :(r.ok?'<div class="note">Application clone created. The original application is intact.</div>':'<div class="err">Some steps failed — see details.</div>');
+    $("#rsLog").innerHTML=hd+lns+((r.warnings||[]).map(w=>`<div class="warnbox">⚠ ${esc(w)}</div>`).join(""));
+    if(!r.dry && r.ok){
+      const tgt = state.cloneNsMode==="other" ? $("#rsCloneTargetNs").value.trim() : $("#rsNs").value;
+      if((r.warnings||[]).length){   // laisser lire les avertissements ; la vérification est à un clic
+        $("#rsLog").insertAdjacentHTML("beforeend",'<div style="margin-top:8px"><button class="btn" id="rsGoVerify">Verify the application now →</button></div>');
+        $("#rsGoVerify").onclick=()=>gotoVerify(tgt,true);
+      } else {
+        $("#rsLog").insertAdjacentHTML("afterbegin",'<div class="note">Opening the verification…</div>');
+        setTimeout(()=>gotoVerify(tgt,true),1200);
+      }
+    }
+    return;
+  }
+  let confirmedCtx="";
+  if(live){
+    const needCtx = ctxInfo.require_confirm ? (ctxInfo.context||"") : null;
+    const res = await confirmDanger({title:"REAL restore", requireText:needCtx, lines:[
+      "Namespace: <b>"+esc($("#rsNs").value||"?")+"</b>",
+      "Target cluster: <b>"+esc(ctxInfo.context||"?")+"</b>",
+      "The application will be <b>stopped</b>, the old PVCs/PVs <b>deleted</b> then recreated on the restored Volume Group(s)."]});
+    if(!res) return;
+    if(typeof res==="string") confirmedCtx=res;
+  }
+  const b=$("#rsGo"); b.disabled=true; b.innerHTML='<span class="spin"></span>Executing…';
+  const body={...state.preview,dry:dry()};
+  if(live && ctxInfo.require_confirm) body.confirm_context=confirmedCtx || $("#rsCtxInput").value.trim();
+  setRsStep(4); rsRunning=true;
+  const total=($("#rsSteps").children.length||1)+8;              // étapes prévues + préflight/réplicas/vérif
+  $("#rsProgress").style.display="block"; $("#rsProgressBar").style.width="2%";
+  $("#rsProgressTxt").textContent="Starting…"; $("#rsCancel").style.display = live ? "" : "none"; $("#rsCancel").disabled=false;
+  $("#rsLog").innerHTML='<div class="hint"><span class="spin"></span> Starting…</div>';
+  const r=await runOp("/api/execute_restore", body, log=>{
+    const done=log.length, last=log[log.length-1];
+    $("#rsProgressBar").style.width=Math.min(96, Math.round(100*done/total))+"%";
+    $("#rsProgressTxt").textContent="Step "+done+" · "+((last&&last.label)||"…");
+    $("#rsLog").innerHTML='<div class="hint"><span class="spin"></span> Execution in progress…</div>'+renderLog(log); });
+  rsRunning=false; $("#rsCancel").style.display="none";
+  $("#rsProgressBar").style.width="100%"; $("#rsProgressTxt").textContent = r.aborted ? "Interrupted" : (r.ok ? "Completed" : "Completed with errors");
+  b.disabled=false; updateGoButton(true);
+  if(r.error && !(r.log&&r.log.length)){$("#rsLog").innerHTML=errBox(r.error)+renderPreflight(r.preflight);return;}
+  const lines=renderLog(r.log);
+  let head;
+  if(r.dry) head='<div class="note">Simulation complete — here is what would be executed in real mode.</div>';
+  else if(r.aborted) head='<div class="err"><b>Sequence aborted</b> — the application was left stopped to avoid an inconsistent restart. See details.</div>';
+  else if(r.ok) head='<div class="note">Restore complete.</div>';
+  else head='<div class="err">Some steps failed — see below.</div>';
+  let reprot="";
+  if(r.reprotect && r.reprotect.length){
+    const items=r.reprotect.map(x=>`<li><b>${esc(x.new_pv_name)}</b> <span class="hint">${esc(x.new_volume_handle||'')}</span></li>`).join("");
+    reprot=`<div class="warnbox">⚠ <b>HYCU re-protection required.</b> The cloned Volume Group(s) below
+       are <b>not yet protected</b> by HYCU (the app's policy pointed at the old VG).
+       <ul class="pvc-list" style="margin-top:8px">${items}</ul>
+       <button class="btn" id="rsReprotectBtn" style="margin-top:6px">Re-protect now in HYCU</button></div>`;
+  }
+  $("#rsLog").innerHTML = head + renderPreflight(r.preflight) + lines + reprot;
+  const rb=$("#rsReprotectBtn"); if(rb) rb.onclick=()=>goReprotect($("#rsNs").value);
+  if(!r.dry && r.ok && !r.aborted){
+    if(reprot){   // ne pas quitter la page tant que la re-protection HYCU n'est pas traitée
+      $("#rsLog").insertAdjacentHTML("beforeend",'<div style="margin-top:8px"><button class="btn" id="rsGoVerify">Verify the application now →</button></div>');
+      $("#rsGoVerify").onclick=()=>gotoVerify($("#rsNs").value,true);
+    } else {
+      $("#rsLog").insertAdjacentHTML("afterbegin",'<div class="note">Opening the verification…</div>');
+      setTimeout(()=>gotoVerify($("#rsNs").value,true),1200);
+    }
+  }
+};
+
+// --------- Vérification ---------
+async function runVerify(){
+  const ns=$("#vfNs").value;
+  const r=await get("/api/verify?ns="+encodeURIComponent(ns));
+  if(r.error){
+    let html=errBox(r.error);
+    // Erreur actionnable : namespace hors liste blanche (ex. namespace créé par un
+    // clone AVANT que l'ajout automatique n'existe) -> proposer l'ajout en un clic.
+    if(r.ns_not_allowed) html+=`<div style="margin-top:8px"><button class="btn" id="vfAllowNs">Allow « ${esc(ns)} » and retry</button></div>`;
+    $("#vfOut").innerHTML=html;
+    const ab=$("#vfAllowNs");
+    if(ab) ab.onclick=async()=>{
+      const f=await get("/api/ns_filter");
+      const rr=await post("/api/ns_filter",{filter:(f.filter||[]).concat([ns])});
+      if(!rr.ok){ $("#vfOut").innerHTML=errBox(rr.error||"Could not update the filter."); return; }
+      const n=await get("/api/namespaces");            // recharger les listes déroulantes
+      const opts=(n.namespaces||[]).map(x=>`<option>${esc(x)}</option>`).join("");
+      ["#bkNs","#rsNs","#vfNs"].forEach(id=>$(id).innerHTML=opts||"<option>—</option>");
+      $("#vfNs").value=ns; state.ns=ns; applyGlobalNs();
+      runVerify();
+    };
+    return false;
+  }
+  const pvcs=r.pvcs.map(p=>`<li class="logline"><span>${badge(p.phase)} <b>${esc(p.name)}</b>
+     <span class="hint">→ ${esc(p.pv||'—')}</span></span></li>`).join("")||'<div class="hint">No PVC.</div>';
+  let allReady=r.pods.length>0;
+  const pods=r.pods.map(p=>{
+    const ok=p.phase==="Running"; if(!ok) allReady=false;
+    const issue = p.issue ? `<div class="hint" style="color:var(--red);margin-top:3px">⚠ ${esc(p.issue.reason)}${p.issue.count>1?' (×'+p.issue.count+')':''} : ${esc(p.issue.message)}</div>` : "";
+    return `<li class="logline"><span class="ic ${ok?'ok':'sim'}">${ok?'✓':'○'}</span>
+     <span><b>${esc(p.name)}</b> <span class="hint">${esc(p.phase)}${p.waiting?' · '+esc(p.waiting):''} · ready ${esc(p.ready)}</span>${issue}</span></li>`;}).join("")
+     ||'<div class="hint">No pods.</div>';
+  $("#vfOut").innerHTML=`<div style="margin-top:12px"><b style="font-size:13px">PVC</b>
+     <ul class="pvc-list">${pvcs}</ul><b style="font-size:13px">Pods</b><ul class="pvc-list">${pods}</ul></div>`;
+  const allBound=r.pvcs.every(p=>(p.phase||"").toLowerCase()==="bound");
+  return allBound && allReady;
+}
+$("#vfRun").onclick=runVerify;
+// Suivi auto CONTINU : rafraîchit toutes les ~3 s jusqu'à l'état stable (tous les PVC
+// Bound + pods Running), avec plafond de sécurité ~10 min. Re-cliquer arrête le suivi.
+let vfTrack=false, vfSeq=0;
+function vfSetBtn(){ $("#vfAuto").textContent = vfTrack? "■ Stop tracking" : "Auto-track (until stable)"; }
+function vfStop(){ vfSeq++; vfTrack=false; vfSetBtn(); }
+async function vfAutoTrack(){
+  if(vfTrack){ vfStop(); return; }               // stop demandé : la boucle en cours s'arrête
+  const my=++vfSeq; vfTrack=true; vfSetBtn();
+  for(let i=0;i<200 && vfTrack && vfSeq===my;i++){   // ~10 min à 3 s ; une seule boucle à la fois
+    const done=await runVerify();
+    if(vfSeq!==my) return;
+    if(done){ $("#vfOut").insertAdjacentHTML("afterbegin",'<div class="note">Stable state: all PVCs are Bound and pods are Running.</div>'); break; }
+    await sleep(3000);
+  }
+  if(vfSeq===my){ vfTrack=false; vfSetBtn(); }
+}
+$("#vfAuto").onclick=vfAutoTrack;
+// Ouvre l'onglet Vérifier sur un namespace donné (après une restauration réelle) et
+// démarre le suivi. Un namespace fraîchement créé (clone d'app) est ajouté à la liste.
+function gotoVerify(ns, track){
+  if(ns){
+    const sel=$("#vfNs");
+    if(sel && ![...sel.options].some(o=>o.value===ns)) sel.insertAdjacentHTML("beforeend",`<option>${esc(ns)}</option>`);
+    state.ns=ns;
+  }
+  switchTab("verify");
+  if(track && !vfTrack) vfAutoTrack(); else runVerify();
+}
+
+// --------- Réglages ---------
+async function loadConfig(){
+  const r=await get("/api/config"); const c=r.config||{};
+  $("#cfgKubectl").value=c.kubectl_path||""; $("#cfgVhPrefix").value=c.volume_handle_prefix||"";
+  $("#cfgCtx").value=(c.allowed_contexts||[]).join(", ");
+  $("#cfgNs").value=(c.namespace_filter||[]).join(", ");
+  $("#cfgLabelSel").value=c.namespace_label_selector||"";
+  $("#cfgAuditDays").value=(c.audit_retention_days??31);
+  $("#cfgMinFree").value=(c.storage_min_free_mb??500);
+  $("#cfgQuota").value=(c.storage_quota_gb??0);
+  $("#cfgDr").checked=!!c.allow_dr_restore;
+  $("#cfgHosts").value=(c.allowed_hosts||[]).join(", ");
+  $("#cfgWait").value=c.wait_timeout; $("#cfgSuffix").value=c.clone_name_suffix||"";
+  $("#cfgConfirm").checked=!!c.require_context_confirm; $("#cfgStrip").checked=!!c.strip_claimref;
+  $("#cfgSim").checked=!!c.simulation_mode_available; $("#cfgLang").value=c.default_lang||"en";
+  applySimAvailability(c.simulation_mode_available);
+  $("#cfgKubeconfig").value=c.kubeconfig_path||"";
+  $("#cfgContext").innerHTML=`<option value="${esc(c.kube_context||'')}">${esc(c.kube_context||'(current kubeconfig context)')}</option>`;
+}
+$("#ctxList").onclick=async()=>{
+  const kc=$("#cfgKubeconfig").value.trim();
+  $("#ctxMsg").textContent="…";
+  const r=await get("/api/contexts"+(kc?("?kubeconfig="+encodeURIComponent(kc)):""));
+  if(!r.ok){ $("#ctxMsg").innerHTML=`<span class="ko">${esc(r.error||'kubectl unavailable')}</span>`; return; }
+  const cur=r.selected||"";
+  $("#cfgContext").innerHTML=`<option value="">(current kubeconfig context)</option>`+
+    (r.contexts||[]).map(c=>`<option value="${esc(c)}" ${c===cur?'selected':''}>${esc(c)}</option>`).join("");
+  $("#ctxMsg").textContent=`${(r.contexts||[]).length} context(s) found`;
+};
+$("#ctxApply").onclick=async()=>{
+  const cfg={kube_context:$("#cfgContext").value, kubeconfig_path:$("#cfgKubeconfig").value.trim()};
+  const r=await post("/api/config",{config:cfg});
+  if(!r.ok){ $("#ctxMsg").innerHTML=`<span class="ko">${esc(r.error||'error')}</span>`; return; }
+  $("#ctxMsg").textContent = cfg.kube_context? ("Context « "+cfg.kube_context+" » applied.") : "Current context in use.";
+  await initApp();   // recharge en-tête + namespaces sur le nouveau cluster
+};
+function csv(s){return (s||"").split(",").map(x=>x.trim()).filter(Boolean);}
+$("#cfgSave").onclick=async()=>{
+  const cfg={kubectl_path:$("#cfgKubectl").value.trim()||"kubectl",
+    volume_handle_prefix:$("#cfgVhPrefix").value.trim(),
+    allowed_contexts:csv($("#cfgCtx").value), namespace_filter:csv($("#cfgNs").value), allowed_hosts:csv($("#cfgHosts").value),
+    namespace_label_selector:$("#cfgLabelSel").value.trim(),
+    audit_retention_days:Math.max(0,parseInt($("#cfgAuditDays").value)||0),
+    storage_min_free_mb:Math.max(0,parseInt($("#cfgMinFree").value)||0),
+    storage_quota_gb:Math.max(0,parseInt($("#cfgQuota").value)||0),
+    allow_dr_restore:$("#cfgDr").checked,
+    wait_timeout:parseInt($("#cfgWait").value)||120, clone_name_suffix:$("#cfgSuffix").value.trim()||"0000",
+    require_context_confirm:$("#cfgConfirm").checked, strip_claimref:$("#cfgStrip").checked,
+    simulation_mode_available:$("#cfgSim").checked, default_lang:$("#cfgLang").value};
+  const r=await post("/api/config",{config:cfg});
+  $("#cfgMsg").textContent = r.ok? "Saved." : ("Error: "+(r.error||""));
+  if(r.ok) applySimAvailability(cfg.simulation_mode_available);   // bandeau simulation affiché/masqué sans rechargement
+  ctxInfo=await get("/api/context");
+};
+
+// --------- Connexions HYCU / Nutanix ---------
+let conn = {hycu:{connected:false}, nutanix:{connected:false}};
+function connDot(on){ return `<span class="conn-dot ${on?'on':''}"></span>`; }
+async function loadConnStatus(){
+  let s = await get("/api/conn_status");
+  if(!s || !s.hycu) s = {hycu:{}, nutanix:{}, prismcentral:{}, vault:(s&&s.vault)||{}};  // réponse d'erreur : ne pas casser l'init
+  conn = s;
+  ntAllVgs=null;   // invalide le cache des VG Nutanix après tout (dé)connexion
+  const st=(x)=>connDot(x.connected)+(x.connected?"connected":"not connected");
+  $("#hyStatus").innerHTML=st(s.hycu); $("#ntStatus").innerHTML=st(s.nutanix); $("#pcStatus").innerHTML=st(s.prismcentral);
+  const s3=s.s3||{};
+  $("#s3Status").innerHTML=st(s3);
+  if(!$("#s3Url").value) $("#s3Url").value=s3.url||"";
+  if(!$("#s3Bucket").value) $("#s3Bucket").value=s3.bucket||"";
+  if(!$("#s3Region").value) $("#s3Region").value=s3.region||"";
+  $("#s3Tls").checked=!!s3.verify_tls; $("#s3Auto").checked=!!s3.auto_upload;
+  $("#s3Enc").checked=!!s3.encrypt; $("#s3EncWrap").style.display=s3.encrypt?"block":"none";
+  if(!$("#hyUrl").value) $("#hyUrl").value = s.hycu.url||"";
+  if(!$("#ntUrl").value) $("#ntUrl").value = s.nutanix.url||"";
+  if(!$("#pcUrl").value) $("#pcUrl").value = s.prismcentral.url||"";
+  $("#hyTls").checked=!!s.hycu.verify_tls; $("#ntTls").checked=!!s.nutanix.verify_tls; $("#pcTls").checked=!!s.prismcentral.verify_tls;
+  $("#bkProtectOff").style.display = s.hycu.connected? "none":"block";
+  $("#bkProtectOn").style.display = s.hycu.connected? "block":"none";
+  renderHdrConn();
+  loadVaultStatus();
+}
+// Pastilles d'état permanentes dans l'en-tête : HYCU / Prism Element / Prism Central.
+// Un clic ouvre l'onglet Connexions (l'opérateur voit AVANT d'agir s'il est connecté).
+function renderHdrConn(){
+  $("#hdrConn").innerHTML=[["HYCU",conn.hycu],["PE",conn.nutanix],["PC",conn.prismcentral]]
+    .map(([l,x])=>`<span class="hc">${connDot(!!(x&&x.connected))}${l}</span>`).join("");
+  renderSourcesTable();
+}
+function loadVaultStatus(){
+  const present = conn && conn.vault && conn.vault.present;
+  $("#vaultStatus").innerHTML = connDot(present) + (present? "vault present" : "no vault");
+  $("#vaultLoad").style.display = present? "inline-block" : "none";
+  $("#vaultForget").style.display = present? "inline-block" : "none";
+}
+function renderKubeBanner(){
+  const el=$("#kubeBanner");
+  if(ctxInfo.kubectl_ok){ el.style.display="none"; el.innerHTML=""; return; }
+  const tips={
+    kubectl_missing:"<b>kubectl not found.</b> Install kubectl and add it to PATH, or set its binary/path in ⚙ Settings (e.g. “microk8s kubectl”).",
+    no_context:"<b>No kubectl context selected.</b> Choose the target cluster: <code>kubectl config use-context &lt;name&gt;</code>, then reload the page.",
+    no_kubeconfig:"<b>No kubectl configuration found.</b> Check <code>%USERPROFILE%\\.kube\\config</code> (or the <code>KUBECONFIG</code> variable), then reload.",
+    other:"<b>Cluster unreachable via kubectl.</b> Check network connectivity and your RBAC rights on the API server."
+  };
+  const tip=tips[ctxInfo.kubectl_hint]||tips.other;
+  el.innerHTML=`<div class="warnbox" style="margin-bottom:14px">⚠ ${tip}
+    <div class="hint" style="margin-top:6px">The <b>Back up</b>, <b>Restore</b> (Kubernetes sequence) and <b>Verify</b> operations require kubectl. The <b>HYCU / Nutanix</b> connections work without kubectl.${ctxInfo.error?`<br><code style="color:#7a221b">${esc(ctxInfo.error)}</code>`:''}</div></div>`;
+  el.style.display="block";
+}
+async function vaultAction(url, needPass){
+  $("#vaultErr").innerHTML="";
+  const body = needPass? {passphrase:$("#vaultPass").value} : {};
+  const r = await post(url, body);
+  $("#vaultPass").value="";
+  return r;
+}
+$("#vaultSave").onclick=async()=>{
+  const r=await vaultAction("/api/creds/save", true);
+  $("#vaultErr").innerHTML = r.ok? `<div class="note">Connections encrypted: ${esc((r.saved||[]).join(', ')||"—")}.`+
+      ((r.clusters||[]).length?`<br>Kubernetes clusters encrypted: ${esc(r.clusters.join(', '))}.`:"")+`</div>`
+                                 : errBox(r.error);
+  await loadConnStatus();
+};
+$("#vaultLoad").onclick=async()=>{
+  const r=await vaultAction("/api/creds/load", true);
+  $("#vaultErr").innerHTML = r.ok? `<div class="note">Connections loaded: ${esc((r.loaded||[]).join(', ')||"—")}.`+
+      ((r.clusters||[]).length?`<br>Kubernetes clusters loaded: ${esc(r.clusters.join(', '))}.`:"")+`</div>`
+                                 : errBox(r.error);
+  await loadConnStatus();
+  if(r.ok) await afterVaultLoad();
+};
+$("#vaultForget").onclick=async()=>{
+  if(!confirm("Delete the encrypted vault from disk?")) return;
+  const r=await vaultAction("/api/creds/forget", false);
+  $("#vaultErr").innerHTML = r.ok? '<div class="note">Vault deleted.</div>' : `<div class="err">${esc(r.error||'')}</div>`;
+  await loadConnStatus();
+};
+let hyAuthMode="basic";
+document.querySelectorAll("#hyAuthMode button").forEach(b=>b.onclick=()=>{
+  document.querySelectorAll("#hyAuthMode button").forEach(x=>x.classList.remove("on"));
+  b.classList.add("on"); hyAuthMode=b.dataset.mode;
+  $("#hyBasicFields").style.display = hyAuthMode==="basic"?"flex":"none";
+  $("#hyApiField").style.display = hyAuthMode==="apikey"?"block":"none";
+});
+const SYS={
+  hycu:        {p:'hy', urlKey:'hycu_url',         tlsKey:'hycu_verify_tls'},
+  nutanix:     {p:'nt', urlKey:'nutanix_url',      tlsKey:'nutanix_verify_tls'},
+  prismcentral:{p:'pc', urlKey:'prismcentral_url', tlsKey:'prismcentral_verify_tls'},
+};
+async function connectSystem(sys){
+  const m=SYS[sys], P='#'+m.p;
+  $(P+'Err').innerHTML="";
+  const url=$(P+'Url').value.trim();
+  if(!url){ $(P+'Err').innerHTML='<div class="err">Enter the URL.</div>'; return; }
+  const cfg={}; cfg[m.urlKey]=url; cfg[m.tlsKey]=$(P+'Tls').checked;
+  await post("/api/config",{config:cfg});
+  let body={system:sys, auth_mode:'basic'};
+  if(sys==='hycu' && hyAuthMode==='apikey'){ body.auth_mode='apikey'; body.api_key=$("#hyApiKey").value; }
+  else { body.user=$(P+'User').value.trim(); body.password=$(P+'Pass').value; }
+  const r=await post("/api/connect",body);
+  $(P+'Pass').value=""; if(sys==='hycu') $("#hyApiKey").value="";
+  if(!r.ok){ $(P+'Err').innerHTML=errBox(r.error); }
+  else if(r.warning){ $(P+'Err').innerHTML=`<div class="warnbox">${esc(r.warning)}</div>`; }
+  await loadConnStatus();
+}
+async function disconnectSystem(sys){ await post("/api/disconnect",{system:sys}); await loadConnStatus(); }
+$("#s3Connect").onclick=async()=>{
+  $("#s3Err").innerHTML="";
+  const b=$("#s3Connect"); b.disabled=true; b.innerHTML='<span class="spin"></span>Testing bucket…';
+  const r=await post("/api/s3/connect",{s3_url:$("#s3Url").value.trim(), s3_bucket:$("#s3Bucket").value.trim(),
+    s3_region:$("#s3Region").value.trim()||"us-east-1", s3_verify_tls:$("#s3Tls").checked,
+    s3_path_style:$("#s3PathStyle").checked, s3_auto_upload:$("#s3Auto").checked,
+    s3_encrypt:$("#s3Enc").checked, enc_passphrase:$("#s3EncPass").value,
+    access:$("#s3Access").value.trim(), secret:$("#s3Secret").value});
+  $("#s3Secret").value=""; $("#s3EncPass").value=""; b.disabled=false; b.textContent="Tester & connecter";
+  if(!r.ok){ $("#s3Err").innerHTML=errBox(r.error); }
+  else { $("#s3Err").innerHTML=`<div class="note">Bucket « ${esc(r.bucket||"")} » accessible.`+
+    (r.auto_upload?" Automatic export enabled.":" Automatic export disabled (tick the box to enable it).")+`</div>`; }
+  await loadConnStatus();
+};
+$("#s3Enc").onchange=()=>{ $("#s3EncWrap").style.display=$("#s3Enc").checked?"block":"none"; };
+function s3ImpSync(){ $("#s3ImportBtn").disabled = !document.querySelectorAll(".s3ImpChk:checked").length; }
+$("#s3ListBtn").onclick=async()=>{
+  const w=$("#s3ImportWrap");
+  if(w.style.display!=="none"){ w.style.display="none"; return; }
+  w.style.display="block"; $("#s3ImpRes").innerHTML="";
+  $("#s3ListOut").innerHTML='<div class="hint"><span class="spin"></span>Listing bucket…</div>';
+  const r=await get("/api/s3/list");
+  if(!r.ok){ $("#s3ListOut").innerHTML=errBox(r.error); return; }
+  const o=r.objects||[];
+  $("#s3ListOut").innerHTML = o.length? `<div class="tcard" style="box-shadow:none;border:1px solid var(--rule)"><table class="ht"><thead><tr><th class="cb"><input type="checkbox" id="s3ImpAll"></th><th>Cluster</th><th>Application</th><th>Timestamp</th><th>Taille</th><th>Encrypted</th></tr></thead><tbody>`+
+    o.map((x,i)=>`<tr><td class="cb"><input type="checkbox" class="s3ImpChk" data-i="${i}"></td><td>${esc(x.cluster)}</td><td style="color:var(--strong)">${esc(x.namespace)}</td><td>${esc(x.timestamp)}</td><td>${esc(fmtBytes(x.size))}</td><td>${x.encrypted?"oui":"—"}</td></tr>`).join("")+
+    `</tbody></table></div>` : '<div class="hint">Aucun export de l\'outil dans ce bucket.</div>';
+  window.s3Objs=o;
+  document.querySelectorAll(".s3ImpChk").forEach(c=>c.onchange=s3ImpSync);
+  const all=$("#s3ImpAll"); if(all) all.onchange=()=>{ document.querySelectorAll(".s3ImpChk").forEach(c=>c.checked=all.checked); s3ImpSync(); };
+  s3ImpSync();
+};
+$("#s3ImportBtn").onclick=async()=>{
+  const items=[...document.querySelectorAll(".s3ImpChk:checked")].map(c=>({key:(window.s3Objs||[])[+c.dataset.i].key}));
+  if(!items.length) return;
+  const b=$("#s3ImportBtn"); b.disabled=true; b.innerHTML='<span class="spin"></span>Import…';
+  const r=await post("/api/s3/import",{items, enc_passphrase:$("#s3ImpPass").value});
+  $("#s3ImpPass").value=""; b.disabled=false; b.textContent="Import selection"; s3ImpSync();
+  const res=r.results||[];
+  $("#s3ImpRes").innerHTML=(r.error&&!res.length?errBox(r.error):"")+(res.length?`<ul class="dlist" style="margin-top:10px">`+res.map(x=>
+    `<li><span class="k" style="display:flex;gap:10px;align-items:center">${stIc(x.ok?"ok":"ko")}${esc(x.key)}</span>`+
+    `<span class="v" style="font-weight:400">${x.ok? x.files+" file(s)" : esc(x.error||"")}</span></li>`).join("")+"</ul>":"");
+};
+$("#s3Disconnect").onclick=async()=>{ await post("/api/disconnect",{system:"s3"}); $("#s3Err").innerHTML=""; await loadConnStatus(); };
+$("#hyConnect").onclick=()=>connectSystem("hycu");
+$("#ntConnect").onclick=()=>connectSystem("nutanix");
+$("#pcConnect").onclick=()=>connectSystem("prismcentral");
+$("#hyDisconnect").onclick=()=>disconnectSystem("hycu");
+$("#ntDisconnect").onclick=()=>disconnectSystem("nutanix");
+$("#pcDisconnect").onclick=()=>disconnectSystem("prismcentral");
+
+// Nutanix : recherche instantanée d'un VG et remplissage de sa RÉFÉRENCE (VG UUID).
+// Les VG sont chargés une fois (pagination serveur) puis filtrés côté navigateur.
+let ntAllVgs=null;
+async function ntFindRef(pvc){
+  const box=document.querySelector(`.ntpick[data-pvc="${CSS.escape(pvc)}"]`);
+  if(box.dataset.open==="1"){ box.dataset.open=""; box.innerHTML=""; return; }  // 2e clic = refermer
+  box.dataset.open="1";
+  box.innerHTML='<div class="hint">Loading Volume Groups…</div>';
+  if(ntAllVgs===null){
+    const r=await get("/api/nutanix/vgs");
+    if(!r.ok){ box.innerHTML=errBox(r.error); return; }
+    ntAllVgs=r.vgs||[];
+  }
+  box.innerHTML=`<div style="border:1px solid var(--line);border-radius:8px;padding:8px;margin-top:6px;background:#fff">
+    <input type="text" class="ntSearch" placeholder="search the cloned VG by name…">
+    <div class="ntResults" style="max-height:200px;overflow:auto;margin-top:6px"></div>
+    <div class="hint ntCount" style="margin-top:4px"></div></div>`;
+  const inp=box.querySelector(".ntSearch"), res=box.querySelector(".ntResults"), cnt=box.querySelector(".ntCount");
+  function render(){
+    const t=(inp.value||"").toLowerCase();
+    let list=t? ntAllVgs.filter(v=>(v.name||"").toLowerCase().includes(t)) : ntAllVgs;
+    const total=list.length, capped=list.length>200; list=list.slice(0,200);
+    res.innerHTML=list.length? list.map(v=>`<div class="logline ntRow" data-uuid="${esc(v.uuid)}" style="cursor:pointer">
+       <span><b>${esc(v.name||v.uuid)}</b> <span class="hint">UUID ${esc(v.uuid||'?')}</span></span></div>`).join("")
+       : '<div class="hint">No Volume Group matches.</div>';
+    cnt.textContent=`${total} VG${total>1?'s':''} of ${ntAllVgs.length}`+(capped?' (200 shown — refine the search)':'');
+    res.querySelectorAll(".ntRow").forEach(row=>row.onclick=()=>{
+      // NKP moderne : l'VG UUID suffit (= suffixe du volumeHandle). Pas d'appel IQN.
+      const ref=row.dataset.uuid;
+      if(!ref){ box.innerHTML='<div class="err">VG UUID unavailable.</div>'; box.dataset.open=""; return; }
+      const ta=document.querySelector(`.rsRef[data-pvc="${CSS.escape(pvc)}"]`); if(ta) ta.value=ref;
+      box.innerHTML='<div class="note" style="margin-top:6px">VG reference (UUID) filled from Nutanix.</div>'; box.dataset.open="";
+    });
+  }
+  inp.oninput=render; render(); inp.focus();
+}
+
+// Suivi générique d'un job HYCU : barre de progression + polling (backup ou restore).
+async function pollJobBar(id, target){
+  const el=(typeof target==="string")?$(target):target; if(!el) return false;
+  for(let i=0;i<240;i++){                       // ~12 min max (240 * 3s)
+    const r=await post("/api/hycu/job",{job_id:id});
+    if(!r.ok){ el.innerHTML=`<div class="hint">Job tracking unavailable: ${esc(r.error||'')}</div>`; return false; }
+    const pct=(r.progress!=null)?r.progress:0, status=r.status||"?";
+    el.innerHTML=`<div class="hint" style="margin-top:8px">Job <code>${esc(id)}</code> — ${esc(status)}${r.progress!=null?(' · '+pct+'%'):''}</div>
+       <div class="jbar"><span style="width:${pct}%"></span></div>`;
+    if(/^(OK|DONE|SUCCESS|SUCCEEDED|COMPLETED?|FINISHED|WARNING)$/i.test(status)){ el.innerHTML+='<div class="note" style="margin-top:6px">Job finished successfully.</div>'; return true; }
+    if(/^(FAILED|ERROR|FATAL|ABORTED?|CANCEL+ED|TIMEOUT)$/i.test(status)){ el.innerHTML+='<div class="err" style="margin-top:6px">Job failed — check in HYCU.</div>'; return false; }
+    await new Promise(s=>setTimeout(s,3000));
+  }
+  el.innerHTML+='<div class="hint">Tracking stopped (timeout) — the job continues on the HYCU side.</div>';
+  return false;
+}
+
+// --------- Filtre des namespaces (éditeur) ---------
+async function refreshNamespaces(){
+  if(typeof clearBkProtect==="function") clearBkProtect();   // l'analyse HYCU précédente n'est plus valide
+  const n=await get("/api/namespaces"); const list=n.namespaces||[];
+  const opts=list.map(x=>`<option>${esc(x)}</option>`).join("");
+  ["#bkNs","#rsNs","#vfNs"].forEach(id=>{
+    const cur=$(id).value; $(id).innerHTML=opts||"<option>—</option>";
+    if(cur && list.includes(cur)){ $(id).value=cur; return; }
+    // La namespace sélectionnée a disparu du nouveau filtre -> purge de l'état dépendant.
+    if(id==="#bkNs"){ $("#bkOut").innerHTML=""; }
+    else if(id==="#vfNs"){ $("#vfOut").innerHTML=""; }
+    else if(id==="#rsNs"){ $("#rsConfig").style.display="none"; $("#rsPlan").style.display="none";
+      $("#rsLog").innerHTML=""; $("#rsErr").innerHTML=""; state.preview=null; loadPvcs(); }
+  });
+}
+let nsAllList=[], nsChecked=new Set();
+function nsVisible(){ const t=($("#nsSearch").value||"").toLowerCase(); return nsAllList.filter(x=>!t||x.toLowerCase().includes(t)); }
+function nsTogglePick(){ const off=$("#nsAll").checked; $("#nsPick").style.opacity=off?".45":"1"; $("#nsPick").style.pointerEvents=off?"none":"auto"; }
+function nsUpdateCount(){
+  if($("#nsAll").checked){ $("#nsCount").textContent="all"; return; }
+  const allManual = nsAllList.length>0 && nsChecked.size===nsAllList.length;
+  $("#nsCount").textContent = nsChecked.size+" / "+nsAllList.length+" selected"
+    + (allManual? " · future namespaces excluded (tick « All »)" : "");
+}
+function renderNsList(){
+  const vis=nsVisible();
+  $("#nsList").innerHTML = vis.length? ('<ul class="pvc-list" style="margin:0">'+vis.map(n=>`<li><label style="display:flex;gap:10px;align-items:center;cursor:pointer;width:100%">
+      <input type="checkbox" class="nsChk" value="${esc(n)}" ${nsChecked.has(n)?'checked':''} style="width:auto">
+      <span class="nm">${esc(n)}</span></label></li>`).join("")+'</ul>')
+    : '<div class="hint">No namespace matches.</div>';
+  $("#nsList").querySelectorAll(".nsChk").forEach(c=>c.onchange=()=>{ c.checked? nsChecked.add(c.value):nsChecked.delete(c.value); nsUpdateCount(); });
+  nsUpdateCount();
+}
+async function openNsFilter(){
+  // Normalisation systématique : on repart d'un état propre à chaque ouverture,
+  // et la sauvegarde reste désactivée tant que le filtre réel n'est pas chargé
+  // (sinon, kubectl en panne -> on enregistrerait [] = écrasement de la whitelist).
+  $("#nsFilterErr").innerHTML=""; $("#nsAll").checked=false;
+  nsAllList=[]; nsChecked=new Set(); $("#nsSearch").value="";
+  $("#nsSave").disabled=true;
+  nsTogglePick(); renderNsList();
+  $("#nsFilter").style.display="flex";
+  const r=await get("/api/ns_filter");
+  if(!r.ok){ $("#nsFilterErr").innerHTML=`<div class="err">${esc(r.error||'kubectl unavailable')} — could not load the list; saving disabled.</div>`; return; }
+  nsAllList=r.all||[]; const filt=r.filter||[], noFilter=filt.length===0;
+  $("#nsAll").checked=noFilter;
+  nsChecked=new Set(noFilter? nsAllList : filt);
+  $("#nsSave").disabled=false;
+  nsTogglePick(); renderNsList();
+}
+document.querySelectorAll(".nsEdit").forEach(b=>b.onclick=openNsFilter);
+$("#nsAll").onchange=()=>{ nsTogglePick(); nsUpdateCount(); };
+$("#nsSearch").oninput=renderNsList;
+$("#nsCheckAll").onclick=()=>{ nsVisible().forEach(n=>nsChecked.add(n)); renderNsList(); };
+$("#nsUncheckAll").onclick=()=>{ nsVisible().forEach(n=>nsChecked.delete(n)); renderNsList(); };
+$("#nsCancel").onclick=()=>{ $("#nsFilter").style.display="none"; };
+$("#nsSave").onclick=async()=>{
+  const filter = $("#nsAll").checked? [] : [...nsChecked];
+  const r=await post("/api/ns_filter",{filter});
+  if(!r.ok){ $("#nsFilterErr").innerHTML=`<div class="err">${esc(r.error||'error')}</div>`; return; }
+  $("#nsFilter").style.display="none";
+  await refreshNamespaces();
+  $("#cfgNs").value=(r.filter||[]).join(", ");   // garder l'onglet Réglages cohérent
+  onPageShown(curPage);                          // Applications / tableau de bord à jour
+};
+refreshDry();
+
+// ============================================================================
+// Interface « HYCU Enterprise Cloud » : pages (Tableau de bord, Applications,
+// Politiques, Tâches) et modales d'opération (Sauvegarde, Set Policy,
+// Restauration, Sources). Les blocs d'origine (mêmes IDs, même logique testée)
+// sont hébergés dans ces modales : ce code se contente de les piloter.
+// ============================================================================
+var rsAutoCheck=false;            // assistant ouvert : volumes présélectionnés (cf. renderRsPvcs)
+var pageTimer=null;
+const MODALS=["mBackup","mPolicy","mRestore","mSources"];
+const FOCUSABLE='a[href],button:not([disabled]),input:not([disabled]):not([type=hidden]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])';
+let modalReturnFocus={};
+function openModal(id){
+  const m=$("#"+id); if(!m) return;
+  const box=m.querySelector(".hmodal")||m;
+  box.setAttribute("role","dialog"); box.setAttribute("aria-modal","true");
+  const h=box.querySelector("h2,h3"); if(h){ if(!h.id) h.id=id+"-title"; box.setAttribute("aria-labelledby",h.id); }
+  modalReturnFocus[id]=document.activeElement;
+  m.style.display="flex";
+  const first=box.querySelector(FOCUSABLE); if(first) setTimeout(()=>first.focus(),30);
+}
+function closeModal(id){
+  const m=$("#"+id); if(!m || m.style.display==="none") return;
+  if(id==="mRestore" && rsRunning){
+    $("#rsLog").insertAdjacentHTML("afterbegin",'<div class="warnbox">Operation in progress: it keeps running server-side. You can resume tracking from the banner at the top of the page.</div>');
+  }
+  m.style.display="none";
+  if(id==="mRestore") rsAutoCheck=false;
+  if(id==="mSources"){ const k=$("#clKc"); if(k) k.value=""; const n=$("#clName"); if(n) n.value=""; }   // kubeconfig = secret
+  const rf=modalReturnFocus[id]; if(rf && rf.focus) try{ rf.focus(); }catch(e){}
+  if(id!=="mSources") onPageShown(curPage);        // l'opération a pu changer l'état affiché
+}
+// Piège de focus : Tab reste dans la modale ouverte la plus haute.
+document.addEventListener("keydown", e=>{
+  if(e.key!=="Tab") return;
+  const open=MODALS.map(id=>$("#"+id)).filter(m=>m && m.style.display!=="none");
+  const m=open[open.length-1]; if(!m) return;
+  const f=[...m.querySelectorAll(FOCUSABLE)].filter(el=>el.offsetParent!==null); if(!f.length) return;
+  if(e.shiftKey && document.activeElement===f[0]){ e.preventDefault(); f[f.length-1].focus(); }
+  else if(!e.shiftKey && document.activeElement===f[f.length-1]){ e.preventDefault(); f[0].focus(); }
+});
+function closeAllModals(){ MODALS.forEach(closeModal); }
+document.querySelectorAll("[data-close]").forEach(b=>b.onclick=()=>closeModal(b.dataset.close));
+document.addEventListener("keydown",e=>{
+  if(e.key!=="Escape") return;
+  if($("#dangerModal").style.display!=="none" || $("#nsFilter").style.display!=="none") return;
+  const open=MODALS.filter(id=>$("#"+id).style.display!=="none");
+  if(open.length) closeModal(open[open.length-1]);
+});
+function bindGo(root){ (root||document).querySelectorAll("[data-go]").forEach(a=>a.onclick=e=>{ e.preventDefault(); switchTab(a.dataset.go); }); }
+bindGo();
+
+// ----- Barre du haut / barre latérale -----
+// Engrenage : petit menu (Sources / Réglages), même style que le menu des clusters.
+function toggleGearMenu(){
+  const m=$("#gearMenu");
+  if(m.style.display==="block"){ m.style.display="none"; return; }
+  $("#clMenu").style.display="none"; $("#helpMenu").style.display="none";
+  const r=$("#srcBtn").getBoundingClientRect();
+  m.style.right=Math.max(8, window.innerWidth-r.right-10)+"px";
+  m.style.display="block";
+}
+$("#srcBtn").onclick=e=>{ e.stopPropagation(); toggleGearMenu(); };
+document.querySelectorAll("#gearMenu .cli").forEach(el=>el.onclick=e=>{
+  e.stopPropagation(); $("#gearMenu").style.display="none";
+  if(el.dataset.act==="sources") openSources();
+  else switchTab("settings");
+});
+$("#ctxLink").onclick=e=>{ e.stopPropagation(); toggleClMenu(); };
+$("#tbHome").onclick=e=>{ e.preventDefault(); switchTab("dashboard"); };
+$("#sbCol").onclick=()=>{ const m=!document.body.classList.contains("sb-min");
+  document.body.classList.toggle("sb-min",m); savePref("sbMin",m); };
+if(prefs().sbMin) document.body.classList.add("sb-min");
+
+// ----- Petits formats -----
+const AGO={now:"just now", min:"%d min ago", h:"%d h ago", d:"%d d ago"};
+function fmtAgo(ts){
+  if(!ts) return "";
+  const s=Math.max(0, Date.now()/1000-ts);
+  if(s<60) return AGO.now;
+  if(s<3600) return AGO.min.replace("%d", Math.round(s/60));
+  if(s<86400) return AGO.h.replace("%d", Math.round(s/3600));
+  return AGO.d.replace("%d", Math.round(s/86400));
+}
+let DATE_FMT=null;   // créé à la première utilisation (PAGE_LANG est déclarée en fin de script)
+function fmtTs(iso){
+  if(!iso) return "—"; const d=new Date(iso); if(isNaN(d)) return String(iso);
+  if(!DATE_FMT) DATE_FMT=new Intl.DateTimeFormat(document.documentElement.lang==="en" ? "en-GB" : "fr-FR", {dateStyle:"short", timeStyle:"medium"});
+  return DATE_FMT.format(d);
+}
+const ST_LABEL={ok:"OK", ko:"Failed", wn:"Warning", na:"Unknown", sim:"Simulation", run:"Running"};
+function stIc(kind, title){
+  const g={ok:"✓", ko:"✕", wn:"!", na:"?", sim:"○", run:"▸"}[kind]||"?";
+  const lab=title||ST_LABEL[kind]||"";
+  return `<span class="st ${kind}" role="img" aria-label="${esc(lab)}" title="${esc(lab)}">${g}</span>`;
+}
+function dnums(l1, v1, l2, v2){
+  return `<div class="dnums"><div><div class="l">${l1}</div><div class="v">${v1}</div></div>`+
+         `<div><div class="l">${l2}</div><div class="v">${v2}</div></div></div>`;
+}
+// Anneaux « à la HYCU » : extérieur (épais) = première mesure, intérieur (fin) = seconde.
+function donutSVG(outer, inner){
+  const clamp=v=>Math.max(0, Math.min(100, v||0));
+  const R1=62, R2=47, C1=2*Math.PI*R1, C2=2*Math.PI*R2, o=clamp(outer), i=clamp(inner);
+  return `<svg class="donut" width="164" height="164" viewBox="0 0 164 164" aria-hidden="true">
+    <circle cx="82" cy="82" r="76" fill="none" stroke="#9BDAC7" stroke-width="5"/>
+    <circle cx="82" cy="82" r="${R1}" fill="none" stroke="#F6D3D1" stroke-width="15"/>
+    <circle cx="82" cy="82" r="${R1}" fill="none" stroke="#05A274" stroke-width="15"
+            stroke-dasharray="${(C1*o/100).toFixed(1)} ${C1.toFixed(1)}" transform="rotate(-90 82 82)"/>
+    <circle cx="82" cy="82" r="${R2}" fill="none" stroke="#EEF0F5" stroke-width="5"/>
+    <circle cx="82" cy="82" r="${R2}" fill="none" stroke="#9BDAC7" stroke-width="5"
+            stroke-dasharray="${(C2*i/100).toFixed(1)} ${C2.toFixed(1)}" transform="rotate(-90 82 82)"/>
+  </svg>`;
+}
+
+// ----- Pages : chargement des données à l'affichage (+ rafraîchissement) -----
+function onPageShown(tab){
+  clearInterval(pageTimer); pageTimer=null;
+  const every=(fn, ms)=>{ pageTimer=setInterval(()=>{ if(document.visibilityState==="visible") fn(); }, ms); };
+  if(tab==="dashboard"){ loadDashboard(); every(loadDashboard, 30000); }
+  else if(tab==="apps") loadApps();
+  else if(tab==="jobs"){ loadJobs(); every(loadJobs, 5000); }
+  else if(tab==="policies") loadPolicies();
+}
+
+// ============================ Applications ============================
+let apps=[], appsSel=new Set(), appsFresh=24, appsPolicy={}, appsScope="one", appsClErr=[];
+// Clé de sélection = cluster|namespace (vue « All clusters » : un même nom de
+// namespace peut exister sur plusieurs clusters).
+// Clé d'une ligne : cluster | namespace | application (plusieurs applications par namespace).
+const appKey=a=>(a.cluster_id||ACTIVE_CID)+"|"+(a.namespace||a.name)+"|"+a.name;
+const appNs=a=>a.namespace||a.name;
+// Libellé du type d'application (stateful = monte des volumes ; stateless = configuration seule).
+function appTypeCell(a){
+  if(a.missing) return '<span class="badge b-lost">Deleted — restorable</span>'+(a.type==="stateless"?' <span class="hint">stateless</span>':"");
+  if(a.type==="stateful") return '<span class="badge b-bound">Stateful</span> <span class="hint">'+(a.volumes||0)+' volume(s)</span>'+(a.unassigned?' <span class="hint">· no workload</span>':"");
+  if(a.type==="stateless") return '<span class="badge b-pending">Stateless</span> <span class="hint">'+((a.workloads||[]).length)+' workload(s)</span>';
+  if(a.type==="empty") return '<span class="badge b-na">Empty</span>';
+  return '<span class="badge b-na">Namespace</span>';
+}
+function updateScopeSeg(){
+  const multi=CLUSTERS.length>1;
+  $("#appsScope").style.display = multi ? "" : "none";
+  if(!multi) appsScope="one";
+  else if(prefs().appsScope==="all") appsScope="all";
+  document.querySelectorAll("#appsScope button").forEach(b=>b.classList.toggle("on", b.dataset.scope===appsScope));
+}
+document.querySelectorAll("#appsScope button").forEach(b=>b.onclick=()=>{
+  appsScope=b.dataset.scope; savePref("appsScope", appsScope); appsSel.clear();
+  document.querySelectorAll("#appsScope button").forEach(x=>x.classList.toggle("on", x===b));
+  loadApps();
+});
+// `fresh` (bouton Actualiser) : ignore le cache serveur de l'inventaire (apps_cache_ttl_s).
+async function loadApps(fresh){
+  $("#appsRefresh").classList.add("busy");
+  const all = appsScope==="all";
+  const r=await get("/api/applications?"+(all ? "scope=all" : "scope=one")+(fresh ? "&fresh=1" : ""));
+  $("#appsRefresh").classList.remove("busy");
+  apps=(r.apps||[]).map(a=>all ? a : Object.assign({}, a, {cluster_id:ACTIVE_CID}));
+  appsFresh=r.freshness_hours||24; appsPolicy=r.policy||{};
+  appsClErr = all ? (r.clusters||[]).filter(c=>!c.ok && !c.skipped) : [];
+  if(all) apps.sort((x,y)=>(x.workspace||"").localeCompare(y.workspace||"") || (x.cluster||"").localeCompare(y.cluster||"") || appNs(x).localeCompare(appNs(y)) || x.name.localeCompare(y.name));
+  const keys=new Set(apps.map(appKey));
+  [...appsSel].forEach(k=>{ if(!keys.has(k)) appsSel.delete(k); });
+  $("#appsTable").classList.toggle("multi", all);
+  if(!r.ok && !apps.length){
+    $("#appsBody").innerHTML=`<tr><td colspan="11">${errBox(r.error||"kubectl ?")}</td></tr>`;
+    updateAppActs(); return r;
+  }
+  renderApps(); return r;
+}
+function appPolicyLabel(){
+  return appsPolicy.enabled ? ("Automatic configuration · "+Math.round(appsPolicy.interval_hours||24)+" h") : "None";
+}
+function appsVisible(){
+  const q=($("#appsSearch").value||"").trim().toLowerCase();
+  return apps.filter(a=>!q || a.name.toLowerCase().includes(q) || appNs(a).toLowerCase().includes(q)
+                           || (a.cluster||"").toLowerCase().includes(q) || (a.workspace||"").toLowerCase().includes(q));
+}
+// Pagination : au-delà de APPS_PAGE_SIZE lignes (grands clusters), le tableau est
+// découpé en pages ; la recherche s'applique à toutes les lignes, la sélection persiste.
+const APPS_PAGE_SIZE=100; let appsPage=0;
+function appsPageRows(rows){
+  const nPages=Math.max(1, Math.ceil(rows.length/APPS_PAGE_SIZE));
+  if(appsPage>=nPages) appsPage=nPages-1;
+  const pg=$("#appsPager");
+  if(rows.length<=APPS_PAGE_SIZE){ pg.style.display="none"; pg.innerHTML=""; return rows; }
+  const from=appsPage*APPS_PAGE_SIZE, to=Math.min(rows.length, from+APPS_PAGE_SIZE);
+  pg.style.display="";
+  pg.innerHTML=`<button class="pact" type="button" id="appsPrev" ${appsPage===0?"disabled":""} title="Previous page">‹</button> `+
+    `<span>${from+1}–${to} / ${rows.length}</span> `+
+    `<button class="pact" type="button" id="appsNext" ${appsPage>=nPages-1?"disabled":""} title="Next page">›</button>`;
+  $("#appsPrev").onclick=()=>{ appsPage--; renderApps(); };
+  $("#appsNext").onclick=()=>{ appsPage++; renderApps(); };
+  return rows.slice(from, to);
+}
+function renderApps(){
+  const rowsAll=appsVisible(), all=appsScope==="all";
+  const nNs=new Set(rowsAll.map(a=>(a.cluster_id||"")+"|"+appNs(a))).size;
+  $("#appsInfo").textContent=rowsAll.length+" application(s) · "+nNs+" namespace(s)";
+  const rows=appsPageRows(rowsAll);
+  let h="";
+  appsClErr.forEach(c=>{ h+=`<tr class="grp"><td colspan="11">${c.workspace?esc(c.workspace)+'<span class="gs">›</span>':""}${esc(c.cluster)}`+
+                             `<span class="ge">${stIc("ko")} ${esc(c.error||"injoignable")}</span></td></tr>`; });
+  if(!rows.length){
+    h+=`<tr><td colspan="11" class="tempty">${apps.length
+      ? "No application matches the search."
+      : "No namespace to display — check the kubectl context or the namespace filter."}</td></tr>`;
+  } else {
+    let grp=null;
+    h+=rows.map(a=>{
+      let g="";
+      const gk=(a.workspace||"")+"|"+(a.cluster_id||"");
+      if(all && gk!==grp){ grp=gk;
+        g=`<tr class="grp"><td colspan="11">${a.workspace?esc(a.workspace)+'<span class="gs">›</span>':""}${esc(a.cluster||"")}`+
+          `${a.cluster_id===ACTIVE_CID?'<span class="tag">ACTIVE</span>':''}</td></tr>`; }
+      const k=appKey(a), sel=appsSel.has(k);
+      const comp = a.missing ? stIc("na","Namespace deleted from the cluster")
+                 : a.compliant ? stIc("ok","Recent configuration backup")
+                 : (a.protected ? stIc("ko","Last backup older than "+appsFresh+" h")
+                                : stIc("na","Never backed up"));
+      // Protection = sauvegardes du NAMESPACE ; un volume de l'application absent de la
+      // dernière sauvegarde (PVC créé depuis) rend sa protection incomplète.
+      const unb=(a.unbacked_pvcs||[]);
+      const prot = !a.protected ? stIc("na","No configuration backup")
+                 : (unb.length && !a.missing) ? stIc("wn", "Volume(s) missing from the latest backup: "+unb.join(", ")+" — run a backup again")
+                 : stIc("ok", a.backups+" configuration backup(s) of the namespace");
+      const last = a.last_backup ? esc(fmtAgo(a.last_backup)) : '<span style="color:var(--muted)">Never</span>';
+      const nameCell = (a.unassigned ? '<i>'+esc(a.name)+'</i>' : esc(a.name))
+        + (a.whole_ns && !a.missing && a.type!=="empty" ? ' <span class="hint">(whole namespace)</span>' : '');
+      return g+`<tr class="clk${sel?' sel':''}" data-k="${esc(k)}"${a.missing?' style="opacity:.75"':''}>
+        <td class="cb"><input type="checkbox" tabindex="-1" ${sel?"checked":""}></td>
+        <td style="color:var(--strong);font-weight:500">${nameCell}</td><td>${esc(appNs(a))}</td>
+        <td class="mc">${esc(a.workspace||"—")}</td><td class="mc">${esc(a.cluster||"")}</td>
+        <td>${appTypeCell(a)}</td><td>${esc(appPolicyLabel())}</td>
+        <td class="ctr">${comp}</td><td class="ctr">${prot}</td><td>${last}</td>
+        <td class="ctr">${a.backups||0}</td></tr>`;
+    }).join("");
+  }
+  $("#appsBody").innerHTML=h;
+  // Sélection : on met à jour LA ligne cliquée (pas de reconstruction du tableau —
+  // coûteuse à 1 000 lignes), puis les actions et la case « tout ».
+  document.querySelectorAll("#appsBody tr.clk").forEach(tr=>tr.onclick=()=>{
+    const k=tr.dataset.k, on=!appsSel.has(k);
+    on ? appsSel.add(k) : appsSel.delete(k);
+    tr.classList.toggle("sel", on); const c=tr.querySelector('input[type="checkbox"]'); if(c) c.checked=on;
+    $("#appsAll").checked = rows.length>0 && rows.every(a=>appsSel.has(appKey(a)));
+    updateAppActs(); });
+  $("#appsAll").checked = rows.length>0 && rows.every(a=>appsSel.has(appKey(a)));
+  updateAppActs();
+}
+function selAppObjs(){ return apps.filter(a=>appsSel.has(appKey(a))); }
+// Namespaces distincts de la sélection (la sauvegarde est par namespace : deux
+// applications du même namespace = une seule sauvegarde).
+function selNsObjs(){
+  const seen=new Set(), out=[];
+  selAppObjs().forEach(a=>{ const k=(a.cluster_id||ACTIVE_CID)+"|"+appNs(a); if(seen.has(k)) return; seen.add(k);
+    out.push({name:appNs(a), cluster_id:a.cluster_id, cluster:a.cluster, workspace:a.workspace, missing:a.missing}); });
+  return out;
+}
+function selApps(){ return selNsObjs().map(a=>a.name); }
+function updateAppActs(){
+  const objs=selAppObjs(), n=objs.length, anyMissing=objs.some(a=>a.missing), anyEmpty=objs.some(a=>a.type==="empty");
+  $("#actBackup").disabled = !n || anyMissing || anyEmpty;
+  ["#actPolicy","#actVerify"].forEach(id=>$(id).disabled = n!==1 || anyMissing);
+  // Restaurer : une application, OU plusieurs applications du MÊME namespace (= tout le
+  // namespace, ex. mariadb + wordpress séparés par leurs étiquettes). Un namespace vide
+  // reste restaurable s'il a des sauvegardes (application supprimée mais namespace
+  // conservé) — restaurer une app SUPPRIMÉE est le cas clé.
+  const sameNs = n>=1 && new Set(objs.map(a=>(a.cluster_id||ACTIVE_CID)+"|"+appNs(a))).size===1;
+  $("#actRestore").disabled = !sameNs || (anyEmpty && !objs[0].protected);
+  const rs=$("#actRestore span"); if(rs){ if(!rs.dataset.lbl) rs.dataset.lbl=rs.textContent;
+    rs.textContent = (sameNs && n>1) ? "Restore the namespace" : rs.dataset.lbl; }
+}
+// Opération sur UNE application d'un autre cluster (vue « All clusters ») : on
+// bascule d'abord le cluster actif, pour que confirmations et garde-fous le désignent.
+async function ensureCluster(a){ if(a && a.cluster_id && a.cluster_id!==ACTIVE_CID) await setActiveCluster(a.cluster_id); }
+$("#appsSearch").oninput=()=>{ appsPage=0; renderApps(); };
+// « Tout sélectionner » porte sur la PAGE affichée (jamais 1 000 lignes d'un coup à l'insu de l'opérateur).
+$("#appsAll").onchange=()=>{ const on=$("#appsAll").checked;
+  appsVisible().slice(appsPage*APPS_PAGE_SIZE, (appsPage+1)*APPS_PAGE_SIZE).forEach(a=>on ? appsSel.add(appKey(a)) : appsSel.delete(appKey(a))); renderApps(); };
+$("#appsRefresh").onclick=()=>loadApps(true);
+$("#actBackup").onclick=async()=>{
+  const objs=selNsObjs();
+  const cids=[...new Set(objs.map(a=>a.cluster_id))];
+  if(cids.length===1) await ensureCluster(objs[0]);
+  openBackupModal(objs.map(a=>a.name), objs);
+};
+$("#actRestore").onclick=async()=>{ const objs=selAppObjs(), a=objs[0]; await ensureCluster(a);
+  if(a.missing) return openRecoverModal(appNs(a));
+  // Plusieurs applications du même namespace sélectionnées -> tout le namespace.
+  openRestoreModal(appNs(a), objs.length>1 ? null : a); };
+$("#actPolicy").onclick=async()=>{ const a=selAppObjs()[0]; await ensureCluster(a); openPolicyModal(appNs(a)); };
+$("#actVerify").onclick=async()=>{ const a=selAppObjs()[0]; await ensureCluster(a); gotoVerify(appNs(a), false); };
+
+// ============================ Modale Sauvegarde ============================
+// Actions principales dans le pied de modale (comme HYCU) : on y DÉPLACE les boutons
+// existants — leurs gestionnaires d'événements suivent l'élément.
+$("#mBackupFoot").append($("#bkRunAll"), $("#bkRun"));
+let bkSel=[], bkObjs=[];
+function openBackupModal(list, objs){
+  bkSel=(list||[]).filter(Boolean);
+  bkObjs=(objs && objs.length===bkSel.length) ? objs : bkSel.map(n=>({name:n, cluster_id:ACTIVE_CID}));
+  const multi=bkSel.length>1, multiCl=new Set(bkObjs.map(o=>o.cluster_id)).size>1;
+  $("#bkOut").innerHTML="";
+  $("#bkNsRow").style.display = multi ? "none" : "";
+  $("#bkSelInfo").style.display = multi ? "" : "none";
+  $("#bkRun").style.display = multi ? "none" : "";
+  $("#bkRunAll").style.display = multi ? "none" : "";
+  $("#bkRunSel").style.display = multi ? "" : "none";
+  if(multi){ $("#bkSelList").textContent=bkObjs.map(o=>multiCl ? o.name+" ("+(o.cluster||o.cluster_id)+")" : o.name).join(", ");
+             $("#bkRunSel").textContent="Back up the selection ("+bkSel.length+")"; }
+  else if(bkSel[0]){ state.ns=bkSel[0]; applyGlobalNs(); }
+  openModal("mBackup");
+}
+$("#bkRunSel").onclick=async()=>{
+  const b=$("#bkRunSel"), dest=$("#bkDest").value.trim(); b.disabled=true;
+  const multiCl=new Set(bkObjs.map(o=>o.cluster_id)).size>1;
+  let lines="", ok=0;
+  for(const o of bkObjs){
+    const lbl=multiCl ? o.name+" ("+(o.cluster||o.cluster_id)+")" : o.name;
+    $("#bkOut").innerHTML=`<div class="hint"><span class="spin"></span>${esc(lbl)}…</div><ul class="dlist">${lines}</ul>`;
+    const r=await post("/api/backup",{ns:o.name, dest}, o.cluster_id);
+    if(r.ok) ok++;
+    lines+=`<li><span class="k" style="display:flex;gap:10px;align-items:center">${stIc(r.ok?"ok":"ko")}${esc(lbl)}</span>`+
+           `<span class="v" style="font-weight:400">${r.ok ? r.count+" volume(s)" : esc(r.error||"")}</span></li>`;
+  }
+  $("#bkOut").innerHTML=`<div class="note">${ok}/${bkObjs.length} namespace(s) backed up.</div><ul class="dlist" style="margin-top:8px">${lines}</ul>`;
+  b.disabled=false;
+};
+
+// ============================ Modale Set Policy ============================
+function openPolicyModal(ns){
+  if(ns){ state.ns=ns; applyGlobalNs(); $("#bkNs").value=ns;
+    if($("#bkNs").value!==ns){                 // namespace disparu / kubectl en panne
+      clearBkProtect(); openModal("mPolicy");
+      $("#bkMatchOut").innerHTML=errBox("Namespace « "+ns+" » not found in the list — refresh Applications (kubectl unavailable?).");
+      return;
+    } }
+  clearBkProtect();
+  $("#mPolicyTitle").innerHTML=esc("Set Policy")+(ns ? '<span class="sep">›</span>'+esc(ns) : "");
+  openModal("mPolicy");
+  if(conn.hycu && conn.hycu.connected) setTimeout(()=>$("#bkMatch").click(), 30);   // analyse : lecture seule
+}
+
+// ============================ Bulk restore (same cluster) ============================
+// Plan (lecture seule) -> Simuler (journal, arrière-plan) -> Lancer (réel : simulation
+// du même plan exigée par le serveur, confirmation du contexte) ; suivi par polling,
+// arrêt propre et reprise (les namespaces déjà recréés ne sont jamais refaits).
+let bulkPlan=null, bulkStatus=null, bulkTimer=null, bulkWasRunning=false;
+function bulkNowLocal(){ const d=new Date(); const p=n=>String(n).padStart(2,"0");
+  return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`; }
+function bulkExclude(){ return ($("#bulkExclude").value||"").split(",").map(s=>s.trim()).filter(Boolean); }
+function openBulkModal(){
+  bulkPlan=null; $("#bulkAsOf").value=bulkNowLocal(); $("#bulkPlanOut").innerHTML=""; $("#bulkRunOut").innerHTML="";
+  $("#bulkCluster").textContent=ctxInfo.context||"—";
+  openModal("mBulk"); bulkSyncBtns(); bulkPoll();
+}
+$("#actBulk").onclick=openBulkModal;
+function bulkSamePlan(j){
+  return !!(j && bulkPlan && j.as_of===bulkPlan.as_of_iso && j.items.length===bulkPlan.items.length
+            && j.items.every((it,i)=>it.ns===bulkPlan.items[i].ns));
+}
+function bulkSyncBtns(){
+  const running=!!(bulkStatus&&bulkStatus.running), j=bulkStatus&&bulkStatus.journal, c=bulkStatus&&bulkStatus.counts;
+  const n=!!(bulkPlan&&bulkPlan.items.length);
+  const simOk=!!(j && j.dry && j.done && !j.stopped && c && c.failed===0 && bulkSamePlan(j));
+  $("#bulkSim").disabled = !n || running;
+  $("#bulkReal").disabled = !n || running || !simOk || dry();
+  $("#bulkReal").title = dry() ? "Turn off the Simulation banner to start the real run." : (!simOk ? "Simulate this plan first (without failure)." : "");
+  $("#bulkStop").style.display = running ? "" : "none";
+  $("#bulkResume").style.display = (j && !running && !j.done && j.items.some(it=>it.status!=="done")) ? "" : "none";
+}
+async function bulkMakePlan(){
+  const b=$("#bulkPlanBtn"); b.disabled=true;
+  $("#bulkPlanOut").innerHTML='<div class="hint"><span class="spin"></span>Analysing backups and cluster…</div>';
+  const r=await post("/api/bulk/plan",{as_of:$("#bulkAsOf").value, exclude:bulkExclude()});
+  b.disabled=false;
+  if(!r.ok){ bulkPlan=null; $("#bulkPlanOut").innerHTML=errBox(r.error); bulkSyncBtns(); return; }
+  bulkPlan=r; $("#bulkPlanOut").innerHTML=bulkRenderPlan(r); bulkSyncBtns();
+}
+$("#bulkPlanBtn").onclick=bulkMakePlan;
+function bulkRenderPlan(r){
+  const rows=r.items.map(it=>`<tr><td style="color:var(--strong);font-weight:500">${esc(it.ns)}</td><td>${esc((it.created||it.timestamp||"").replace("T"," ").slice(0,16))}</td>
+     <td>${it.stateless?'<span class="badge b-pending">Stateless</span>':(it.volumes.length+" volume(s)")}${it.partial?' <span class="badge b-lost">partial</span>':''}</td>
+     <td>${(it.warnings||[]).length?'<span class="ko">⚠ '+esc(it.warnings.join(" · "))+'</span>':'<span class="ok">✓</span>'}</td></tr>`).join("");
+  const sk=(r.skipped||[]).map(s=>`<li><b>${esc(s.ns)}</b> — ${esc(s.reason)}</li>`).join("");
+  const warnN=r.items.filter(it=>(it.warnings||[]).length).length;
+  return `<div class="note"><b>${r.items.length}</b> namespace(s) to recreate on <b>${esc(r.context||r.cluster||"?")}</b> · reference time ${esc((r.as_of_iso||"").replace("T"," "))}${warnN?` · <span class="ko">${warnN} with a warning</span>`:""}${r.vault_unlocked?"":' · <span class="ko">vault locked</span>'}${r.hycu?"":' · <span class="hint">HYCU not connected: vanished Volume Groups will not be restored</span>'}</div>
+    ${r.items.length?`<div class="tcard" style="box-shadow:none;border:1px solid var(--rule);max-height:300px;overflow:auto"><table class="ht" id="bulkPlanTable"><thead><tr><th>Namespace</th><th>Backup</th><th>Content</th><th>Warnings</th></tr></thead><tbody>${rows}</tbody></table></div>`:'<div class="hint">Aucun namespace supprimé avec une sauvegarde antérieure à l\'instant de référence.</div>'}
+    ${sk?`<details style="margin-top:8px"><summary class="hint">${(r.skipped||[]).length} namespace(s) skipped</summary><ul class="dlist" style="margin-top:6px">${sk}</ul></details>`:""}`;
+}
+async function bulkStart(dryRun){
+  let confirmedCtx="";
+  if(!dryRun){
+    const needCtx = ctxInfo.require_confirm ? (ctxInfo.context||"") : null;
+    const res=await confirmDanger({title:"REAL bulk restore", requireText:needCtx, lines:[
+      "<b>"+bulkPlan.items.length+"</b> namespace(s) will be RECREATED on <b>"+esc(ctxInfo.context||"?")+"</b> from their backups.",
+      "Sequential, journaled execution; vanished Volume Groups will be restored by HYCU (real operations).",
+      "Present namespaces are left untouched."]});
+    if(!res) return; if(typeof res==="string") confirmedCtx=res;
+  }
+  const body={as_of:$("#bulkAsOf").value, exclude:bulkExclude(), dry:dryRun};
+  if(!dryRun && ctxInfo.require_confirm) body.confirm_context=confirmedCtx;
+  const r=await post("/api/bulk/run", body);
+  if(!r.ok){ $("#bulkRunOut").innerHTML=errBox(r.error); return; }
+  bulkPoll();
+}
+$("#bulkSim").onclick=()=>bulkStart(true);
+$("#bulkReal").onclick=()=>bulkStart(false);
+$("#dry").addEventListener("change",()=>{ if($("#mBulk").style.display!=="none") bulkSyncBtns(); });   // bandeau Simulation
+$("#bulkStop").onclick=async()=>{ const r=await post("/api/bulk/stop",{}); if(!r.ok) $("#bulkRunOut").insertAdjacentHTML("afterbegin", errBox(r.error)); };
+$("#bulkResume").onclick=async()=>{
+  const j=bulkStatus&&bulkStatus.journal; if(!j) return;
+  let confirmedCtx="";
+  if(!j.dry){
+    const needCtx = ctxInfo.require_confirm ? (ctxInfo.context||"") : null;
+    const res=await confirmDanger({title:"Resume the bulk restore (REAL)", requireText:needCtx, lines:[
+      "The remaining namespaces (pending, stopped or failed) will be recreated; those already recreated are not redone."]});
+    if(!res) return; if(typeof res==="string") confirmedCtx=res;
+  }
+  const body={resume:true, dry:j.dry}; if(!j.dry && ctxInfo.require_confirm) body.confirm_context=confirmedCtx;
+  const r=await post("/api/bulk/run", body);
+  if(!r.ok){ $("#bulkRunOut").innerHTML=errBox(r.error); return; }
+  bulkPoll();
+};
+async function bulkPoll(){
+  clearTimeout(bulkTimer);
+  if($("#mBulk").style.display==="none") return;
+  const st=await get("/api/bulk/status"); if(!st.ok) return;
+  bulkStatus=st; bulkRenderStatus(st); bulkSyncBtns();
+  if(st.running){ bulkWasRunning=true; bulkTimer=setTimeout(bulkPoll, 2000); }
+  else if(bulkWasRunning){ bulkWasRunning=false; loadApps(true); }   // namespaces recréés : inventaire à jour
+}
+function bulkRenderStatus(st){
+  const j=st.journal; if(!j){ $("#bulkRunOut").innerHTML=""; return; }
+  const c=st.counts, pct=c.total?Math.round(100*(c.done+c.failed)/c.total):0;
+  const IC={done:"ok",failed:"ko",running:"run",pending:"na",stopped:"wn"};
+  const head = st.running ? '<span class="spin"></span> Running' : j.stopped ? "Stopped" : j.done ? (c.failed ? "Finished with failures" : "Finished") : "Interrupted";
+  $("#bulkRunOut").innerHTML=`<div class="${j.dry?'warnbox':'note'}" id="bulkHead"><b>${j.dry?"Simulation":"Réel"}</b> · ${head} · ${c.done+c.failed} / ${c.total} (${c.failed} failure(s)) · reference time ${esc((j.as_of||"").replace("T"," "))}${j.started?" · started "+esc(j.started.replace("T"," ")):""}</div>
+    <div style="height:6px;background:var(--rule);border-radius:3px;margin:6px 0 10px"><div style="height:6px;width:${pct}%;background:#41327C;border-radius:3px"></div></div>
+    <div class="tcard" style="box-shadow:none;border:1px solid var(--rule);max-height:320px;overflow:auto"><table class="ht" id="bulkStatusTable"><thead><tr><th>Namespace</th><th>State</th><th>Detail</th></tr></thead><tbody>${
+      j.items.map(it=>`<tr><td style="color:var(--strong);font-weight:500">${esc(it.ns)}</td><td>${stIc(IC[it.status]||"na", it.status)} ${esc(it.status)}</td>
+        <td>${it.error?'<span class="ko">'+esc(it.error)+'</span>':''}${(it.run_warnings||[]).length?'<div class="hint">⚠ '+esc(it.run_warnings.join(" · "))+'</div>':''}${(it.log||[]).length?`<details><summary class="hint">${it.log.length} step(s)</summary>${renderLog(it.log)}</details>`:''}</td></tr>`).join("")}</tbody></table></div>`;
+}
+
+// ============================ Modale Sources (engrenage) ============================
+const SRC=[{key:"hycu", name:"HYCU", type:"Backup & restore (REST API)"},
+           {key:"nutanix", name:"Prism Element", type:"Nutanix — Volume Groups (v2 API)"},
+           {key:"prismcentral", name:"Prism Central", type:"Nutanix — multi-cluster (v3/v4 API)"},
+           {key:"s3", name:"S3 object storage", type:"Backup export (optional)"},
+           {key:"vault", name:"Credentials vault", type:"Encrypted storage (optional)"}];
+let srcSel="hycu";
+const CHK_SVG='<svg width="14" height="14" viewBox="0 0 18 18" aria-hidden="true"><path d="M4.5 9.4l3 3 6-6.4" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+function clById(id){ return CLUSTERS.find(c=>c.id===id); }
+function clType(c){
+  if(c.local) return "Kubernetes — local configuration";
+  if(c.source==="nkp") return "Kubernetes — NKP"+(c.workspace?" (workspace "+c.workspace+")":"");
+  return "Kubernetes — imported kubeconfig";
+}
+function clStatusIc(c){
+  const h=c.health;
+  if(h && !h.ok) return stIc("ko","Cluster unreachable (checked "+fmtAgo(h.at)+") : "+(h.error||""));
+  if(c.local) return c.configured ? stIc("ok","Context: "+(c.context||"")) : stIc("na","Not configured");
+  const a=c.auth||{}, w=(a.warnings||[]).concat(c.warning?[c.warning]:[]).join(" ");
+  if(a.level==="error") return stIc("ko", w);
+  if(a.level==="warn" || c.warning) return stIc("wn", w);
+  if(h && h.ok) return stIc("ok","Reachable ("+fmtAgo(h.at)+") · authentication: "+(a.type||"?"));
+  return stIc("ok","Authentication: "+(a.type||"?"));
+}
+function renderSourcesTable(){
+  const body=$("#srcBody"); if(!body) return;
+  const row=(key, name, type, url, st)=>`<tr class="clk${key===srcSel?' sel':''}" data-key="${esc(key)}"><td>${name}</td><td>${esc(type)}</td>`+
+           `<td><code>${esc(url||"—")}</code></td><td class="ctr">${st}</td></tr>`;
+  let h=`<tr class="srcsec"><td colspan="4">HYCU &amp; Nutanix</td></tr>`;
+  h+=SRC.map(s=>{
+    let url="—", st;
+    if(s.key==="vault"){
+      st = (conn.vault && conn.vault.present) ? stIc("ok","Vault present") : stIc("na","No vault");
+    } else {
+      const x=conn[s.key]||{}; url=x.url||"—";
+      if(s.key==="s3" && x.url) url=x.url+"/"+(x.bucket||"");
+      st = x.connected ? stIc("ok","Connected") : (x.configured ? stIc("wn","Configured, not connected") : stIc("na","Not configured"));
+      if(s.key==="s3" && x.connected && !x.auto_upload) st=stIc("wn","Connected — automatic export disabled");
+    }
+    return row(s.key, esc(s.name), s.type, url, st);
+  }).join("");
+  h+=`<tr class="srcsec"><td colspan="4">Kubernetes clusters</td></tr>`;
+  h+=CLUSTERS.map(c=>row("cluster:"+c.id, esc(c.name)+(c.id===ACTIVE_CID?'<span class="tag">ACTIVE</span>':''),
+        clType(c), c.local ? (c.kubeconfig_path||"default kubeconfig") : c.server, clStatusIc(c))).join("");
+  body.innerHTML=h;
+  body.querySelectorAll("tr.clk").forEach(tr=>tr.onclick=()=>{ srcSel=tr.dataset.key; showSourceCard(); renderSourcesTable(); });
+}
+function showSourceCard(){
+  const card = srcSel.indexOf("cluster:")===0 ? "cluster" : srcSel;
+  document.querySelectorAll("#tab-connect > .card").forEach(c=>c.style.display = c.dataset.card===card ? "" : "none");
+  if(card==="cluster") renderClusterCard(srcSel.slice(8));
+  if(card==="nkp") $("#nkpMgmt").textContent = ctxInfo.context || "—";
+}
+function openSources(i){
+  if(typeof i==="number") srcSel=SRC[i].key;
+  else if(typeof i==="string") srcSel=i;
+  renderSourcesTable(); showSourceCard(); openModal("mSources");
+}
+$("#clAddBtn").onclick=()=>openSources("cluster-add");
+$("#nkpBtn").onclick=()=>openSources("nkp");
+
+// ----- Clusters Kubernetes : liste, sélecteur de la barre du haut, cluster actif -----
+async function loadClusters(){
+  const r=await get("/api/clusters","local");
+  if(r && r.ok) CLUSTERS=r.clusters||CLUSTERS;
+  if(!clById(ACTIVE_CID)) ACTIVE_CID="local";      // cluster retiré / session verrouillée
+  renderClMenu(); renderSourcesTable(); updateScopeSeg();
+  return CLUSTERS;
+}
+function renderCtx(){
+  $("#ctx").textContent = ctxInfo.context || "unavailable";
+  $("#ctxWarn").innerHTML = (ctxInfo.context && ctxInfo.allowed && ctxInfo.allowed.length && !ctxInfo.context_ok)
+    ? ' <span class="bad">⚠ not in allowed list</span>'
+    : ((ctxInfo.auth && ctxInfo.auth.level==="error") ? ' <span class="bad">⚠ token expired</span>' : '');
+  $("#ctxLink").title = "Active Kubernetes cluster"+(ctxInfo.workspace?(" — workspace "+ctxInfo.workspace):"")+" — click to choose another one";
+}
+function renderClMenu(){
+  const m=$("#clMenu");
+  m.innerHTML=CLUSTERS.map(c=>`<div class="cli${c.id===ACTIVE_CID?' on':''}" data-cid="${esc(c.id)}" role="menuitem">`+
+      `<span class="chk">${c.id===ACTIVE_CID?CHK_SVG:''}</span><span>${esc(c.name)}</span>`+
+      `<span class="ws">${esc(c.local ? "local configuration" : (c.workspace || "imported kubeconfig"))}</span></div>`).join("")+
+    `<div class="msep"></div><div class="cli act" data-act="add" role="menuitem"><span class="chk"></span>Add a Kubernetes cluster…</div>`+
+    `<div class="cli act" data-act="manage" role="menuitem"><span class="chk"></span>Manage clusters…</div>`;
+  m.querySelectorAll(".cli").forEach(el=>el.onclick=async e=>{
+    e.stopPropagation(); m.style.display="none";
+    if(el.dataset.act==="add") return openSources("cluster-add");
+    if(el.dataset.act==="manage") return openSources("cluster:"+ACTIVE_CID);
+    if(el.dataset.cid!==ACTIVE_CID) await setActiveCluster(el.dataset.cid);
+  });
+}
+function toggleClMenu(){
+  const m=$("#clMenu");
+  if(m.style.display==="block"){ m.style.display="none"; return; }
+  $("#gearMenu").style.display="none"; $("#helpMenu").style.display="none";
+  renderClMenu();
+  const r=$("#ctxLink").getBoundingClientRect();
+  m.style.right=Math.max(8, window.innerWidth-r.right-10)+"px";
+  m.style.display="block";
+}
+document.addEventListener("click",()=>{ ["clMenu","gearMenu","helpMenu"].forEach(i=>$("#"+i).style.display="none"); });
+async function setActiveCluster(cid){
+  if(!clById(cid)) return;
+  ACTIVE_CID=cid; savePref("cluster", cid);
+  if(vfTrack) vfStop();                             // ni à un changement de cluster
+  ["mBackup","mPolicy","mRestore"].forEach(closeModal);
+  if(appsScope!=="all") appsSel.clear();
+  state.ns=null;
+  ctxInfo=await get("/api/context");
+  renderCtx(); renderKubeBanner(); renderClMenu(); renderSourcesTable();
+  if($("#mSources").style.display!=="none") showSourceCard();
+  await refreshNamespaces();
+  onPageShown(curPage);
+}
+// Coffre déverrouillé : les clusters mémorisés reviennent -> reprendre le cluster préféré.
+async function afterVaultLoad(){
+  await loadClusters();
+  const p=prefs().cluster;
+  if(p && p!==ACTIVE_CID && clById(p)) await setActiveCluster(p);
+}
+function renderClusterCard(cid){
+  const c=clById(cid); $("#clDErr").innerHTML="";
+  if(!c){ $("#clDTitle").textContent="Cluster"; $("#clDBody").innerHTML='<div class="hint">Cluster not found.</div>'; return; }
+  $("#clDTitle").textContent=c.name;
+  const li=(k,v)=>`<li><span class="k">${k}</span><span class="v">${v}</span></li>`;
+  let h='<ul class="dlist">';
+  h+=li("Type", esc(clType(c)));
+  if(c.local){
+    h+=li("kubectl context", c.context?`<code>${esc(c.context)}</code>`:"—");
+    h+=li("Kubeconfig", `<code>${esc(c.kubeconfig_path||"default kubeconfig")}</code>`);
+  } else {
+    h+=li("kubectl context", `<code>${esc(c.context)}</code>`);
+    h+=li("API server", `<code>${esc(c.server||"—")}</code>`);
+    if(c.workspace) h+=li("NKP workspace", esc(c.workspace));
+    if(c.management) h+=li("Management cluster", esc(c.management));
+    h+=li("Authentication", esc((c.auth||{}).type||"?")+" "+clStatusIc(c));
+  }
+  h+=li("Backups", c.local ? `<code>hycu-backups/_contexts/${esc(c.context||"…")}/&lt;namespace&gt;/</code>` : `<code>hycu-backups/_clusters/${esc(c.id)}/&lt;namespace&gt;/</code>`);
+  if(c.health) h+=li("Last health check", (c.health.ok?stIc("ok","Reachable"):stIc("ko",esc(c.health.error||"")))+" "+esc(fmtAgo(c.health.at)));
+  h+='</ul>';
+  if(c.health && !c.health.ok) h+=`<div class="err" style="margin-top:10px">Cluster unreachable at last check: ${esc(c.health.error||"")}</div>`;
+  const w=((c.auth||{}).warnings||[]).concat(c.warning?[c.warning]:[]);
+  if(w.length) h+=`<div class="warnbox" style="margin-top:10px">⚠ ${w.map(esc).join("<br>")}</div>`;
+  if(c.local && !c.configured) h+=`<div class="warnbox" style="margin-top:10px">No local kubectl context: add a cluster with its kubeconfig, or configure kubectl (Settings).</div>`;
+  $("#clDBody").innerHTML=h;
+  $("#clUse").disabled = c.id===ACTIVE_CID;
+  $("#clUse").textContent = c.id===ACTIVE_CID ? "Active cluster" : "Set as active cluster";
+  $("#clRemove").style.display = c.local ? "none" : "";
+  $("#clLocalCfg").style.display = c.local ? "" : "none";
+  $("#clUse").onclick=()=>setActiveCluster(c.id);
+  $("#clLocalCfg").onclick=()=>{ closeModal("mSources"); switchTab("settings"); };
+  $("#clRemove").onclick=async()=>{
+    if(!confirm("Remove cluster « "+c.name+" »? Its kubeconfig is forgotten; its backups stay on disk.")) return;
+    const r=await post("/api/clusters/remove",{id:c.id},"local");
+    if(!r.ok){ $("#clDErr").innerHTML=errBox(r.error); return; }
+    const wasActive = c.id===ACTIVE_CID;
+    await loadClusters();
+    srcSel="cluster:"+(wasActive?"local":ACTIVE_CID);
+    if(wasActive) await setActiveCluster("local");
+    showSourceCard(); renderSourcesTable();
+  };
+}
+
+// ----- Ajout d'un cluster (kubeconfig fichier / collé) -----
+let clInspectT=null, clCtxs=[];
+function clCtxInfo(){
+  const c=clCtxs.find(x=>x.name===$("#clCtx").value); if(!c){ $("#clCtxInfo").innerHTML=""; return; }
+  const a=c.auth||{};
+  $("#clCtxInfo").innerHTML=`<ul class="dlist" style="margin-top:8px"><li><span class="k">API server</span><span class="v"><code>${esc(c.server||"—")}</code></span></li>`+
+    `<li><span class="k">Authentication</span><span class="v">${esc(a.type||"?")} ${a.level==="error"?stIc("ko"):a.level==="warn"?stIc("wn"):stIc("ok")}</span></li></ul>`+
+    ((a.warnings||[]).length?`<div class="warnbox" style="margin-top:8px">⚠ ${a.warnings.map(esc).join("<br>")}</div>`:"");
+  if(!$("#clName").value.trim() || $("#clName").dataset.auto==="1"){
+    $("#clName").value=(c.cluster||c.name||"").replace(/[^A-Za-z0-9._-]+/g,"-").slice(0,63); $("#clName").dataset.auto="1"; }
+}
+async function clInspect(){
+  const kc=$("#clKc").value; $("#clErr").innerHTML="";
+  if(!kc.trim()){ $("#clCtxWrap").style.display="none"; clCtxs=[]; return; }
+  const r=await post("/api/clusters/inspect",{kubeconfig:kc},"local");
+  if(!r.ok){ $("#clCtxWrap").style.display="none"; clCtxs=[]; $("#clErr").innerHTML=errBox(r.error); return; }
+  clCtxs=r.contexts||[];
+  $("#clCtx").innerHTML=clCtxs.map(c=>`<option value="${esc(c.name)}">${esc(c.name)}</option>`).join("");
+  $("#clCtx").value=r.current||(clCtxs[0]||{}).name||"";
+  $("#clCtxWrap").style.display="block"; clCtxInfo();
+}
+$("#clKc").oninput=()=>{ clearTimeout(clInspectT); clInspectT=setTimeout(clInspect, 500); };
+$("#clCtx").onchange=clCtxInfo;
+$("#clName").oninput=()=>{ $("#clName").dataset.auto=""; };
+$("#clFile").onchange=()=>{
+  const f=$("#clFile").files[0]; if(!f) return;
+  if(f.size>1024*1024){ $("#clErr").innerHTML=errBox("Kubeconfig too large (1 MB max)."); return; }
+  const rd=new FileReader(); rd.onload=()=>{ $("#clKc").value=rd.result; $("#clFile").value=""; clInspect(); }; rd.readAsText(f);
+};
+$("#clAdd").onclick=async()=>{
+  const b=$("#clAdd"); $("#clErr").innerHTML="";
+  if(!$("#clKc").value.trim()){ $("#clErr").innerHTML=errBox("Load or paste a kubeconfig first."); return; }
+  b.disabled=true; b.innerHTML='<span class="spin"></span>Testing connection…';
+  const r=await post("/api/clusters/add",{name:$("#clName").value.trim(), kubeconfig:$("#clKc").value,
+                                          context:$("#clCtx").value||""},"local");
+  b.disabled=false; b.textContent="Test & add";
+  if(!r.ok){ $("#clErr").innerHTML=errBox(r.error); if(r.need_context) clInspect(); return; }
+  $("#clKc").value=""; $("#clName").value=""; $("#clName").dataset.auto=""; $("#clCtxWrap").style.display="none"; clCtxs=[];
+  await loadClusters();
+  srcSel="cluster:"+r.cluster.id; renderSourcesTable(); showSourceCard();
+  $("#clDErr").innerHTML=`<div class="note">Cluster added. Choose “Set as active cluster” to use it, or select it in the top bar.</div>`;
+};
+
+// ----- Découverte NKP (workspaces -> clusters) depuis le cluster de management actif -----
+let nkpData=null;
+function nkpSync(){
+  const n=document.querySelectorAll(".nkpChk:checked").length;
+  $("#nkpImport").disabled = !(n && $("#nkpAck").checked);
+  $("#nkpImport").textContent = n ? "Import selection ("+n+")" : "Import selection";
+}
+$("#nkpAck").onchange=nkpSync;
+$("#nkpDiscover").onclick=()=>nkpLoad(false);
+async function nkpLoad(keepRes){
+  const b=$("#nkpDiscover"); if(!keepRes) $("#nkpRes").innerHTML=""; $("#nkpImportWrap").style.display="none";
+  b.disabled=true; $("#nkpOut").innerHTML='<div class="hint"><span class="spin"></span>Reading workspaces…</div>';
+  const r=await get("/api/nkp/discover"); b.disabled=false; nkpData=r;
+  if(!r.ok){ $("#nkpOut").innerHTML=errBox(r.error); return; }
+  const cl=r.clusters||[];
+  if(!cl.length){ $("#nkpOut").innerHTML='<div class="hint">No cluster found in the workspaces.</div>'; return; }
+  let h=`<div class="tcard" style="box-shadow:none;border:1px solid var(--rule);margin-top:12px"><table class="ht"><thead><tr><th class="cb"></th><th>Cluster</th><th>Phase</th><th>Status</th></tr></thead><tbody>`, ws=null;
+  cl.forEach((c,i)=>{
+    if(c.workspace!==ws){ ws=c.workspace; h+=`<tr class="grp"><td colspan="4">Workspace <span class="gs">›</span>${esc(ws)}</td></tr>`; }
+    const dis=c.host||!!c.registered;
+    const st=c.host ? "Management cluster (active)" : (c.registered ? "Already imported ("+c.registered+")" : "—");
+    h+=`<tr><td class="cb"><input type="checkbox" class="nkpChk" data-i="${i}" ${dis?"disabled":""}></td>`+
+       `<td style="color:var(--strong)">${esc(c.name)}</td><td>${esc(c.phase||"—")}</td><td>${esc(st)}</td></tr>`;
+  });
+  $("#nkpOut").innerHTML=h+"</tbody></table></div>";
+  document.querySelectorAll(".nkpChk").forEach(x=>x.onchange=nkpSync);
+  $("#nkpImportWrap").style.display="block"; $("#nkpAck").checked=false; nkpSync();
+}
+$("#nkpImport").onclick=async()=>{
+  const items=[...document.querySelectorAll(".nkpChk:checked")].map(x=>nkpData.clusters[+x.dataset.i])
+    .map(c=>({namespace:c.namespace, name:c.name, secret:c.secret, workspace:c.workspace}));
+  if(!items.length) return;
+  const b=$("#nkpImport"); b.disabled=true; b.innerHTML='<span class="spin"></span>Import…';
+  const r=await post("/api/nkp/import",{ack:$("#nkpAck").checked, items});
+  nkpSync();
+  const res=r.results||[];
+  $("#nkpRes").innerHTML=(r.error&&!res.length?errBox(r.error):"")+(res.length?`<ul class="dlist" style="margin-top:10px">`+res.map(x=>
+    `<li><span class="k" style="display:flex;gap:10px;align-items:center">${stIc(x.ok?"ok":"ko")}${esc(x.cluster)}</span>`+
+    `<span class="v" style="font-weight:400">${x.ok ? "Imported as « "+esc(x.name)+" »"+(x.warning?" — "+esc(x.warning):"") : esc(x.error||"")}</span></li>`).join("")+"</ul>":"");
+  await loadClusters();
+  if(r.imported) await nkpLoad(true);
+};
+
+// ============================ Politiques ============================
+async function loadPolicies(){
+  await loadAutoBackup();
+  const s=await get("/api/auto_backup")||{};
+  const on=!!s.enabled;
+  $("#polBody").innerHTML=`<tr class="clk" id="polRow">
+    <td style="color:var(--strong);font-weight:500">Kubernetes configuration</td>
+    <td>PV/PVC manifests and resources of the filtered namespaces</td>
+    <td>${on ? "Every "+Math.round(s.interval_hours||24)+" h" : "—"}</td>
+    <td>${abRetLabel(s)}</td>
+    <td><code>${esc(s.dest||"hycu-backups/")}</code></td>
+    <td class="ctr">${on ? stIc("ok","Enabled") : stIc("na","Disabled")}</td></tr>`;
+  $("#polRow").onclick=()=>$("#abEnabled").scrollIntoView({behavior:"smooth", block:"center"});
+  if(conn.hycu && conn.hycu.connected){
+    $("#polHycu").innerHTML='<div class="hint"><span class="spin"></span></div>';
+    const p=await get("/api/hycu/policies");
+    $("#polHycu").innerHTML = !p.ok ? errBox(p.error) : ((p.policies||[]).length
+      ? `<div class="tcard" style="box-shadow:none;border:1px solid var(--rule)"><table class="ht"><thead><tr><th>Name</th><th>UUID</th></tr></thead><tbody>`+
+        p.policies.map(x=>`<tr><td>${esc(x.name||"—")}</td><td><code>${esc(x.uuid||"")}</code></td></tr>`).join("")+`</tbody></table></div>`
+      : '<div class="hint">No HYCU policy.</div>');
+  } else {
+    $("#polHycu").innerHTML='<div class="warnbox">Register the HYCU source (⚙ at the top right) to display its policies.</div>';
+  }
+}
+$("#abSave").addEventListener("click", ()=>setTimeout(()=>{ if(curPage==="policies") loadPolicies(); }, 900));
+
+// ============================ Tâches ============================
+const JOB_LBL={backup:"Configuration backup", backup_all:"Configuration backup (batch)",
+  auto_backup:"Automatic backup", restore_end:"Kubernetes restore (PV/PVC)",
+  clone_app:"Application clone", orchestrate_inplace:"In-place restore",
+  hycu_restore:"HYCU restore (Volume Group)", hycu_protect:"HYCU protection",
+  s3_upload:"S3 export (object storage)", s3_import:"S3 import (repatriation)",
+  restore_objects:"Configuration objects restore"};
+const JOB_ST={success:["ok","Success"], failed:["ko","Failed"], simulation:["sim","Simulation"]};
+let jobsData=null;
+async function loadJobs(){
+  $("#jobsRefresh").classList.add("busy");
+  const r=await get("/api/jobs");
+  $("#jobsRefresh").classList.remove("busy");
+  jobsData=r; renderJobs(); return r;
+}
+function jobCounts(r){
+  const c=(r&&r.counts)||{};
+  const cell=(n, ic, l)=>`<div><div class="n">${n}</div>${ic}<div class="l">${l}</div></div>`;
+  return cell(c.success||0, stIc("ok"), "Success") + cell(c.failed||0, stIc("ko"), "Failed") +
+         cell(c.simulation||0, stIc("sim"), "Simulation") +
+         cell((r&&r.running)||0, stIc("run"), "In progress");
+}
+function jobRowData(j){
+  const st=JOB_ST[j.status]||["na", j.status];
+  const app = (j.target_namespace && j.target_namespace!==j.namespace)
+    ? esc(j.namespace)+" → "+esc(j.target_namespace) : esc(j.namespace||"—");
+  const det = j.volumes!=null ? j.volumes+" volume(s)" : (j.detail||"");
+  return {st, app, det, lbl: JOB_LBL[j.event]||j.event};
+}
+function renderJobs(){
+  const r=jobsData||{};
+  $("#jobsCounts").innerHTML=jobCounts(r);
+  const q=($("#jobsSearch").value||"").trim().toLowerCase();
+  const rows=(r.jobs||[]).filter(j=>!q || (JOB_LBL[j.event]||j.event).toLowerCase().includes(q)
+                                        || (j.namespace||"").toLowerCase().includes(q)
+                                        || (j.cluster||"").toLowerCase().includes(q));
+  $("#jobsInfo").textContent=rows.length+" job(s)"
+    +((r.total||0)>(r.jobs||[]).length? " · showing the "+(r.jobs||[]).length+" most recent of "+r.total:"")
+    +((r.retention_days||0)>0? " · history kept "+r.retention_days+" d (Settings)":"");
+  $("#jobsBody").innerHTML = rows.length ? rows.map(j=>{ const d=jobRowData(j);
+      return `<tr><td style="color:var(--strong)">${esc(d.lbl)}</td><td>${d.app}</td><td>${esc(j.cluster==="*"?"All":(j.cluster||"—"))}</td><td>${esc(d.det)}</td>`+
+             `<td>${esc(fmtTs(j.ts))}</td><td class="ctr">${stIc(d.st[0], d.st[1])}</td></tr>`; }).join("")
+    : `<tr><td colspan="6" class="tempty">No job recorded yet.</td></tr>`;
+}
+$("#jobsSearch").oninput=renderJobs;
+$("#jobsRefresh").onclick=()=>loadJobs();
+
+// ============================ Tableau de bord ============================
+function jobsChart(days){
+  if(!days || !days.length) return "";
+  const W=560, H=170, pl=30, pr=26, pt=10, pb=24, n=days.length;
+  const mx=Math.max(4, ...days.map(d=>Math.max(d.success, d.failed, d.simulation)));
+  const top=Math.ceil(mx/4)*4;
+  const X=i=>pl+i*(W-pl-pr)/Math.max(1, n-1), Y=v=>pt+(H-pt-pb)*(1-v/top);
+  let g="";
+  for(let k=0;k<=4;k++){ const v=top*k/4, y=Y(v).toFixed(1);
+    g+=`<line x1="${pl}" y1="${y}" x2="${W-pr}" y2="${y}" stroke="#D5DAE3" stroke-dasharray="4 4"/>`+
+       `<text x="${pl-7}" y="${(+y+4).toFixed(1)}" text-anchor="end" font-size="10" fill="#6B7089">${Math.round(v)}</text>`; }
+  const serie=(key, col)=>`<polyline points="${days.map((d,i)=>X(i).toFixed(1)+","+Y(d[key]).toFixed(1)).join(" ")}" fill="none" stroke="${col}" stroke-width="1.6"/>`+
+    days.map((d,i)=>`<circle cx="${X(i).toFixed(1)}" cy="${Y(d[key]).toFixed(1)}" r="3" fill="${col}"/>`).join("");
+  const lbl=days.map((d,i)=>`<text x="${X(i).toFixed(1)}" y="${H-6}" text-anchor="middle" font-size="10" fill="#6B7089">${d.date.slice(8,10)}/${d.date.slice(5,7)}</text>`).join("");
+  return `<svg viewBox="0 0 ${W} ${H}" width="100%" style="display:block;max-height:240px;margin:0 auto" aria-hidden="true">${g}${serie("simulation","#6688FF")}${serie("failed","#E9605A")}${serie("success","#05A274")}${lbl}</svg>`;
+}
+function fmtBytes(n){
+  if(n==null) return "—";
+  const u=["o","Ko","Mo","Go","To"]; let i=0;
+  while(n>=1024 && i<u.length-1){ n/=1024; i++; }
+  return (i? n.toFixed(1) : n)+" "+u[i];
+}
+function storageBar(pct){
+  const col = pct>=90? "var(--red)" : pct>=80? "var(--orange)" : "var(--green)";
+  return `<div style="height:8px;border-radius:4px;background:#EEF0F5;overflow:hidden;margin:4px 0 2px">
+    <div style="width:${Math.min(100,pct)}%;height:100%;background:${col}"></div></div>`;
+}
+async function loadDashboard(){
+  const [a, j, ab, st]=(await Promise.allSettled([get("/api/applications"), get("/api/jobs"), get("/api/auto_backup"), get("/api/storage")]))
+    .map(x=>x.status==="fulfilled" ? x.value : {ok:false, error:String(x.reason||"erreur")});
+  const alive=(a.apps||[]).filter(x=>!x.missing), n=alive.length;
+  const prot=n ? Math.round(100*alive.filter(x=>x.protected).length/n) : 0;
+  const comp=n ? Math.round(100*alive.filter(x=>x.compliant).length/n) : 0;
+  const list=a.apps||[];
+  $("#dbApps").innerHTML=donutSVG(prot, comp)+dnums("Protection", prot+"%", "Compliance", comp+"%");
+
+  const on=!!ab.enabled;
+  $("#dbPolicy").innerHTML=`<div style="display:flex;align-items:center;gap:10px;margin:4px 0 10px">${on ? stIc("ok") : stIc("na")}
+      <span class="dbig" style="margin:0">${on ? "Enabled" : "Disabled"}</span></div>
+    <ul class="dlist">
+      <li><span class="k">Frequency</span><span class="v">${on ? "Every "+Math.round(ab.interval_hours||24)+" h" : "—"}</span></li>
+      <li><span class="k">Retention</span><span class="v">${esc(abRetLabel(ab))}</span></li>
+      <li><span class="k">Last run</span><span class="v">${ab.last_run ? esc(fmtAgo(ab.last_run))+" "+stIc(ab.last_ok?"ok":"ko") : "—"}</span></li>
+      <li><span class="k">Next run</span><span class="v">${ab.next_due ? esc(new Date(ab.next_due*1000).toLocaleString()) : "—"}</span></li>
+    </ul>`;
+
+  const keys=["hycu","nutanix","prismcentral"];
+  const nConn=keys.filter(k=>conn[k] && conn[k].connected).length;
+  const nConf=keys.filter(k=>conn[k] && conn[k].configured).length;
+  $("#dbSources").innerHTML=donutSVG(Math.round(100*nConn/3), Math.round(100*nConf/3))+
+    dnums("Connected", nConn+"/3", "Configured", nConf+"/3");
+  $("#dbSources").style.cursor="pointer"; $("#dbSources").onclick=()=>openSources();
+  $("#dbCluster").style.cursor="pointer"; $("#dbCluster").onclick=()=>openSources("cluster:"+ACTIVE_CID);
+
+  $("#dbCluster").innerHTML=`<div class="dbig" style="font-size:21px;word-break:break-all">${esc(ctxInfo.context||"—")}</div>
+    <div class="hint" style="margin:0 0 8px">${ctxInfo.workspace ? "Workspace "+esc(ctxInfo.workspace) : "Active cluster"}</div>
+    <ul class="dlist">
+      <li><span class="k">kubectl</span><span class="v">${ctxInfo.kubectl_ok ? stIc("ok","Operational") : stIc("ko","Unavailable")}</span></li>
+      <li><span class="k">Registered clusters</span><span class="v">${CLUSTERS.length}</span></li>
+      <li><span class="k">Applications</span><span class="v">${n}</span></li>
+      <li><span class="k">Namespaces</span><span class="v">${new Set(alive.map(x=>x.namespace||x.name)).size}</span></li>
+      <li><span class="k">Namespace filter</span><span class="v">${a.filtered ? "Active" : "None"}</span></li>
+      <li><span class="k">Mode</span><span class="v">${dry() ? "Simulation" : '<span class="ko">Real</span>'}</span></li>
+    </ul>`;
+
+  const roots=(st&&st.roots)||[];
+  $("#dbStorage").innerHTML = roots.length? roots.map(x=>{
+    if(!x.exists) return `<div class="hint">Folder missing: <code>${esc(x.path)}</code></div>`;
+    const pct=x.disk_used_pct||0;
+    const alert = pct>=90? ' <span class="bad" style="background:var(--red);color:#fff;border-radius:3px;padding:0 6px;font-size:11px">disk almost full</span>'
+                : pct>=80? ' '+stIc("wn","Disk "+pct+"%") : "";
+    return `<div style="margin-bottom:10px">
+      <div class="hint" style="margin:0" title="${esc(x.path)}"><code>${esc(x.path.length>34? "…"+x.path.slice(-33):x.path)}</code>${alert}</div>
+      ${storageBar(pct)}
+      <div class="hint" style="margin:0">${pct}% used · ${esc(fmtBytes(x.disk_free))} free of ${esc(fmtBytes(x.disk_total))}</div>
+      <ul class="dlist" style="margin-top:6px">
+        <li><span class="k">Backups</span><span class="v">${x.backups_count||0} versions · ${esc(fmtBytes(x.backups_bytes))}</span></li>
+        <li><span class="k">Audit log</span><span class="v">${esc(fmtBytes(x.audit_bytes))}</span></li>
+        ${(st.quota_gb||0)>0? `<li><span class="k">Quota</span><span class="v">${(x.backups_bytes/1024/1024/1024).toFixed(1)} / ${st.quota_gb} Go${x.backups_bytes>st.quota_gb*1073741824? ' '+stIc("wn","Quota exceeded: oldest pruned at next pass"):''}</span></li>`:''}
+      </ul></div>`;
+  }).join("") : '<div class="tempty">—</div>';
+  $("#dbStorage").innerHTML += (st.min_free_mb||0)>0? `<div class="hint" style="margin-top:2px">Guardrail: backup refused below ${st.min_free_mb} MB free.</div>` : "";
+  $("#dbJobs").innerHTML=jobsChart(j.days)+`<div class="jcounts">${jobCounts(j)}</div>`;
+  const last=(j.jobs||[]).slice(0, 5);
+  $("#dbLast").innerHTML = last.length
+    ? `<ul class="dlist">`+last.map(x=>{ const d=jobRowData(x);
+        const ep=Date.parse(x.ts||"")/1000;
+        return `<li><span class="k" style="display:flex;align-items:center;gap:8px;min-width:0">${stIc(d.st[0], d.st[1])}<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(d.lbl)}`+
+               `${x.namespace ? ' <span style="color:var(--muted)">· '+d.app+'</span>' : ''}</span></span>`+
+               `<span class="v" style="font-weight:400;color:var(--muted);white-space:nowrap">${esc(isNaN(ep)?"":fmtAgo(ep))}</span></li>`; }).join("")+
+      `</ul><div style="margin-top:8px"><a href="#" class="lnk" data-go="jobs">View all jobs</a></div>`
+    : `<div class="tempty">No job recorded yet.</div>`;
+  bindGo($("#dbLast"));
+  $("#dbHealth").innerHTML = CLUSTERS.length
+    ? `<ul class="dlist">`+CLUSTERS.map(c=>{
+        const h=c.health;
+        const ic = h? (h.ok? stIc("ok","Reachable") : stIc("ko",h.error||"")) : stIc("na","Not checked yet");
+        return `<li><span class="k" style="display:flex;align-items:center;gap:8px">${ic}<span>${esc(c.name)}</span></span>`+
+               `<span class="v" style="font-weight:400;color:var(--muted)">${h? esc(fmtAgo(h.at)) : "—"}</span></li>`;}).join("")+
+      `</ul><div style="margin-top:8px"><a href="#" class="lnk" id="dbHealthLnk">Manage clusters</a></div>`
+    : '<div class="tempty">—</div>';
+  const hl=$("#dbHealthLnk"); if(hl) hl.onclick=e=>{ e.preventDefault(); openSources("cluster:"+ACTIVE_CID); };
+}
+
+// ============================ Assistant de restauration ============================
+const RS_TITLE="Application restore";
+const RS_KINDS={cloneapp:"Restore the whole application (copy)",
+                inplace:"Restore storage in place",
+                reattach:"Restore storage to new volumes",
+                objects:"Restore configuration objects",
+                dr:"DR restore (another cluster / context)"};
+var rsWizPage="type", rsWizKind=null, rsWizAct=null, rsWizHtml="", rsTgtMode=null;
+$("#rsAdvBody").append($("#rsCustomDirLbl"), $("#rsCustomDirWrap"));   // options avancées repliées
+function rsKindFromState(){ return state.mode==="inplace" ? "inplace" : (state.cloneSub==="cloneapp" ? "cloneapp" : "reattach"); }
+function rsSyncOpts(){ document.querySelectorAll("#rsPgType .opt").forEach(o=>o.classList.toggle("sel", o.dataset.kind===rsWizKind)); }
+function rsSyncTgtOpts(){ document.querySelectorAll("#rsPgTarget .opt").forEach(o=>o.classList.toggle("sel", o.dataset.nsmode===rsTgtMode)); }
+// « Next » depuis la page Type : le clone d'application passe d'abord par la page
+// « cible du clone » (2 cartes) ; les autres types vont directement au formulaire.
+function rsNextFromType(){
+  if(rsWizKind==="cloneapp") return rsShowPage("target");
+  if(rsWizKind==="objects") return objOpen();
+  if(rsWizKind==="dr") return drOpen("dr");
+  if(rsWizKind==="recover") return drOpen("recover", drRecoverNs);
+  return rsToForm();
+}
+function rsTargetToForm(){
+  if(!rsTgtMode) return;
+  const b=document.querySelector('#rsCloneNsMode button[data-nsmode="'+rsTgtMode+'"]');
+  if(b) b.click();                       // synchronise state.cloneNsMode + champs affichés
+  return rsToForm();
+}
+document.querySelectorAll("#rsPgType .opt").forEach(o=>{
+  o.onclick=()=>{ rsWizKind=o.dataset.kind; rsSyncOpts(); rsWizSync(); };
+  o.ondblclick=()=>{ rsWizKind=o.dataset.kind; rsSyncOpts(); rsNextFromType(); };
+});
+document.querySelectorAll("#rsPgTarget .opt").forEach(o=>{
+  o.onclick=()=>{ rsTgtMode=o.dataset.nsmode; rsSyncTgtOpts(); rsWizSync(); };
+  o.ondblclick=()=>{ rsTgtMode=o.dataset.nsmode; rsSyncTgtOpts(); rsTargetToForm(); };
+});
+function rsShowPage(p){
+  rsWizPage=p;
+  if(p==="target"){ rsTgtMode=state.cloneNsMode||"same"; rsSyncTgtOpts(); }
+  setRsStep(p==="type" ? 1 : p==="form" ? 2 : 3);
+  $("#rsPgType").style.display = p==="type" ? "block" : "none";
+  $("#rsPgTarget").style.display = p==="target" ? "block" : "none";
+  $("#rsPgObjects").style.display = p==="objects" ? "block" : "none";
+  $("#rsPgDr").style.display = p==="dr" ? "block" : "none";
+  $("#rsPgForm").style.display = p==="form" ? "block" : "none";
+  $("#rsPgPlan").style.display = p==="plan" ? "block" : "none";
+  // Retour vers le formulaire : re-masquer #rsPlan, sinon le prochain « Next »
+  // (qui re-affiche le plan avec la MÊME valeur display:block) ne déclenche aucune
+  // mutation -> l'observer ne bascule jamais sur la page 3 (bouton muet).
+  if(p!=="plan") $("#rsPlan").style.display="none";
+  $("#mRestoreTitle").innerHTML = p==="type" ? esc(RS_TITLE)
+    : esc(RS_TITLE)+'<span class="sep">›</span>'+esc(RS_KINDS[rsWizKind]||"");
+  $("#rsWizBack").style.display = p==="type" ? "none" : "";
+  const b=$("#mRestore .hm-body"); if(b) b.scrollTop=0;
+  rsWizSync();
+}
+// Libellé « namespace › application » de l'assistant (application ciblée, ou namespace entier).
+function rsAppLabel(){
+  const a=state.app;
+  if(!a || a.whole_ns) return esc(state.ns||"—");
+  // Lien « tout le namespace » : élargit la restauration à toutes les applications du
+  // namespace (visible sur chaque page de l'assistant, pas seulement la page Type).
+  return esc(state.ns||"—")+' <span class="sep">›</span> '+esc(a.name)+
+    (a.type==="stateless" ? ' <span class="badge b-pending">Stateless</span>' : a.type==="stateful" ? ' <span class="badge b-bound">Stateful</span>' : "")+
+    ' <a href="#" class="rsWholeNs" style="margin-left:8px;font-weight:400;font-size:12px">whole namespace</a>';
+}
+document.addEventListener("click", e=>{ const a=e.target.closest && e.target.closest(".rsWholeNs, #rsWholeNs");
+  if(a){ e.preventDefault(); rsTargetWholeNs(); } });
+function openRestoreModal(ns, app){
+  ns = ns || state.ns || $("#rsNs").value; if(!ns) return;
+  state.ns=ns; applyGlobalNs();
+  // Application ciblée (page Applications) : {name, type, pvcs, whole_ns}. Sans
+  // application (whole namespace), l'assistant se comporte comme avant.
+  state.app = (app && app.name && !app.whole_ns) ? {ns:ns, name:app.name, type:app.type, pvcs:app.pvcs||[], workloads:app.workloads||[], unassigned:!!app.unassigned} : null;
+  rsWizKind=rsKindFromState(); rsSyncOpts();
+  $("#rsWizApp").innerHTML=rsAppLabel();
+  $("#rsWizCluster").innerHTML=`<b>${esc(ctxInfo.context||"—")}</b>`;
+  ["#rsLog","#rsInplaceLog","#rsErr"].forEach(id=>$(id).innerHTML="");
+  if($("#rsCustomDir").checked) $("#rsAdvWrap").open=true;
+  rsRenderAppNote();
+  openModal("mRestore");
+  // Application STATELESS : les parcours de stockage n'ont pas de sens -> seules les cartes
+  // « copie » (clone des workloads + dépendances) et « objets de configuration » restent,
+  // la seconde présélectionnée (restauration = ré-appliquer ses objets).
+  const sl = !!(state.app && state.app.type==="stateless");
+  document.querySelectorAll('#rsPgType .opt').forEach(o=>{ o.style.display = (sl && (o.dataset.kind==="inplace"||o.dataset.kind==="reattach"||o.dataset.kind==="dr")) ? "none" : ""; });
+  if(sl){ rsWizKind="objects"; rsSyncOpts(); }
+  rsShowPage("type");
+}
+// Clone d'une application STATELESS (aucun volume) : le formulaire n'a pas de volumes à
+// cocher ; le serveur copie les workloads de l'application (+ dépendances).
+function rsStatelessClone(){ return !!(state.app && state.app.type==="stateless" && rsWizKind==="cloneapp"); }
+// Note « application ciblée » de l'assistant, avec le lien « tout le namespace » : quand
+// une application fonctionnelle est découpée en plusieurs applications par ses étiquettes
+// (ex. mariadb + wordpress), l'opérateur élargit la restauration à tout le namespace.
+function rsRenderAppNote(){
+  const note=$("#rsAppNote"); if(!note) return;
+  note.style.display = state.app ? "block" : "none";
+  const link=`<div style="margin-top:6px"><a href="#" id="rsWholeNs">Rather restore <b>the whole namespace « ${esc(state.ns||"")} »</b> (all its applications)</a></div>`;
+  note.innerHTML = !state.app ? "" : (state.app.type==="stateless"
+    ? `Application <b>${esc(state.app.name)}</b>: <b>stateless</b> (no volume). Restoring it = re-applying its configuration objects (workloads, Services, ConfigMaps…) from a backup snapshot — the <b>“configuration objects”</b> path, preselected.`
+    : `Application <b>${esc(state.app.name)}</b>: <b>stateful</b> — its volumes (${esc(state.app.pvcs.join(", ")||"—")}) will be preselected; the other volumes of the namespace stay unticked.`)+link;
+}
+function rsTargetWholeNs(){
+  state.app=null; rsRenderAppNote();
+  document.querySelectorAll('#rsPgType .opt').forEach(o=>o.style.display="");   // tous les parcours de nouveau
+  $("#rsWizApp").innerHTML=rsAppLabel(); const oa=$("#objApp"); if(oa) oa.innerHTML=rsAppLabel();
+  if(rsWizPage==="form"){ rsAutoCheck=true; document.querySelectorAll(".rsChk").forEach(c=>c.checked=true); rebuildVolCfgs(); }
+  else if(rsWizPage==="objects"){ objLoadList(); }
+  rsWizSync();
+}
+async function rsToForm(){
+  if(!rsWizKind) return;
+  const k=rsWizKind, clk=sel=>{ const b=document.querySelector(sel); if(b) b.click(); };
+  if(k==="inplace") clk('#rsMode button[data-mode="inplace"]');
+  else { clk('#rsMode button[data-mode="clone"]');
+         clk('#rsCloneSub button[data-sub="'+(k==="cloneapp" ? "cloneapp" : "reattach")+'"]'); }
+  rsShowPage("form");
+  rsAutoCheck=true;
+  $("#rsPlan").style.display="none";
+  if(rsStatelessClone()){
+    state.ns=$("#rsNs").value||state.ns; state.backup_path=null; state.selected={};
+    $("#rsPvcs").innerHTML=`<div class="note">Application <b>${esc(state.app.name)}</b>: <b>stateless</b>, no volume to restore. The copy recreates its workloads (${esc((state.app.workloads||[]).map(w=>w.kind+"/"+w.name).join(", ")||"—")}) and their dependencies from the cluster.</div>`;
+    $("#rsConfig").style.display="none"; setRsStep(2); rsWizSync(); return;
+  }
+  $("#rsPvcs").innerHTML='<div class="hint"><span class="spin"></span>Loading volumes…</div>';
+  await loadPvcs();
+  rsWizSync();
+}
+// UNE action principale dans le pied de modale, qui relaie le bouton d'origine adapté
+// à l'étape (clone HYCU groupé, restauration sur place, construction du plan, lancement).
+function rsWizSync(){
+  const go=$("#rsWizGo"); let lbl="Next", dis=false, act=null, src=null;
+  if(rsWizPage==="type"){ dis=!rsWizKind; act=rsNextFromType; }
+  else if(rsWizPage==="dr"){
+    const n=document.querySelectorAll(".drRef").length;
+    const filled=[...document.querySelectorAll(".drRef")].filter(t=>t.value.trim()).length;
+    // Réutilisation des volumes d'origine : aucun UUID requis (le serveur les déduit
+    // de la sauvegarde). Sinon, tous les volumes doivent avoir une référence. Une
+    // sauvegarde STATELESS (aucun volume, workloads dans l'instantané) se restaure sans volume.
+    const needRefs = !drRecoverReuse();
+    const b=drSel(), noVol = !n && !!(b && b.stateless);
+    lbl=dry()? "Restore (simulation)" : "Restore (real)";
+    dis=!drAllowed || (!n && !noVol) || (needRefs && filled<n) || drBusy || !$("#drTargetNs").value.trim();
+    act=drRun;
+  }
+  else if(rsWizPage==="objects"){
+    const n=document.querySelectorAll(".objChk:checked").length;
+    if(objPhase==="pick"){ lbl="Preview differences"; dis=!n || objBusy; act=objToDiff; }
+    else { lbl=dry()? "Apply (simulation)" : "Apply (real)"; dis=!n || objBusy; act=objApply; }
+  }
+  else if(rsWizPage==="target"){ dis=!rsTgtMode; act=rsTargetToForm; }
+  else if(rsWizPage==="form"){
+    const n=document.querySelectorAll(".rsChk:checked").length;
+    const hyOn=!!(conn.hycu && conn.hycu.connected);
+    if(rsStatelessClone()){ lbl="Check the copy"; act=()=>$("#rsPreview").click(); }
+    else if(state.mode==="inplace" && hyOn){ src=$("#rsInplaceRun"); lbl="Restore"; }
+    else {
+      const items=collectItems(), filled=items.length>0 && items.every(i=>(i.new_ref||"").trim());
+      const batch=$("#hyBatchGo");
+      if(batch && !filled){ src=batch; lbl="Restore"; }
+      else { dis=!n; act=()=>$("#rsPreview").click(); }
+    }
+    if(src){ dis=!n || src.disabled; act=()=>src.click(); }
+  } else { src=$("#rsGo"); lbl=(src.textContent||"").trim() || "Launch"; dis=src.disabled; act=()=>src.click(); }
+  const busy = src && src.querySelector(".spin");
+  const html = busy ? '<span class="spin"></span>'+esc((src.textContent||"").trim()) : esc(lbl);
+  if(html!==rsWizHtml){ go.innerHTML=html; rsWizHtml=html; }
+  go.disabled=dis; rsWizAct=act;
+  const live=!dry(), m=$("#rsWizMode");
+  m.textContent = live ? "Real mode" : "Simulation";
+  m.className="badge "+(live ? "live" : "sim");
+}
+$("#rsWizGo").onclick=()=>{ if(rsWizAct && !$("#rsWizGo").disabled) rsWizAct(); };
+$("#rsWizBack").onclick=()=>{
+  if(rsWizPage==="dr") return rsShowPage("type");
+  if(rsWizPage==="objects"){
+    if(objPhase==="diff"){ objPhase="pick"; $("#objDiffWrap").style.display="none"; $("#objPick").style.display="block"; $("#objLog").innerHTML=""; rsWizSync(); return; }
+    return rsShowPage("type");
+  }
+  rsShowPage(rsWizPage==="plan" ? "form"
+    : (rsWizPage==="form" && rsWizKind==="cloneapp") ? "target" : "type");
+};
+
+// ----- DR restore: reprise sur CE cluster depuis une sauvegarde étrangère -----
+var drAllowed=false, drBusy=false, drBackups=[], drMode="dr", drRecoverNs=null;
+// Application SUPPRIMÉE du cluster : récupération sur le MÊME cluster/contexte —
+// mêmes mécanismes que la page DR (sources depuis la sauvegarde seule), mais SANS
+// la dérogation allow_dr_restore (le serveur vérifie que la sauvegarde est d'ici).
+function openRecoverModal(ns){
+  state.ns=ns; state.app=null;         // la récupération recrée tout le namespace
+  const note=$("#rsAppNote"); if(note){ note.style.display="none"; note.innerHTML=""; }
+  rsWizKind="recover"; rsSyncOpts();   // kind dédié : « Retour » puis « Next » ne devient jamais une DR
+  ["#rsLog","#rsInplaceLog","#rsErr"].forEach(id=>{ const e=$(id); if(e) e.innerHTML=""; });
+  openModal("mRestore");
+  drOpen("recover", ns);
+}
+$("#drOpenCfg").onclick=()=>{ closeModal("mRestore"); switchTab("settings"); };
+async function drOpen(mode, recoverNs){
+  drMode = mode==="recover" ? "recover" : "dr";
+  drRecoverNs = drMode==="recover" ? (recoverNs||null) : null;
+  // Rien de l'ouverture précédente ne doit rester cliquable pendant le chargement :
+  // occupé + listes vidées, jusqu'au rendu des sauvegardes fraîches.
+  drBusy=true; drBackups=[]; $("#drVols").innerHTML=""; $("#drBackupSel").innerHTML=""; $("#drTargetNs").value="";
+  $("#drLog").innerHTML=""; $("#drErr").innerHTML="";
+  $("#drSc").value="";                 // jamais de remap hérité d'un parcours précédent
+  $("#drRefs").checked=true;
+  rsShowPage("dr");
+  if(drMode==="recover"){
+    $("#mRestoreTitle").innerHTML=esc(RS_TITLE)+'<span class="sep">›</span>'+esc("Restore the deleted application « "+recoverNs+" »");
+    $("#drWarnDr").style.display="none"; $("#drWarnRec").style.display="block";
+    $("#drReuseWrap").style.display="block"; $("#drReuse").checked=true;
+  } else {
+    $("#drWarnDr").style.display="block"; $("#drWarnRec").style.display="none";
+    $("#drReuseWrap").style.display="none";
+  }
+  $("#drCluster").textContent=ctxInfo.context||"—";
+  $("#drClusterRec").textContent=ctxInfo.context||"—";
+  const r=await get("/api/dr/backups");
+  // Récupération même-cluster : pas de dérogation requise — le serveur re-vérifie.
+  drAllowed = drMode==="recover" ? !!r.ok : !!(r.ok && r.allowed);
+  $("#drGate").style.display = drAllowed? "none":"block";
+  $("#drForm").style.display = drAllowed? "block":"none";
+  if(!drAllowed){ drBusy=false; rsWizSync(); return; }
+  drBackups=(r.backups||[]).filter(b=> drMode==="recover"
+    ? (b.restorable_here && b.namespace===drRecoverNs) : true);
+  $("#drBackupSel").innerHTML = drBackups.length? drBackups.map((b,i)=>
+    `<option value="${i}">${esc(b.cluster)}${b.context&&b.cluster_id==="local"?" ("+esc(b.context)+")":""} › ${esc(b.namespace)} › ${esc(b.timestamp)}${b.imported?" · S3 import":""}</option>`).join("")
+    : '<option value="">(no backup)</option>';
+  drBusy=false;
+  drRenderVols();
+  rsWizSync();
+}
+$("#drBackupSel").onchange=()=>drRenderVols();
+function drSel(){ return drBackups[+$("#drBackupSel").value]||null; }
+// Récupération : par défaut on réutilise les volumes d'origine (case cochée) -> aucune
+// saisie. La grille d'UUID n'apparaît que pour la reprise d'activité, ou si l'humain a
+// restauré les données sur de NOUVEAUX volumes (case décochée).
+function drRecoverReuse(){ return drMode==="recover" && $("#drReuse").checked; }
+function drRenderVols(){
+  const b=drSel();
+  $("#drTargetNs").value=b? b.namespace : "";
+  // Honnêteté : sauvegarde sans instantané de ressources -> volumes uniquement.
+  $("#drNoRes").style.display = (b && b.has_resources===false)? "block":"none";
+  // Secrets de la sauvegarde : masqués (non recréés) ou chiffrés (coffre à déverrouiller).
+  const sn=$("#drSecretsNote"), sm=b&&b.secrets;
+  if(sn){ sn.style.display = (sm==="redacted"||sm==="encrypted") ? "block" : "none";
+    sn.innerHTML = sm==="redacted" ? "The <b>Secrets</b> of this backup are <b>redacted</b>: they will not be recreated (recreate them by hand after the restore)."
+      : sm==="encrypted" ? "The <b>Secrets</b> of this backup are <b>encrypted</b> with the vault passphrase: unlock the vault (⚙ → Sources) before starting, otherwise they will not be recreated." : ""; }
+  const refs=(b&&b.vol_refs)||{};
+  // En récupération, chaque champ est PRÉ-REMPLI avec l'UUID d'origine (issu de la
+  // sauvegarde) : l'humain n'a rien à taper. En DR, les champs restent vides (nouveaux VG).
+  $("#drVols").innerHTML = b && b.volumes.length? b.volumes.map(v=>
+    `<div class="drVol"><div class="drVolNm">${esc(v)}</div>
+     <input type="text" class="drRef" data-pvc="${esc(v)}" spellcheck="false" autocomplete="off"
+       value="${drMode==="recover"&&refs[v]?esc(refs[v]):""}"
+       placeholder="${esc(drMode==="recover"?"Volume Group UUID (8-4-4-4-12)":"UUID of the VG restored/cloned on the target site (8-4-4-4-12)")}"></div>`).join("")
+    : (b && b.stateless ? '<div class="note"><b>Stateless</b> backup (no volume): the workloads'+((b.apps||[]).length?' ('+esc((b.apps||[]).join(", "))+')':'')+' et leurs dépendances seront recréés depuis l\'instantané.</div>'
+                        : '<div class="hint">No volume in this backup.</div>');
+  document.querySelectorAll(".drRef").forEach(t=>t.oninput=rsWizSync);
+  drSyncReuse();
+}
+// Bascule d'affichage de la grille selon « réutiliser les volumes d'origine ».
+function drSyncReuse(){
+  const reuse=drRecoverReuse();
+  $("#drVols").style.display = reuse? "none":"block";
+  $("#drVolsLabel").style.display = (drMode==="recover")? (reuse?"none":"block") : "block";
+  if(drMode==="recover") $("#drVolsLabel").textContent="New volumes — paste the ID (UUID) provided by HYCU";
+  else $("#drVolsLabel").textContent="Volumes — paste the UUID of the VG restored/cloned on the target site";
+  // Bouton « auto HYCU » : seulement quand la grille est visible ET HYCU + Prism connectés.
+  const autoOk = !reuse && (conn.hycu&&conn.hycu.connected)
+                 && ((conn.prismcentral&&conn.prismcentral.connected)||(conn.nutanix&&conn.nutanix.connected));
+  $("#drAutoWrap").style.display = autoOk? "block":"none";
+  rsWizSync();
+}
+$("#drReuse").onchange=drSyncReuse;
+// Auto-provisionnement : HYCU clone les VG et l'outil découvre leurs nouveaux UUID,
+// qu'il inscrit dans la grille (aucune saisie). Simulation = plan seulement.
+$("#drAuto").onclick=async()=>{
+  const b=drSel(); if(!b) return;
+  const refs=(b&&b.vol_refs)||{}, hy=(b&&b.vol_hycu)||{}, names=(b&&b.vol_names)||{};
+  // Source pour HYCU = l'identité HYCU du VG (contrat) si disponible, sinon l'UUID Nutanix ;
+  // le nom du VG aide à retrouver un VG SUPPRIMÉ du cluster dans le catalogue HYCU.
+  const volumes=[...document.querySelectorAll(".drRef")].map(t=>({pvc:t.dataset.pvc,
+    source_vg_uuid:hy[t.dataset.pvc]||refs[t.dataset.pvc]||"", vg_name:names[t.dataset.pvc]||""}));
+  if(!volumes.length || volumes.some(v=>!v.source_vg_uuid)){
+    $("#drErr").innerHTML=errBox("Source VG UUID missing from the backup: automation not possible, enter the UUIDs manually."); return; }
+  if(!dry() && !(await confirmDanger({title:"REAL HYCU clones", lines:[
+      "Trigger in HYCU the <b>clone</b> of <b>"+volumes.length+"</b> Volume Group(s) (nouveaux VG créés) ?",
+      "The new IDs will be filled into the grid automatically."]}))) return;
+  const btn=$("#drAuto"); btn.disabled=true; drBusy=true; rsWizSync();
+  $("#drErr").innerHTML=""; $("#drLog").innerHTML='<div class="hint"><span class="spin"></span>HYCU: creating the volumes…</div>';
+  try{
+    const r=await post("/api/hycu/provision_clone", {volumes, dry:dry()});
+    if(!r.ok){ $("#drErr").innerHTML=errBox(r.error); $("#drLog").innerHTML=renderLog(r.log||[]); return; }
+    if(!r.dry){ (r.items||[]).forEach(it=>{ const el=document.querySelector('.drRef[data-pvc="'+(window.CSS&&CSS.escape?CSS.escape(it.pvc):it.pvc)+'"]'); if(el && it.new_ref) el.value=it.new_ref; }); }
+    $("#drLog").innerHTML=renderLog(r.log||[]);
+  } finally { btn.disabled=false; drBusy=false; rsWizSync(); }
+};
+$("#drTargetNs").oninput=()=>rsWizSync();
+async function drRun(){
+  const b=drSel(); if(!b) return;
+  // Réutilisation des volumes d'origine : on n'envoie PAS d'UUID, le serveur le déduit
+  // de la sauvegarde (source de vérité). Sinon on transmet ce que l'humain a saisi.
+  const reuse=drRecoverReuse();
+  const items=[...document.querySelectorAll(".drRef")].map(t=>({pvc:t.dataset.pvc, new_ref:reuse?"":t.value.trim()}));
+  const live=!dry();
+  let confirmedCtx="";
+  if(live){
+    const needCtx = ctxInfo.require_confirm ? (ctxInfo.context||"") : null;
+    const res=await confirmDanger({title:(drMode==="recover"?"Restore of a DELETED application":"REAL DR restore"), requireText:needCtx, lines:[
+      "Source backup: <b>"+esc(b.cluster)+" › "+esc(b.namespace)+" › "+esc(b.timestamp)+"</b>",
+      "TARGET cluster: <b>"+esc(ctxInfo.context||"?")+"</b> · target namespace: <b>"+esc($("#drTargetNs").value)+"</b>",
+      drMode==="recover"
+        ? "The application will be RECREATED on this cluster from the backup (namespace, PV/PVC, workloads, non-redacted dependencies)."
+        : "The cross-cluster guard is LIFTED for this operation: the application will be recreated on this cluster from the backup (PV/PVC, workloads, non-redacted dependencies).",
+      ...((drMode==="recover" && drRecoverReuse() && conn.hycu && conn.hycu.connected)
+        ? ["If an original volume has disappeared from the cluster, HYCU will RESTORE it automatically (real HYCU operation) before the recreation."] : [])]});
+    if(!res) return;
+    if(typeof res==="string") confirmedCtx=res;
+  }
+  drBusy=true; rsWizSync();
+  $("#drLog").innerHTML='<div class="hint"><span class="spin"></span>DR restore…</div>';
+  const body={namespace:b.namespace, target_namespace:$("#drTargetNs").value.trim(),
+              backup_path:b.path, items, dry:dry(),
+              dr_storageclass:$("#drSc").value.trim(), clone_refs:$("#drRefs").checked};
+  if(drMode==="recover") body.from_backup_only=true; else body.dr_restore=true;
+  if(live && ctxInfo.require_confirm) body.confirm_context=confirmedCtx;
+  const r=await runOp("/api/clone_app", body, log=>{ $("#drLog").innerHTML=renderLog(log); });
+  drBusy=false; rsWizSync();
+  const head = r.ok? (r.dry? '<div class="warnbox">Simulation — séquence qui serait exécutée.</div>'
+                           : '<div class="note">Restauration DR finishede. Vérifiez l\'application, puis re-protégez ses Volume Groups dans HYCU.</div>')
+                   : errBox(r.error);
+  $("#drLog").innerHTML=head+((r.warnings||[]).length?`<div class="warnbox" style="margin-top:8px">${r.warnings.map(esc).join("<br>")}</div>`:"")+renderLog(r.log);
+}
+
+// ----- Restauration guidée des OBJETS de configuration (resources.json) -----
+var objItems=[], objPhase="pick", objBusy=false, objBackups=[];
+function objBody_(){ return {namespace:$("#rsNs").value||state.ns,
+  backup_path:($("#objBackupSel").value||null), backup_root:state.backup_root||null,
+  app:(state.app && !state.app.unassigned) ? state.app.name : null}; }
+async function objOpen(){
+  objPhase="pick"; objBusy=true; objItems=[];
+  $("#objApp").innerHTML=rsAppLabel();
+  $("#objErr").innerHTML=""; $("#objLog").innerHTML=""; $("#objDiffWrap").style.display="none";
+  $("#objPick").style.display="block";
+  $("#objBody").innerHTML='<tr><td colspan="4" class="tempty"><span class="spin"></span></td></tr>';
+  rsShowPage("objects");
+  const ns=state.ns||$("#rsNs").value;
+  const b=await get("/api/backups?ns="+encodeURIComponent(ns)+(state.backup_root?("&root="+encodeURIComponent(state.backup_root)):""));
+  objBackups=(b.backups||[]);
+  $("#objBackupSel").innerHTML=objBackups.map(x=>`<option value="${esc(x.path)}">${esc(x.timestamp)} — ${((x.index||{}).volumes||[]).length} volume(s)${(x.index||{}).resources_count!=null?(" · "+(x.index||{}).resources_count+" objects"):""}</option>`).join("")
+    || '<option value="">(no backup)</option>';
+  await objLoadList();
+}
+$("#objBackupSel").onchange=()=>objLoadList();
+async function objLoadList(){
+  objBusy=true; rsWizSync();
+  $("#objErr").innerHTML=""; $("#objLog").innerHTML="";
+  if(!$("#objBackupSel").value){
+    $("#objBody").innerHTML='<tr><td colspan="4" class="tempty">Aucune sauvegarde pour ce namespace — lancez d\'abord une sauvegarde (Applications → Back up).</td></tr>';
+    objItems=[]; objBusy=false; rsWizSync(); return;
+  }
+  const r=await post("/api/objects/list", objBody_());
+  objBusy=false;
+  if(!r.ok){ $("#objBody").innerHTML=""; $("#objErr").innerHTML=errBox(r.error); objItems=[]; rsWizSync(); return; }
+  objItems=r.items||[];
+  // Application ciblée : ses objets sont marqués (in_app) et PRÉCOCHÉS ; les objets des
+  // autres applications du namespace sont masqués par défaut (case « seulement… »).
+  const appOn = !!(r.app);
+  $("#objOnlyAppWrap").style.display = appOn ? "" : "none";
+  $("#objInfo").textContent="("+objItems.length+" objet(s) dans l'instantané"+(appOn?(" · "+(r.app_count||0)+" of the application « "+r.app+" »"):"")+")";
+  $("#objBody").innerHTML=objItems.length? objItems.map(o=>`<tr class="clk${o.redacted?'':' '}${appOn&&!o.in_app?' objOther':''}" data-i="${o.i}">
+     <td class="cb"><input type="checkbox" class="objChk" data-i="${o.i}" ${o.redacted?"disabled":""} ${appOn&&o.in_app&&!o.redacted?"checked":""}></td>
+     <td>${esc(o.kind)}</td><td style="color:var(--strong);font-weight:500">${esc(o.name)}</td>
+     <td>${o.encrypted?'<span class="badge b-pending">Secret encrypted — unlock the vault</span>':o.redacted?'<span class="badge b-pending">Secret redacted — not restorable</span>':(appOn&&!o.in_app?'<span class="hint">other application / shared</span>':"")}</td></tr>`).join("")
+    : '<tr><td colspan="4" class="tempty">Empty snapshot.</td></tr>';
+  document.querySelectorAll("#objBody tr.clk").forEach(tr=>tr.onclick=e=>{
+    if(e.target.classList.contains("objChk")) return rsWizSync();
+    const c=tr.querySelector(".objChk"); if(c && !c.disabled){ c.checked=!c.checked; rsWizSync(); } });
+  document.querySelectorAll(".objChk").forEach(c=>c.onchange=rsWizSync);
+  $("#objAll").checked=false; objSyncOnlyApp(); rsWizSync();
+}
+function objSyncOnlyApp(){
+  const only = $("#objOnlyAppWrap").style.display!=="none" && $("#objOnlyApp").checked;
+  document.querySelectorAll("#objBody tr.objOther").forEach(tr=>{ tr.style.display = only ? "none" : "";
+    if(only){ const c=tr.querySelector(".objChk"); if(c) c.checked=false; } });
+}
+$("#objOnlyApp").onchange=()=>{ objSyncOnlyApp(); rsWizSync(); };
+$("#objAll").onchange=()=>{ const on=$("#objAll").checked;
+  document.querySelectorAll("#objBody tr").forEach(tr=>{ if(tr.style.display==="none") return;
+    const c=tr.querySelector(".objChk:not([disabled])"); if(c) c.checked=on; }); rsWizSync(); };
+function objSelIdx(){ return [...document.querySelectorAll(".objChk:checked")].map(c=>+c.dataset.i); }
+async function objToDiff(){
+  objBusy=true; rsWizSync();
+  $("#objErr").innerHTML="";
+  $("#objDiff").innerHTML='<div class="hint"><span class="spin"></span>Comparaison avec l\'état live…</div>';
+  $("#objDiffWrap").style.display="block";
+  const r=await post("/api/objects/diff", Object.assign(objBody_(), {indexes:objSelIdx()}));
+  objBusy=false;
+  if(!r.ok){ $("#objDiffWrap").style.display="none"; $("#objErr").innerHTML=errBox(r.error); rsWizSync(); return; }
+  const ST={identical:["ok","Identical to live — apply is a no-op"], differs:["wn","Differs from live"],
+            absent:["run","Absent from live — will be (re)created"], error:["ko","Cannot read live state"],
+            redacted:["ko","Secret redacted"]};
+  $("#objDiff").innerHTML=(r.results||[]).map(x=>{
+    const st=ST[x.status]||["na",x.status];
+    const body = x.status==="differs" ? `<pre class="box" style="margin:6px 0 0;max-height:260px;overflow:auto">${esc(x.diff)}</pre>`
+      : (x.error? `<div class="hint" style="color:var(--red)">${esc(x.error)}</div>` : "");
+    return `<div class="repl" style="margin-bottom:10px"><div class="nm" style="display:flex;gap:10px;align-items:center">${stIc(st[0],st[1])}<b>${esc(x.kind)}/${esc(x.name)}</b><span class="hint">${esc(st[1])}</span></div>${body}</div>`;
+  }).join("") || '<div class="hint">Nothing to compare.</div>';
+  $("#objPick").style.display="none"; objPhase="diff"; rsWizSync();
+}
+async function objApply(){
+  const live=!dry();
+  let confirmedCtx="";
+  if(live){
+    const needCtx = ctxInfo.require_confirm ? (ctxInfo.context||"") : null;
+    const res=await confirmDanger({title:"REAL object restore", requireText:needCtx, lines:[
+      "Namespace: <b>"+esc($("#rsNs").value||state.ns||"?")+"</b>",
+      "Target cluster: <b>"+esc(ctxInfo.context||"?")+"</b>",
+      "<b>"+objSelIdx().length+"</b> configuration object(s) will be OVERWRITTEN by the backup version (kubectl apply). Volumes and data are untouched."]});
+    if(!res) return;
+    if(typeof res==="string") confirmedCtx=res;
+  }
+  objBusy=true; rsWizSync();
+  $("#objLog").innerHTML='<div class="hint"><span class="spin"></span>Applying…</div>';
+  const body=Object.assign(objBody_(), {indexes:objSelIdx(), dry:dry()});
+  if(live && ctxInfo.require_confirm) body.confirm_context=confirmedCtx;
+  const r=await post("/api/objects/restore", body);
+  objBusy=false; rsWizSync();
+  const head = r.ok? (r.dry? '<div class="warnbox">Simulation — commandes qui seraient exécutées.</div>'
+                           : `<div class="note">${r.applied} object(s) applied${r.skipped?(" · "+r.skipped+" skipped"):""}.</div>`)
+                   : errBox(r.error);
+  $("#objLog").innerHTML=head+renderLog(r.log);
+}
+setInterval(()=>{ if($("#mRestore").style.display!=="none") rsWizSync(); }, 300);
+
+// ----- Langue FR/EN : cookie lu par le serveur, page + messages retraduits au rechargement -----
+const PAGE_LANG="en";
+$("#langBtn").onclick=()=>{
+  document.cookie="hycu_lang="+(PAGE_LANG==="fr"?"en":"fr")+";path=/;max-age=31536000;SameSite=Lax";
+  location.reload();
+};
+</script>
+</body>
+</html>"""
+# <<< UI-END
+
+# Mode développement : HYCU_DEV_UI=1 assemble l'interface depuis ui/ (index.html,
+# styles.css, app.js, i18n/en.json) à chaque démarrage, sans passer par build.py.
+# Le `.py` reste 100 % autonome : sans cette variable, l'UI embarquée est utilisée.
+if os.environ.get("HYCU_DEV_UI") == "1":
     try:
-        with open(_UI_PATH, encoding="utf-8") as _f:
-            HTML = _f.read()
-        print("UI chargée depuis ui.html (mode développement).")
+        import importlib.util as _ilu
+        _spec = _ilu.spec_from_file_location("hycu_build", os.path.join(os.path.dirname(os.path.abspath(__file__)), "build.py"))
+        _b = _ilu.module_from_spec(_spec); _spec.loader.exec_module(_b)
+        HTML, HTML_EN, I18N_EN = _b.assemble(os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui"))
+        print("UI assemblée depuis ui/ (mode développement).")
     except Exception as _e:                      # pragma: no cover
-        print("ui.html illisible (%s) : UI embarquée utilisée." % _e)
+        print("ui/ inexploitable (%s) : UI embarquée utilisée." % _e)
 
-
-# ------------------------------------------------------------------------------
-# i18n — interface bilingue FR/EN (cookie « hycu_lang », bouton EN/FR dans l'en-tête)
-# ------------------------------------------------------------------------------
-# Principe : le FRANÇAIS reste la langue canonique du code (HTML, JS, messages).
-# La traduction est purement une couche de PRÉSENTATION, appliquée à deux endroits :
-#   1. la page servie sur « / » : le source HTML/JS est traduit par remplacement de
-#      fragments (les plus longs d'abord), puis mis en cache — les chaînes construites
-#      dynamiquement par le JS sont couvertes puisque le source lui-même est traduit ;
-#   2. les réponses JSON (_json) : seules les clés textuelles connues (error, label,
-#      warnings…) sont traduites — les données (noms, UUID, manifestes) sont intactes.
-# La logique interne (regex sur les messages, audit.log, hints kubectl) travaille
-# toujours sur les textes français d'origine : aucune incidence fonctionnelle.
-# Chaque fragment FR doit être un extrait EXACT d'une ligne du source ou d'un message.
-I18N_EN = []
-
-# --- Page : <head>, modale de confirmation, assistant, déverrouillage, filtre ns ---
-I18N_EN += [
+# >>> I18N-BEGIN — région GÉNÉRÉE par build.py depuis ui/i18n/en.json (ne pas éditer à la main)
+I18N_EN = [
     ('<html lang="fr">', '<html lang="en">'),
-    ("<title>HYCU · Kubernetes sur Nutanix</title>", "<title>HYCU · Kubernetes on Nutanix</title>"),
-    ("Confirmer l'action réelle", "Confirm the real action"),
-    ("Pour confirmer, retapez <b", "To confirm, retype <b"),
-    (">Annuler<", ">Cancel<"),
-    ("Confirmer en mode réel", "Confirm in real mode"),
-    ("Configuration initiale", "Initial setup"),
-    (">Précédent<", ">Back<"),
-    ("Suivant", "Next"),
-    ("Déverrouiller les connexions", "Unlock saved connections"),
-    ("Un coffre d'identifiants chiffré a été trouvé. Saisissez la phrase secrète maîtresse",
-     "An encrypted credentials vault was found. Enter the master passphrase"),
-    ("pour reconnecter automatiquement HYCU / Nutanix.", "to reconnect HYCU / Nutanix automatically."),
-    ("Phrase secrète (≥ 8 caractères)", "Passphrase (≥ 8 characters)"),
-    ("Phrase secrète", "Passphrase"),
-    (">Plus tard<", ">Later<"),
-    ("Déverrouiller", "Unlock"),
-    ("Connexions rechargées : ", "Connections reloaded: "),
-    ("Filtrer les namespaces", "Filter namespaces"),
-    ("Toutes les namespaces (aucun filtre)", "All namespaces (no filter)"),
-    ("Affiche toutes les namespaces, y compris celles créées plus tard.",
-     "Shows every namespace, including ones created later."),
-    ("rechercher une namespace…", "search for a namespace…"),
-    ("Tout cocher (visibles)", "Check all (visible)"),
-    ("Tout décocher (visibles)", "Uncheck all (visible)"),
-    ("Enregistrer le filtre", "Save filter"),
+    ('<title>HYCU · Kubernetes sur Nutanix</title>', '<title>HYCU · Kubernetes on Nutanix</title>'),
+    ("Confirmer l'action réelle", 'Confirm the real action'),
+    ('Pour confirmer, retapez <b', 'To confirm, retype <b'),
+    ('>Annuler<', '>Cancel<'),
+    ('Confirmer en mode réel', 'Confirm in real mode'),
+    ('Configuration initiale', 'Initial setup'),
+    ('>Précédent<', '>Back<'),
+    ('Suivant', 'Next'),
+    ('Déverrouiller les connexions', 'Unlock saved connections'),
+    ("Un coffre d'identifiants chiffré a été trouvé. Saisissez la phrase secrète maîtresse", 'An encrypted credentials vault was found. Enter the master passphrase'),
+    ('pour reconnecter automatiquement HYCU / Nutanix.', 'to reconnect HYCU / Nutanix automatically.'),
+    ('Phrase secrète (≥ 8 caractères)', 'Passphrase (≥ 8 characters)'),
+    ('Phrase secrète', 'Passphrase'),
+    ('>Plus tard<', '>Later<'),
+    ('Déverrouiller', 'Unlock'),
+    ('Connexions rechargées : ', 'Connections reloaded: '),
+    ('Filtrer les namespaces', 'Filter namespaces'),
+    ('Toutes les namespaces (aucun filtre)', 'All namespaces (no filter)'),
+    ('Affiche toutes les namespaces, y compris celles créées plus tard.', 'Shows every namespace, including ones created later.'),
+    ('rechercher une namespace…', 'search for a namespace…'),
+    ('Tout cocher (visibles)', 'Check all (visible)'),
+    ('Tout décocher (visibles)', 'Uncheck all (visible)'),
+    ('Enregistrer le filtre', 'Save filter'),
     ('textContent="toutes"', 'textContent="all"'),
     ('" sélectionnée(s)"', '" selected"'),
     ('" · futures namespaces exclues (cochez « Toutes »)"', '" · future namespaces excluded (tick « All »)"'),
-    ("Aucune namespace ne correspond.", "No namespace matches."),
-    (" — impossible de charger la liste ; sauvegarde désactivée.",
-     " — could not load the list; saving disabled."),
+    ('Aucune namespace ne correspond.', 'No namespace matches.'),
+    (' — impossible de charger la liste ; sauvegarde désactivée.', ' — could not load the list; saving disabled.'),
     ("'kubectl indisponible'", "'kubectl unavailable'"),
     ("||'erreur'", "||'error'"),
-    # --- En-tête, bandeau simulation, navigation ---
-    ("Protection Kubernetes sur Nutanix", "Kubernetes Protection on Nutanix"),
-    ("Contexte kubectl détecté : <b>", "Detected kubectl context: <b>"),
+    ('Protection Kubernetes sur Nutanix', 'Kubernetes Protection on Nutanix'),
+    ('Contexte kubectl détecté : <b>', 'Detected kubectl context: <b>'),
     ('title="Afficher l\'interface en anglais">EN</button>', 'title="Passer en français / Switch to French">FR</button>'),
     ('const PAGE_LANG="fr"', 'const PAGE_LANG="en"'),
-    ("⚠ hors liste autorisée", "⚠ not in allowed list"),
-    ("Mode simulation activé", "Simulation mode on"),
-    (" — aucune commande destructive n'est exécutée.", " — no destructive command is executed."),
-    ("Désactivez-le seulement quand vous êtes prêt à agir réellement.",
-     "Turn it off only when you are ready to act for real."),
+    ('⚠ hors liste autorisée', '⚠ not in allowed list'),
+    ('Mode simulation activé', 'Simulation mode on'),
+    (" — aucune commande destructive n'est exécutée.", ' — no destructive command is executed.'),
+    ('Désactivez-le seulement quand vous êtes prêt à agir réellement.', 'Turn it off only when you are ready to act for real.'),
     ('"MODE RÉEL — les commandes seront exécutées"', '"REAL MODE — commands will be executed"'),
     ('aria-label="Sections de l\'outil"', 'aria-label="Tool sections"'),
-]
-
-# --- Onglet Sauvegarder (HTML + JS) et protection HYCU ---
-I18N_EN += [
     ("Sauvegarder les volumes d'un namespace", "Back up a namespace's volumes"),
-    ("Exporte et nettoie automatiquement tous les PV et PVC du namespace.",
-     "Automatically exports and cleans all PVs and PVCs in the namespace."),
-    ("Équivaut aux boucles kubectl + nettoyage manuel des manifestes.",
-     "Equivalent to the kubectl loops + manual manifest cleanup."),
+    ('Exporte et nettoie automatiquement tous les PV et PVC du namespace.', 'Automatically exports and cleans all PVs and PVCs in the namespace.'),
+    ('Équivaut aux boucles kubectl + nettoyage manuel des manifestes.', 'Equivalent to the kubectl loops + manual manifest cleanup.'),
     ('title="Filtrer la liste des namespaces"', 'title="Filter the namespace list"'),
-    (">✎ Filtrer<", ">✎ Filter<"),
-    ("Sauvegarder ce namespace", "Back up this namespace"),
-    ("Sauvegarder tous les namespaces autorisés par le filtre (tous si aucun filtre)",
-     "Back up all namespaces allowed by the filter (all if no filter)"),
-    ("Sauvegarder tous (filtrés)", "Back up all (filtered)"),
-    ("Dossier de destination (optionnel)", "Destination folder (optional)"),
-    ("Vide = hycu-backups/ (à côté du programme). Ex. D:\\sauvegardes\\hycu  ou  /mnt/backups",
-     "Empty = hycu-backups/ (next to the program). E.g. D:\\backups\\hycu  or  /mnt/backups"),
-    ("Chemin sur la machine qui exécute l'outil. Le sous-dossier &lt;namespace&gt;/&lt;horodatage&gt; est créé automatiquement.",
-     "Path on the machine running the tool. The &lt;namespace&gt;/&lt;timestamp&gt; subfolder is created automatically."),
-    ("Protéger les données dans HYCU", "Protect the data in HYCU"),
-    ("L'export ci-dessus ne sauvegarde que les <b>manifestes</b> (la « recette » du restore).",
-     "The export above only saves the <b>manifests</b> (the restore “recipe”)."),
-    ("Les <b>données</b> vivent dans les Volume Groups Nutanix : seul HYCU les sauvegarde réellement.",
-     "The <b>data</b> lives in Nutanix Volume Groups: only HYCU actually backs it up."),
-    ("Ici, on associe les PVC du namespace aux Volume Groups HYCU, on assigne une politique, et on lance",
-     "Here we match the namespace's PVCs to HYCU Volume Groups, assign a policy, and trigger"),
-    ("une sauvegarde.</p>", "a backup.</p>"),
-    ("Enregistrez la source HYCU (⚙ en haut à droite) pour activer cette section.",
-     "Register the HYCU source (⚙ at the top right) to enable this section."),
-    ("Analyser la correspondance PVC ↔ Volume Group HYCU", "Analyze the PVC ↔ HYCU Volume Group mapping"),
-    ("Politique HYCU à assigner (optionnel)", "HYCU policy to assign (optional)"),
-    ("Sauvegarde complète (forceFull)", "Full backup (forceFull)"),
-    ("Assigner + sauvegarder maintenant", "Assign + back up now"),
-    ("</span>Sauvegarde…", "</span>Backing up…"),
-    (" volume(s) sauvegardé(s) dans", " volume(s) backed up to"),
-    (" ressource(s) de config (Deployments, Services, Secrets…)",
-     " config resource(s) (Deployments, Services, Secrets…)"),
-    ("(IQN détecté)", "(IQN detected)"),
-    ("⚠ Récupérez cette sauvegarde <b>hors du cluster</b> via ⬇ Télécharger (.zip) — ou copiez le dossier vers un autre stockage : c'est votre filet de sécurité en cas de sinistre.",
-     "⚠ Get this backup <b>off the cluster</b> via ⬇ Download (.zip) — or copy the folder to other storage: it is your safety net in a disaster."),
-    ("⚠ Récupérez ces sauvegardes <b>hors du cluster</b> via ⬇ Télécharger — ou copiez les dossiers vers un autre stockage : c'est votre filet de sécurité en cas de sinistre.",
-     "⚠ Get these backups <b>off the cluster</b> via ⬇ Download — or copy the folders to other storage: it is your safety net in a disaster."),
+    ('>✎ Filtrer<', '>✎ Filter<'),
+    ('Sauvegarder ce namespace', 'Back up this namespace'),
+    ('Sauvegarder tous les namespaces autorisés par le filtre (tous si aucun filtre)', 'Back up all namespaces allowed by the filter (all if no filter)'),
+    ('Sauvegarder tous (filtrés)', 'Back up all (filtered)'),
+    ('Dossier de destination (optionnel)', 'Destination folder (optional)'),
+    ('Vide = hycu-backups/ (à côté du programme). Ex. D:\\sauvegardes\\hycu  ou  /mnt/backups', 'Empty = hycu-backups/ (next to the program). E.g. D:\\backups\\hycu  or  /mnt/backups'),
+    ("Chemin sur la machine qui exécute l'outil. Le sous-dossier &lt;namespace&gt;/&lt;horodatage&gt; est créé automatiquement.", 'Path on the machine running the tool. The &lt;namespace&gt;/&lt;timestamp&gt; subfolder is created automatically.'),
+    ('Protéger les données dans HYCU', 'Protect the data in HYCU'),
+    ("L'export ci-dessus ne sauvegarde que les <b>manifestes</b> (la « recette » du restore).", 'The export above only saves the <b>manifests</b> (the restore “recipe”).'),
+    ('Les <b>données</b> vivent dans les Volume Groups Nutanix : seul HYCU les sauvegarde réellement.', 'The <b>data</b> lives in Nutanix Volume Groups: only HYCU actually backs it up.'),
+    ('Ici, on associe les PVC du namespace aux Volume Groups HYCU, on assigne une politique, et on lance', "Here we match the namespace's PVCs to HYCU Volume Groups, assign a policy, and trigger"),
+    ('une sauvegarde.</p>', 'a backup.</p>'),
+    ('Enregistrez la source HYCU (⚙ en haut à droite) pour activer cette section.', 'Register the HYCU source (⚙ at the top right) to enable this section.'),
+    ('Analyser la correspondance PVC ↔ Volume Group HYCU', 'Analyze the PVC ↔ HYCU Volume Group mapping'),
+    ('Politique HYCU à assigner (optionnel)', 'HYCU policy to assign (optional)'),
+    ('Sauvegarde complète (forceFull)', 'Full backup (forceFull)'),
+    ('Assigner + sauvegarder maintenant', 'Assign + back up now'),
+    ('</span>Sauvegarde…', '</span>Backing up…'),
+    (' volume(s) sauvegardé(s) dans', ' volume(s) backed up to'),
+    (' ressource(s) de config (Deployments, Services, Secrets…)', ' config resource(s) (Deployments, Services, Secrets…)'),
+    ('(IQN détecté)', '(IQN detected)'),
+    ("⚠ Récupérez cette sauvegarde <b>hors du cluster</b> via ⬇ Télécharger (.zip) — ou copiez le dossier vers un autre stockage : c'est votre filet de sécurité en cas de sinistre.", '⚠ Get this backup <b>off the cluster</b> via ⬇ Download (.zip) — or copy the folder to other storage: it is your safety net in a disaster.'),
+    ("⚠ Récupérez ces sauvegardes <b>hors du cluster</b> via ⬇ Télécharger — ou copiez les dossiers vers un autre stockage : c'est votre filet de sécurité en cas de sinistre.", '⚠ Get these backups <b>off the cluster</b> via ⬇ Download — or copy the folders to other storage: it is your safety net in a disaster.'),
     ("'Tout télécharger (.zip)'", "'Download all (.zip)'"),
     ("'Télécharger (.zip)'", "'Download (.zip)'"),
-    ("⬇ Télécharger (.zip)", "⬇ Download (.zip)"),
+    ('⬇ Télécharger (.zip)', '⬇ Download (.zip)'),
     ("'Télécharger'", "'Download'"),
-    (" — aucun PVC (ignoré)", " — no PVC (skipped)"),
+    (' — aucun PVC (ignoré)', ' — no PVC (skipped)'),
     ("||'échec'", "||'failed'"),
-    (" namespace(s) sauvegardé(s) · ", " namespace(s) backed up · "),
-    (" volume(s) au total ", " volume(s) in total "),
+    (' namespace(s) sauvegardé(s) · ', ' namespace(s) backed up · '),
+    (' volume(s) au total ', ' volume(s) in total '),
     ('"namespaces du filtre"', '"namespaces in the filter"'),
     ('"tous les namespaces du cluster"', '"all cluster namespaces"'),
-    ("Mode simulation (bandeau du haut) : montre les appels HYCU.",
-     "Simulation mode (banner at top): shows the HYCU calls."),
-    ("Mode réel : exécute sur HYCU.", "Real mode: executes on HYCU."),
-    ("Cochez au moins un Volume Group (les correspondances « par nom » doivent être confirmées).",
-     "Check at least one Volume Group (“by name” matches must be confirmed)."),
-    ("Protection HYCU RÉELLE", "REAL HYCU protection"),
-    ("Assigner la politique puis <b>sauvegarder</b>", "Assign the policy then <b>back up</b>"),
+    ('Mode simulation (bandeau du haut) : montre les appels HYCU.', 'Simulation mode (banner at top): shows the HYCU calls.'),
+    ('Mode réel : exécute sur HYCU.', 'Real mode: executes on HYCU.'),
+    ('Cochez au moins un Volume Group (les correspondances « par nom » doivent être confirmées).', 'Check at least one Volume Group (“by name” matches must be confirmed).'),
+    ('Protection HYCU RÉELLE', 'REAL HYCU protection'),
+    ('Assigner la politique puis <b>sauvegarder</b>', 'Assign the policy then <b>back up</b>'),
     (':"<b>Sauvegarder</b>")', ':"<b>Back up</b>")'),
     ('" ces Volume Groups :"', '" these Volume Groups:"'),
-    ("Simulation — appels qui seraient envoyés à HYCU :", "Simulation — calls that would be sent to HYCU:"),
-    ("Politique assignée / sauvegarde HYCU déclenchée.", "Policy assigned / HYCU backup triggered."),
-    ("Échec — voir le détail.", "Failed — see details."),
-    ("par nom — à confirmer", "by name — to be confirmed"),
-    ("ambigu : plusieurs Volume Groups correspondent — vérifiez dans HYCU",
-     "ambiguous: several Volume Groups match — check in HYCU"),
-    ("aucun Volume Group HYCU trouvé", "no HYCU Volume Group found"),
-    (">conforme<", ">compliant<"),
-    (">non conforme<", ">non-compliant<"),
-    (">à sauvegarder<", ">to back up<"),
-    (">non protégé<", ">not protected<"),
-    ("· politique : <b>", "· policy: <b>"),
-    ("· backups : ", "· backups: "),
+    ('Simulation — appels qui seraient envoyés à HYCU :', 'Simulation — calls that would be sent to HYCU:'),
+    ('Politique assignée / sauvegarde HYCU déclenchée.', 'Policy assigned / HYCU backup triggered.'),
+    ('Échec — voir le détail.', 'Failed — see details.'),
+    ('par nom — à confirmer', 'by name — to be confirmed'),
+    ('ambigu : plusieurs Volume Groups correspondent — vérifiez dans HYCU', 'ambiguous: several Volume Groups match — check in HYCU'),
+    ('aucun Volume Group HYCU trouvé', 'no HYCU Volume Group found'),
+    ('>conforme<', '>compliant<'),
+    ('>non conforme<', '>non-compliant<'),
+    ('>à sauvegarder<', '>to back up<'),
+    ('>non protégé<', '>not protected<'),
+    ('· politique : <b>', '· policy: <b>'),
+    ('· backups : ', '· backups: '),
     ("?'oui':'non'", "?'yes':'no'"),
-    ("Aucun PVC dans ce namespace.", "No PVC in this namespace."),
-    (" par nom (à confirmer) · ", " by name (to confirm) · "),
-    (" ambigu(s) · ", " ambiguous · "),
-    (" non trouvé(s)", " not found"),
-    ("(ne pas changer la politique)", "(do not change the policy)"),
-    ("Analyse en cours…", "Analyzing…"),
-]
-
-# --- Onglet Restaurer : HTML statique + guides de flux ---
-I18N_EN += [
-    (">2 · Configurer<", ">2 · Configure<"),
-    (">3 · Lancer<", ">3 · Launch<"),
-    ("Choisir le namespace et les volumes", "Choose the namespace and volumes"),
-    ("Lire les sauvegardes depuis un dossier personnalisé", "Read backups from a custom folder"),
-    ("Ex. D:\\sauvegardes\\hycu  ou  /mnt/backups  (dossier contenant &lt;namespace&gt;/&lt;horodatage&gt;/)",
-     "E.g. D:\\backups\\hycu  or  /mnt/backups  (folder containing &lt;namespace&gt;/&lt;timestamp&gt;/)"),
-    ("Les sauvegardes lues (et utilisées pour la restauration) seront cherchées ici, au lieu de <code>hycu-backups/</code>.",
-     "Backups will be read (and used for the restore) from here instead of <code>hycu-backups/</code>."),
-    ("Sauvegarde de configuration à restaurer", "Configuration backup to restore"),
-    (">Clone (nouveau VG)<", ">Clone (new VG)<"),
-    (">Restauration sur place<", ">Restore in place<"),
-    ("Que faire du clone ?", "What to do with the clone?"),
-    (">Rattacher à l'app existante<", ">Reattach to the existing app<"),
-    (">Cloner l'application<", ">Clone the application<"),
-    ("Cible du clone d'application", "Application clone target"),
-    (">Même namespace (suffixe)<", ">Same namespace (suffix)<"),
-    (">Autre namespace<", ">Other namespace<"),
-    ("Suffixe appliqué aux copies", "Suffix applied to the copies"),
-    ("Namespace cible", "Target namespace"),
-    ("Cloner aussi les dépendances (Secrets, ConfigMaps, ServiceAccount, Services qui ciblent l'app)",
-     "Also clone the dependencies (Secrets, ConfigMaps, ServiceAccount, Services targeting the app)"),
-    ("— nécessaire pour que les pods démarrent dans l'autre namespace",
-     "— required for the pods to start in the other namespace"),
-    ("Restauration sur place orchestrée", "Orchestrated in-place restore"),
-    ("Lancer la restauration sur place", "Launch the in-place restore"),
-    ("Vérifier puis lancer", "Review then launch"),
-    ("Vérifiez les remplacements dérivés et la séquence, puis lancez.",
-     "Review the derived replacements and the sequence, then launch."),
-    ("Séquence prévue", "Planned sequence"),
-    ("Confirmation du contexte cible (mode réel)", "Target context confirmation (real mode)"),
-    ("retapez le nom du contexte kubectl", "retype the kubectl context name"),
-    ("Lancer la restauration", "Launch the restore"),
-    # Guides de flux (lignes complètes, remplacées avant les fragments plus courts)
-]
-
-# --- Onglet Restaurer : JS (volumes, orchestration HYCU, in-place, clone d'app) ---
-I18N_EN += [
-    (" (la plus récente)", " (most recent)"),
+    ('Aucun PVC dans ce namespace.', 'No PVC in this namespace.'),
+    (' par nom (à confirmer) · ', ' by name (to confirm) · '),
+    (' ambigu(s) · ', ' ambiguous · '),
+    (' non trouvé(s)', ' not found'),
+    ('(ne pas changer la politique)', '(do not change the policy)'),
+    ('Analyse en cours…', 'Analyzing…'),
+    ('>2 · Configurer<', '>2 · Configure<'),
+    ('>3 · Lancer<', '>3 · Launch<'),
+    ('Choisir le namespace et les volumes', 'Choose the namespace and volumes'),
+    ('Lire les sauvegardes depuis un dossier personnalisé', 'Read backups from a custom folder'),
+    ('Ex. D:\\sauvegardes\\hycu  ou  /mnt/backups  (dossier contenant &lt;namespace&gt;/&lt;horodatage&gt;/)', 'E.g. D:\\backups\\hycu  or  /mnt/backups  (folder containing &lt;namespace&gt;/&lt;timestamp&gt;/)'),
+    ('Les sauvegardes lues (et utilisées pour la restauration) seront cherchées ici, au lieu de <code>hycu-backups/</code>.', 'Backups will be read (and used for the restore) from here instead of <code>hycu-backups/</code>.'),
+    ('Sauvegarde de configuration à restaurer', 'Configuration backup to restore'),
+    ('>Clone (nouveau VG)<', '>Clone (new VG)<'),
+    ('>Restauration sur place<', '>Restore in place<'),
+    ('Que faire du clone ?', 'What to do with the clone?'),
+    (">Rattacher à l'app existante<", '>Reattach to the existing app<'),
+    (">Cloner l'application<", '>Clone the application<'),
+    ("Cible du clone d'application", 'Application clone target'),
+    ('>Même namespace (suffixe)<', '>Same namespace (suffix)<'),
+    ('>Autre namespace<', '>Other namespace<'),
+    ('Suffixe appliqué aux copies', 'Suffix applied to the copies'),
+    ('Namespace cible', 'Target namespace'),
+    ("Cloner aussi les dépendances (Secrets, ConfigMaps, ServiceAccount, Services qui ciblent l'app)", 'Also clone the dependencies (Secrets, ConfigMaps, ServiceAccount, Services targeting the app)'),
+    ("— nécessaire pour que les pods démarrent dans l'autre namespace", '— required for the pods to start in the other namespace'),
+    ('Restauration sur place orchestrée', 'Orchestrated in-place restore'),
+    ('Lancer la restauration sur place', 'Launch the in-place restore'),
+    ('Vérifier puis lancer', 'Review then launch'),
+    ('Vérifiez les remplacements dérivés et la séquence, puis lancez.', 'Review the derived replacements and the sequence, then launch.'),
+    ('Séquence prévue', 'Planned sequence'),
+    ('Confirmation du contexte cible (mode réel)', 'Target context confirmation (real mode)'),
+    ('retapez le nom du contexte kubectl', 'retype the kubectl context name'),
+    ('Lancer la restauration', 'Launch the restore'),
+    (' (la plus récente)', ' (most recent)'),
     ('"dossier personnalisé"', '"custom folder"'),
     ('"sauvegarde (dossier perso)"', '"backup (custom folder)"'),
     ('"dernière sauvegarde"', '"latest backup"'),
     ('"sauvegarde choisie"', '"selected backup"'),
     ('phase:"sauvegardé"', 'phase:"backed up"'),
-    ("Aucun volume. Sauvegardez d'abord la configuration de cette application (Applications → Sauvegarder).",
-     "No volume. First back up this application's configuration (Applications → Back up)."),
-    ("· source : ", "· source: "),
-    ("Rechercher le VG dans Prism", "Search for the VG in Prism"),
-    ("(UUID du VG, ou NutanixVolumes-&lt;uuid&gt;, ou IQN legacy)", "(VG UUID, or NutanixVolumes-&lt;uuid&gt;, or legacy IQN)"),
-    ("Recherche du Volume Group HYCU…", "Searching for the HYCU Volume Group…"),
+    ("Aucun volume. Sauvegardez d'abord la configuration de cette application (Applications → Sauvegarder).", "No volume. First back up this application's configuration (Applications → Back up)."),
+    ('· source : ', '· source: '),
+    ('Rechercher le VG dans Prism', 'Search for the VG in Prism'),
+    ('(UUID du VG, ou NutanixVolumes-&lt;uuid&gt;, ou IQN legacy)', '(VG UUID, or NutanixVolumes-&lt;uuid&gt;, or legacy IQN)'),
+    ('Recherche du Volume Group HYCU…', 'Searching for the HYCU Volume Group…'),
     ("(correspondance '", "(match '"),
     ("' — à vérifier)<", "' — to verify)<"),
     ('placeholder="auto-détecté"', 'placeholder="auto-detected"'),
-    ("Point de restauration", "Restore point"),
-    ("Nom du VG cloné", "Cloned VG name"),
-    ("Simulation — appel HYCU qui serait envoyé :", "Simulation — HYCU call that would be sent:"),
-    (" volume(s) prêt(s)", " volume(s) ready"),
+    ('Point de restauration', 'Restore point'),
+    ('Nom du VG cloné', 'Cloned VG name'),
+    ('Simulation — appel HYCU qui serait envoyé :', 'Simulation — HYCU call that would be sent:'),
+    (' volume(s) prêt(s)', ' volume(s) ready'),
     ('" · MODE RÉEL"', '" · REAL MODE"'),
-    ("Sélectionnez un point de restauration par volume.", "Select a restore point for each volume."),
-    ("Restauration SUR PLACE RÉELLE", "REAL IN-PLACE restore"),
+    ('Sélectionnez un point de restauration par volume.', 'Select a restore point for each volume.'),
+    ('Restauration SUR PLACE RÉELLE', 'REAL IN-PLACE restore'),
     ('"Namespace : <b>"', '"Namespace: <b>"'),
-    ("L'application sera <b>ARRÊTÉE</b>, les volumes restaurés <b>in-place</b> dans HYCU (données écrasées par le point choisi), puis l'application <b>REDÉMARRÉE</b>.",
-     "The application will be <b>STOPPED</b>, the volumes restored <b>in-place</b> in HYCU (data overwritten by the chosen point), then the application <b>RESTARTED</b>."),
-    ("</span>Orchestration…", "</span>Orchestrating…"),
-    ("</span> Démarrage…", "</span> Starting…"),
-    ("</span> Orchestration en cours…", "</span> Orchestration in progress…"),
-    ("Simulation — séquence et appels HYCU qui seraient exécutés.",
-     "Simulation — sequence and HYCU calls that would be executed."),
-    (r"<b>Séquence interrompue</b> — l\'application est restée arrêtée. Voir le détail.",
-     r"<b>Sequence aborted</b> — the application was left stopped. See details."),
-    ("Restauration sur place terminée.", "In-place restore complete."),
-    ("Des étapes ont échoué — voir le détail.", "Some steps failed — see details."),
-    (">Des étapes ont échoué.<", ">Some steps failed.<"),
-]
-
-# --- Onglet Restaurer : plan, clone d'app, lancement · Vérifier · Réglages ---
-I18N_EN += [
-    ("Aperçu prêt. Vérifiez ci-dessous, puis cliquez « <b>Lancer le clone de l'application (réel)</b> » en bas pour créer la copie.",
-     "Preview ready. Review below, then click “<b>Launch the application clone (real)</b>” at the bottom to create the copy."),
-    ("L'application d'origine n'est pas touchée.", "The original application is untouched."),
-    ("Clone d'application → namespace <b>", "Application clone → namespace <b>"),
+    ("L'application sera <b>ARRÊTÉE</b>, les volumes restaurés <b>in-place</b> dans HYCU (données écrasées par le point choisi), puis l'application <b>REDÉMARRÉE</b>.", 'The application will be <b>STOPPED</b>, the volumes restored <b>in-place</b> in HYCU (data overwritten by the chosen point), then the application <b>RESTARTED</b>.'),
+    ('</span>Orchestration…', '</span>Orchestrating…'),
+    ('</span> Démarrage…', '</span> Starting…'),
+    ('</span> Orchestration en cours…', '</span> Orchestration in progress…'),
+    ('Simulation — séquence et appels HYCU qui seraient exécutés.', 'Simulation — sequence and HYCU calls that would be executed.'),
+    ("<b>Séquence interrompue</b> — l\\'application est restée arrêtée. Voir le détail.", '<b>Sequence aborted</b> — the application was left stopped. See details.'),
+    ('Restauration sur place terminée.', 'In-place restore complete.'),
+    ('Des étapes ont échoué — voir le détail.', 'Some steps failed — see details.'),
+    ('>Des étapes ont échoué.<', '>Some steps failed.<'),
+    ("Aperçu prêt. Vérifiez ci-dessous, puis cliquez « <b>Lancer le clone de l'application (réel)</b> » en bas pour créer la copie.", 'Preview ready. Review below, then click “<b>Launch the application clone (real)</b>” at the bottom to create the copy.'),
+    ("L'application d'origine n'est pas touchée.", 'The original application is untouched.'),
+    ("Clone d'application → namespace <b>", 'Application clone → namespace <b>'),
     ("'(même namespace, suffixe)':'(autre namespace)'", "'(same namespace, suffix)':'(other namespace)'"),
-    (">PV créés</span>", ">PVs created</span>"),
-    (">PVC créés</span>", ">PVCs created</span>"),
-    (">Applications clonées</span>", ">Cloned applications</span>"),
-    (">Dépendances clonées</span>", ">Cloned dependencies</span>"),
+    ('>PV créés</span>', '>PVs created</span>'),
+    ('>PVC créés</span>', '>PVCs created</span>'),
+    ('>Applications clonées</span>', '>Cloned applications</span>'),
+    ('>Dépendances clonées</span>', '>Cloned dependencies</span>'),
     ("||'aucune'", "||'none'"),
     ('||"aucune"', '||"none"'),
-    ("Voir les manifestes des applications clonées", "View the cloned applications' manifests"),
-    (r"<li>Créer le namespace cible (si « autre »)</li><li>Créer les PV/PVC clonés (sur le VG cloné)</li><li>Créer les applications clonées (elles démarrent automatiquement)</li><li>L\'application d\'origine n\'est PAS modifiée ni arrêtée</li>",
-     r"<li>Create the target namespace (if “other”)</li><li>Create the cloned PVs/PVCs (on the cloned VG)</li><li>Create the cloned applications (they start automatically)</li><li>The original application is NOT modified or stopped</li>"),
-    ("Cochez au moins un PVC.", "Tick at least one PVC."),
-    ("Indiquez le namespace cible.", "Provide the target namespace."),
-    ("Aucun changement de chaîne.", "No string change."),
-    ("volumeHandle dérivé", "derived volumeHandle"),
-    ("Voir le manifeste complet du nouveau PV", "View the full manifest of the new PV"),
-    ("Corrigez les volumes en erreur avant de lancer.", "Fix the volumes in error before launching."),
-    ('"Mode réel : ces opérations seront exécutées sur le cluster."',
-     '"Real mode: these operations will be executed on the cluster."'),
+    ('Voir les manifestes des applications clonées', "View the cloned applications' manifests"),
+    ("<li>Créer le namespace cible (si « autre »)</li><li>Créer les PV/PVC clonés (sur le VG cloné)</li><li>Créer les applications clonées (elles démarrent automatiquement)</li><li>L\\'application d\\'origine n\\'est PAS modifiée ni arrêtée</li>", '<li>Create the target namespace (if “other”)</li><li>Create the cloned PVs/PVCs (on the cloned VG)</li><li>Create the cloned applications (they start automatically)</li><li>The original application is NOT modified or stopped</li>'),
+    ('Cochez au moins un PVC.', 'Tick at least one PVC.'),
+    ('Indiquez le namespace cible.', 'Provide the target namespace.'),
+    ('Aucun changement de chaîne.', 'No string change.'),
+    ('volumeHandle dérivé', 'derived volumeHandle'),
+    ('Voir le manifeste complet du nouveau PV', 'View the full manifest of the new PV'),
+    ('Corrigez les volumes en erreur avant de lancer.', 'Fix the volumes in error before launching.'),
+    ('"Mode réel : ces opérations seront exécutées sur le cluster."', '"Real mode: these operations will be executed on the cluster."'),
     ('"Mode simulation : rien ne sera modifié."', '"Simulation mode: nothing will be changed."'),
     ('"la restauration sur place (flux manuel)"', '"the in-place restore (manual flow)"'),
     ('"le clone de l\'application"', '"the application clone"'),
     ('= "le clone";', '= "the clone";'),
     ('"Lancer " : "Simuler "', '"Launch " : "Simulate "'),
     ('" (réel)"', '" (real)"'),
-    ("Clone d'application RÉEL", "REAL application clone"),
-    ("Une <b>COPIE</b> de l'application sera créée", "A <b>COPY</b> of the application will be created"),
+    ("Clone d'application RÉEL", 'REAL application clone'),
+    ("Une <b>COPIE</b> de l'application sera créée", 'A <b>COPY</b> of the application will be created'),
     ('" dans le <b>même namespace</b> (avec suffixe)"', '" in the <b>same namespace</b> (with a suffix)"'),
     ('" dans le namespace cible <b>"', '" in the target namespace <b>"'),
-    ("L'application d'origine n'est <b>PAS</b> modifiée ni arrêtée.",
-     "The original application is <b>NOT</b> modified or stopped."),
-    ("</span> Clonage en cours…", "</span> Cloning in progress…"),
-    (r"Simulation — ressources qui seraient créées (l\'app d\'origine reste intacte).",
-     r"Simulation — resources that would be created (the original app stays intact)."),
-    (r"Clone d\'application créé. L\'application d\'origine est intacte.",
-     r"Application clone created. The original application is intact."),
-    ("Restauration RÉELLE", "REAL restore"),
-    ("L'application sera <b>arrêtée</b>, les anciens PVC/PV <b>supprimés</b> puis recréés sur le(s) Volume Group(s) restauré(s).",
-     "The application will be <b>stopped</b>, the old PVCs/PVs <b>deleted</b> then recreated on the restored Volume Group(s)."),
-    ("</span>Exécution…", "</span>Executing…"),
-    ("</span> Exécution en cours…", "</span> Execution in progress…"),
-    ("Simulation terminée — voici ce qui serait exécuté en mode réel.",
-     "Simulation complete — here is what would be executed in real mode."),
-    (r"<b>Séquence interrompue</b> — l\'application est restée arrêtée pour éviter un redémarrage incohérent. Voir le détail.",
-     r"<b>Sequence aborted</b> — the application was left stopped to avoid an inconsistent restart. See details."),
-    ("Restauration terminée.", "Restore complete."),
-    ("Des étapes ont échoué — voir ci-dessous.", "Some steps failed — see below."),
-    ("⚠ <b>Re-protection HYCU requise.</b> Le(s) Volume Group(s) cloné(s) ci-dessous",
-     "⚠ <b>HYCU re-protection required.</b> The cloned Volume Group(s) below"),
-    ("ne sont <b>pas encore protégés</b> par HYCU (la politique de l'app pointait l'ancien VG).",
-     "are <b>not yet protected</b> by HYCU (the app's policy pointed at the old VG)."),
-    ("Re-protéger maintenant dans HYCU", "Re-protect now in HYCU"),
-    # Vérifier
+    ("L'application d'origine n'est <b>PAS</b> modifiée ni arrêtée.", 'The original application is <b>NOT</b> modified or stopped.'),
+    ('</span> Clonage en cours…', '</span> Cloning in progress…'),
+    ("Simulation — ressources qui seraient créées (l\\'app d\\'origine reste intacte).", 'Simulation — resources that would be created (the original app stays intact).'),
+    ("Clone d\\'application créé. L\\'application d\\'origine est intacte.", 'Application clone created. The original application is intact.'),
+    ('Restauration RÉELLE', 'REAL restore'),
+    ("L'application sera <b>arrêtée</b>, les anciens PVC/PV <b>supprimés</b> puis recréés sur le(s) Volume Group(s) restauré(s).", 'The application will be <b>stopped</b>, the old PVCs/PVs <b>deleted</b> then recreated on the restored Volume Group(s).'),
+    ('</span>Exécution…', '</span>Executing…'),
+    ('</span> Exécution en cours…', '</span> Execution in progress…'),
+    ('Simulation terminée — voici ce qui serait exécuté en mode réel.', 'Simulation complete — here is what would be executed in real mode.'),
+    ("<b>Séquence interrompue</b> — l\\'application est restée arrêtée pour éviter un redémarrage incohérent. Voir le détail.", '<b>Sequence aborted</b> — the application was left stopped to avoid an inconsistent restart. See details.'),
+    ('Restauration terminée.', 'Restore complete.'),
+    ('Des étapes ont échoué — voir ci-dessous.', 'Some steps failed — see below.'),
+    ('⚠ <b>Re-protection HYCU requise.</b> Le(s) Volume Group(s) cloné(s) ci-dessous', '⚠ <b>HYCU re-protection required.</b> The cloned Volume Group(s) below'),
+    ("ne sont <b>pas encore protégés</b> par HYCU (la politique de l'app pointait l'ancien VG).", "are <b>not yet protected</b> by HYCU (the app's policy pointed at the old VG)."),
+    ('Re-protéger maintenant dans HYCU', 'Re-protect now in HYCU'),
     ("Vérifier l'état d'un namespace", "Verify a namespace's state"),
-    ("Confirme que les PVC sont liés (Bound) et que les pods tournent.",
-     "Confirms that the PVCs are Bound and the pods are running."),
-    (">Vérifier<", ">Verify<"),
-    ("Rafraîchit la vérification toutes les ~3 s et s'arrête dès que tous les PVC sont Bound et les pods Running (10 min max) ; recliquez pour arrêter",
-     "Re-runs the check every ~3 s and stops as soon as all PVCs are Bound and pods are Running (10 min max); click again to stop"),
-    ("Suivi auto (jusqu'à stable)", "Auto-track (until stable)"),
-    ("■ Arrêter le suivi", "■ Stop tracking"),
-    ("État stable : tous les PVC sont Bound et les pods Running.",
-     "Stable state: all PVCs are Bound and pods are Running."),
-    (">Aucun PVC.<", ">No PVC.<"),
-    ("· prêts ", "· ready "),
-    (">Aucun pod.<", ">No pods.<"),
-    # Réglages
-    ("Choisissez explicitement le cluster, au lieu de suivre le contexte courant.",
-     "Choose the cluster explicitly instead of following the current context."),
-    ("L'outil ajoute <code>--context</code> (et <code>--kubeconfig</code>) à chaque commande kubectl.",
-     "The tool adds <code>--context</code> (and <code>--kubeconfig</code>) to every kubectl command."),
-    ("Fichier kubeconfig (vide = défaut ~/.kube/config)", "kubeconfig file (empty = default ~/.kube/config)"),
-    (">Contexte<", ">Context<"),
-    ("Lister les contextes", "List contexts"),
-    ("Utiliser ce contexte", "Use this context"),
-    ("Réglages (adaptation par client)", "Settings (per-customer adaptation)"),
-    ("Ces réglages sont enregistrés dans <code>hycu_config.json</code> à côté du programme.",
-     "These settings are saved in <code>hycu_config.json</code> next to the program."),
-    ("Laissez vide ce que vous ne voulez pas contraindre.", "Leave blank anything you don't want to constrain."),
-    ("Binaire kubectl", "kubectl binary"),
-    ("Préfixe volumeHandle (vide = auto)", "volumeHandle prefix (empty = auto)"),
-    ("Timeout d'attente (s)", "Wait timeout (s)"),
-    ("Suffixe de nom de clone", "Clone name suffix"),
-    ("Exiger la confirmation du contexte avant toute action réelle",
-     "Require context confirmation before any real action"),
-    ("Retirer entièrement claimRef du PV (laisser le PVC rebinder)",
-     "Strip claimRef entirely from the PV (let the PVC rebind)"),
-    ("Enregistrer les réglages", "Save settings"),
-    ("(contexte courant du kubeconfig)", "(current kubeconfig context)"),
-    (" contexte(s) trouvé(s)", " context(s) found"),
+    ('Confirme que les PVC sont liés (Bound) et que les pods tournent.', 'Confirms that the PVCs are Bound and the pods are running.'),
+    ('>Vérifier<', '>Verify<'),
+    ("Rafraîchit la vérification toutes les ~3 s et s'arrête dès que tous les PVC sont Bound et les pods Running (10 min max) ; recliquez pour arrêter", 'Re-runs the check every ~3 s and stops as soon as all PVCs are Bound and pods are Running (10 min max); click again to stop'),
+    ("Suivi auto (jusqu'à stable)", 'Auto-track (until stable)'),
+    ('■ Arrêter le suivi', '■ Stop tracking'),
+    ('État stable : tous les PVC sont Bound et les pods Running.', 'Stable state: all PVCs are Bound and pods are Running.'),
+    ('>Aucun PVC.<', '>No PVC.<'),
+    ('· prêts ', '· ready '),
+    ('>Aucun pod.<', '>No pods.<'),
+    ('Choisissez explicitement le cluster, au lieu de suivre le contexte courant.', 'Choose the cluster explicitly instead of following the current context.'),
+    ("L'outil ajoute <code>--context</code> (et <code>--kubeconfig</code>) à chaque commande kubectl.", 'The tool adds <code>--context</code> (and <code>--kubeconfig</code>) to every kubectl command.'),
+    ('Fichier kubeconfig (vide = défaut ~/.kube/config)', 'kubeconfig file (empty = default ~/.kube/config)'),
+    ('>Contexte<', '>Context<'),
+    ('Lister les contextes', 'List contexts'),
+    ('Utiliser ce contexte', 'Use this context'),
+    ('Réglages (adaptation par client)', 'Settings (per-customer adaptation)'),
+    ('Ces réglages sont enregistrés dans <code>hycu_config.json</code> à côté du programme.', 'These settings are saved in <code>hycu_config.json</code> next to the program.'),
+    ('Laissez vide ce que vous ne voulez pas contraindre.', "Leave blank anything you don't want to constrain."),
+    ('Binaire kubectl', 'kubectl binary'),
+    ('Préfixe volumeHandle (vide = auto)', 'volumeHandle prefix (empty = auto)'),
+    ("Timeout d'attente (s)", 'Wait timeout (s)'),
+    ('Suffixe de nom de clone', 'Clone name suffix'),
+    ('Exiger la confirmation du contexte avant toute action réelle', 'Require context confirmation before any real action'),
+    ('Retirer entièrement claimRef du PV (laisser le PVC rebinder)', 'Strip claimRef entirely from the PV (let the PVC rebind)'),
+    ('Enregistrer les réglages', 'Save settings'),
+    ('(contexte courant du kubeconfig)', '(current kubeconfig context)'),
+    (' contexte(s) trouvé(s)', ' context(s) found'),
     ('"Contexte « "', '"Context « "'),
     ('" » appliqué."', '" » applied."'),
     ('"Contexte courant utilisé."', '"Current context in use."'),
     ('"Enregistré."', '"Saved."'),
     ('"Erreur : "', '"Error: "'),
-]
-
-# --- Connexions, assistant (JS), bannière kubectl, coffre, VG picker, jobs ---
-I18N_EN += [
-    ("HYCU — connexion", "HYCU — connection"),
-    ("Pour lister les points de restauration et orchestrer le clone/restore d'un Volume Group",
-     "To list restore points and orchestrate the clone/restore of a Volume Group"),
-    ("depuis l'assistant de restauration (<b>Applications → Restaurer</b>). Les identifiants restent <b>en mémoire</b> le temps de la session — jamais écrits sur disque.",
-     "from the restore wizard (<b>Applications → Restore</b>). Credentials stay <b>in memory</b> for the session — never written to disk."),
-    ("URL HYCU (port 8443)", "HYCU URL (port 8443)"),
-    ("Authentification", "Authentication"),
-    (">Basic (utilisateur)<", ">Basic (user)<"),
-    (">Clé API<", ">API key<"),
-    (">Identifiant<", ">Username<"),
-    (">Mot de passe<", ">Password<"),
-    (">Clé API <", ">API key <"),
-    ("(HYCU : Aide → API Keys)", "(HYCU: Help → API Keys)"),
-    ("Vérifier le certificat TLS (décoché = certificat auto-signé accepté)",
-     "Verify the TLS certificate (unchecked = self-signed accepted)"),
-    ("Vérifier le certificat TLS", "Verify the TLS certificate"),
-    ("Tester &amp; connecter", "Test &amp; connect"),
-    (">Déconnecter<", ">Disconnect<"),
-    ("</span>non connecté", "</span>not connected"),
+    ('HYCU — connexion', 'HYCU — connection'),
+    ("Pour lister les points de restauration et orchestrer le clone/restore d'un Volume Group", 'To list restore points and orchestrate the clone/restore of a Volume Group'),
+    ("depuis l'assistant de restauration (<b>Applications → Restaurer</b>). Les identifiants restent <b>en mémoire</b> le temps de la session — jamais écrits sur disque.", 'from the restore wizard (<b>Applications → Restore</b>). Credentials stay <b>in memory</b> for the session — never written to disk.'),
+    ('URL HYCU (port 8443)', 'HYCU URL (port 8443)'),
+    ('Authentification', 'Authentication'),
+    ('>Basic (utilisateur)<', '>Basic (user)<'),
+    ('>Clé API<', '>API key<'),
+    ('>Identifiant<', '>Username<'),
+    ('>Mot de passe<', '>Password<'),
+    ('>Clé API <', '>API key <'),
+    ('(HYCU : Aide → API Keys)', '(HYCU: Help → API Keys)'),
+    ('Vérifier le certificat TLS (décoché = certificat auto-signé accepté)', 'Verify the TLS certificate (unchecked = self-signed accepted)'),
+    ('Vérifier le certificat TLS', 'Verify the TLS certificate'),
+    ('Tester &amp; connecter', 'Test &amp; connect'),
+    ('>Déconnecter<', '>Disconnect<'),
+    ('</span>non connecté', '</span>not connected'),
     ('?"connecté":"non connecté"', '?"connected":"not connected"'),
-    ("Nutanix Prism Element — connexion", "Nutanix Prism Element — connection"),
-    ("Récupère automatiquement la référence (UUID) du Volume Group cloné (lecture seule, API v2)",
-     "Automatically fetches the cloned Volume Group's reference (UUID) (read-only, API v2)"),
-    ("dans l'assistant de restauration. Identifiants en mémoire de session uniquement.",
-     "in the restore wizard. Credentials kept in session memory only."),
-    ("URL Prism Element", "Prism Element URL"),
-    ("Nutanix Prism Central — connexion", "Nutanix Prism Central — connection"),
-    ("Alternative multi-cluster (API v3). Sert aussi à récupérer la référence (UUID) du Volume Group",
-     "Multi-cluster alternative (API v3). Also used to fetch the reference (UUID) of the Volume Group"),
-    ("cloné si vous n'utilisez pas Prism Element. Identifiants en mémoire de session uniquement.",
-     "cloned if you do not use Prism Element. Credentials kept in session memory only."),
-    ("URL Prism Central", "Prism Central URL"),
-    ("exemple.com", "example.com"),
-    ("Mémoriser les connexions (chiffré)", "Remember connections (encrypted)"),
-    ("(<code>hycu_secrets.enc</code>), protégé par une <b>phrase secrète maîtresse</b> — jamais stockée.",
-     "(<code>hycu_secrets.enc</code>), protected by a <b>master passphrase</b> — never stored."),
-    ("Par défaut, rien n'est écrit (RAM seulement), le choix le plus sûr.",
-     "By default nothing is written (RAM only), the safest choice."),
-    ("Enregistrer (chiffrer)", "Save (encrypt)"),
-    ("Charger (déchiffrer)", "Load (decrypt)"),
-    (">Oublier<", ">Forget<"),
-    ("</span>aucun coffre", "</span>no vault"),
+    ('Nutanix Prism Element — connexion', 'Nutanix Prism Element — connection'),
+    ('Récupère automatiquement la référence (UUID) du Volume Group cloné (lecture seule, API v2)', "Automatically fetches the cloned Volume Group's reference (UUID) (read-only, API v2)"),
+    ("dans l'assistant de restauration. Identifiants en mémoire de session uniquement.", 'in the restore wizard. Credentials kept in session memory only.'),
+    ('URL Prism Element', 'Prism Element URL'),
+    ('Nutanix Prism Central — connexion', 'Nutanix Prism Central — connection'),
+    ('Alternative multi-cluster (API v3). Sert aussi à récupérer la référence (UUID) du Volume Group', 'Multi-cluster alternative (API v3). Also used to fetch the reference (UUID) of the Volume Group'),
+    ("cloné si vous n'utilisez pas Prism Element. Identifiants en mémoire de session uniquement.", 'cloned if you do not use Prism Element. Credentials kept in session memory only.'),
+    ('URL Prism Central', 'Prism Central URL'),
+    ('Mémoriser les connexions (chiffré)', 'Remember connections (encrypted)'),
+    ('(<code>hycu_secrets.enc</code>), protégé par une <b>phrase secrète maîtresse</b> — jamais stockée.', '(<code>hycu_secrets.enc</code>), protected by a <b>master passphrase</b> — never stored.'),
+    ("Par défaut, rien n'est écrit (RAM seulement), le choix le plus sûr.", 'By default nothing is written (RAM only), the safest choice.'),
+    ('Enregistrer (chiffrer)', 'Save (encrypt)'),
+    ('Charger (déchiffrer)', 'Load (decrypt)'),
+    ('>Oublier<', '>Forget<'),
+    ('</span>aucun coffre', '</span>no vault'),
     ('"coffre présent"', '"vault present"'),
     ('"aucun coffre"', '"no vault"'),
-    ("MD5 n'étant pas réversible, le coffre utilise un chiffrement",
-     "The vault uses passphrase-based encryption"),
-    ("par phrase secrète (PBKDF2-HMAC-SHA256 + scellé d'intégrité).",
-     "(PBKDF2-HMAC-SHA256 + integrity seal)."),
-    ("Supprimer le coffre chiffré du disque ?", "Delete the encrypted vault from disk?"),
-    ("Connexions chiffrées : ", "Connections encrypted: "),
-    ("Connexions chargées : ", "Connections loaded: "),
-    ("Coffre supprimé.", "Vault deleted."),
-    (r"Renseignez l\'URL.", r"Enter the URL."),
-    # Assistant (étapes JS)
-    ("Première configuration", "First-time setup"),
-    ("Langue de l'interface", "Interface language"),
-    ("Aucun fichier <code>hycu_config.json</code> n'a été trouvé. Quelques questions",
-     "No <code>hycu_config.json</code> file was found. A few questions"),
-    ("pour le générer — vous pourrez tout modifier ensuite dans la page Réglages.",
-     "to generate it — you can change everything later in the Settings page."),
-    ("Quel binaire kubectl utiliser ?", "Which kubectl binary should be used?"),
-    ("Choisissez la distribution, ou saisissez une commande / un chemin personnalisé.",
-     "Pick the distribution, or enter a custom command / path."),
-    ("Commande kubectl", "kubectl command"),
-    ("Verrouiller le(s) cluster(s) ?", "Lock down the cluster(s)?"),
-    ("Restreindre l'outil à des contextes kubectl précis évite d'agir par erreur sur le mauvais cluster.",
-     "Restricting the tool to specific kubectl contexts avoids acting on the wrong cluster by mistake."),
-    (">Tous les contextes</b>", ">All contexts</b>"),
-    ("Aucune restriction.", "No restriction."),
-    (">Restreindre</b>", ">Restrict</b>"),
-    ("N'autoriser que les contextes listés.", "Allow only the listed contexts."),
-    ("Contextes autorisés (virgules)", "Allowed contexts (commas)"),
-    ("Limiter aux namespaces concernés ?", "Limit to the relevant namespaces?"),
-    ("Vous pouvez n'exposer que les namespaces applicatifs protégés par HYCU.",
-     "You can expose only the application namespaces protected by HYCU."),
-    (">Tous les namespaces</b>", ">All namespaces</b>"),
-    ("Lister tous les namespaces du cluster.", "List every namespace in the cluster."),
-    ("N'afficher que les namespaces listés.", "Show only the listed namespaces."),
-    ("Namespaces autorisés (virgules)", "Allowed namespaces (commas)"),
-    ("Garde-fou avant action réelle", "Safety check before real actions"),
-    ("Recommandé : exiger de retaper le nom du contexte avant toute restauration réelle.",
-     "Recommended: require retyping the context name before any real restore."),
-    ("Exiger la confirmation du contexte", "Require context confirmation"),
-    ("L'opérateur retape le contexte cible avant d'agir.", "The operator retypes the target context before acting."),
-    ("Réglages avancés (facultatif)", "Advanced settings (optional)"),
-    ("Les valeurs par défaut conviennent à la plupart des environnements.",
-     "The defaults suit most environments."),
-    ("Suffixe nom de clone", "Clone name suffix"),
-    ("Préfixe volumeHandle (vide = auto-détecté)", "volumeHandle prefix (empty = auto-detected)"),
-    ("auto-détecté depuis le PV existant", "auto-detected from the existing PV"),
-    ("Créer la configuration", "Create the configuration"),
-    ("Vérifiez puis créez <code>hycu_config.json</code> (modifiable ensuite dans ⚙ Réglages).",
-     "Review then create <code>hycu_config.json</code> (editable later in ⚙ Settings)."),
-    ("Étape ${wizStep+1} / ${wizSteps.length}", "Step ${wizStep+1} / ${wizSteps.length}"),
-    ("</span>Création…", "</span>Creating…"),
-    (">Échec : ", ">Failed: "),
+    ("MD5 n'étant pas réversible, le coffre utilise un chiffrement", 'The vault uses passphrase-based encryption'),
+    ("par phrase secrète (PBKDF2-HMAC-SHA256 + scellé d'intégrité).", '(PBKDF2-HMAC-SHA256 + integrity seal).'),
+    ('Supprimer le coffre chiffré du disque ?', 'Delete the encrypted vault from disk?'),
+    ('Connexions chiffrées : ', 'Connections encrypted: '),
+    ('Connexions chargées : ', 'Connections loaded: '),
+    ('Coffre supprimé.', 'Vault deleted.'),
+    ("Renseignez l\\'URL.", 'Enter the URL.'),
+    ('Première configuration', 'First-time setup'),
+    ("Langue de l'interface", 'Interface language'),
+    ("Aucun fichier <code>hycu_config.json</code> n'a été trouvé. Quelques questions", 'No <code>hycu_config.json</code> file was found. A few questions'),
+    ('pour le générer — vous pourrez tout modifier ensuite dans la page Réglages.', 'to generate it — you can change everything later in the Settings page.'),
+    ('Quel binaire kubectl utiliser ?', 'Which kubectl binary should be used?'),
+    ('Choisissez la distribution, ou saisissez une commande / un chemin personnalisé.', 'Pick the distribution, or enter a custom command / path.'),
+    ('Commande kubectl', 'kubectl command'),
+    ('Verrouiller le(s) cluster(s) ?', 'Lock down the cluster(s)?'),
+    ("Restreindre l'outil à des contextes kubectl précis évite d'agir par erreur sur le mauvais cluster.", 'Restricting the tool to specific kubectl contexts avoids acting on the wrong cluster by mistake.'),
+    ('>Tous les contextes</b>', '>All contexts</b>'),
+    ('Aucune restriction.', 'No restriction.'),
+    ('>Restreindre</b>', '>Restrict</b>'),
+    ("N'autoriser que les contextes listés.", 'Allow only the listed contexts.'),
+    ('Contextes autorisés (virgules)', 'Allowed contexts (commas)'),
+    ('Limiter aux namespaces concernés ?', 'Limit to the relevant namespaces?'),
+    ("Vous pouvez n'exposer que les namespaces applicatifs protégés par HYCU.", 'You can expose only the application namespaces protected by HYCU.'),
+    ('>Tous les namespaces</b>', '>All namespaces</b>'),
+    ('Lister tous les namespaces du cluster.', 'List every namespace in the cluster.'),
+    ("N'afficher que les namespaces listés.", 'Show only the listed namespaces.'),
+    ('Namespaces autorisés (virgules)', 'Allowed namespaces (commas)'),
+    ('Garde-fou avant action réelle', 'Safety check before real actions'),
+    ('Recommandé : exiger de retaper le nom du contexte avant toute restauration réelle.', 'Recommended: require retyping the context name before any real restore.'),
+    ('Exiger la confirmation du contexte', 'Require context confirmation'),
+    ("L'opérateur retape le contexte cible avant d'agir.", 'The operator retypes the target context before acting.'),
+    ('Réglages avancés (facultatif)', 'Advanced settings (optional)'),
+    ('Les valeurs par défaut conviennent à la plupart des environnements.', 'The defaults suit most environments.'),
+    ('Suffixe nom de clone', 'Clone name suffix'),
+    ('Préfixe volumeHandle (vide = auto-détecté)', 'volumeHandle prefix (empty = auto-detected)'),
+    ('auto-détecté depuis le PV existant', 'auto-detected from the existing PV'),
+    ('Créer la configuration', 'Create the configuration'),
+    ('Vérifiez puis créez <code>hycu_config.json</code> (modifiable ensuite dans ⚙ Réglages).', 'Review then create <code>hycu_config.json</code> (editable later in ⚙ Settings).'),
+    ('Étape ${wizStep+1} / ${wizSteps.length}', 'Step ${wizStep+1} / ${wizSteps.length}'),
+    ('</span>Création…', '</span>Creating…'),
+    ('>Échec : ', '>Failed: '),
     ('|| "indisponible"', '|| "unavailable"'),
     ('||"indisponible"', '||"unavailable"'),
-    # Bannière kubectl
-    ("<b>kubectl introuvable.</b> Installez kubectl et ajoutez-le au PATH, ou indiquez son binaire/chemin dans ⚙ Réglages (ex. « microk8s kubectl »).",
-     "<b>kubectl not found.</b> Install kubectl and add it to PATH, or set its binary/path in ⚙ Settings (e.g. “microk8s kubectl”)."),
-    ("<b>Aucun contexte kubectl sélectionné.</b> Choisissez le cluster cible : <code>kubectl config use-context &lt;nom&gt;</code>, puis rechargez la page.",
-     "<b>No kubectl context selected.</b> Choose the target cluster: <code>kubectl config use-context &lt;name&gt;</code>, then reload the page."),
-    ("<b>Aucune configuration kubectl trouvée.</b> Vérifiez <code>%USERPROFILE%\\\\.kube\\\\config</code> (ou la variable <code>KUBECONFIG</code>), puis rechargez.",
-     "<b>No kubectl configuration found.</b> Check <code>%USERPROFILE%\\\\.kube\\\\config</code> (or the <code>KUBECONFIG</code> variable), then reload."),
-    ("<b>Cluster injoignable via kubectl.</b> Vérifiez la connectivité réseau et vos droits (RBAC) sur l'API server.",
-     "<b>Cluster unreachable via kubectl.</b> Check network connectivity and your RBAC rights on the API server."),
-    ("Les opérations <b>Sauvegarder</b>, <b>Restaurer</b> (séquence Kubernetes) et <b>Vérifier</b> nécessitent kubectl. Les connexions <b>HYCU / Nutanix</b> fonctionnent, elles, sans kubectl.",
-     "The <b>Back up</b>, <b>Restore</b> (Kubernetes sequence) and <b>Verify</b> operations require kubectl. The <b>HYCU / Nutanix</b> connections work without kubectl."),
-    # Recherche de VG Nutanix + suivi de job
-    ("Chargement des Volume Groups…", "Loading Volume Groups…"),
-    ("rechercher le VG cloné par nom…", "search the cloned VG by name…"),
-    ("Aucun Volume Group ne correspond.", "No Volume Group matches."),
-    ("} sur ${ntAllVgs.length}", "} of ${ntAllVgs.length}"),
+    ('<b>kubectl introuvable.</b> Installez kubectl et ajoutez-le au PATH, ou indiquez son binaire/chemin dans ⚙ Réglages (ex. « microk8s kubectl »).', '<b>kubectl not found.</b> Install kubectl and add it to PATH, or set its binary/path in ⚙ Settings (e.g. “microk8s kubectl”).'),
+    ('<b>Aucun contexte kubectl sélectionné.</b> Choisissez le cluster cible : <code>kubectl config use-context &lt;nom&gt;</code>, puis rechargez la page.', '<b>No kubectl context selected.</b> Choose the target cluster: <code>kubectl config use-context &lt;name&gt;</code>, then reload the page.'),
+    ('<b>Aucune configuration kubectl trouvée.</b> Vérifiez <code>%USERPROFILE%\\\\.kube\\\\config</code> (ou la variable <code>KUBECONFIG</code>), puis rechargez.', '<b>No kubectl configuration found.</b> Check <code>%USERPROFILE%\\\\.kube\\\\config</code> (or the <code>KUBECONFIG</code> variable), then reload.'),
+    ("<b>Cluster injoignable via kubectl.</b> Vérifiez la connectivité réseau et vos droits (RBAC) sur l'API server.", '<b>Cluster unreachable via kubectl.</b> Check network connectivity and your RBAC rights on the API server.'),
+    ('Les opérations <b>Sauvegarder</b>, <b>Restaurer</b> (séquence Kubernetes) et <b>Vérifier</b> nécessitent kubectl. Les connexions <b>HYCU / Nutanix</b> fonctionnent, elles, sans kubectl.', 'The <b>Back up</b>, <b>Restore</b> (Kubernetes sequence) and <b>Verify</b> operations require kubectl. The <b>HYCU / Nutanix</b> connections work without kubectl.'),
+    ('Chargement des Volume Groups…', 'Loading Volume Groups…'),
+    ('rechercher le VG cloné par nom…', 'search the cloned VG by name…'),
+    ('Aucun Volume Group ne correspond.', 'No Volume Group matches.'),
+    ('} sur ${ntAllVgs.length}', '} of ${ntAllVgs.length}'),
     ("' (200 affichés — affinez)'", "' (200 shown — refine the search)'"),
-    ("UUID du VG indisponible.", "VG UUID unavailable."),
-    ("Référence du VG (UUID) remplie depuis Nutanix.", "VG reference (UUID) filled from Nutanix."),
-    ("Suivi du job indisponible : ", "Job tracking unavailable: "),
-    ("Job terminé avec succès.", "Job finished successfully."),
-    ("Job en échec — vérifiez dans HYCU.", "Job failed — check in HYCU."),
-    ("Suivi interrompu (délai) — le job continue côté HYCU.",
-     "Tracking stopped (timeout) — the job continues on the HYCU side."),
-    # runOp + errHint (JS)
+    ('UUID du VG indisponible.', 'VG UUID unavailable.'),
+    ('Référence du VG (UUID) remplie depuis Nutanix.', 'VG reference (UUID) filled from Nutanix.'),
+    ('Suivi du job indisponible : ', 'Job tracking unavailable: '),
+    ('Job terminé avec succès.', 'Job finished successfully.'),
+    ('Job en échec — vérifiez dans HYCU.', 'Job failed — check in HYCU.'),
+    ('Suivi interrompu (délai) — le job continue côté HYCU.', 'Tracking stopped (timeout) — the job continues on the HYCU side.'),
     ('"Démarrage de l\'opération impossible."', '"Could not start the operation."'),
     ('"Suivi de l\'opération interrompu."', '"Operation tracking interrupted."'),
     ('"Opération terminée sans résultat."', '"Operation finished with no result."'),
-    ('"Délai de suivi dépassé (l\'opération continue peut-être côté serveur)."',
-     '"Tracking timed out (the operation may still be running server-side)."'),
-    ("Identifiants refusés — vérifiez l'utilisateur/mot de passe, ou la clé API HYCU (Aide → API Keys, requise si 2FA).",
-     "Credentials rejected — check the username/password, or the HYCU API key (Help → API Keys, required with 2FA)."),
-    ("Accès refusé — droits insuffisants (RBAC / rôle sur l'API).",
-     "Access denied — insufficient rights (RBAC / API role)."),
-    ("Endpoint introuvable — vérifiez l'URL de base et la version d'API (⚙ Réglages).",
-     "Endpoint not found — check the base URL and the API version (⚙ Settings)."),
-    ("Certificat TLS — cochez/décochez « Vérifier le certificat TLS » dans Connexions selon votre PKI.",
-     "TLS certificate — tick/untick “Verify the TLS certificate” in Connections to match your PKI."),
-    ("Hôte injoignable — vérifiez l'URL:port (HYCU 8443, Prism 9440), le réseau et le pare-feu.",
-     "Host unreachable — check the URL:port (HYCU 8443, Prism 9440), the network and the firewall."),
-    ("Enregistrez d'abord la source (⚙ en haut à droite).", "Register the source first (⚙ at the top right)."),
-    ("Namespace hors liste autorisée — voir ⚙ Réglages → namespaces autorisés.",
-     "Namespace not in the allowed list — see ⚙ Settings → allowed namespaces."),
-    ("Contexte kubectl hors liste autorisée — voir ⚙ Réglages.",
-     "kubectl context not in the allowed list — see ⚙ Settings."),
-    ("Retapez le nom exact du contexte cible pour confirmer (mode réel).",
-     "Retype the exact target context name to confirm (real mode)."),
-    ("Rechargez la page (Ctrl+Shift+R) : le jeton de sécurité a expiré.",
-     "Reload the page (Ctrl+Shift+R): the security token has expired."),
-]
-
-# --- Messages backend (JSON) : générique, sauvegarde, préparation & exécution restore ---
-I18N_EN += [
-    ("Une autre opération est déjà en cours. Réessayez.", "Another operation is already running. Try again."),
-    ("Opération inconnue ou expirée.", "Unknown or expired operation."),
-    ("Erreur interne : ", "Internal error: "),
-    ("Erreur interne.", "Internal error."),
+    ('"Délai de suivi dépassé (l\'opération continue peut-être côté serveur)."', '"Tracking timed out (the operation may still be running server-side)."'),
+    ("Identifiants refusés — vérifiez l'utilisateur/mot de passe, ou la clé API HYCU (Aide → API Keys, requise si 2FA).", 'Credentials rejected — check the username/password, or the HYCU API key (Help → API Keys, required with 2FA).'),
+    ("Accès refusé — droits insuffisants (RBAC / rôle sur l'API).", 'Access denied — insufficient rights (RBAC / API role).'),
+    ("Endpoint introuvable — vérifiez l'URL de base et la version d'API (⚙ Réglages).", 'Endpoint not found — check the base URL and the API version (⚙ Settings).'),
+    ('Certificat TLS — cochez/décochez « Vérifier le certificat TLS » dans Connexions selon votre PKI.', 'TLS certificate — tick/untick “Verify the TLS certificate” in Connections to match your PKI.'),
+    ("Hôte injoignable — vérifiez l'URL:port (HYCU 8443, Prism 9440), le réseau et le pare-feu.", 'Host unreachable — check the URL:port (HYCU 8443, Prism 9440), the network and the firewall.'),
+    ("Enregistrez d'abord la source (⚙ en haut à droite).", 'Register the source first (⚙ at the top right).'),
+    ('Namespace hors liste autorisée — voir ⚙ Réglages → namespaces autorisés.', 'Namespace not in the allowed list — see ⚙ Settings → allowed namespaces.'),
+    ('Contexte kubectl hors liste autorisée — voir ⚙ Réglages.', 'kubectl context not in the allowed list — see ⚙ Settings.'),
+    ('Retapez le nom exact du contexte cible pour confirmer (mode réel).', 'Retype the exact target context name to confirm (real mode).'),
+    ('Rechargez la page (Ctrl+Shift+R) : le jeton de sécurité a expiré.', 'Reload the page (Ctrl+Shift+R): the security token has expired.'),
+    ('Une autre opération est déjà en cours. Réessayez.', 'Another operation is already running. Try again.'),
+    ('Opération inconnue ou expirée.', 'Unknown or expired operation.'),
+    ('Erreur interne : ', 'Internal error: '),
+    ('Erreur interne.', 'Internal error.'),
     ("Commande introuvable : '", "Command not found: '"),
     ("' est-il installé et dans le PATH ?", "' — is it installed and in the PATH?"),
-    ("Délai dépassé (", "Timeout exceeded ("),
-    ("s) — le job continue côté HYCU.", "s) — the job continues on the HYCU side."),
-    ("Réponse JSON illisible : ", "Unreadable JSON response: "),
-    ("Référence de volume invalide : impossible d'en extraire l'UUID du Volume Group.",
-     "Invalid volume reference: could not extract the Volume Group UUID from it."),
-    ("Collez l'UUID du VG (8-4-4-4-12), un volumeHandle « NutanixVolumes-<uuid> »,",
-     "Paste the VG UUID (8-4-4-4-12), a volumeHandle « NutanixVolumes-<uuid> »,"),
-    ("ou (clusters iSCSI hérités) l'IQN complet du VG cloné.",
-     "or (legacy iSCSI clusters) the full IQN of the cloned VG."),
-    ("UUID du VG", "VG UUID"),
+    ('Délai dépassé (', 'Timeout exceeded ('),
+    ('s) — le job continue côté HYCU.', 's) — the job continues on the HYCU side.'),
+    ('Réponse JSON illisible : ', 'Unreadable JSON response: '),
+    ("Référence de volume invalide : impossible d'en extraire l'UUID du Volume Group.", 'Invalid volume reference: could not extract the Volume Group UUID from it.'),
+    ("Collez l'UUID du VG (8-4-4-4-12), un volumeHandle « NutanixVolumes-<uuid> »,", 'Paste the VG UUID (8-4-4-4-12), a volumeHandle « NutanixVolumes-<uuid> »,'),
+    ("ou (clusters iSCSI hérités) l'IQN complet du VG cloné.", 'or (legacy iSCSI clusters) the full IQN of the cloned VG.'),
+    ('UUID du VG', 'VG UUID'),
     ("Nom de PV invalide : '", "Invalid PV name: '"),
     ("' (RFC 1123 attendu).", "' (RFC 1123 expected)."),
-    ("nom du PV", "PV name"),
-    ("Dossier de destination inutilisable (", "Unusable destination folder ("),
-    ("Le chemin de destination n'est pas un dossier : ", "The destination path is not a folder: "),
-    (" » introuvable dans le kubeconfig.", " » not found in the kubeconfig."),
+    ('nom du PV', 'PV name'),
+    ('Dossier de destination inutilisable (', 'Unusable destination folder ('),
+    ("Le chemin de destination n'est pas un dossier : ", 'The destination path is not a folder: '),
+    (' » introuvable dans le kubeconfig.', ' » not found in the kubeconfig.'),
     ("' non autorisé par la configuration.", "' not allowed by the configuration."),
     ("' non autorisé.", "' not allowed."),
     ("Aucun PVC trouvé dans le namespace '", "No PVC found in namespace '"),
-    ("Liste des namespaces indisponible.", "Namespace list unavailable."),
-    ("Aucun namespace à sauvegarder.", "No namespace to back up."),
-    ("Sauvegarde introuvable.", "Backup not found."),
-    ("Sauvegarde trop volumineuse pour un téléchargement direct.", "Backup too large for a direct download."),
-    ("Erreur lors de la création de l'archive.", "Error while creating the archive."),
-    ("Jeton anti-CSRF invalide ou absent.", "CSRF token invalid or missing."),
-    ("Charge trop volumineuse.", "Payload too large."),
-    ("JSON invalide", "Invalid JSON"),
-    # Workloads / suppression / attente
-    ("Arrêt ", "Stopping "),
-    ("arrêt de ", "stopping of "),
-    ("Redémarrage ", "Restarting "),
-    ("aucun contrôleur", "no controller"),
-    ("Pods arrêtés", "Pods stopped"),
-    ("(attente) pods montant les PVC", "(waiting) pods mounting the PVCs"),
-    ("aucun pod ne monte les volumes ciblés", "no pod mounts the targeted volumes"),
-    ("Pods encore présents", "Pods still present"),
-    ("Délai dépassé, pods encore actifs : ", "Timeout exceeded, pods still active: "),
-    (" déjà absent", " already absent"),
-    ("rien à supprimer", "nothing to delete"),
-    ("Attente suppression ", "Waiting for deletion of "),
-    ("Déblocage finalizer ", "Unblocking finalizer "),
-    (" non supprimé", " not deleted"),
-    ("État : ", "State: "),
-    ("Attente PVC ", "Waiting for PVC "),
-    (" lié (Bound)", " to bind (Bound)"),
-    ("Suppression PVC ", "Deleting PVC "),
-    ("Suppression PV ", "Deleting PV "),
-    ("Suppression ", "Deleting "),
-    ("suppression du PVC ", "deletion of PVC "),
-    ("suppression du PV ", "deletion of PV "),
-    # Préparation du restore
-    ("PVC manquant.", "Missing PVC."),
-    ("Indiquez la référence du Volume Group cloné/restauré pour « ",
-     "Provide the reference of the cloned/restored Volume Group for « "),
-    ("(UUID du VG, volumeHandle, ou IQN).", "(VG UUID, volumeHandle, or IQN)."),
-    ("Référence invalide pour « ", "Invalid reference for « "),
-    (" » : aucun UUID détecté. Collez l'UUID du VG ", " »: no UUID detected. Paste the VG UUID "),
-    ("(8-4-4-4-12), un volumeHandle « NutanixVolumes-<uuid> », ou l'IQN complet.",
-     "(8-4-4-4-12), a volumeHandle « NutanixVolumes-<uuid> », or the full IQN."),
-    ("Manifeste du PV introuvable pour « ", "PV manifest not found for « "),
-    (" ». Sauvegardez d'abord ce namespace, ", " ». Back up this namespace first, "),
-    ("ou vérifiez que le PV existe encore.", "or check that the PV still exists."),
-    ("L'UUID fourni correspond au NOM du VG (« pvc-<uuid> », = UUID du PVC) et non à l'UUID",
-     "The provided UUID matches the VG NAME (« pvc-<uuid> », = the PVC's UUID), not the UUID"),
-    ("du Volume Group. Vous avez probablement saisi le nom du VG au lieu de son UUID —",
-     "of the Volume Group. You probably entered the VG name instead of its UUID —"),
-    ("utilisez « Rechercher le VG dans Prism » ou copiez l'UUID du VG (suffixe de NutanixVolumes-… / ntnx-k8s-…).",
-     "use “Search for the VG in Prism” or copy the VG UUID (the suffix of NutanixVolumes-… / ntnx-k8s-…)."),
-    ("L'UUID est identique à l'ancien : le clone n'a peut-être pas produit de nouveau VG",
-     "The UUID is identical to the old one: the clone may not have produced a new VG"),
-    ("(UUID du VG source saisi au lieu du VG cloné ?).", "(source VG UUID entered instead of the cloned VG?)."),
-    ("Aucun changement détecté dans le manifeste : en restauration sur place avec le même VG,",
-     "No change detected in the manifest: for an in-place restore with the same VG,"),
-    ("un simple redémarrage des pods suffit à remonter les données restaurées.",
-     "simply restarting the pods is enough to mount the restored data."),
-    ("Un ou plusieurs volumes n'ont pas pu être préparés.", "One or more volumes could not be prepared."),
-    # Plan
-    ("Arrêter l'application (tous les Deployments/StatefulSets du namespace -> 0 réplica)",
-     "Stop the application (all Deployments/StatefulSets in the namespace -> 0 replicas)"),
-    ("Attendre l'arrêt effectif des pods qui montent les volumes ciblés",
-     "Wait for the pods mounting the targeted volumes to actually stop"),
-    ("Supprimer l'ancien PVC « ", "Delete the old PVC « "),
-    ("Supprimer l'ancien PV « ", "Delete the old PV « "),
-    (" » (+ déblocage finalizer si nécessaire)", " » (+ finalizer unblock if needed)"),
-    ("Créer le nouveau PV « ", "Create the new PV « "),
-    ("Recréer le PVC « ", "Recreate the PVC « "),
-    (" » et le lier au nouveau PV, attendre l'état Bound", " » and bind it to the new PV, wait for Bound"),
-    ("Redémarrer l'application (réplicas d'origine restaurés)", "Restart the application (original replicas restored)"),
-    ("Vérifier : tous les PVC liés (Bound) et pods démarrés", "Verify: all PVCs Bound and pods started"),
-    ("APRÈS : re-protéger le(s) nouveau(x) Volume Group(s) dans HYCU",
-     "AFTER: re-protect the new Volume Group(s) in HYCU"),
-    ("(politique / catégorie Prism) — non automatisé par cet outil",
-     "(Prism policy / category) — not automated by this tool"),
-    # Garde contexte + exécution
-    ("Contexte kubectl « ", "kubectl context « "),
-    (" » non autorisé par la configuration", " » not allowed by the configuration"),
-    ("Confirmation du contexte requise : retapez le nom du contexte ciblé",
-     "Context confirmation required: retype the targeted context name"),
-    (" ») pour confirmer.", " ») to confirm."),
-    ("Reprise d'une restauration interrompue", "Resuming an interrupted restore"),
-    ("Démarrée ", "Started "),
-    ("). Sauvegarde de sécurité initiale réutilisée ;", "). Initial safety backup reused;"),
-    ("les étapes déjà faites sont rejouées sans dommage.", "steps already done are safely replayed."),
-    ("Sauvegarde de sécurité du namespace avant restauration", "Safety backup of the namespace before the restore"),
-    ("Sauvegarde de sécurité impossible (", "Safety backup failed ("),
-    (") — restauration annulée pour ne pas", ") — restore cancelled so as not to"),
-    ("détruire sans filet. Corrigez puis relancez.", "destroy without a safety net. Fix the issue then retry."),
-    ("Réplicas mémorisés", "Replicas recorded"),
-    ("(lecture) réplicas cibles", "(read) target replicas"),
-    ("⚠ Pod(s) NON géré(s) par un Deployment/StatefulSet montant les volumes ciblés",
-     "⚠ Pod(s) NOT managed by a Deployment/StatefulSet mounting the targeted volumes"),
-    (" (contrôleur : ", " (controller: "),
-    (". Le scale-down ne les arrêtera pas — arrêtez-les manuellement",
-     ". The scale-down will not stop them — stop them manually"),
-    ("(DaemonSet/Job/Operator/pod nu) avant de continuer.", "(DaemonSet/Job/Operator/bare pod) before continuing."),
-    ("attente de l'arrêt des pods", "waiting for the pods to stop"),
-    ("Protection du VG source : PV ", "Protecting the source VG: PV "),
-    ("Protection du VG : PV ", "Protecting the VG: PV "),
-    ("Évite que la suppression du PV/PVC ne supprime le Volume Group Nutanix",
-     "Prevents the PV/PVC deletion from deleting the Nutanix Volume Group"),
-    ("(reclaimPolicy=Delete par défaut).", "(reclaimPolicy=Delete by default)."),
-    ("(+ finalizer si besoin)", "(+ finalizer if needed)"),
-    ("Création du nouveau PV ", "Creating the new PV "),
-    ("protection (Retain) du PV source ", "protection (Retain) of the source PV "),
-    ("protection (Retain) du PV ", "protection (Retain) of PV "),
-    (" — suppression annulée pour", " — deletion cancelled to"),
-    ("ne pas risquer la perte du Volume Group", "avoid risking the loss of the Volume Group"),
-    ("création du nouveau PV ", "creation of the new PV "),
-    ("Recréation du PVC ", "Recreating PVC "),
-    ("recréation du PVC ", "recreation of PVC "),
-    ("liaison (Bound) du PVC ", "binding (Bound) of PVC "),
-    (" non recréé", " not recreated"),
-    ("Manifeste du PVC introuvable (ni sauvegarde ni live) : le PVC sera recréé",
-     "PVC manifest not found (neither backup nor live): the PVC will be recreated"),
-    ("par votre déploiement applicatif (vérifiez ensuite qu'il devient Bound).",
-     "by your application deployment (check afterwards that it becomes Bound)."),
-    ("SÉQUENCE INTERROMPUE", "SEQUENCE ABORTED"),
-    ("Échec à l'étape : ", "Failed at step: "),
-    ("L'application reste ARRÊTÉE (réplicas à 0) pour éviter de redémarrer sur des",
-     "The application stays STOPPED (replicas at 0) to avoid restarting on"),
-    ("volumes incohérents. Corrigez la cause, puis relancez la restauration (les",
-     "inconsistent volumes. Fix the cause, then rerun the restore (the"),
-    ("réplicas d'origine sont mémorisés), ou redémarrez manuellement :",
-     "original replicas are recorded), or restart manually:"),
-    (" lié à ", " bound to "),
-    (" au lieu de ", " instead of "),
-    ("⚠ volumeHandle INATTENDU — vérifiez le volume réellement monté",
-     "⚠ UNEXPECTED volumeHandle — check the volume actually mounted"),
-    ("Incohérence(s) : ", "Inconsistency(ies): "),
-    (". Le pod tourne peut-être sur le mauvais Volume Group.",
-     ". The pod may be running on the wrong Volume Group."),
-    ("volumeHandle conforme au VG attendu pour tous les volumes",
-     "volumeHandle matches the expected VG for all volumes"),
-    ("Vérification finale", "Final verification"),
-]
-
-# --- Messages backend (JSON) : connexions, coffre, Nutanix, HYCU, clone d'app ---
-I18N_EN += [
-    ("Schéma d'URL refusé (", "URL scheme refused ("),
-    (") : seuls http/https sont autorisés.", "): only http/https are allowed."),
-    ("HTTP %s", "HTTP %s"),
-    ("Connexion impossible : ", "Connection failed: "),
-    ("Erreur TLS : ", "TLS error: "),
-    (" non configurée (⚙ Sources).", " not configured (⚙ Sources)."),
-    ("Non connecté à ", "Not connected to "),
-    ("Système inconnu.", "Unknown system."),
-    ("Clé API requise.", "API key required."),
-    ("Identifiant et mot de passe requis.", "Username and password required."),
-    ("Authentification ", "Authentication "),
-    (" refusée (HTTP ", " refused (HTTP "),
-    ("Vérifiez les identifiants", "Check the credentials"),
-    ("ou utilisez une clé API si le 2FA est activé", "or use an API key if 2FA is enabled"),
-    ("la version de l'API v3/v4", "the API version v3/v4"),
-    ("Connecté, mais l'endpoint de test « ", "Connected, but the test endpoint « "),
-    (" » est introuvable (HTTP 404).", " » was not found (HTTP 404)."),
-    ("Les chemins REST dépendent de la version : vérifiez ", "REST paths depend on the version: check "),
-    (" et ajustez si besoin.", " and adjust if needed."),
-    ("Échec de connexion ", "Connection failed for "),
-    ("Cette URL est identique à celle de ", "This URL is identical to the one for "),
-    ("Prism Element et Prism Central doivent pointer vers des hôtes différents.",
-     "Prism Element and Prism Central must point to different hosts."),
-    ("Attention : cette URL semble être un ", "Warning: this URL looks like a "),
-    (", pas un ", ", not a "),
-    (" — vérifiez de ne pas avoir", " — make sure you did not"),
-    ("inversé les deux connecteurs. La connexion est tout de même établie.",
-     "swap the two connectors. The connection was still established."),
-    ("Certificat TLS NON vérifié — les identifiants transitent vers un hôte non",
-     "TLS certificate NOT verified — credentials are sent to an unauthenticated"),
-    ("authentifié. N'utilisez ce mode que sur un réseau de gestion de confiance.",
-     "host. Use this mode only on a trusted management network."),
-    ("Choisissez une phrase secrète d'au moins 8 caractères.", "Choose a passphrase of at least 8 characters."),
-    ("Connectez-vous d'abord à au moins un système.", "Connect to at least one system first."),
-    ("Écriture du coffre impossible : ", "Could not write the vault: "),
-    ("Aucune connexion mémorisée.", "No saved connections."),
-    ("Lecture du coffre impossible : ", "Could not read the vault: "),
-    ("Phrase secrète incorrecte (ou fichier altéré).", "Incorrect passphrase (or corrupted file)."),
-    ("Données déchiffrées illisibles.", "Decrypted data unreadable."),
-    ("Suppression impossible : ", "Deletion failed: "),
-    ("Aucune connexion Nutanix (Prism Element ou Central).", "No Nutanix connection (Prism Element or Central)."),
-    ("Erreur Nutanix.", "Nutanix error."),
-    ("UUID de Volume Group manquant.", "Missing Volume Group UUID."),
-    ("UUID introuvable dans la réponse Nutanix pour ce VG.", "UUID not found in the Nutanix response for this VG."),
-    ("Le détachement automatique requiert Prism Element (API v2).",
-     "Automatic detach requires Prism Element (API v2)."),
-    ("Connectez Prism Element, ou détachez le VG de sa VM dans Prism.",
-     "Connect Prism Element, or detach the VG from its VM in Prism."),
-    ("Connectez Prism Central : l'API v4 Volumes (et le CSI) y sont servies.",
-     "Connect Prism Central: the v4 Volumes API (and the CSI) are served there."),
-    ("Renseigner hypervisorAttachedDiskUUIDs (disque du VG cloné ",
-     "Set hypervisorAttachedDiskUUIDs (cloned VG disk "),
-    ("Lu via Prism Central v4 ; sans lui le CSI tente l'attach iSCSI (échec).",
-     "Read via Prism Central v4; without it the CSI attempts the iSCSI attach (fails)."),
+    ('Liste des namespaces indisponible.', 'Namespace list unavailable.'),
+    ('Aucun namespace à sauvegarder.', 'No namespace to back up.'),
+    ('Sauvegarde introuvable.', 'Backup not found.'),
+    ('Sauvegarde trop volumineuse pour un téléchargement direct.', 'Backup too large for a direct download.'),
+    ("Erreur lors de la création de l'archive.", 'Error while creating the archive.'),
+    ('Jeton anti-CSRF invalide ou absent.', 'CSRF token invalid or missing.'),
+    ('Charge trop volumineuse.', 'Payload too large.'),
+    ('JSON invalide', 'Invalid JSON'),
+    ('Arrêt ', 'Stopping '),
+    ('arrêt de ', 'stopping of '),
+    ('Redémarrage ', 'Restarting '),
+    ('aucun contrôleur', 'no controller'),
+    ('Pods arrêtés', 'Pods stopped'),
+    ('(attente) pods montant les PVC', '(waiting) pods mounting the PVCs'),
+    ('aucun pod ne monte les volumes ciblés', 'no pod mounts the targeted volumes'),
+    ('Pods encore présents', 'Pods still present'),
+    ('Délai dépassé, pods encore actifs : ', 'Timeout exceeded, pods still active: '),
+    (' déjà absent', ' already absent'),
+    ('rien à supprimer', 'nothing to delete'),
+    ('Attente suppression ', 'Waiting for deletion of '),
+    ('Déblocage finalizer ', 'Unblocking finalizer '),
+    (' non supprimé', ' not deleted'),
+    ('État : ', 'State: '),
+    ('Attente PVC ', 'Waiting for PVC '),
+    (' lié (Bound)', ' to bind (Bound)'),
+    ('Suppression PVC ', 'Deleting PVC '),
+    ('Suppression PV ', 'Deleting PV '),
+    ('Suppression ', 'Deleting '),
+    ('suppression du PVC ', 'deletion of PVC '),
+    ('suppression du PV ', 'deletion of PV '),
+    ('PVC manquant.', 'Missing PVC.'),
+    ('Indiquez la référence du Volume Group cloné/restauré pour « ', 'Provide the reference of the cloned/restored Volume Group for « '),
+    ('(UUID du VG, volumeHandle, ou IQN).', '(VG UUID, volumeHandle, or IQN).'),
+    ('Référence invalide pour « ', 'Invalid reference for « '),
+    (" » : aucun UUID détecté. Collez l'UUID du VG ", ' »: no UUID detected. Paste the VG UUID '),
+    ("(8-4-4-4-12), un volumeHandle « NutanixVolumes-<uuid> », ou l'IQN complet.", '(8-4-4-4-12), a volumeHandle « NutanixVolumes-<uuid> », or the full IQN.'),
+    ('Manifeste du PV introuvable pour « ', 'PV manifest not found for « '),
+    (" ». Sauvegardez d'abord ce namespace, ", ' ». Back up this namespace first, '),
+    ('ou vérifiez que le PV existe encore.', 'or check that the PV still exists.'),
+    ("L'UUID fourni correspond au NOM du VG (« pvc-<uuid> », = UUID du PVC) et non à l'UUID", "The provided UUID matches the VG NAME (« pvc-<uuid> », = the PVC's UUID), not the UUID"),
+    ('du Volume Group. Vous avez probablement saisi le nom du VG au lieu de son UUID —', 'of the Volume Group. You probably entered the VG name instead of its UUID —'),
+    ("utilisez « Rechercher le VG dans Prism » ou copiez l'UUID du VG (suffixe de NutanixVolumes-… / ntnx-k8s-…).", 'use “Search for the VG in Prism” or copy the VG UUID (the suffix of NutanixVolumes-… / ntnx-k8s-…).'),
+    ("L'UUID est identique à l'ancien : le clone n'a peut-être pas produit de nouveau VG", 'The UUID is identical to the old one: the clone may not have produced a new VG'),
+    ('(UUID du VG source saisi au lieu du VG cloné ?).', '(source VG UUID entered instead of the cloned VG?).'),
+    ('Aucun changement détecté dans le manifeste : en restauration sur place avec le même VG,', 'No change detected in the manifest: for an in-place restore with the same VG,'),
+    ('un simple redémarrage des pods suffit à remonter les données restaurées.', 'simply restarting the pods is enough to mount the restored data.'),
+    ("Un ou plusieurs volumes n'ont pas pu être préparés.", 'One or more volumes could not be prepared.'),
+    ("Arrêter l'application (tous les Deployments/StatefulSets du namespace -> 0 réplica)", 'Stop the application (all Deployments/StatefulSets in the namespace -> 0 replicas)'),
+    ("Attendre l'arrêt effectif des pods qui montent les volumes ciblés", 'Wait for the pods mounting the targeted volumes to actually stop'),
+    ("Supprimer l'ancien PVC « ", 'Delete the old PVC « '),
+    ("Supprimer l'ancien PV « ", 'Delete the old PV « '),
+    (' » (+ déblocage finalizer si nécessaire)', ' » (+ finalizer unblock if needed)'),
+    ('Créer le nouveau PV « ', 'Create the new PV « '),
+    ('Recréer le PVC « ', 'Recreate the PVC « '),
+    (" » et le lier au nouveau PV, attendre l'état Bound", ' » and bind it to the new PV, wait for Bound'),
+    ("Redémarrer l'application (réplicas d'origine restaurés)", 'Restart the application (original replicas restored)'),
+    ('Vérifier : tous les PVC liés (Bound) et pods démarrés', 'Verify: all PVCs Bound and pods started'),
+    ('APRÈS : re-protéger le(s) nouveau(x) Volume Group(s) dans HYCU', 'AFTER: re-protect the new Volume Group(s) in HYCU'),
+    ('(politique / catégorie Prism) — non automatisé par cet outil', '(Prism policy / category) — not automated by this tool'),
+    ('Contexte kubectl « ', 'kubectl context « '),
+    (' » non autorisé par la configuration', ' » not allowed by the configuration'),
+    ('Confirmation du contexte requise : retapez le nom du contexte ciblé', 'Context confirmation required: retype the targeted context name'),
+    (' ») pour confirmer.', ' ») to confirm.'),
+    ("Reprise d'une restauration interrompue", 'Resuming an interrupted restore'),
+    ('Démarrée ', 'Started '),
+    ('). Sauvegarde de sécurité initiale réutilisée ;', '). Initial safety backup reused;'),
+    ('les étapes déjà faites sont rejouées sans dommage.', 'steps already done are safely replayed.'),
+    ('Sauvegarde de sécurité du namespace avant restauration', 'Safety backup of the namespace before the restore'),
+    ('Sauvegarde de sécurité impossible (', 'Safety backup failed ('),
+    (') — restauration annulée pour ne pas', ') — restore cancelled so as not to'),
+    ('détruire sans filet. Corrigez puis relancez.', 'destroy without a safety net. Fix the issue then retry.'),
+    ('Réplicas mémorisés', 'Replicas recorded'),
+    ('(lecture) réplicas cibles', '(read) target replicas'),
+    ('⚠ Pod(s) NON géré(s) par un Deployment/StatefulSet montant les volumes ciblés', '⚠ Pod(s) NOT managed by a Deployment/StatefulSet mounting the targeted volumes'),
+    (' (contrôleur : ', ' (controller: '),
+    ('. Le scale-down ne les arrêtera pas — arrêtez-les manuellement', '. The scale-down will not stop them — stop them manually'),
+    ('(DaemonSet/Job/Operator/pod nu) avant de continuer.', '(DaemonSet/Job/Operator/bare pod) before continuing.'),
+    ("attente de l'arrêt des pods", 'waiting for the pods to stop'),
+    ('Protection du VG source : PV ', 'Protecting the source VG: PV '),
+    ('Protection du VG : PV ', 'Protecting the VG: PV '),
+    ('Évite que la suppression du PV/PVC ne supprime le Volume Group Nutanix', 'Prevents the PV/PVC deletion from deleting the Nutanix Volume Group'),
+    ('(reclaimPolicy=Delete par défaut).', '(reclaimPolicy=Delete by default).'),
+    ('(+ finalizer si besoin)', '(+ finalizer if needed)'),
+    ('Création du nouveau PV ', 'Creating the new PV '),
+    ('protection (Retain) du PV source ', 'protection (Retain) of the source PV '),
+    ('protection (Retain) du PV ', 'protection (Retain) of PV '),
+    (' — suppression annulée pour', ' — deletion cancelled to'),
+    ('ne pas risquer la perte du Volume Group', 'avoid risking the loss of the Volume Group'),
+    ('création du nouveau PV ', 'creation of the new PV '),
+    ('Recréation du PVC ', 'Recreating PVC '),
+    ('recréation du PVC ', 'recreation of PVC '),
+    ('liaison (Bound) du PVC ', 'binding (Bound) of PVC '),
+    (' non recréé', ' not recreated'),
+    ('Manifeste du PVC introuvable (ni sauvegarde ni live) : le PVC sera recréé', 'PVC manifest not found (neither backup nor live): the PVC will be recreated'),
+    ("par votre déploiement applicatif (vérifiez ensuite qu'il devient Bound).", 'by your application deployment (check afterwards that it becomes Bound).'),
+    ('SÉQUENCE INTERROMPUE', 'SEQUENCE ABORTED'),
+    ("Échec à l'étape : ", 'Failed at step: '),
+    ("L'application reste ARRÊTÉE (réplicas à 0) pour éviter de redémarrer sur des", 'The application stays STOPPED (replicas at 0) to avoid restarting on'),
+    ('volumes incohérents. Corrigez la cause, puis relancez la restauration (les', 'inconsistent volumes. Fix the cause, then rerun the restore (the'),
+    ("réplicas d'origine sont mémorisés), ou redémarrez manuellement :", 'original replicas are recorded), or restart manually:'),
+    (' lié à ', ' bound to '),
+    (' au lieu de ', ' instead of '),
+    ('⚠ volumeHandle INATTENDU — vérifiez le volume réellement monté', '⚠ UNEXPECTED volumeHandle — check the volume actually mounted'),
+    ('Incohérence(s) : ', 'Inconsistency(ies): '),
+    ('. Le pod tourne peut-être sur le mauvais Volume Group.', '. The pod may be running on the wrong Volume Group.'),
+    ('volumeHandle conforme au VG attendu pour tous les volumes', 'volumeHandle matches the expected VG for all volumes'),
+    ('Vérification finale', 'Final verification'),
+    ("Schéma d'URL refusé (", 'URL scheme refused ('),
+    (') : seuls http/https sont autorisés.', '): only http/https are allowed.'),
+    ('Connexion impossible : ', 'Connection failed: '),
+    ('Erreur TLS : ', 'TLS error: '),
+    (' non configurée (⚙ Sources).', ' not configured (⚙ Sources).'),
+    ('Non connecté à ', 'Not connected to '),
+    ('Système inconnu.', 'Unknown system.'),
+    ('Clé API requise.', 'API key required.'),
+    ('Identifiant et mot de passe requis.', 'Username and password required.'),
+    ('Authentification ', 'Authentication '),
+    (' refusée (HTTP ', ' refused (HTTP '),
+    ('Vérifiez les identifiants', 'Check the credentials'),
+    ('ou utilisez une clé API si le 2FA est activé', 'or use an API key if 2FA is enabled'),
+    ("la version de l'API v3/v4", 'the API version v3/v4'),
+    ("Connecté, mais l'endpoint de test « ", 'Connected, but the test endpoint « '),
+    (' » est introuvable (HTTP 404).', ' » was not found (HTTP 404).'),
+    ('Les chemins REST dépendent de la version : vérifiez ', 'REST paths depend on the version: check '),
+    (' et ajustez si besoin.', ' and adjust if needed.'),
+    ('Échec de connexion ', 'Connection failed for '),
+    ('Cette URL est identique à celle de ', 'This URL is identical to the one for '),
+    ('Prism Element et Prism Central doivent pointer vers des hôtes différents.', 'Prism Element and Prism Central must point to different hosts.'),
+    ('Attention : cette URL semble être un ', 'Warning: this URL looks like a '),
+    (', pas un ', ', not a '),
+    (' — vérifiez de ne pas avoir', ' — make sure you did not'),
+    ('inversé les deux connecteurs. La connexion est tout de même établie.', 'swap the two connectors. The connection was still established.'),
+    ('Certificat TLS NON vérifié — les identifiants transitent vers un hôte non', 'TLS certificate NOT verified — credentials are sent to an unauthenticated'),
+    ("authentifié. N'utilisez ce mode que sur un réseau de gestion de confiance.", 'host. Use this mode only on a trusted management network.'),
+    ("Choisissez une phrase secrète d'au moins 8 caractères.", 'Choose a passphrase of at least 8 characters.'),
+    ("Connectez-vous d'abord à au moins un système.", 'Connect to at least one system first.'),
+    ('Écriture du coffre impossible : ', 'Could not write the vault: '),
+    ('Aucune connexion mémorisée.', 'No saved connections.'),
+    ('Lecture du coffre impossible : ', 'Could not read the vault: '),
+    ('Phrase secrète incorrecte (ou fichier altéré).', 'Incorrect passphrase (or corrupted file).'),
+    ('Données déchiffrées illisibles.', 'Decrypted data unreadable.'),
+    ('Suppression impossible : ', 'Deletion failed: '),
+    ('Aucune connexion Nutanix (Prism Element ou Central).', 'No Nutanix connection (Prism Element or Central).'),
+    ('Erreur Nutanix.', 'Nutanix error.'),
+    ('UUID de Volume Group manquant.', 'Missing Volume Group UUID.'),
+    ('UUID introuvable dans la réponse Nutanix pour ce VG.', 'UUID not found in the Nutanix response for this VG.'),
+    ('Le détachement automatique requiert Prism Element (API v2).', 'Automatic detach requires Prism Element (API v2).'),
+    ('Connectez Prism Element, ou détachez le VG de sa VM dans Prism.', 'Connect Prism Element, or detach the VG from its VM in Prism.'),
+    ("Connectez Prism Central : l'API v4 Volumes (et le CSI) y sont servies.", 'Connect Prism Central: the v4 Volumes API (and the CSI) are served there.'),
+    ('Renseigner hypervisorAttachedDiskUUIDs (disque du VG cloné ', 'Set hypervisorAttachedDiskUUIDs (cloned VG disk '),
+    ("Lu via Prism Central v4 ; sans lui le CSI tente l'attach iSCSI (échec).", 'Read via Prism Central v4; without it the CSI attempts the iSCSI attach (fails).'),
     ("Aligner l'IQN du PV sur la cible iSCSI réelle du VG ", "Align the PV's IQN with the VG's real iSCSI target "),
-    ("Lu via Prism Central v4 (un VG créé par HYCU porte une cible « hycu-clone-vg-… »).", "Read through Prism Central v4 (a VG created by HYCU carries a “hycu-clone-vg-…” target)."),
-    ("IQN du PV non vérifié (Prism Central non connecté)", "PV IQN not checked (Prism Central not connected)"),
-    ("Si le pod reste en FailedMount (« iscsiadm: No records found »), connectez Prism Central et relancez : la cible iSCSI du VG restauré peut différer de l'IQN dérivé.",
-     "If the pod stays in FailedMount (“iscsiadm: No records found”), connect Prism Central and retry: the restored VG's iSCSI target may differ from the derived IQN."),
-    ("IQN du PV non vérifié (cible iSCSI du VG ", "PV IQN not checked (iSCSI target of VG "),
-    (" illisible)", " unreadable)"),
+    ('Lu via Prism Central v4 (un VG créé par HYCU porte une cible « hycu-clone-vg-… »).', 'Read through Prism Central v4 (a VG created by HYCU carries a “hycu-clone-vg-…” target).'),
+    ('IQN du PV non vérifié (Prism Central non connecté)', 'PV IQN not checked (Prism Central not connected)'),
+    ("Si le pod reste en FailedMount (« iscsiadm: No records found »), connectez Prism Central et relancez : la cible iSCSI du VG restauré peut différer de l'IQN dérivé.", "If the pod stays in FailedMount (“iscsiadm: No records found”), connect Prism Central and retry: the restored VG's iSCSI target may differ from the derived IQN."),
+    ('IQN du PV non vérifié (cible iSCSI du VG ', 'PV IQN not checked (iSCSI target of VG '),
+    (' illisible)', ' unreadable)'),
     ("Prism Central n'a pas renvoyé le targetName du VG.", "Prism Central did not return the VG's targetName."),
-    ("IQN du PV aligné sur la cible iSCSI réelle du VG", "PV IQN aligned with the VG's real iSCSI target"),
-    ("IQN du PV conforme à la cible iSCSI du VG", "PV IQN matches the VG's iSCSI target"),
-    ("VG modifié par le restore in-place — rafraîchissement du PV ", "VG changed by the in-place restore — refreshing PV "),
-    (" avec les attributs à jour (Retain -> delete -> apply)", " with up-to-date attributes (Retain -> delete -> apply)"),
-    ("hypervisorAttachedDiskUUIDs non ajouté (le PV source ne le porte pas)",
-     "hypervisorAttachedDiskUUIDs not added (the source PV does not carry it)"),
-    ("Le CSI de ce cluster attache le Volume Group sans cet attribut, comme pour le PV d'origine : forme du PV source reproduite.",
-     "This cluster's CSI attaches the Volume Group without this attribute, as for the original PV: the source PV's shape is reproduced."),
-    ("hypervisorAttachedDiskUUIDs NON renseigné (Prism Central non connecté)",
-     "hypervisorAttachedDiskUUIDs NOT set (Prism Central not connected)"),
-    ("Le CSI tentera l'attach iSCSI et l'attachement échouera. Connectez Prism Central.",
-     "The CSI will attempt the iSCSI attach and the attachment will fail. Connect Prism Central."),
-    ("hypervisorAttachedDiskUUIDs renseigné depuis le VG cloné",
-     "hypervisorAttachedDiskUUIDs set from the cloned VG"),
-    ("Disque(s) du VG cloné : ", "Cloned VG disk(s): "),
-    ("hypervisorAttachedDiskUUIDs NON renseigné (disque introuvable)",
-     "hypervisorAttachedDiskUUIDs NOT set (disk not found)"),
-    ("Aucun disque lu pour le VG ", "No disk read for VG "),
-    ("Le CSI tentera l'attach iSCSI ; vérifiez le VG cloné dans Prism.",
-     "The CSI will attempt the iSCSI attach; check the cloned VG in Prism."),
-    ("Disque du PV ", "Disk of PV "),
-    (" non vérifié (Prism Central non connecté)", " not verified (Prism Central not connected)"),
-    ("Si le pod reste en FailedMount («failed to get symlink»), connectez",
-     "If the pod stays in FailedMount (“failed to get symlink”), connect"),
-    ("Prism Central et relancez la restauration sur place.", "Prism Central and rerun the in-place restore."),
-    ("Disque du VG remplacé par le restore in-place — rafraîchissement du PV ",
-     "VG disk replaced by the in-place restore — refreshing PV "),
-    ("Recréer le PV ", "Recreate PV "),
-    (" avec le disque à jour (Retain -> delete -> apply)", " with the up-to-date disk (Retain -> delete -> apply)"),
-    ("Rafraîchissement du PV interrompu : ", "PV refresh interrupted: "),
-    ("Rafraîchissement du PV ", "Refresh of PV "),
-    (" annulé : état du PV indéterminé (", " cancelled: PV state undetermined ("),
-    (" — suppression refusée pour ne pas risquer la perte du",
-     " — deletion refused to avoid risking the loss of the"),
-    ("Volume Group. Vérifiez l'accès kubectl puis relancez.", "Volume Group. Check kubectl access then retry."),
-    ("vérification de l'état du PV ", "checking the state of PV "),
-    (" avant suppression", " before deletion"),
-    ("Recréation du PV ", "Recreating PV "),
-    (" (disque rafraîchi)", " (refreshed disk)"),
-    ("recréation du PV ", "recreation of PV "),
-    # HYCU
-    ("Point de restauration requis.", "Restore point required."),
-    ("Simulation : aucun appel HYCU envoyé. Vérifiez l'appel ci-dessus,",
-     "Simulation: no HYCU call sent. Review the call above,"),
-    ("puis désactivez la simulation pour lancer réellement.", "then turn off simulation to launch for real."),
-    ("Identifiant de job manquant.", "Missing job identifier."),
-    ("Re-vérification de la correspondance impossible : ", "Could not re-verify the mapping: "),
-    ("Volume Group(s) hors de la correspondance actuelle du namespace « ",
-     "Volume Group(s) outside the current mapping of namespace « "),
-    ("Aucun Volume Group HYCU à protéger", "No HYCU Volume Group to protect"),
-    ("Assigner la politique", "Assign the policy"),
-    ("Échec de l'assignation de politique : ", "Policy assignment failed: "),
-    ("Lancer la sauvegarde maintenant", "Start the backup now"),
-    ("Job HYCU non identifié — fin non confirmable.", "HYCU job not identified — completion cannot be confirmed."),
-    (" terminé", " finished"),
-    (" en échec", " failed"),
-    ("Connectez-vous à HYCU pour orchestrer la restauration sur place.",
-     "Connect to HYCU to orchestrate the in-place restore."),
-    ("Aucun volume avec un point de restauration sélectionné.", "No volume with a selected restore point."),
-    ("Une étape a échoué. L'application reste ARRÊTÉE pour éviter de redémarrer sur",
-     "A step failed. The application stays STOPPED to avoid restarting on"),
-    ("des données incohérentes. Corrigez puis relancez, ou redémarrez :",
-     "inconsistent data. Fix the issue then retry, or restart manually:"),
-    # Clone d'application
-    ("Un suffixe est requis pour cloner dans le même namespace.",
-     "A suffix is required to clone within the same namespace."),
+    ('IQN du PV aligné sur la cible iSCSI réelle du VG', "PV IQN aligned with the VG's real iSCSI target"),
+    ('IQN du PV conforme à la cible iSCSI du VG', "PV IQN matches the VG's iSCSI target"),
+    ('VG modifié par le restore in-place — rafraîchissement du PV ', 'VG changed by the in-place restore — refreshing PV '),
+    (' avec les attributs à jour (Retain -> delete -> apply)', ' with up-to-date attributes (Retain -> delete -> apply)'),
+    ('hypervisorAttachedDiskUUIDs non ajouté (le PV source ne le porte pas)', 'hypervisorAttachedDiskUUIDs not added (the source PV does not carry it)'),
+    ("Le CSI de ce cluster attache le Volume Group sans cet attribut, comme pour le PV d'origine : forme du PV source reproduite.", "This cluster's CSI attaches the Volume Group without this attribute, as for the original PV: the source PV's shape is reproduced."),
+    ('hypervisorAttachedDiskUUIDs NON renseigné (Prism Central non connecté)', 'hypervisorAttachedDiskUUIDs NOT set (Prism Central not connected)'),
+    ("Le CSI tentera l'attach iSCSI et l'attachement échouera. Connectez Prism Central.", 'The CSI will attempt the iSCSI attach and the attachment will fail. Connect Prism Central.'),
+    ('hypervisorAttachedDiskUUIDs renseigné depuis le VG cloné', 'hypervisorAttachedDiskUUIDs set from the cloned VG'),
+    ('Disque(s) du VG cloné : ', 'Cloned VG disk(s): '),
+    ('hypervisorAttachedDiskUUIDs NON renseigné (disque introuvable)', 'hypervisorAttachedDiskUUIDs NOT set (disk not found)'),
+    ('Aucun disque lu pour le VG ', 'No disk read for VG '),
+    ("Le CSI tentera l'attach iSCSI ; vérifiez le VG cloné dans Prism.", 'The CSI will attempt the iSCSI attach; check the cloned VG in Prism.'),
+    ('Disque du PV ', 'Disk of PV '),
+    (' non vérifié (Prism Central non connecté)', ' not verified (Prism Central not connected)'),
+    ('Si le pod reste en FailedMount («failed to get symlink»), connectez', 'If the pod stays in FailedMount (“failed to get symlink”), connect'),
+    ('Prism Central et relancez la restauration sur place.', 'Prism Central and rerun the in-place restore.'),
+    ('Disque du VG remplacé par le restore in-place — rafraîchissement du PV ', 'VG disk replaced by the in-place restore — refreshing PV '),
+    ('Recréer le PV ', 'Recreate PV '),
+    (' avec le disque à jour (Retain -> delete -> apply)', ' with the up-to-date disk (Retain -> delete -> apply)'),
+    ('Rafraîchissement du PV interrompu : ', 'PV refresh interrupted: '),
+    ('Rafraîchissement du PV ', 'Refresh of PV '),
+    (' annulé : état du PV indéterminé (', ' cancelled: PV state undetermined ('),
+    (' — suppression refusée pour ne pas risquer la perte du', ' — deletion refused to avoid risking the loss of the'),
+    ("Volume Group. Vérifiez l'accès kubectl puis relancez.", 'Volume Group. Check kubectl access then retry.'),
+    ("vérification de l'état du PV ", 'checking the state of PV '),
+    (' avant suppression', ' before deletion'),
+    ('Recréation du PV ', 'Recreating PV '),
+    (' (disque rafraîchi)', ' (refreshed disk)'),
+    ('recréation du PV ', 'recreation of PV '),
+    ('Point de restauration requis.', 'Restore point required.'),
+    ("Simulation : aucun appel HYCU envoyé. Vérifiez l'appel ci-dessus,", 'Simulation: no HYCU call sent. Review the call above,'),
+    ('puis désactivez la simulation pour lancer réellement.', 'then turn off simulation to launch for real.'),
+    ('Identifiant de job manquant.', 'Missing job identifier.'),
+    ('Re-vérification de la correspondance impossible : ', 'Could not re-verify the mapping: '),
+    ('Volume Group(s) hors de la correspondance actuelle du namespace « ', 'Volume Group(s) outside the current mapping of namespace « '),
+    ('Aucun Volume Group HYCU à protéger', 'No HYCU Volume Group to protect'),
+    ('Assigner la politique', 'Assign the policy'),
+    ("Échec de l'assignation de politique : ", 'Policy assignment failed: '),
+    ('Lancer la sauvegarde maintenant', 'Start the backup now'),
+    ('Job HYCU non identifié — fin non confirmable.', 'HYCU job not identified — completion cannot be confirmed.'),
+    (' terminé', ' finished'),
+    (' en échec', ' failed'),
+    ('Connectez-vous à HYCU pour orchestrer la restauration sur place.', 'Connect to HYCU to orchestrate the in-place restore.'),
+    ('Aucun volume avec un point de restauration sélectionné.', 'No volume with a selected restore point.'),
+    ("Une étape a échoué. L'application reste ARRÊTÉE pour éviter de redémarrer sur", 'A step failed. The application stays STOPPED to avoid restarting on'),
+    ('des données incohérentes. Corrigez puis relancez, ou redémarrez :', 'inconsistent data. Fix the issue then retry, or restart manually:'),
+    ('Un suffixe est requis pour cloner dans le même namespace.', 'A suffix is required to clone within the same namespace.'),
     ("Nom de namespace cible invalide : '", "Invalid target namespace name: '"),
-    ("Aucun volume sélectionné.", "No volume selected."),
-    ("Référence du VG cloné manquante/invalide pour « ", "Missing/invalid cloned VG reference for « "),
-    (" » : la référence est identique au volume SOURCE — le clone",
-     " »: the reference is identical to the SOURCE volume — the clone"),
-    ("pointerait vers le même disque Nutanix que l'application d'origine (risque de",
-     "would point to the same Nutanix disk as the original application (risk of"),
-    ("multi-attach/corruption). Collez l'UUID du VG CLONÉ.", "multi-attach/corruption). Paste the UUID of the CLONED VG."),
-    (" » : la référence correspond au NOM du Volume Group", " »: the reference matches the Volume Group NAME"),
-    ("(« pvc-<uuid-du-PVC> ») et non à son UUID. Collez l'UUID du VG cloné.",
-     "(« pvc-<PVC-uuid> ») and not its UUID. Paste the cloned VG UUID."),
-    ("Manifeste du PVC introuvable pour « ", "PVC manifest not found for « "),
-    ("Le nom du PV cloné doit différer de l'original « ", "The cloned PV name must differ from the original « "),
-    ("Le workload « ", "The workload « "),
-    (" » monte aussi le(s) PVC ", " » also mounts the PVC(s) "),
-    (" non sélectionné(s) : ", " not selected: "),
-    ("sélectionnez TOUS les volumes de cette application pour la cloner.",
-     "select ALL the volumes of this application to clone it."),
-    (" » utilise un sélecteur matchExpressions : le clone dans",
-     " » uses a matchExpressions selector: cloning within"),
-    ("le même namespace n'est pas supporté (risque de collision de pods). Choisissez « Autre namespace ».",
-     "the same namespace is not supported (pod collision risk). Choose “Other namespace”."),
-    (" » utilise des volumeClaimTemplates : son clone provisionnera de",
-     " » uses volumeClaimTemplates: its clone will provision"),
-    ("NOUVEAUX volumes (pas le VG cloné). À adapter manuellement.",
-     "NEW volumes (not the cloned VG). Adapt it manually."),
-    ("Dépendances clonées automatiquement vers « ", "Dependencies automatically cloned to « "),
-    ("Référencé(s) par l'app mais INTROUVABLE(S) dans « ", "Referenced by the app but NOT FOUND in « "),
-    (" » — à créer à la main : ", " » — create manually: "),
-    ("Non clonés automatiquement : Ingress, NetworkPolicies et les liaisons RBAC",
-     "Not cloned automatically: Ingress, NetworkPolicies and the RBAC bindings"),
-    ("(RoleBindings) des ServiceAccounts — à recréer si l'app en dépend.",
-     "(RoleBindings) of the ServiceAccounts — recreate them if the app depends on them."),
-    ("Clone des dépendances DÉSACTIVÉ : à recréer manuellement dans « ",
-     "Dependency cloning DISABLED: recreate manually in « "),
-    ("Same-namespace : les Services / Ingress / NetworkPolicies de l'app NE sont PAS clonés et",
-     "Same-namespace: the app's Services / Ingress / NetworkPolicies are NOT cloned and"),
-    ("peuvent router vers les pods d'origine (labels hors-sélecteur conservés). À cloner/éditer séparément.",
-     "may route to the original pods (non-selector labels kept). Clone/edit them separately."),
-    ("Aucun Deployment/StatefulSet ne monte ces PVC : seuls le PV et le PVC clonés seront",
-     "No Deployment/StatefulSet mounts these PVCs: only the cloned PV and PVC will be"),
-    ("créés (déployez votre application dessus).", "created (deploy your application on top of them)."),
-    ("Objet(s) déjà présent(s) — refus pour ne rien écraser : ",
-     "Object(s) already present — refusing to overwrite anything: "),
-    ("Changez le suffixe ou le namespace cible.", "Change the suffix or the target namespace."),
-    ("rien n'a été créé.", "nothing was created."),
-    ("Namespace cible « ", "Target namespace « "),
-    (" déjà présent — conservé", " already present — kept"),
-    ("Non écrasé (la version existante de « ", "Not overwritten (the existing version of « "),
-    (" » est gardée).", " » is kept)."),
-    ("Dépendance clonée ", "Cloned dependency "),
-    ("PV cloné ", "Cloned PV "),
-    ("PVC cloné ", "Cloned PVC "),
-    ("Application clonée ", "Cloned application "),
-]
-
-# --- Fluidité du parcours : pastilles d'en-tête, barre « action suivante », suivi auto ---
-I18N_EN += [
-    ("État des sources — cliquer pour ouvrir les Sources",
-     "Source status — click to open Sources"),
-    ("Plan prêt — dernière étape :", "Plan ready — final step:"),
-    ("Tous les points de restauration sont sélectionnés.", "All restore points are selected."),
-    (" point(s) de restauration sélectionné(s).", " restore point(s) selected."),
-    ("Toutes les références VG sont remplies.", "All VG references are filled."),
-    (" référence(s) VG remplie(s).", " VG reference(s) filled."),
-    ("Aller au lancement", "Go to launch"),
-    ("Voir les volumes", "Show the volumes"),
-    (r"Vérifier l\'application maintenant →", r"Verify the application now →"),
-    ("Ouverture de la vérification…", "Opening the verification…"),
-]
-
-# --- Parcours Restaurer simplifié : panneau HYCU groupé, textes allégés ---
-I18N_EN += [
-    ("Cochez le(s) volume(s) à restaurer — plusieurs volumes = une seule transaction.",
-     "Tick the volume(s) to restore — several volumes = a single transaction."),
-    ("Manifestes PV/PVC (le « squelette ») — indépendant du point de restauration HYCU des <b>données</b>.",
-     "PV/PVC manifests (the “skeleton”) — independent from the HYCU restore point of the <b>data</b>."),
-    ("Type d'opération", "Operation type"),
-    ("Restaurer les données (Volume Groups)", "Restore the data (Volume Groups)"),
-    ("Arrêt de l'application → restore in-place HYCU → redémarrage.</b> Aucune référence à saisir.",
-     "Stop the application → HYCU in-place restore → restart.</b> No reference to enter."),
-    ("Continuer : vérifier et lancer", "Continue: review and launch"),
-    ("Nom du nouveau PV", "New PV name"),
-    ("Avancé (optionnel) — noms générés, saisie manuelle", "Advanced (optional) — generated names, manual entry"),
-    ("Référence du VG (obligatoire) & noms générés", "VG reference (required) & generated names"),
-    ("✓ référence remplie", "✓ reference filled"),
-    ("— référence à remplir", "— reference to fill"),
-    ("Choisissez un <b>point de restauration</b> par volume (le plus récent est pré-sélectionné), puis <b>Lancer la restauration sur place</b>.",
-     "Choose a <b>restore point</b> per volume (the most recent is pre-selected), then <b>Launch the in-place restore</b>."),
-    ("Restaurez le VG dans HYCU, collez son UUID par volume (volet <b>Avancé</b>), puis <b>",
-     "Restore the VG in HYCU, paste its UUID per volume (<b>Advanced</b> section), then <b>"),
-    ("Clonez chaque VG dans HYCU, collez son UUID par volume (volet <b>Avancé</b>), puis <b>",
-     "Clone each VG in HYCU, paste its UUID per volume (<b>Advanced</b> section), then <b>"),
-    ("Connectez HYCU pour automatiser.", "Connect HYCU to automate."),
-    ("Choisissez un <b>point de restauration</b> par volume (le plus récent est pré-sélectionné), puis cliquez <b>Restaurer les VG depuis HYCU</b> — références et plan s'enchaînent automatiquement.",
-     "Choose a <b>restore point</b> per volume (the most recent is pre-selected), then click <b>Restore the VGs from HYCU</b> — references and plan follow automatically."),
-    ("points indisponibles", "restore points unavailable"),
-    ("Aucun Volume Group HYCU associé — collez la référence dans « Avancé ».",
-     "No HYCU Volume Group matched — paste the reference under “Advanced”."),
-    (" (le plus récent)", " (most recent)"),
-    ("Aucun point de restauration pour ce VG.", "No restore point for this VG."),
-    ("→ VG HYCU <b>", "→ HYCU VG <b>"),
-    ("Restaurer les VG depuis HYCU", "Restore the VGs from HYCU"),
-    ("Clone les VG au point choisi et remplit les références — aucune donnée écrasée.",
-     "Clones the VGs at the chosen point and fills the references — no data overwritten."),
-    ("Connectez Nutanix (Prism) pour récupérer la référence automatiquement, ou utilisez le volet Avancé.",
-     "Connect Nutanix (Prism) to fetch the reference automatically, or use the Advanced section."),
-    (" » introuvable côté Nutanix — utilisez le volet Avancé.",
-     " » not found on the Nutanix side — use the Advanced section."),
+    ('Aucun volume sélectionné.', 'No volume selected.'),
+    ('Référence du VG cloné manquante/invalide pour « ', 'Missing/invalid cloned VG reference for « '),
+    (' » : la référence est identique au volume SOURCE — le clone', ' »: the reference is identical to the SOURCE volume — the clone'),
+    ("pointerait vers le même disque Nutanix que l'application d'origine (risque de", 'would point to the same Nutanix disk as the original application (risk of'),
+    ("multi-attach/corruption). Collez l'UUID du VG CLONÉ.", 'multi-attach/corruption). Paste the UUID of the CLONED VG.'),
+    (' » : la référence correspond au NOM du Volume Group', ' »: the reference matches the Volume Group NAME'),
+    ("(« pvc-<uuid-du-PVC> ») et non à son UUID. Collez l'UUID du VG cloné.", '(« pvc-<PVC-uuid> ») and not its UUID. Paste the cloned VG UUID.'),
+    ('Manifeste du PVC introuvable pour « ', 'PVC manifest not found for « '),
+    ("Le nom du PV cloné doit différer de l'original « ", 'The cloned PV name must differ from the original « '),
+    ('Le workload « ', 'The workload « '),
+    (' » monte aussi le(s) PVC ', ' » also mounts the PVC(s) '),
+    (' non sélectionné(s) : ', ' not selected: '),
+    ('sélectionnez TOUS les volumes de cette application pour la cloner.', 'select ALL the volumes of this application to clone it.'),
+    (' » utilise un sélecteur matchExpressions : le clone dans', ' » uses a matchExpressions selector: cloning within'),
+    ("le même namespace n'est pas supporté (risque de collision de pods). Choisissez « Autre namespace ».", 'the same namespace is not supported (pod collision risk). Choose “Other namespace”.'),
+    (' » utilise des volumeClaimTemplates : son clone provisionnera de', ' » uses volumeClaimTemplates: its clone will provision'),
+    ('NOUVEAUX volumes (pas le VG cloné). À adapter manuellement.', 'NEW volumes (not the cloned VG). Adapt it manually.'),
+    ('Dépendances clonées automatiquement vers « ', 'Dependencies automatically cloned to « '),
+    ("Référencé(s) par l'app mais INTROUVABLE(S) dans « ", 'Referenced by the app but NOT FOUND in « '),
+    (' » — à créer à la main : ', ' » — create manually: '),
+    ('Non clonés automatiquement : Ingress, NetworkPolicies et les liaisons RBAC', 'Not cloned automatically: Ingress, NetworkPolicies and the RBAC bindings'),
+    ("(RoleBindings) des ServiceAccounts — à recréer si l'app en dépend.", '(RoleBindings) of the ServiceAccounts — recreate them if the app depends on them.'),
+    ('Clone des dépendances DÉSACTIVÉ : à recréer manuellement dans « ', 'Dependency cloning DISABLED: recreate manually in « '),
+    ("Same-namespace : les Services / Ingress / NetworkPolicies de l'app NE sont PAS clonés et", "Same-namespace: the app's Services / Ingress / NetworkPolicies are NOT cloned and"),
+    ("peuvent router vers les pods d'origine (labels hors-sélecteur conservés). À cloner/éditer séparément.", 'may route to the original pods (non-selector labels kept). Clone/edit them separately.'),
+    ('Aucun Deployment/StatefulSet ne monte ces PVC : seuls le PV et le PVC clonés seront', 'No Deployment/StatefulSet mounts these PVCs: only the cloned PV and PVC will be'),
+    ('créés (déployez votre application dessus).', 'created (deploy your application on top of them).'),
+    ('Objet(s) déjà présent(s) — refus pour ne rien écraser : ', 'Object(s) already present — refusing to overwrite anything: '),
+    ('Changez le suffixe ou le namespace cible.', 'Change the suffix or the target namespace.'),
+    ("rien n'a été créé.", 'nothing was created.'),
+    ('Namespace cible « ', 'Target namespace « '),
+    (' déjà présent — conservé', ' already present — kept'),
+    ('Non écrasé (la version existante de « ', 'Not overwritten (the existing version of « '),
+    (' » est gardée).', ' » is kept).'),
+    ('Dépendance clonée ', 'Cloned dependency '),
+    ('PV cloné ', 'Cloned PV '),
+    ('PVC cloné ', 'Cloned PVC '),
+    ('Application clonée ', 'Cloned application '),
+    ('État des sources — cliquer pour ouvrir les Sources', 'Source status — click to open Sources'),
+    ('Plan prêt — dernière étape :', 'Plan ready — final step:'),
+    ('Tous les points de restauration sont sélectionnés.', 'All restore points are selected.'),
+    (' point(s) de restauration sélectionné(s).', ' restore point(s) selected.'),
+    ('Toutes les références VG sont remplies.', 'All VG references are filled.'),
+    (' référence(s) VG remplie(s).', ' VG reference(s) filled.'),
+    ('Aller au lancement', 'Go to launch'),
+    ('Voir les volumes', 'Show the volumes'),
+    ("Vérifier l\\'application maintenant →", 'Verify the application now →'),
+    ('Ouverture de la vérification…', 'Opening the verification…'),
+    ('Cochez le(s) volume(s) à restaurer — plusieurs volumes = une seule transaction.', 'Tick the volume(s) to restore — several volumes = a single transaction.'),
+    ('Manifestes PV/PVC (le « squelette ») — indépendant du point de restauration HYCU des <b>données</b>.', 'PV/PVC manifests (the “skeleton”) — independent from the HYCU restore point of the <b>data</b>.'),
+    ("Type d'opération", 'Operation type'),
+    ('Restaurer les données (Volume Groups)', 'Restore the data (Volume Groups)'),
+    ("Arrêt de l'application → restore in-place HYCU → redémarrage.</b> Aucune référence à saisir.", 'Stop the application → HYCU in-place restore → restart.</b> No reference to enter.'),
+    ('Continuer : vérifier et lancer', 'Continue: review and launch'),
+    ('Nom du nouveau PV', 'New PV name'),
+    ('Avancé (optionnel) — noms générés, saisie manuelle', 'Advanced (optional) — generated names, manual entry'),
+    ('Référence du VG (obligatoire) & noms générés', 'VG reference (required) & generated names'),
+    ('✓ référence remplie', '✓ reference filled'),
+    ('— référence à remplir', '— reference to fill'),
+    ('Choisissez un <b>point de restauration</b> par volume (le plus récent est pré-sélectionné), puis <b>Lancer la restauration sur place</b>.', 'Choose a <b>restore point</b> per volume (the most recent is pre-selected), then <b>Launch the in-place restore</b>.'),
+    ('Restaurez le VG dans HYCU, collez son UUID par volume (volet <b>Avancé</b>), puis <b>', 'Restore the VG in HYCU, paste its UUID per volume (<b>Advanced</b> section), then <b>'),
+    ('Clonez chaque VG dans HYCU, collez son UUID par volume (volet <b>Avancé</b>), puis <b>', 'Clone each VG in HYCU, paste its UUID per volume (<b>Advanced</b> section), then <b>'),
+    ('Connectez HYCU pour automatiser.', 'Connect HYCU to automate.'),
+    ("Choisissez un <b>point de restauration</b> par volume (le plus récent est pré-sélectionné), puis cliquez <b>Restaurer les VG depuis HYCU</b> — références et plan s'enchaînent automatiquement.", 'Choose a <b>restore point</b> per volume (the most recent is pre-selected), then click <b>Restore the VGs from HYCU</b> — references and plan follow automatically.'),
+    ('points indisponibles', 'restore points unavailable'),
+    ('Aucun Volume Group HYCU associé — collez la référence dans « Avancé ».', 'No HYCU Volume Group matched — paste the reference under “Advanced”.'),
+    (' (le plus récent)', ' (most recent)'),
+    ('Aucun point de restauration pour ce VG.', 'No restore point for this VG.'),
+    ('→ VG HYCU <b>', '→ HYCU VG <b>'),
+    ('Restaurer les VG depuis HYCU', 'Restore the VGs from HYCU'),
+    ('Clone les VG au point choisi et remplit les références — aucune donnée écrasée.', 'Clones the VGs at the chosen point and fills the references — no data overwritten.'),
+    ('Connectez Nutanix (Prism) pour récupérer la référence automatiquement, ou utilisez le volet Avancé.', 'Connect Nutanix (Prism) to fetch the reference automatically, or use the Advanced section.'),
+    (' » introuvable côté Nutanix — utilisez le volet Avancé.', ' » not found on the Nutanix side — use the Advanced section.'),
     ('?"Aucun":"Plusieurs")+" VG nommé(s) exactement « ', '?"No":"Multiple")+" VG named exactly « '),
-    (" » — utilisez le volet Avancé pour choisir le bon.",
-     " » — use the Advanced section to pick the right one."),
-    ("VG trouvé mais UUID non exposé — utilisez le volet Avancé.",
-     "VG found but UUID not exposed — use the Advanced section."),
-    ("Clones HYCU RÉELS", "REAL HYCU clones"),
-    ("Déclencher dans HYCU le <b>clone</b> de <b>", "Trigger in HYCU the <b>clone</b> of <b>"),
-    ("</b> Volume Group(s) au point choisi ?", "</b> Volume Group(s) at the chosen point?"),
-    ("Les VG sources ne sont <b>pas</b> modifiés — de <b>nouveaux</b> VG sont créés.",
-     "The source VGs are <b>not</b> modified — <b>new</b> VGs are created."),
-    ("Clones HYCU en cours…", "HYCU clones in progress…"),
-    ("Clone HYCU…", "HYCU clone…"),
-    ("Job HYCU non identifié — récupérez la référence via le volet Avancé une fois le clone terminé.",
-     "HYCU job not identified — fetch the reference via the Advanced section once the clone completes."),
-    ("✓ VG cloné — référence <code>", "✓ VG cloned — reference <code>"),
-    ("</code> remplie.", "</code> filled."),
-    # Namespace créé par un clone : ajout automatique au filtre + bouton de secours.
-    (" » ajouté aux namespaces autorisés", " » added to the allowed namespaces"),
-    ("Filtre mis à jour (⚙ Réglages) pour que Vérifier/Restaurer acceptent ce namespace.",
-     "Filter updated (⚙ Settings) so Verify/Restore accept this namespace."),
-    ("Autoriser « ", "Allow « "),
-    (" » et réessayer", " » and retry"),
-    ("Mise à jour du filtre impossible.", "Could not update the filter."),
-    # Sauvegarde automatique de la configuration (onglet 1).
-    ("Sauvegarde automatique de la configuration (PV/PVC)",
-     "Automatic configuration backup (PV/PVC manifests)"),
-    ("Sauvegarde régulièrement les <b>manifestes PV/PVC</b> (la « recette » du restore) de tous les",
-     "Regularly backs up the <b>PV/PVC manifests</b> (the restore “recipe”) of all"),
-    ("namespaces autorisés par le filtre — tant que l'outil est lancé. <b>Pas les données</b> des volumes :",
-     "namespaces allowed by the filter — while the tool is running. <b>Not the data</b> of the volumes:"),
-    ("Sauvegarde automatique</label>", "Automatic backup</label>"),
-    ("Intervalle (heures)", "Interval (hours)"),
-    ("Versions à conserver", "Versions to keep"),
+    (' » — utilisez le volet Avancé pour choisir le bon.', ' » — use the Advanced section to pick the right one.'),
+    ('VG trouvé mais UUID non exposé — utilisez le volet Avancé.', 'VG found but UUID not exposed — use the Advanced section.'),
+    ('Clones HYCU RÉELS', 'REAL HYCU clones'),
+    ('Déclencher dans HYCU le <b>clone</b> de <b>', 'Trigger in HYCU the <b>clone</b> of <b>'),
+    ('</b> Volume Group(s) au point choisi ?', '</b> Volume Group(s) at the chosen point?'),
+    ('Les VG sources ne sont <b>pas</b> modifiés — de <b>nouveaux</b> VG sont créés.', 'The source VGs are <b>not</b> modified — <b>new</b> VGs are created.'),
+    ('Clones HYCU en cours…', 'HYCU clones in progress…'),
+    ('Clone HYCU…', 'HYCU clone…'),
+    ('Job HYCU non identifié — récupérez la référence via le volet Avancé une fois le clone terminé.', 'HYCU job not identified — fetch the reference via the Advanced section once the clone completes.'),
+    ('✓ VG cloné — référence <code>', '✓ VG cloned — reference <code>'),
+    ('</code> remplie.', '</code> filled.'),
+    (' » ajouté aux namespaces autorisés', ' » added to the allowed namespaces'),
+    ('Filtre mis à jour (⚙ Réglages) pour que Vérifier/Restaurer acceptent ce namespace.', 'Filter updated (⚙ Settings) so Verify/Restore accept this namespace.'),
+    ('Autoriser « ', 'Allow « '),
+    (' » et réessayer', ' » and retry'),
+    ('Mise à jour du filtre impossible.', 'Could not update the filter.'),
+    ('Sauvegarde automatique de la configuration (PV/PVC)', 'Automatic configuration backup (PV/PVC manifests)'),
+    ('Sauvegarde régulièrement les <b>manifestes PV/PVC</b> (la « recette » du restore) de tous les', 'Regularly backs up the <b>PV/PVC manifests</b> (the restore “recipe”) of all'),
+    ("namespaces autorisés par le filtre — tant que l'outil est lancé. <b>Pas les données</b> des volumes :", 'namespaces allowed by the filter — while the tool is running. <b>Not the data</b> of the volumes:'),
+    ('Sauvegarde automatique</label>', 'Automatic backup</label>'),
+    ('Intervalle (heures)', 'Interval (hours)'),
+    ('Versions à conserver', 'Versions to keep'),
     ('? "Activée" : "Désactivée"', '? "Enabled" : "Disabled"'),
-    (">Désactivée</b>", ">Disabled</b>"),
+    ('>Désactivée</b>', '>Disabled</b>'),
     ('"Toutes les "', '"Every "'),
-    ("Sauvegarde en cours…", "Backup in progress…"),
+    ('Sauvegarde en cours…', 'Backup in progress…'),
     ('" Dernière : "', '" Last: "'),
     ('" · Prochaine : "', '" · Next: "'),
     ('" · Première exécution dans moins d\'une minute."', '" · First run in less than a minute."'),
-    (" namespace(s) sauvegardé(s), ", " namespace(s) backed up, "),
-    (" ancienne(s) version(s) supprimée(s)", " old version(s) deleted"),
-    # Fenêtre « À propos » (bouton ? de l'en-tête).
-    ("Plugin pour HYCU Enterprise Cloud", "Plugin for HYCU Enterprise Cloud"),
-    ("Plugin gratuit, fourni « tel quel », sans aucune garantie ni engagement de HYCU.",
-     "This is a free plugin, provided as-is, without any warranty or engagement from HYCU."),
-    ("<b>Version :</b>", "<b>Version:</b>"),
-    ("<b>Journal d'audit :</b>", "<b>Audit log:</b>"),
-    ("<b>Configuration :</b>", "<b>Configuration:</b>"),
-    ("<b>Sauvegardes :</b>", "<b>Backups:</b>"),
-    (">Fermer</button>", ">Close</button>"),
-]
-
-# --- Interface « HYCU Enterprise Cloud » : pages, modales, assistant de restauration ---
-I18N_EN += [
-    # Barre du haut / barre latérale
+    (' namespace(s) sauvegardé(s), ', ' namespace(s) backed up, '),
+    (' ancienne(s) version(s) supprimée(s)', ' old version(s) deleted'),
+    ('Plugin pour HYCU Enterprise Cloud', 'Plugin for HYCU Enterprise Cloud'),
+    ('Plugin gratuit, fourni « tel quel », sans aucune garantie ni engagement de HYCU.', 'This is a free plugin, provided as-is, without any warranty or engagement from HYCU.'),
+    ('<b>Version :</b>', '<b>Version:</b>'),
+    ("<b>Journal d'audit :</b>", '<b>Audit log:</b>'),
+    ('<b>Configuration :</b>', '<b>Configuration:</b>'),
+    ('<b>Sauvegardes :</b>', '<b>Backups:</b>'),
+    ('>Fermer</button>', '>Close</button>'),
     ('title="Tableau de bord"', 'title="Dashboard"'),
     ('<span class="nl">Tableau de bord</span>', '<span class="nl">Dashboard</span>'),
     ('<span class="nl">Politiques</span>', '<span class="nl">Policies</span>'),
     ('<span class="nl">Tâches</span>', '<span class="nl">Jobs</span>'),
-    ("Réduire / déployer le menu", "Collapse / expand the menu"),
-    ("Sections de l'outil", "Tool sections"),
+    ('Réduire / déployer le menu', 'Collapse / expand the menu'),
+    ("Sections de l'outil", 'Tool sections'),
     ('title="Fermer"', 'title="Close"'),
     ('title="Actualiser"', 'title="Refresh"'),
     ('placeholder="Rechercher"', 'placeholder="Search"'),
     ('title="Tout sélectionner"', 'title="Select all"'),
-    # Tableau de bord
     ('<h2 class="dtitle">Dernières tâches</h2>', '<h2 class="dtitle">Recent jobs</h2>'),
-    ('dnums("Protection"', 'dnums("Protection"'),
     ('"Conformité"', '"Compliance"'),
     ('"Connectées"', '"Connected"'),
     ('"Configurées"', '"Configured"'),
@@ -13109,56 +18120,50 @@ I18N_EN += [
     ('<span class="k">Filtre des namespaces</span>', '<span class="k">Namespace filter</span>'),
     ('? "Actif" : "Aucun"', '? "Active" : "None"'),
     ('<span class="ko">Réel</span>', '<span class="ko">Real</span>'),
-    ("Voir toutes les tâches", "View all jobs"),
-    ("à l'instant", "just now"),
+    ('Voir toutes les tâches', 'View all jobs'),
+    ("à l'instant", 'just now'),
     ('"il y a %d min"', '"%d min ago"'),
     ('"il y a %d h"', '"%d h ago"'),
     ('"il y a %d j"', '"%d d ago"'),
-    # Applications
     ('<span>Sauvegarder</span>', '<span>Back up</span>'),
     ('<span>Restaurer</span>', '<span>Restore</span>'),
     ('<span>Vérifier</span>', '<span>Verify</span>'),
-    ("Définir la politique", "Set Policy"),
+    ('Définir la politique', 'Set Policy'),
     ('<th>Nom</th>', '<th>Name</th>'),
     ('<th>Politique</th>', '<th>Policy</th>'),
     ('<th class="ctr">Conformité</th>', '<th class="ctr">Compliance</th>'),
     ('<th>Dernière sauvegarde</th>', '<th>Last backup</th>'),
     ('"Configuration auto · "', '"Automatic configuration · "'),
     (': "Aucune";', ': "None";'),
-    ("Aucune application ne correspond à la recherche.", "No application matches the search."),
-    ("Aucun namespace à afficher — vérifiez le contexte kubectl ou le filtre des namespaces.",
-     "No namespace to display — check the kubectl context or the namespace filter."),
-    ("Sauvegarde de configuration récente", "Recent configuration backup"),
-    ("Dernière sauvegarde plus ancienne que ", "Last backup older than "),
-    ("Jamais sauvegardée", "Never backed up"),
-    (" sauvegarde(s) de configuration", " configuration backup(s)"),
-    ("Aucune sauvegarde de configuration", "No configuration backup"),
+    ('Aucune application ne correspond à la recherche.', 'No application matches the search.'),
+    ('Aucun namespace à afficher — vérifiez le contexte kubectl ou le filtre des namespaces.', 'No namespace to display — check the kubectl context or the namespace filter.'),
+    ('Sauvegarde de configuration récente', 'Recent configuration backup'),
+    ('Dernière sauvegarde plus ancienne que ', 'Last backup older than '),
+    ('Jamais sauvegardée', 'Never backed up'),
+    (' sauvegarde(s) de configuration', ' configuration backup(s)'),
+    ('Aucune sauvegarde de configuration', 'No configuration backup'),
     ('>Jamais</span>', '>Never</span>'),
-    # Politiques
     ('<h1 class="ptitle">Politiques</h1>', '<h1 class="ptitle">Policies</h1>'),
     ('<th>Objet protégé</th>', '<th>Protected object</th>'),
     ('<th>Fréquence</th>', '<th>Frequency</th>'),
     ('<th>Rétention</th>', '<th>Retention</th>'),
     ('<th>Cible</th>', '<th>Target</th>'),
     ('<th class="ctr">État</th>', '<th class="ctr">Status</th>'),
-    ("Configuration Kubernetes", "Kubernetes configuration"),
-    ("Manifestes PV/PVC et ressources des namespaces du filtre", "PV/PVC manifests and resources of the filtered namespaces"),
+    ('Configuration Kubernetes', 'Kubernetes configuration'),
+    ('Manifestes PV/PVC et ressources des namespaces du filtre', 'PV/PVC manifests and resources of the filtered namespaces'),
     ('"Activée")', '"Enabled")'),
     ('"Désactivée")', '"Disabled")'),
-    ("Politiques HYCU (données des volumes)", "HYCU policies (volume data)"),
-    ("Politiques définies dans HYCU, assignables aux Volume Groups d'une application via",
-     "Policies defined in HYCU, assignable to an application's Volume Groups via"),
-    ("elles sont protégées par HYCU (<b>Applications", "they are protected by HYCU (<b>Applications"),
-    ("Aucune politique HYCU.", "No HYCU policy."),
-    ("Enregistrez la source HYCU (⚙ en haut à droite) pour afficher ses politiques.",
-     "Register the HYCU source (⚙ at the top right) to display its policies."),
-    # Tâches
+    ('Politiques HYCU (données des volumes)', 'HYCU policies (volume data)'),
+    ("Politiques définies dans HYCU, assignables aux Volume Groups d'une application via", "Policies defined in HYCU, assignable to an application's Volume Groups via"),
+    ('elles sont protégées par HYCU (<b>Applications', 'they are protected by HYCU (<b>Applications'),
+    ('Aucune politique HYCU.', 'No HYCU policy.'),
+    ('Enregistrez la source HYCU (⚙ en haut à droite) pour afficher ses politiques.', 'Register the HYCU source (⚙ at the top right) to display its policies.'),
     ('<h1 class="ptitle">Tâches ', '<h1 class="ptitle">Jobs '),
     ('<th>Tâche</th>', '<th>Job</th>'),
     ('<th>Détail</th>', '<th>Details</th>'),
     ('<th>Démarrée</th>', '<th>Started</th>'),
     ('"Sauvegarde de configuration (lot)"', '"Configuration backup (batch)"'),
-    ("Sauvegarde de configuration", "Configuration backup"),
+    ('Sauvegarde de configuration', 'Configuration backup'),
     ('"Sauvegarde automatique"', '"Automatic backup"'),
     ('"Restauration Kubernetes (PV/PVC)"', '"Kubernetes restore (PV/PVC)"'),
     ('"Clone d\'application"', '"Application clone"'),
@@ -13169,36 +18174,29 @@ I18N_EN += [
     ('"Échec"', '"Failed"'),
     ('"En cours"', '"In progress"'),
     ('" tâche(s)"', '" job(s)"'),
-    ("Aucune tâche enregistrée pour l'instant.", "No job recorded yet."),
-    # Vérification / Réglages
+    ("Aucune tâche enregistrée pour l'instant.", 'No job recorded yet.'),
     ('<span class="sep">›</span>Vérification</h1>', '<span class="sep">›</span>Verification</h1>'),
     ('<h1 class="ptitle">Réglages</h1>', '<h1 class="ptitle">Settings</h1>'),
-    # Modales
-    ("Restauration de l'application", "Application restore"),
-    ("Sauvegarder la sélection", "Back up the selection"),
+    ("Restauration de l'application", 'Application restore'),
+    ('Sauvegarder la sélection', 'Back up the selection'),
     ('<label class="fld">Namespaces sélectionnés</label>', '<label class="fld">Selected namespaces</label>'),
-    (" namespace(s) sauvegardé(s).</div>", " namespace(s) backed up.</div>"),
+    (' namespace(s) sauvegardé(s).</div>', ' namespace(s) backed up.</div>'),
     ('id="rsWizBack">Retour</button>', 'id="rsWizBack">Back</button>'),
     ('id="rsWizGo">Suivant</button>', 'id="rsWizGo">Next</button>'),
     ('"Suivant"', '"Next"'),
     ('lbl="Restaurer"', 'lbl="Restore"'),
     ('|| "Lancer"', '|| "Launch"'),
     ('"Mode réel"', '"Real mode"'),
-    # Assistant de restauration : types
-    ("Restaurer toute l'application (copie)", "Restore the whole application (copy)"),
-    ("Restaurer le stockage sur place", "Restore storage in place"),
-    ("Restaurer le stockage vers de nouveaux volumes", "Restore storage to new volumes"),
-    ("Restaure le stockage et les objets de l'application (workloads, dépendances) dans le même namespace (suffixe) ou dans un autre. L'original n'est pas modifié.",
-     "Restores the application storage and objects (workloads, dependencies) into the same namespace (suffix) or another one. The original is not modified."),
-    ("Restaure les données dans les volumes d'origine. L'application est arrêtée puis redémarrée.",
-     "Restores the data into the original volumes. The application is stopped, then restarted."),
-    ("Restaure vers de nouveaux Volume Groups et y rattache l'application. Les volumes d'origine sont conservés.",
-     "Restores to new Volume Groups and attaches the application to them. The original volumes are kept."),
+    ("Restaurer toute l'application (copie)", 'Restore the whole application (copy)'),
+    ('Restaurer le stockage sur place', 'Restore storage in place'),
+    ('Restaurer le stockage vers de nouveaux volumes', 'Restore storage to new volumes'),
+    ("Restaure le stockage et les objets de l'application (workloads, dépendances) dans le même namespace (suffixe) ou dans un autre. L'original n'est pas modifié.", 'Restores the application storage and objects (workloads, dependencies) into the same namespace (suffix) or another one. The original is not modified.'),
+    ("Restaure les données dans les volumes d'origine. L'application est arrêtée puis redémarrée.", 'Restores the data into the original volumes. The application is stopped, then restarted.'),
+    ("Restaure vers de nouveaux Volume Groups et y rattache l'application. Les volumes d'origine sont conservés.", 'Restores to new Volume Groups and attaches the application to them. The original volumes are kept.'),
     ('>Cluster cible</label>', '>Target cluster</label>'),
     ('<label class="fld">Volumes à restaurer</label>', '<label class="fld">Volumes to restore</label>'),
-    ("Avancé — dossier de sauvegardes personnalisé", "Advanced — custom backup folder"),
-    ("Chargement des volumes…", "Loading volumes…"),
-    # Sources
+    ('Avancé — dossier de sauvegardes personnalisé', 'Advanced — custom backup folder'),
+    ('Chargement des volumes…', 'Loading volumes…'),
     ('"Sauvegarde & restauration (API REST)"', '"Backup & restore (REST API)"'),
     ('"Nutanix — Volume Groups (API v2)"', '"Nutanix — Volume Groups (v2 API)"'),
     ('"Nutanix — multi-cluster (API v3/v4)"', '"Nutanix — multi-cluster (v3/v4 API)"'),
@@ -13209,58 +18207,45 @@ I18N_EN += [
     ('"Connecté"', '"Connected"'),
     ('"Configuré, non connecté"', '"Configured, not connected"'),
     ('"Non configuré"', '"Not configured"'),
-]
-
-# --- Multi-cluster (kubeconfigs ajoutés depuis l'interface) + découverte NKP ---
-I18N_EN += [
-    # Barre du haut / menu des clusters
-    ("Cluster Kubernetes actif — cliquer pour en choisir un autre", "Active Kubernetes cluster — click to choose another one"),
+    ('Cluster Kubernetes actif — cliquer pour en choisir un autre', 'Active Kubernetes cluster — click to choose another one'),
     ('"Cluster Kubernetes actif"+', '"Active Kubernetes cluster"+'),
     ('" — cliquer pour en choisir un autre"', '" — click to choose another one"'),
-    ("⚠ jeton expiré", "⚠ token expired"),
+    ('⚠ jeton expiré', '⚠ token expired'),
     ('"configuration locale"', '"local configuration"'),
     ('"kubeconfig importé"', '"imported kubeconfig"'),
-    ("Gérer les clusters…", "Manage clusters…"),
-    ("Ajouter un cluster Kubernetes", "Add a Kubernetes cluster"),
-    ("Découvrir les workspaces NKP", "Discover NKP workspaces"),
-    # Sources
-    ("Enregistrez ici les systèmes utilisés par l'outil — HYCU, Nutanix et vos clusters Kubernetes. Les identifiants et kubeconfigs restent en mémoire le temps de la session (ou dans le coffre chiffré si vous le choisissez).",
-     "Register here the systems used by the tool — HYCU, Nutanix and your Kubernetes clusters. Credentials and kubeconfigs stay in memory for the session (or in the encrypted vault if you choose so)."),
-    ("<th>URL / serveur</th>", "<th>URL / server</th>"),
-    (">Clusters Kubernetes<", ">Kubernetes clusters<"),
-    ("Kubernetes — configuration locale", "Kubernetes — local configuration"),
-    ("Kubernetes — kubeconfig importé", "Kubernetes — imported kubeconfig"),
+    ('Gérer les clusters…', 'Manage clusters…'),
+    ('Ajouter un cluster Kubernetes', 'Add a Kubernetes cluster'),
+    ('Découvrir les workspaces NKP', 'Discover NKP workspaces'),
+    ("Enregistrez ici les systèmes utilisés par l'outil — HYCU, Nutanix et vos clusters Kubernetes. Les identifiants et kubeconfigs restent en mémoire le temps de la session (ou dans le coffre chiffré si vous le choisissez).", 'Register here the systems used by the tool — HYCU, Nutanix and your Kubernetes clusters. Credentials and kubeconfigs stay in memory for the session (or in the encrypted vault if you choose so).'),
+    ('<th>URL / serveur</th>', '<th>URL / server</th>'),
+    ('>Clusters Kubernetes<', '>Kubernetes clusters<'),
+    ('Kubernetes — configuration locale', 'Kubernetes — local configuration'),
+    ('Kubernetes — kubeconfig importé', 'Kubernetes — imported kubeconfig'),
     ('"kubeconfig par défaut"', '"default kubeconfig"'),
     ('class="tag">ACTIF<', 'class="tag">ACTIVE<'),
     ('"Contexte : "+', '"Context: "+'),
     ('"Authentification : "+', '"Authentication: "+'),
-    ("Option : enregistrer les identifiants saisis (et les kubeconfigs des clusters ajoutés) dans un coffre <b>chiffré</b>",
-     "Optional: store the credentials entered (and the kubeconfigs of added clusters) in an <b>encrypted</b> vault"),
-    ("Clusters Kubernetes rechargés : ", "Kubernetes clusters reloaded: "),
-    ("Clusters Kubernetes chiffrés : ", "Kubernetes clusters encrypted: "),
-    ("Clusters Kubernetes chargés : ", "Kubernetes clusters loaded: "),
-    # Fiche d'ajout
-    ("Chargez le <b>kubeconfig</b> du cluster (fichier ou copier-coller). Comme un mot de passe, il reste",
-     "Load the cluster <b>kubeconfig</b> (file or copy-paste). Like a password, it stays"),
-    ("<b>en mémoire</b> le temps de la session, et n'est écrit sur disque que <b>chiffré</b> si vous utilisez le coffre.",
-     "<b>in memory</b> for the session, and is only written to disk <b>encrypted</b> if you use the vault."),
-    ("Les sauvegardes de chaque cluster sont rangées séparément.", "Each cluster's backups are stored separately."),
+    ('Option : enregistrer les identifiants saisis (et les kubeconfigs des clusters ajoutés) dans un coffre <b>chiffré</b>', 'Optional: store the credentials entered (and the kubeconfigs of added clusters) in an <b>encrypted</b> vault'),
+    ('Clusters Kubernetes rechargés : ', 'Kubernetes clusters reloaded: '),
+    ('Clusters Kubernetes chiffrés : ', 'Kubernetes clusters encrypted: '),
+    ('Clusters Kubernetes chargés : ', 'Kubernetes clusters loaded: '),
+    ('Chargez le <b>kubeconfig</b> du cluster (fichier ou copier-coller). Comme un mot de passe, il reste', 'Load the cluster <b>kubeconfig</b> (file or copy-paste). Like a password, it stays'),
+    ("<b>en mémoire</b> le temps de la session, et n'est écrit sur disque que <b>chiffré</b> si vous utilisez le coffre.", '<b>in memory</b> for the session, and is only written to disk <b>encrypted</b> if you use the vault.'),
+    ('Les sauvegardes de chaque cluster sont rangées séparément.', "Each cluster's backups are stored separately."),
     ('<label class="fld">Nom du cluster</label>', '<label class="fld">Cluster name</label>'),
     ('<label class="fld">Fichier kubeconfig</label>', '<label class="fld">Kubeconfig file</label>'),
-    ("…ou collez son contenu (YAML ou JSON)", "…or paste its content (YAML or JSON)"),
+    ('…ou collez son contenu (YAML ou JSON)', '…or paste its content (YAML or JSON)'),
     ('<label class="fld">Contexte</label><select id="clCtx">', '<label class="fld">Context</label><select id="clCtx">'),
     ('id="clAdd" type="button">Tester &amp; ajouter<', 'id="clAdd" type="button">Test &amp; add<'),
     ('"Tester & ajouter"', '"Test & add"'),
-    ("Test de connexion en lecture seule (liste des namespaces, 10 s max).", "Read-only connection test (namespace list, 10 s max)."),
-    ("Test de connexion…", "Testing connection…"),
-    ("Chargez ou collez d'abord un kubeconfig.", "Load or paste a kubeconfig first."),
-    ("Cluster ajouté. Choisissez « Définir comme cluster actif » pour l'utiliser, ou sélectionnez-le dans la barre du haut.",
-     "Cluster added. Choose “Set as active cluster” to use it, or select it in the top bar."),
-    # Fiche d'un cluster
-    ("Définir comme cluster actif", "Set as active cluster"),
+    ('Test de connexion en lecture seule (liste des namespaces, 10 s max).', 'Read-only connection test (namespace list, 10 s max).'),
+    ('Test de connexion…', 'Testing connection…'),
+    ("Chargez ou collez d'abord un kubeconfig.", 'Load or paste a kubeconfig first.'),
+    ("Cluster ajouté. Choisissez « Définir comme cluster actif » pour l'utiliser, ou sélectionnez-le dans la barre du haut.", 'Cluster added. Choose “Set as active cluster” to use it, or select it in the top bar.'),
+    ('Définir comme cluster actif', 'Set as active cluster'),
     ('"Cluster actif"', '"Active cluster"'),
     ('data-scope="one">Cluster actif<', 'data-scope="one">Active cluster<'),
-    ("Tous les clusters", "All clusters"),
+    ('Tous les clusters', 'All clusters'),
     ('==="*"?"Tous":', '==="*"?"All":'),
     ('id="clLocalCfg" type="button">Ouvrir les réglages<', 'id="clLocalCfg" type="button">Open settings<'),
     ('id="clRemove" type="button">Retirer<', 'id="clRemove" type="button">Remove<'),
@@ -13269,150 +18254,123 @@ I18N_EN += [
     ('li("Workspace NKP"', 'li("NKP workspace"'),
     ('li("Cluster de management"', 'li("Management cluster"'),
     ('li("Sauvegardes"', 'li("Backups"'),
-    ("Serveur API", "API server"),
-    ("Aucun contexte kubectl local : ajoutez un cluster avec son kubeconfig, ou configurez kubectl (Réglages).",
-     "No local kubectl context: add a cluster with its kubeconfig, or configure kubectl (Settings)."),
+    ('Serveur API', 'API server'),
+    ('Aucun contexte kubectl local : ajoutez un cluster avec son kubeconfig, ou configurez kubectl (Réglages).', 'No local kubectl context: add a cluster with its kubeconfig, or configure kubectl (Settings).'),
     ('"Retirer le cluster « "', '"Remove cluster « "'),
-    ('" » ? Son kubeconfig est oublié ; ses sauvegardes restent sur disque."',
-     '" »? Its kubeconfig is forgotten; its backups stay on disk."'),
-    # Découverte NKP
-    ("Découverte des workspaces NKP (optionnel)", "NKP workspace discovery (optional)"),
-    ("Depuis le <b>cluster de management</b> NKP, liste les <b>workspaces</b> et leurs clusters, puis importe",
-     "From the NKP <b>management cluster</b>, lists the <b>workspaces</b> and their clusters, then imports"),
-    ("leurs kubeconfigs. Cluster interrogé : ", "their kubeconfigs. Queried cluster: "),
-    ("(le cluster actif — choisissez le cluster de management", "(the active cluster — choose the management cluster"),
-    ("dans la barre du haut).", "in the top bar)."),
-    ("<b>Droits élevés requis</b> sur le cluster de management : lecture des Workspaces, des",
-     "<b>Elevated rights required</b> on the management cluster: read access to Workspaces,"),
-    ("KommanderClusters et des <b>Secrets</b> kubeconfig des namespaces de workspace. Les kubeconfigs importés donnent",
-     "KommanderClusters and kubeconfig <b>Secrets</b> in workspace namespaces. Imported kubeconfigs often grant"),
-    ("souvent un accès <b>administrateur</b> aux clusters : ils restent en mémoire (coffre chiffré en option), jamais en clair sur disque.",
-     "<b>administrator</b> access to the clusters: they stay in memory (optional encrypted vault), never in clear text on disk."),
+    ('" » ? Son kubeconfig est oublié ; ses sauvegardes restent sur disque."', '" »? Its kubeconfig is forgotten; its backups stay on disk."'),
+    ('Découverte des workspaces NKP (optionnel)', 'NKP workspace discovery (optional)'),
+    ('Depuis le <b>cluster de management</b> NKP, liste les <b>workspaces</b> et leurs clusters, puis importe', 'From the NKP <b>management cluster</b>, lists the <b>workspaces</b> and their clusters, then imports'),
+    ('leurs kubeconfigs. Cluster interrogé : ', 'their kubeconfigs. Queried cluster: '),
+    ('(le cluster actif — choisissez le cluster de management', '(the active cluster — choose the management cluster'),
+    ('dans la barre du haut).', 'in the top bar).'),
+    ('<b>Droits élevés requis</b> sur le cluster de management : lecture des Workspaces, des', '<b>Elevated rights required</b> on the management cluster: read access to Workspaces,'),
+    ('KommanderClusters et des <b>Secrets</b> kubeconfig des namespaces de workspace. Les kubeconfigs importés donnent', 'KommanderClusters and kubeconfig <b>Secrets</b> in workspace namespaces. Imported kubeconfigs often grant'),
+    ('souvent un accès <b>administrateur</b> aux clusters : ils restent en mémoire (coffre chiffré en option), jamais en clair sur disque.', '<b>administrator</b> access to the clusters: they stay in memory (optional encrypted vault), never in clear text on disk.'),
     ('id="nkpDiscover" type="button">Découvrir<', 'id="nkpDiscover" type="button">Discover<'),
-    ("J'ai compris : importer les kubeconfigs des clusters cochés", "I understand: import the kubeconfigs of the checked clusters"),
-    ("Importer la sélection", "Import selection"),
-    ("Lecture des workspaces…", "Reading workspaces…"),
-    ("Aucun cluster trouvé dans les workspaces.", "No cluster found in the workspaces."),
-    ("Cluster de management (actif)", "Management cluster (active)"),
+    ("J'ai compris : importer les kubeconfigs des clusters cochés", 'I understand: import the kubeconfigs of the checked clusters'),
+    ('Importer la sélection', 'Import selection'),
+    ('Lecture des workspaces…', 'Reading workspaces…'),
+    ('Aucun cluster trouvé dans les workspaces.', 'No cluster found in the workspaces.'),
+    ('Cluster de management (actif)', 'Management cluster (active)'),
     ('"Déjà importé ("', '"Already imported ("'),
     ('"Importé sous « "', '"Imported as « "'),
-    # Pages : Applications, tableau de bord, confirmations, réglages
-    ("Clusters enregistrés", "Registered clusters"),
+    ('Clusters enregistrés', 'Registered clusters'),
     ('"Cluster ciblé : <b>"', '"Target cluster: <b>"'),
-    ("Cluster local (contexte kubectl)", "Local cluster (kubectl context)"),
-    ("Les clusters <b>supplémentaires</b> (kubeconfig importé, workspaces NKP) se gèrent depuis <b>⚙ Sources</b>.",
-     "<b>Additional</b> clusters (imported kubeconfig, NKP workspaces) are managed from <b>⚙ Sources</b>."),
-    ("Contextes / clusters autorisés (séparés par des virgules ; vide = tous)", "Allowed contexts / clusters (comma-separated; empty = all)"),
-    ("Namespaces autorisés — cluster local (vide = tous)", "Allowed namespaces — local cluster (empty = all)"),
-    # Messages du serveur
-    ("Authentification par plugin exec (« ", "Exec plugin authentication (« "),
-    ("Authentification « auth-provider » (", "« auth-provider » authentication ("),
-    ("Le jeton est lu depuis un fichier local (", "The token is read from a local file ("),
-    (") : il doit exister là où tourne l'outil.", "): it must exist where the tool runs."),
-    ("Le jeton a EXPIRÉ : régénérez le kubeconfig.", "The token has EXPIRED: regenerate the kubeconfig."),
-    ("Le jeton a EXPIRÉ (", "The token has EXPIRED ("),
-    (") : régénérez le kubeconfig.", "): regenerate the kubeconfig."),
-    ("Le jeton expire dans moins de 24 h (", "The token expires in less than 24 h ("),
-    (") : les sauvegardes planifiées échoueront ensuite.", "): scheduled backups will fail afterwards."),
-    ("Le certificat client est un fichier local (", "The client certificate is a local file ("),
-    ("Authentification par identifiant/mot de passe (basic) : désactivée sur la plupart des clusters récents.",
-     "Username/password (basic) authentication: disabled on most recent clusters."),
-    ("Aucune information d'authentification reconnue pour ce contexte.", "No recognized authentication information for this context."),
-    ("Vérification TLS du serveur DÉSACTIVÉE (insecure-skip-tls-verify).", "Server TLS verification DISABLED (insecure-skip-tls-verify)."),
-    ("L'autorité de certification est un fichier local (", "The certificate authority is a local file ("),
-    ("Kubeconfig vide.", "Empty kubeconfig."),
-    ("Kubeconfig trop volumineux (1 Mo max).", "Kubeconfig too large (1 MB max)."),
-    ("Kubeconfig invalide : ", "Invalid kubeconfig: "),
-    ("Kubeconfig illisible : ", "Unreadable kubeconfig: "),
-    ("kubectl config view a échoué", "kubectl config view failed"),
-    ("Aucun contexte dans ce kubeconfig.", "No context in this kubeconfig."),
-    ("Cluster injoignable.", "Cluster unreachable."),
-    ("Nom de cluster invalide (1 à 63 caractères, lettres/chiffres/-/./_).", "Invalid cluster name (1 to 63 characters, letters/digits/-/./_)."),
-    ("Ce nom est réservé au cluster local : choisissez-en un autre.", "This name is reserved for the local cluster: choose another one."),
-    ("Un cluster nommé « ", "A cluster named « "),
-    (" » est déjà enregistré.", " » is already registered."),
-    ("Ce kubeconfig contient plusieurs contextes : choisissez-en un.", "This kubeconfig contains several contexts: choose one."),
-    (" » introuvable dans ce kubeconfig.", " » not found in this kubeconfig."),
-    ("Connexion au cluster impossible : ", "Cannot connect to the cluster: "),
-    ("Le cluster local (configuration) ne peut pas être retiré ici : voir Réglages.",
-     "The local cluster (configuration) cannot be removed here: see Settings."),
-    ("Cluster inconnu.", "Unknown cluster."),
-    ("Liste des clusters NKP (KommanderCluster) indisponible : ", "NKP cluster list (KommanderCluster) unavailable: "),
-    ("Confirmez d'abord l'avertissement sur les privilèges requis.", "First acknowledge the warning about required privileges."),
-    ("Nom invalide.", "Invalid name."),
-    (" » illisible : ", " » unreadable: "),
-    ("Aucun kubeconfig trouvé dans le Secret « ", "No kubeconfig found in Secret « "),
-    ("Aucun cluster importé.", "No cluster imported."),
-    ("Cette sauvegarde provient du cluster « ", "This backup comes from cluster « "),
-    (" », alors que le cluster actif est « ", " », while the active cluster is « "),
-    ("Cluster local non configuré.", "Local cluster not configured."),
-    ("aucun cluster disponible", "no cluster available"),
-    ("Sauvegarde introuvable ou hors de la zone autorisée : ", "Backup not found or outside the allowed area: "),
-    ("Sauvegarde illisible (", "Unreadable backup ("),
-    (") : index.json manquant ou corrompu (", "): index.json missing or corrupt ("),
-    ("Restauration en cours (transaction) : sauvegarde différée.", "Restore in progress (transaction): backup deferred."),
-    (" en ÉCHEC : ", " FAILED: "),
-    ("Inventaire des Deployments/StatefulSets impossible (", "Deployments/StatefulSets inventory unavailable ("),
-    (") — séquence annulée.", ") — sequence cancelled."),
-    ("état des pods invérifiable (kubectl en erreur) : ", "pod state unverifiable (kubectl failing): "),
-    ("⚠ Liste des pods indisponible (contrôle des pods non gérés sauté)",
-     "⚠ Pod list unavailable (unmanaged-pods check skipped)"),
-    ("Inventaire des workloads impossible", "Workload inventory unavailable"),
+    ('Cluster local (contexte kubectl)', 'Local cluster (kubectl context)'),
+    ('Les clusters <b>supplémentaires</b> (kubeconfig importé, workspaces NKP) se gèrent depuis <b>⚙ Sources</b>.', '<b>Additional</b> clusters (imported kubeconfig, NKP workspaces) are managed from <b>⚙ Sources</b>.'),
+    ('Contextes / clusters autorisés (séparés par des virgules ; vide = tous)', 'Allowed contexts / clusters (comma-separated; empty = all)'),
+    ('Namespaces autorisés — cluster local (vide = tous)', 'Allowed namespaces — local cluster (empty = all)'),
+    ('Authentification par plugin exec (« ', 'Exec plugin authentication (« '),
+    ('Authentification « auth-provider » (', '« auth-provider » authentication ('),
+    ('Le jeton est lu depuis un fichier local (', 'The token is read from a local file ('),
+    (") : il doit exister là où tourne l'outil.", '): it must exist where the tool runs.'),
+    ('Le jeton a EXPIRÉ : régénérez le kubeconfig.', 'The token has EXPIRED: regenerate the kubeconfig.'),
+    ('Le jeton a EXPIRÉ (', 'The token has EXPIRED ('),
+    (') : régénérez le kubeconfig.', '): regenerate the kubeconfig.'),
+    ('Le jeton expire dans moins de 24 h (', 'The token expires in less than 24 h ('),
+    (') : les sauvegardes planifiées échoueront ensuite.', '): scheduled backups will fail afterwards.'),
+    ('Le certificat client est un fichier local (', 'The client certificate is a local file ('),
+    ('Authentification par identifiant/mot de passe (basic) : désactivée sur la plupart des clusters récents.', 'Username/password (basic) authentication: disabled on most recent clusters.'),
+    ("Aucune information d'authentification reconnue pour ce contexte.", 'No recognized authentication information for this context.'),
+    ('Vérification TLS du serveur DÉSACTIVÉE (insecure-skip-tls-verify).', 'Server TLS verification DISABLED (insecure-skip-tls-verify).'),
+    ("L'autorité de certification est un fichier local (", 'The certificate authority is a local file ('),
+    ('Kubeconfig vide.', 'Empty kubeconfig.'),
+    ('Kubeconfig trop volumineux (1 Mo max).', 'Kubeconfig too large (1 MB max).'),
+    ('Kubeconfig invalide : ', 'Invalid kubeconfig: '),
+    ('Kubeconfig illisible : ', 'Unreadable kubeconfig: '),
+    ('kubectl config view a échoué', 'kubectl config view failed'),
+    ('Aucun contexte dans ce kubeconfig.', 'No context in this kubeconfig.'),
+    ('Cluster injoignable.', 'Cluster unreachable.'),
+    ('Nom de cluster invalide (1 à 63 caractères, lettres/chiffres/-/./_).', 'Invalid cluster name (1 to 63 characters, letters/digits/-/./_).'),
+    ('Ce nom est réservé au cluster local : choisissez-en un autre.', 'This name is reserved for the local cluster: choose another one.'),
+    ('Un cluster nommé « ', 'A cluster named « '),
+    (' » est déjà enregistré.', ' » is already registered.'),
+    ('Ce kubeconfig contient plusieurs contextes : choisissez-en un.', 'This kubeconfig contains several contexts: choose one.'),
+    (' » introuvable dans ce kubeconfig.', ' » not found in this kubeconfig.'),
+    ('Connexion au cluster impossible : ', 'Cannot connect to the cluster: '),
+    ('Le cluster local (configuration) ne peut pas être retiré ici : voir Réglages.', 'The local cluster (configuration) cannot be removed here: see Settings.'),
+    ('Cluster inconnu.', 'Unknown cluster.'),
+    ('Liste des clusters NKP (KommanderCluster) indisponible : ', 'NKP cluster list (KommanderCluster) unavailable: '),
+    ("Confirmez d'abord l'avertissement sur les privilèges requis.", 'First acknowledge the warning about required privileges.'),
+    ('Nom invalide.', 'Invalid name.'),
+    (' » illisible : ', ' » unreadable: '),
+    ('Aucun kubeconfig trouvé dans le Secret « ', 'No kubeconfig found in Secret « '),
+    ('Aucun cluster importé.', 'No cluster imported.'),
+    ('Cette sauvegarde provient du cluster « ', 'This backup comes from cluster « '),
+    (' », alors que le cluster actif est « ', ' », while the active cluster is « '),
+    ('Cluster local non configuré.', 'Local cluster not configured.'),
+    ('aucun cluster disponible', 'no cluster available'),
+    ('Sauvegarde introuvable ou hors de la zone autorisée : ', 'Backup not found or outside the allowed area: '),
+    ('Sauvegarde illisible (', 'Unreadable backup ('),
+    (') : index.json manquant ou corrompu (', '): index.json missing or corrupt ('),
+    ('Restauration en cours (transaction) : sauvegarde différée.', 'Restore in progress (transaction): backup deferred.'),
+    (' en ÉCHEC : ', ' FAILED: '),
+    ('Inventaire des Deployments/StatefulSets impossible (', 'Deployments/StatefulSets inventory unavailable ('),
+    (') — séquence annulée.', ') — sequence cancelled.'),
+    ('état des pods invérifiable (kubectl en erreur) : ', 'pod state unverifiable (kubectl failing): '),
+    ('⚠ Liste des pods indisponible (contrôle des pods non gérés sauté)', '⚠ Pod list unavailable (unmanaged-pods check skipped)'),
+    ('Inventaire des workloads impossible', 'Workload inventory unavailable'),
     ('id="abSave">Enregistrer<', 'id="abSave">Save<'),
     ('"Cluster injoignable (contrôle "', '"Cluster unreachable (checked "'),
     ('"Joignable ("', '"Reachable ("'),
     ('") · authentification : "', '") · authentication: "'),
     ('li("Dernier contrôle de santé"', 'li("Last health check"'),
     ('"Joignable"', '"Reachable"'),
-    ("Cluster injoignable au dernier contrôle : ", "Cluster unreachable at last check: "),
+    ('Cluster injoignable au dernier contrôle : ', 'Cluster unreachable at last check: '),
     ('<span>Réglages</span>', '<span>Settings</span>'),
     ('title="Sources & Réglages"', 'title="Sources & Settings"'),
-    ("cluster injoignable", "cluster unreachable"),
-    # Export S3 (stockage objet)
-    ("Stockage objet S3 — export des sauvegardes (optionnel)", "S3 object storage — backup export (optional)"),
-    ("Copie chaque sauvegarde de configuration (<code>.zip</code>) vers un bucket <b>compatible S3</b>",
-     "Copies every configuration backup (<code>.zip</code>) to an <b>S3-compatible</b> bucket"),
-    ("(Nutanix Objects, MinIO, AWS S3…) : le filet de sécurité vit alors <b>hors du cluster</b> qu'il protège.",
-     "(Nutanix Objects, MinIO, AWS S3…): the safety net then lives <b>outside the cluster</b> it protects."),
-    ("Clés d'accès en <b>mémoire</b> le temps de la session (coffre chiffré en option).",
-     "Access keys stay <b>in memory</b> for the session (encrypted vault optional)."),
-    ("<label class=\"fld\">Endpoint S3</label>", "<label class=\"fld\">S3 endpoint</label>"),
-    ("Clé d'accès (Access key)", "Access key"),
-    ("Clé secrète (Secret key)", "Secret key"),
-    ("Région (signature)", "Region (signing)"),
-    ("URL de type chemin (Objects / MinIO)", "Path-style URL (Objects / MinIO)"),
-    ("<b>Export automatique</b> : envoyer chaque sauvegarde réussie (manuelle et planifiée) vers le bucket",
-     "<b>Automatic export</b>: send every successful backup (manual and scheduled) to the bucket"),
-    ("Test en lecture seule (liste du bucket, 1 objet). Objets créés :",
-     "Read-only test (bucket listing, 1 object). Objects created:"),
-    ("Test du bucket…", "Testing bucket…"),
-    ("Export automatique activé.", "Automatic export enabled."),
-    ("Export automatique désactivé (cochez la case pour l'activer).", "Automatic export disabled (tick the box to enable it)."),
-    ("Export automatique désactivé", "Automatic export disabled"),
-    ("Connecté — export automatique désactivé", "Connected — automatic export disabled"),
-    ("Export des sauvegardes (optionnel)", "Backup export (optional)"),
+    ('cluster injoignable', 'cluster unreachable'),
+    ('Stockage objet S3 — export des sauvegardes (optionnel)', 'S3 object storage — backup export (optional)'),
+    ('Copie chaque sauvegarde de configuration (<code>.zip</code>) vers un bucket <b>compatible S3</b>', 'Copies every configuration backup (<code>.zip</code>) to an <b>S3-compatible</b> bucket'),
+    ("(Nutanix Objects, MinIO, AWS S3…) : le filet de sécurité vit alors <b>hors du cluster</b> qu'il protège.", '(Nutanix Objects, MinIO, AWS S3…): the safety net then lives <b>outside the cluster</b> it protects.'),
+    ("Clés d'accès en <b>mémoire</b> le temps de la session (coffre chiffré en option).", 'Access keys stay <b>in memory</b> for the session (encrypted vault optional).'),
+    ('<label class="fld">Endpoint S3</label>', '<label class="fld">S3 endpoint</label>'),
+    ("Clé d'accès (Access key)", 'Access key'),
+    ('Clé secrète (Secret key)', 'Secret key'),
+    ('Région (signature)', 'Region (signing)'),
+    ('URL de type chemin (Objects / MinIO)', 'Path-style URL (Objects / MinIO)'),
+    ('<b>Export automatique</b> : envoyer chaque sauvegarde réussie (manuelle et planifiée) vers le bucket', '<b>Automatic export</b>: send every successful backup (manual and scheduled) to the bucket'),
+    ('Test en lecture seule (liste du bucket, 1 objet). Objets créés :', 'Read-only test (bucket listing, 1 object). Objects created:'),
+    ('Test du bucket…', 'Testing bucket…'),
+    ('Export automatique activé.', 'Automatic export enabled.'),
+    ("Export automatique désactivé (cochez la case pour l'activer).", 'Automatic export disabled (tick the box to enable it).'),
+    ('Export automatique désactivé', 'Automatic export disabled'),
+    ('Connecté — export automatique désactivé', 'Connected — automatic export disabled'),
+    ('Export des sauvegardes (optionnel)', 'Backup export (optional)'),
     ('"Stockage objet S3"', '"S3 object storage"'),
-    ("Export S3 (stockage objet)", "S3 export (object storage)"),
-    ("Endpoint S3 ou bucket non configuré (⚙ Sources).", "S3 endpoint or bucket not configured (⚙ Sources)."),
-    ("Non connecté au stockage objet : renseignez les clés d'accès (⚙ Sources).",
-     "Not connected to the object storage: enter the access keys (⚙ Sources)."),
-    ("Renseignez la clé d'accès (Access key) et la clé secrète (Secret key).",
-     "Enter the access key and the secret key."),
-    ("Test du bucket impossible : ", "Bucket test failed: "),
-    (" — clés d'accès refusées (ou horloge du serveur décalée : SigV4 exige une heure juste).",
-     " — access keys refused (or server clock skewed: SigV4 requires accurate time)."),
-    (" — bucket introuvable : vérifiez son nom (et s3_path_style).",
-     " — bucket not found: check its name (and s3_path_style)."),
-    (" — mauvaise région (s3_region) ou style d'URL (s3_path_style).",
-     " — wrong region (s3_region) or URL style (s3_path_style)."),
-    ("Stockage objet injoignable : ", "Object storage unreachable: "),
-    ("Endpoint S3 injoignable — vérifiez le PORT (MinIO : 9000 = API S3, pas la console 9001 ; Nutanix Objects : 443), le protocole http/https, et que la machine qui exécute l'outil (le Pod, pas votre poste) atteint cet hôte.",
-     "S3 endpoint unreachable — check the PORT (MinIO: 9000 = S3 API, not the 9001 console; Nutanix Objects: 443), the http/https scheme, and that the machine running the tool (the Pod, not your workstation) can reach that host."),
-    ("sauvegarde trop volumineuse pour l'export (", "backup too large for export ("),
-    ("envoi refusé", "upload refused"),
-    # Rétention GFS
-    ('<option value="count">N versions</option><option value="gfs">GFS (j/sem/mois)</option>',
-     '<option value="count">N versions</option><option value="gfs">GFS (d/wk/mo)</option>'),
+    ('Export S3 (stockage objet)', 'S3 export (object storage)'),
+    ('Endpoint S3 ou bucket non configuré (⚙ Sources).', 'S3 endpoint or bucket not configured (⚙ Sources).'),
+    ("Non connecté au stockage objet : renseignez les clés d'accès (⚙ Sources).", 'Not connected to the object storage: enter the access keys (⚙ Sources).'),
+    ("Renseignez la clé d'accès (Access key) et la clé secrète (Secret key).", 'Enter the access key and the secret key.'),
+    ('Test du bucket impossible : ', 'Bucket test failed: '),
+    (" — clés d'accès refusées (ou horloge du serveur décalée : SigV4 exige une heure juste).", ' — access keys refused (or server clock skewed: SigV4 requires accurate time).'),
+    (' — bucket introuvable : vérifiez son nom (et s3_path_style).', ' — bucket not found: check its name (and s3_path_style).'),
+    (" — mauvaise région (s3_region) ou style d'URL (s3_path_style).", ' — wrong region (s3_region) or URL style (s3_path_style).'),
+    ('Stockage objet injoignable : ', 'Object storage unreachable: '),
+    ("Endpoint S3 injoignable — vérifiez le PORT (MinIO : 9000 = API S3, pas la console 9001 ; Nutanix Objects : 443), le protocole http/https, et que la machine qui exécute l'outil (le Pod, pas votre poste) atteint cet hôte.", 'S3 endpoint unreachable — check the PORT (MinIO: 9000 = S3 API, not the 9001 console; Nutanix Objects: 443), the http/https scheme, and that the machine running the tool (the Pod, not your workstation) can reach that host.'),
+    ("sauvegarde trop volumineuse pour l'export (", 'backup too large for export ('),
+    ('envoi refusé', 'upload refused'),
+    ('<option value="count">N versions</option><option value="gfs">GFS (j/sem/mois)</option>', '<option value="count">N versions</option><option value="gfs">GFS (d/wk/mo)</option>'),
     ('<label class="fld">Rétention</label>', '<label class="fld">Retention</label>'),
     ('<label class="fld">Jours</label>', '<label class="fld">Days</label>'),
     ('<label class="fld">Semaines</label>', '<label class="fld">Weeks</label>'),
@@ -13421,419 +18379,317 @@ I18N_EN += [
     ('" mois"', '" mo"'),
     (' · rétention : ', ' · retention: '),
     ('" par namespace."', '" per namespace."'),
-    # Sélecteur d'étiquettes
-    ("Sélecteur d'étiquettes des namespaces (vide = inactif ; s'applique à tous les clusters)",
-     "Namespace label selector (empty = inactive; applies to all clusters)"),
-    ('placeholder="hycu.io/backup=true  ou  env in (prod,preprod)"',
-     'placeholder="hycu.io/backup=true  or  env in (prod,preprod)"'),
-    # Rapport
-    ("Rapport de conformité (HTML autonome) : applications, RPO, santé des clusters, tâches",
-     "Compliance report (standalone HTML): applications, RPO, cluster health, jobs"),
-    ("Export CSV des applications (Excel)", "CSV export of applications (Excel)"),
-    ("<span>Rapport HTML</span>", "<span>HTML report</span>"),
-    ("<title>Rapport de protection Kubernetes</title>", "<title>Kubernetes Protection Report</title>"),
-    ("<h1>Rapport de protection des applications Kubernetes</h1>", "<h1>Kubernetes application protection report</h1>"),
-    ("Généré le ", "Generated on "),
-    ("· outil v", "· tool v"),
-    ("</b>applications</span>", "</b>applications</span>"),
-    ("</b>protégées</span>", "</b>protected</span>"),
-    ("</b>conformes</span>", "</b>compliant</span>"),
-    ("</b>tâches ok / échec / simulation</span>", "</b>jobs ok / failed / simulation</span>"),
-    ("<h2>Applications (protection de la configuration)</h2>", "<h2>Applications (configuration protection)</h2>"),
-    ("<th>Protégée</th>", "<th>Protected</th>"),
-    ("<th>Conforme</th>", "<th>Compliant</th>"),
-    ("<th>Versions</th>", "<th>Versions</th>"),
-    ("<h2>Santé des clusters</h2>", "<h2>Cluster health</h2>"),
-    ("<th>Joignable</th>", "<th>Reachable</th>"),
-    ("<h2>Dernières tâches (30)</h2>", "<h2>Recent jobs (30)</h2>"),
-    ("<th>Horodatage</th>", "<th>Timestamp</th>"),
-    (">aucune application<", ">no application<"),
-    (">aucun contrôle encore exécuté<", ">no check executed yet<"),
-    (">aucune tâche<", ">no job<"),
-    ("Rapport généré par l'outil HYCU · Kubernetes · Nutanix — politique : sauvegarde",
-     "Report generated by the HYCU · Kubernetes · Nutanix tool — policy: automatic"),
-    # Chiffrement S3
-    ("<b>Chiffrer les exports</b> (option) : les objets envoyés sont chiffrés — le bucket peut être un stockage non maîtrisé",
-     "<b>Encrypt exports</b> (optional): uploaded objects are encrypted — the bucket can be untrusted storage"),
-    ("Phrase de chiffrement des exports (à conserver : elle sert au déchiffrement)",
-     "Export encryption passphrase (keep it: it is needed for decryption)"),
-    ("Déchiffrement hors interface : ", "Decryption outside the UI: "),
-    # Restauration d'objets
-    ("Restaurer des objets de configuration", "Restore configuration objects"),
-    ("Ré-applique des objets choisis (Deployments, Services, ConfigMaps…) depuis l'instantané d'une sauvegarde, avec aperçu des différences. Ne touche ni aux volumes ni aux données.",
-     "Re-applies selected objects (Deployments, Services, ConfigMaps…) from a backup's snapshot, with a diff preview. Volumes and data are untouched."),
-    ("Sauvegarde (instantané de config)", "Backup (config snapshot)"),
-    ("Objets à restaurer ", "Objects to restore "),
-    (">Type</th><th>Nom</th><th>Note</th>", ">Kind</th><th>Name</th><th>Note</th>"),
-    ("Aperçu des différences (live → sauvegarde)", "Diff preview (live → backup)"),
-    ("Prévisualiser les différences", "Preview differences"),
-    ("Appliquer (simulation)", "Apply (simulation)"),
-    ("Appliquer (réel)", "Apply (real)"),
-    ("objet(s) dans l'instantané)", "object(s) in the snapshot)"),
-    ("(aucune sauvegarde)", "(no backup)"),
-    ("Instantané vide.", "Empty snapshot."),
-    ("Secret masqué — non restaurable", "Secret redacted — not restorable"),
+    ("Sélecteur d'étiquettes des namespaces (vide = inactif ; s'applique à tous les clusters)", 'Namespace label selector (empty = inactive; applies to all clusters)'),
+    ('placeholder="hycu.io/backup=true  ou  env in (prod,preprod)"', 'placeholder="hycu.io/backup=true  or  env in (prod,preprod)"'),
+    ('Rapport de conformité (HTML autonome) : applications, RPO, santé des clusters, tâches', 'Compliance report (standalone HTML): applications, RPO, cluster health, jobs'),
+    ('Export CSV des applications (Excel)', 'CSV export of applications (Excel)'),
+    ('<span>Rapport HTML</span>', '<span>HTML report</span>'),
+    ('<title>Rapport de protection Kubernetes</title>', '<title>Kubernetes Protection Report</title>'),
+    ('<h1>Rapport de protection des applications Kubernetes</h1>', '<h1>Kubernetes application protection report</h1>'),
+    ('Généré le ', 'Generated on '),
+    ('· outil v', '· tool v'),
+    ('</b>protégées</span>', '</b>protected</span>'),
+    ('</b>conformes</span>', '</b>compliant</span>'),
+    ('</b>tâches ok / échec / simulation</span>', '</b>jobs ok / failed / simulation</span>'),
+    ('<h2>Applications (protection de la configuration)</h2>', '<h2>Applications (configuration protection)</h2>'),
+    ('<th>Protégée</th>', '<th>Protected</th>'),
+    ('<th>Conforme</th>', '<th>Compliant</th>'),
+    ('<h2>Santé des clusters</h2>', '<h2>Cluster health</h2>'),
+    ('<th>Joignable</th>', '<th>Reachable</th>'),
+    ('<h2>Dernières tâches (30)</h2>', '<h2>Recent jobs (30)</h2>'),
+    ('<th>Horodatage</th>', '<th>Timestamp</th>'),
+    ('>aucune application<', '>no application<'),
+    ('>aucun contrôle encore exécuté<', '>no check executed yet<'),
+    ('>aucune tâche<', '>no job<'),
+    ("Rapport généré par l'outil HYCU · Kubernetes · Nutanix — politique : sauvegarde", 'Report generated by the HYCU · Kubernetes · Nutanix tool — policy: automatic'),
+    ('<b>Chiffrer les exports</b> (option) : les objets envoyés sont chiffrés — le bucket peut être un stockage non maîtrisé', '<b>Encrypt exports</b> (optional): uploaded objects are encrypted — the bucket can be untrusted storage'),
+    ('Phrase de chiffrement des exports (à conserver : elle sert au déchiffrement)', 'Export encryption passphrase (keep it: it is needed for decryption)'),
+    ('Déchiffrement hors interface : ', 'Decryption outside the UI: '),
+    ('Restaurer des objets de configuration', 'Restore configuration objects'),
+    ("Ré-applique des objets choisis (Deployments, Services, ConfigMaps…) depuis l'instantané d'une sauvegarde, avec aperçu des différences. Ne touche ni aux volumes ni aux données.", "Re-applies selected objects (Deployments, Services, ConfigMaps…) from a backup's snapshot, with a diff preview. Volumes and data are untouched."),
+    ('Sauvegarde (instantané de config)', 'Backup (config snapshot)'),
+    ('Objets à restaurer ', 'Objects to restore '),
+    ('>Type</th><th>Nom</th><th>Note</th>', '>Kind</th><th>Name</th><th>Note</th>'),
+    ('Aperçu des différences (live → sauvegarde)', 'Diff preview (live → backup)'),
+    ('Prévisualiser les différences', 'Preview differences'),
+    ('Appliquer (simulation)', 'Apply (simulation)'),
+    ('Appliquer (réel)', 'Apply (real)'),
+    ("objet(s) dans l'instantané)", 'object(s) in the snapshot)'),
+    ('(aucune sauvegarde)', '(no backup)'),
+    ('Instantané vide.', 'Empty snapshot.'),
+    ('Secret masqué — non restaurable', 'Secret redacted — not restorable'),
     ('"Identique au live — apply sans effet"', '"Identical to live — apply is a no-op"'),
     ('"Diffère du live"', '"Differs from live"'),
     ('"Absent du live — sera (re)créé"', '"Absent from live — will be (re)created"'),
     ('"Lecture du live impossible"', '"Cannot read live state"'),
     ('"Secret masqué"', '"Secret redacted"'),
-    ("Rien à comparer.", "Nothing to compare."),
-    ("Restauration d'objets RÉELLE", "REAL object restore"),
-    ("</b> objet(s) de configuration seront ÉCRASÉS par la version de la sauvegarde (kubectl apply). Les volumes et les données ne sont pas touchés.",
-     "</b> configuration object(s) will be OVERWRITTEN by the backup version (kubectl apply). Volumes and data are untouched."),
-    ("Application…", "Applying…"),
-    (" objet(s) appliqué(s)", " object(s) applied"),
-    (" ignoré(s)", " skipped"),
-    ("resources.json illisible : ", "resources.json unreadable: "),
-    ("Secret masqué à la sauvegarde : non restaurable.", "Secret redacted at backup time: not restorable."),
-    ("Aucun objet sélectionné.", "No object selected."),
-    ("Ignoré : ", "Skipped: "),
-    (" (Secret masqué à la sauvegarde)", " (Secret redacted at backup time)"),
-    ("Restaurez ce Secret depuis sa source d'origine.", "Restore this Secret from its original source."),
-    ("Appliquer ", "Apply "),
-    (" objet(s) en échec.", " object(s) failed."),
-    ("<h2>Export hors cluster</h2>", "<h2>Off-cluster export</h2>"),
-    (" h, rétention ", " h, retention "),
+    ('Rien à comparer.', 'Nothing to compare.'),
+    ("Restauration d'objets RÉELLE", 'REAL object restore'),
+    ('</b> objet(s) de configuration seront ÉCRASÉS par la version de la sauvegarde (kubectl apply). Les volumes et les données ne sont pas touchés.', '</b> configuration object(s) will be OVERWRITTEN by the backup version (kubectl apply). Volumes and data are untouched.'),
+    ('Application…', 'Applying…'),
+    (' objet(s) appliqué(s)', ' object(s) applied'),
+    (' ignoré(s)', ' skipped'),
+    ('resources.json illisible : ', 'resources.json unreadable: '),
+    ('Secret masqué à la sauvegarde : non restaurable.', 'Secret redacted at backup time: not restorable.'),
+    ('Aucun objet sélectionné.', 'No object selected.'),
+    ('Ignoré : ', 'Skipped: '),
+    (' (Secret masqué à la sauvegarde)', ' (Secret redacted at backup time)'),
+    ("Restaurez ce Secret depuis sa source d'origine.", 'Restore this Secret from its original source.'),
+    ('Appliquer ', 'Apply '),
+    (' objet(s) en échec.', ' object(s) failed.'),
+    ('<h2>Export hors cluster</h2>', '<h2>Off-cluster export</h2>'),
+    (' h, rétention ', ' h, retention '),
     (' · "+(x.index||{}).resources_count+" objets"', ' · "+(x.index||{}).resources_count+" objects"'),
-    # Menu « ? » + page d'aide (/help)
     ('title="Aide &amp; À propos"', 'title="Help &amp; About"'),
-    ("<span>Aide (guide)</span>", "<span>Help (guide)</span>"),
-    ("<span>À propos</span>", "<span>About</span>"),
-    ("<title>Aide — Protection Kubernetes sur Nutanix</title>", "<title>Help — Kubernetes Protection on Nutanix</title>"),
-    ("<h1>Aide — Protection Kubernetes sur Nutanix</h1>", "<h1>Help — Kubernetes Protection on Nutanix</h1>"),
-    ("· toutes les actions destructives sont simulées par défaut", "· every destructive action is simulated by default"),
-    ("Cette page est servie par l'outil (fonctionne hors-ligne). Fermez l'onglet pour revenir à l'interface.",
-     "This page is served by the tool itself (works offline). Close the tab to return to the UI."),
-    ("Démarrage rapide", "Quick start"),
-    ("<b>Enregistrez vos sources</b> : ⚙ (en haut à droite) → <b>Sources</b> → HYCU, Prism Central/Element, et vos <b>clusters Kubernetes</b> si besoin. Les identifiants restent en mémoire (ou dans le coffre chiffré).",
-     "<b>Register your sources</b>: ⚙ (top right) → <b>Sources</b> → HYCU, Prism Central/Element, and your <b>Kubernetes clusters</b> if needed. Credentials stay in memory (or in the encrypted vault)."),
-    ("<b>Sauvegardez la configuration</b> : page <b>Applications</b> → cochez vos applications → <b>Sauvegarder</b>. Activez ensuite la <b>sauvegarde automatique</b> (page Politiques).",
-     "<b>Back up the configuration</b>: <b>Applications</b> page → tick your applications → <b>Back up</b>. Then enable the <b>automatic backup</b> (Policies page)."),
-    ("<b>Testez une restauration</b> en <b>mode simulation</b> (bandeau du haut, activé par défaut) : Applications → une application → <b>Restaurer</b>. Rien n'est exécuté tant que la simulation est active.",
-     "<b>Test a restore</b> in <b>simulation mode</b> (top banner, on by default): Applications → one application → <b>Restore</b>. Nothing runs while simulation is on."),
-    ("L'outil orchestre la <b>configuration</b> (manifestes PV/PVC, objets) ; les <b>données</b> des volumes sont protégées par <b>HYCU</b> (Volume Groups Nutanix). Les deux sont complémentaires.",
-     "The tool orchestrates the <b>configuration</b> (PV/PVC manifests, objects); the volume <b>data</b> is protected by <b>HYCU</b> (Nutanix Volume Groups). They complement each other."),
-    ("L'interface", "The interface"),
-    ("<b>Barre du haut</b> : pastilles d'état HYCU/PE/PC · <b>cluster actif</b> (cliquez pour changer de cluster ou en ajouter) · ⚙ <b>Sources / Réglages</b> · <b>?</b> Aide / À propos · <b>EN/FR</b>.",
-     "<b>Top bar</b>: HYCU/PE/PC status dots · <b>active cluster</b> (click to switch or add one) · ⚙ <b>Sources / Settings</b> · <b>?</b> Help / About · <b>EN/FR</b>."),
-    ("<b>Tableau de bord</b> : anneaux protection/conformité, politique, sources, cluster, activité des tâches.",
-     "<b>Dashboard</b>: protection/compliance rings, policy, sources, cluster, job activity."),
-    ("<b>Applications</b> : une ligne par namespace. Sélectionnez, puis agissez en haut à droite : <b>Sauvegarder · Restaurer · Définir la politique · Vérifier</b>. Bascule <b>Cluster actif / Tous les clusters</b> (regroupés par workspace NKP).",
-     "<b>Applications</b>: one row per namespace. Select, then act at the top right: <b>Back up · Restore · Set Policy · Verify</b>. <b>Active cluster / All clusters</b> toggle (grouped by NKP workspace)."),
-    ("<b>Politiques</b> : sauvegarde automatique de la configuration (fréquence, rétention) + politiques HYCU.",
-     "<b>Policies</b>: automatic configuration backup (frequency, retention) + HYCU policies."),
-    ("<b>Tâches</b> : historique (succès/échec/simulation), cluster de chaque tâche, boutons <b>Rapport HTML/CSV</b>.",
-     "<b>Jobs</b>: history (success/failed/simulation), cluster of each job, <b>HTML/CSV report</b> buttons."),
-    ("<b>Le bandeau Simulation</b> : tant qu'il est activé, AUCUNE commande destructive n'est exécutée — l'outil montre ce qu'il ferait. Désactivez-le seulement au moment d'agir.",
-     "<b>The Simulation banner</b>: while it is on, NO destructive command runs — the tool shows what it would do. Turn it off only when ready to act."),
-    ("Clusters Kubernetes (multi-cluster & NKP)", "Kubernetes clusters (multi-cluster & NKP)"),
-    ("Le <b>cluster local</b> vient de la configuration (kubeconfig/contexte — ⚙ → Réglages).",
-     "The <b>local cluster</b> comes from the configuration (kubeconfig/context — ⚙ → Settings)."),
-    ("<b>Ajouter un cluster</b> : ⚙ → Sources → <b>Ajouter un cluster Kubernetes</b> → chargez ou collez son kubeconfig → <b>Tester &amp; ajouter</b>. L'outil analyse l'authentification (jeton expiré, plugin exec…) et vous avertit.",
-     "<b>Add a cluster</b>: ⚙ → Sources → <b>Add a Kubernetes cluster</b> → load or paste its kubeconfig → <b>Test &amp; add</b>. The tool analyses the authentication (expired token, exec plugin…) and warns you."),
-    ("<b>NKP</b> : rendez le cluster de management actif, puis Sources → <b>Découvrir les workspaces NKP</b> → cochez les clusters → <b>Importer</b> (droits élevés requis, avertissement explicite).",
-     "<b>NKP</b>: make the management cluster active, then Sources → <b>Discover NKP workspaces</b> → tick the clusters → <b>Import</b> (elevated rights required, explicit warning)."),
-    ("Les sauvegardes de chaque cluster sont rangées <b>séparément</b>, et une sauvegarde ne se restaure que sur son cluster d'origine.",
-     "Each cluster's backups are stored <b>separately</b>, and a backup only restores onto its source cluster."),
-    ("Les kubeconfigs sont des <b>secrets</b> : mémoire de session + coffre chiffré (jamais en clair sur disque).",
-     "Kubeconfigs are <b>secrets</b>: session memory + encrypted vault (never in clear on disk)."),
-    ("Sauvegarder", "Back up"),
-    ("<b>Applications → Sauvegarder</b> : exporte et nettoie les manifestes <b>PV/PVC</b> (la « recette » du restore) + un <b>instantané des autres objets</b> (Deployments, Services, ConfigMaps, Secrets…) dans <code>resources.json</code> — les données des Secrets sont <b>chiffrées</b> (<code>secrets.enc</code>, phrase du coffre) ; sans coffre déverrouillé ni <code>HYCU_VAULT_PASSPHRASE</code>, elles restent en clair et la sauvegarde le signale (réglage <code>backup_secrets</code>).",
-     "<b>Applications → Back up</b>: exports and cleans the <b>PV/PVC</b> manifests (the restore “recipe”) + a <b>snapshot of the other objects</b> (Deployments, Services, ConfigMaps, Secrets…) into <code>resources.json</code> — Secret data is <b>encrypted</b> (<code>secrets.enc</code>, vault passphrase); without an unlocked vault or <code>HYCU_VAULT_PASSPHRASE</code> it stays in clear and the backup says so (<code>backup_secrets</code> setting)."),
-    ("<b>Sauvegarder tous (filtrés)</b> : tous les namespaces autorisés d'un coup ; un namespace sans PVC est ignoré.",
-     "<b>Back up all (filtered)</b>: every allowed namespace at once; a namespace without PVCs is skipped."),
-    ("Dossier par défaut : <code>hycu-backups/</code> — <b>copiez-le hors du cluster</b> (téléchargement .zip dans l'assistant de restauration, ou export S3 automatique, voir plus bas).",
-     "Default folder: <code>hycu-backups/</code> — <b>copy it off the cluster</b> (.zip download in the restore wizard, or automatic S3 export, see below)."),
-    ("Le filtre des namespaces (entonnoir) et le <b>sélecteur d'étiquettes</b> (Réglages) bornent ce que l'outil voit et touche.",
-     "The namespace filter (funnel) and the <b>label selector</b> (Settings) bound what the tool sees and touches."),
-    ("Sauvegarde automatique & rétention", "Automatic backup & retention"),
-    ("Page <b>Politiques</b> : activez la sauvegarde automatique (intervalle en heures). Elle couvre <b>tous les clusters connus</b>, tant que l'outil tourne ; un passage manqué est rattrapé au démarrage.",
-     "<b>Policies</b> page: enable the automatic backup (interval in hours). It covers <b>all known clusters</b> while the tool runs; a missed run is caught up at startup."),
-    ("<b>Rétention</b> : « N versions » (défaut), ou <b>GFS</b> — la plus récente de chaque jour / semaine / mois (7 j / 4 sem / 12 mois par défaut).",
-     "<b>Retention</b>: “N versions” (default), or <b>GFS</b> — the most recent of each day / week / month (7 d / 4 wk / 12 mo by default)."),
-    ("La sauvegarde d'une restauration en cours n'est jamais supprimée par la rétention.",
-     "The backup of an in-progress restore is never pruned by retention."),
-    ("<b>Garde-fous du stockage</b> (Réglages) : plancher d'espace libre (sauvegarde refusée en dessous), quota global optionnel (purge des plus anciennes au-delà), historique des tâches borné (31 j par défaut). La tuile <b>Stockage</b> du tableau de bord surveille le disque.",
-     "<b>Storage guardrails</b> (Settings): free-space floor (backups refused below it), optional global quota (oldest pruned above it), bounded job history (31 d by default). The dashboard's <b>Storage</b> tile watches the disk."),
-    ("<b>Applications → Définir la politique</b> : l'outil associe chaque PVC à son <b>Volume Group</b> HYCU (correspondance par UUID), assigne une politique HYCU et peut lancer une sauvegarde.",
-     "<b>Applications → Set Policy</b>: the tool matches each PVC to its HYCU <b>Volume Group</b> (UUID match), assigns a HYCU policy and can start a backup."),
-    ("Une correspondance « par nom » doit être <b>confirmée</b> (case à cocher) ; une ambiguïté n'est jamais tranchée automatiquement.",
-     "A “by name” match must be <b>confirmed</b> (checkbox); an ambiguity is never resolved automatically."),
-    ("Restaurer — les 5 parcours", "Restore — the 5 flows"),
-    ("<b>Restaurer toute l'application (copie)</b> : volumes + objets vers le même namespace (suffixe) ou un autre. L'original n'est pas modifié. Idéal pour vérifier une sauvegarde.",
-     "<b>Restore the whole application (copy)</b>: volumes + objects into the same namespace (suffix) or another one. The original is untouched. Ideal to verify a backup."),
-    ("<b>Restaurer le stockage sur place</b> : HYCU restaure les données <b>dans</b> les volumes d'origine ; l'application est arrêtée puis redémarrée. Choisissez un point de restauration par volume (le plus récent est présélectionné).",
-     "<b>Restore storage in place</b>: HYCU restores the data <b>into</b> the original volumes; the application is stopped then restarted. Pick a restore point per volume (most recent pre-selected)."),
-    ("<b>Restaurer le stockage vers de nouveaux volumes</b> : de nouveaux Volume Groups sont clonés, l'application y est rattachée ; les volumes d'origine sont conservés.",
-     "<b>Restore storage to new volumes</b>: new Volume Groups are cloned and the application re-attached; original volumes are kept."),
-    ("<b>Restaurer des objets de configuration</b> : ré-applique des objets choisis depuis l'instantané d'une sauvegarde, avec <b>aperçu des différences</b> avant tout apply. Ne touche ni aux volumes ni aux données.",
-     "<b>Restore configuration objects</b>: re-applies selected objects from a backup snapshot, with a <b>diff preview</b> before any apply. Volumes and data untouched."),
-    ("Déroulé conseillé : lancez d'abord en <b>simulation</b> (plan affiché, aucun effet), relisez le récapitulatif, puis désactivez la simulation et relancez. En mode réel, l'outil demande de <b>retaper le nom du cluster</b>. Après une restauration réelle, la <b>Vérification</b> s'ouvre automatiquement (PVC Bound, pods Running).",
-     "Recommended flow: run in <b>simulation</b> first (plan shown, no effect), review the summary, then turn simulation off and relaunch. In real mode the tool asks you to <b>retype the cluster name</b>. After a real restore, <b>Verification</b> opens automatically (PVC Bound, pods Running)."),
-    ("Si une étape échoue, la séquence <b>s'arrête</b> et l'application reste arrêtée (jamais redémarrée sur des volumes incohérents). Corrigez puis <b>relancez</b> : la reprise est idempotente et les réplicas d'origine sont mémorisés.",
-     "If a step fails, the sequence <b>stops</b> and the application stays stopped (never restarted on inconsistent volumes). Fix then <b>relaunch</b>: resumption is idempotent and original replicas are remembered."),
-    ("Export S3 (optionnel)", "S3 export (optional)"),
-    ("Restauration en masse (même cluster)", "Bulk restore (same cluster)"),
-    ("<li><b>Applications → Restaurer en masse</b> : recrée d'un coup <b>tous les namespaces supprimés</b> du cluster actif depuis leur dernière sauvegarde antérieure à un <b>instant de référence</b> (namespace, PV/PVC, workloads, dépendances, Secrets si le coffre est déverrouillé, Volume Groups restaurés par HYCU s'ils ont disparu, applications stateless). Les namespaces <b>encore présents</b> sont ignorés : une application vivante se restaure depuis sa propre ligne.</li>",
-     "<li><b>Applications → Bulk restore</b>: recreates at once <b>every deleted namespace</b> of the active cluster from its latest backup prior to a <b>reference time</b> (namespace, PV/PVC, workloads, dependencies, Secrets when the vault is unlocked, Volume Groups restored by HYCU if they are gone, stateless applications). Namespaces <b>still present</b> are skipped: a live application is restored from its own row.</li>"),
-    ("<li><b>Préparer le plan</b> montre, avant tout, les namespaces retenus (sauvegarde choisie, contenu, avertissements : Secrets masqués ou chiffrés avec coffre verrouillé, sauvegarde partielle, sans instantané) et ceux ignorés, avec la raison.</li>",
-     "<li><b>Prepare the plan</b> first shows the selected namespaces (chosen backup, content, warnings: redacted Secrets or encrypted with a locked vault, partial backup, no snapshot) and the skipped ones, with the reason.</li>"),
-    ("<li><b>Simuler</b> exécute le plan en simulation, en arrière-plan, avec un journal par namespace ; <b>Lancer (réel)</b> n'est possible qu'après une simulation complète et sans échec du <b>même</b> plan, bandeau Simulation désactivé, et confirmation du cluster.</li>",
-     "<li><b>Simulate</b> runs the plan in simulation, in the background, with a journal per namespace; <b>Start (real)</b> is only possible after a complete, failure-free simulation of the <b>same</b> plan, with the Simulation banner off and the cluster confirmed.</li>"),
-    ("<li>Exécution <b>séquentielle</b> (les restaurations HYCU durent des minutes chacune : comptez des heures pour des centaines de namespaces) ; <b>Arrêter</b> termine le namespace en cours ; <b>Reprendre</b> rejoue seulement les namespaces restants ou en échec — un namespace déjà recréé n'est jamais refait. Le journal (<code>_bulk_restore.json</code>) survit à un redémarrage ; la sauvegarde automatique est suspendue pendant le run.</li>",
-     "<li><b>Sequential</b> execution (each HYCU restore takes minutes: expect hours for hundreds of namespaces); <b>Stop</b> finishes the current namespace; <b>Resume</b> replays only the remaining or failed namespaces — a namespace already recreated is never redone. The journal (<code>_bulk_restore.json</code>) survives a restart; the automatic backup is suspended during the run.</li>"),
-    ("⚙ → Sources → <b>Stockage objet S3</b> : endpoint compatible S3 (Nutanix Objects, MinIO, AWS…), bucket, clés d'accès → <b>Tester &amp; connecter</b>.",
-     "⚙ → Sources → <b>S3 object storage</b>: S3-compatible endpoint (Nutanix Objects, MinIO, AWS…), bucket, access keys → <b>Test &amp; connect</b>."),
-    ("Cochez <b>Export automatique</b> : chaque sauvegarde réussie part aussi en <code>.zip</code> vers le bucket — le filet de sécurité vit hors du cluster.",
-     "Tick <b>Automatic export</b>: every successful backup also goes as a <code>.zip</code> to the bucket — the safety net lives off-cluster."),
-    ("Option <b>chiffrement</b> : les objets sont chiffrés avant l'envoi ; déchiffrement : <code>python3 hycu_k8s_nutanix.py --decrypt fichier.zip.enc</code>.",
-     "Optional <b>encryption</b>: objects are encrypted before upload; decryption: <code>python3 hycu_k8s_nutanix.py --decrypt file.zip.enc</code>."),
-    ("Rapport & supervision", "Report & monitoring"),
-    ("Page <b>Tâches</b> → <b>Rapport HTML</b> (conformité : applications, RPO, santé des clusters, tâches) ou <b>CSV</b> (Excel).",
-     "<b>Jobs</b> page → <b>HTML report</b> (compliance: applications, RPO, cluster health, jobs) or <b>CSV</b> (Excel)."),
-    ("<code>GET /metrics</code> : métriques Prometheus (local uniquement) — outil actif, sauvegarde auto, clusters joignables, connexions.",
-     "<code>GET /metrics</code>: Prometheus metrics (local only) — tool up, auto backup, reachable clusters, connections."),
-    ("La <b>santé des clusters</b> est contrôlée périodiquement (pastilles dans Sources).",
-     "<b>Cluster health</b> is checked periodically (dots in Sources)."),
-    ("Sécurité en bref", "Security in short"),
-    ("Serveur sur <b>127.0.0.1 uniquement</b>, anti-CSRF, mode simulation par défaut, confirmation du cluster avant toute action réelle, journal d'audit complet.",
-     "Server on <b>127.0.0.1 only</b>, anti-CSRF, simulation mode by default, cluster confirmation before any real action, full audit log."),
-    ("Identifiants et kubeconfigs : <b>mémoire de session</b> (verrouillés à chaque nouvelle session navigateur), coffre chiffré optionnel (phrase secrète maîtresse).",
-     "Credentials and kubeconfigs: <b>session memory</b> (locked at each new browser session), optional encrypted vault (master passphrase)."),
-    ("En mode Kubernetes, la frontière de sécurité est le <b>RBAC du namespace</b> de l'outil : qui peut faire un port-forward est opérateur.",
-     "In Kubernetes mode, the security boundary is the tool's <b>namespace RBAC</b>: whoever can port-forward is an operator."),
-    ("Dépannage express", "Quick troubleshooting"),
-    ("<th>Symptôme</th><th>Piste</th>", "<th>Symptom</th><th>Lead</th>"),
-    ("« Contexte : indisponible »</td><td>kubectl absent du PATH ou contexte non configuré (⚙ → Réglages).",
-     "“Context: unavailable”</td><td>kubectl missing from PATH or context not configured (⚙ → Settings)."),
-    ("« Namespace non autorisé »</td><td>Hors du filtre des namespaces (entonnoir) ou du sélecteur d'étiquettes.",
-     "“Namespace not allowed”</td><td>Outside the namespace filter (funnel) or the label selector."),
-    ("Les connexions redemandent le déverrouillage</td><td>Normal : nouvelle session navigateur = identifiants verrouillés. Saisissez la phrase du coffre.",
-     "Connections ask to be unlocked again</td><td>Expected: new browser session = credentials locked. Enter the vault passphrase."),
-    ("« Cluster « x » inconnu »</td><td>Cluster retiré ou session verrouillée : déverrouillez le coffre ou re-choisissez un cluster (barre du haut).",
-     "“Cluster « x » unknown”</td><td>Cluster removed or session locked: unlock the vault or pick a cluster again (top bar)."),
-    ("« Cette sauvegarde provient du cluster « x » »</td><td>Sélectionnez le cluster d'origine de la sauvegarde dans la barre du haut.",
-     "“This backup comes from cluster « x »”</td><td>Select the backup's source cluster in the top bar."),
-    ("Séquence « interrompue »</td><td>Lisez l'étape en échec dans le journal, corrigez, relancez (reprise idempotente).",
-     "“Interrupted” sequence</td><td>Read the failing step in the log, fix, relaunch (idempotent resumption)."),
-    ("Export S3 en 403</td><td>Clés refusées, ou horloge du serveur décalée (SigV4 exige une heure juste).",
-     "S3 export fails with 403</td><td>Keys refused, or server clock skewed (SigV4 requires accurate time)."),
-    (" · les ", " · showing the "),
-    (" plus récentes affichées sur ", " most recent of "),
-    (" · historique conservé ", " · history kept "),
-    (" j (Réglages)", " d (Settings)"),
-    ("Historique des tâches (jours ; 0 = illimité)", "Job history (days; 0 = unlimited)"),
+    ('<span>Aide (guide)</span>', '<span>Help (guide)</span>'),
+    ('<span>À propos</span>', '<span>About</span>'),
+    ('<title>Aide — Protection Kubernetes sur Nutanix</title>', '<title>Help — Kubernetes Protection on Nutanix</title>'),
+    ('<h1>Aide — Protection Kubernetes sur Nutanix</h1>', '<h1>Help — Kubernetes Protection on Nutanix</h1>'),
+    ('· toutes les actions destructives sont simulées par défaut', '· every destructive action is simulated by default'),
+    ("Cette page est servie par l'outil (fonctionne hors-ligne). Fermez l'onglet pour revenir à l'interface.", 'This page is served by the tool itself (works offline). Close the tab to return to the UI.'),
+    ('Démarrage rapide', 'Quick start'),
+    ('<b>Enregistrez vos sources</b> : ⚙ (en haut à droite) → <b>Sources</b> → HYCU, Prism Central/Element, et vos <b>clusters Kubernetes</b> si besoin. Les identifiants restent en mémoire (ou dans le coffre chiffré).', '<b>Register your sources</b>: ⚙ (top right) → <b>Sources</b> → HYCU, Prism Central/Element, and your <b>Kubernetes clusters</b> if needed. Credentials stay in memory (or in the encrypted vault).'),
+    ('<b>Sauvegardez la configuration</b> : page <b>Applications</b> → cochez vos applications → <b>Sauvegarder</b>. Activez ensuite la <b>sauvegarde automatique</b> (page Politiques).', '<b>Back up the configuration</b>: <b>Applications</b> page → tick your applications → <b>Back up</b>. Then enable the <b>automatic backup</b> (Policies page).'),
+    ("<b>Testez une restauration</b> en <b>mode simulation</b> (bandeau du haut, activé par défaut) : Applications → une application → <b>Restaurer</b>. Rien n'est exécuté tant que la simulation est active.", '<b>Test a restore</b> in <b>simulation mode</b> (top banner, on by default): Applications → one application → <b>Restore</b>. Nothing runs while simulation is on.'),
+    ("L'outil orchestre la <b>configuration</b> (manifestes PV/PVC, objets) ; les <b>données</b> des volumes sont protégées par <b>HYCU</b> (Volume Groups Nutanix). Les deux sont complémentaires.", 'The tool orchestrates the <b>configuration</b> (PV/PVC manifests, objects); the volume <b>data</b> is protected by <b>HYCU</b> (Nutanix Volume Groups). They complement each other.'),
+    ("L'interface", 'The interface'),
+    ("<b>Barre du haut</b> : pastilles d'état HYCU/PE/PC · <b>cluster actif</b> (cliquez pour changer de cluster ou en ajouter) · ⚙ <b>Sources / Réglages</b> · <b>?</b> Aide / À propos · <b>EN/FR</b>.", '<b>Top bar</b>: HYCU/PE/PC status dots · <b>active cluster</b> (click to switch or add one) · ⚙ <b>Sources / Settings</b> · <b>?</b> Help / About · <b>EN/FR</b>.'),
+    ('<b>Tableau de bord</b> : anneaux protection/conformité, politique, sources, cluster, activité des tâches.', '<b>Dashboard</b>: protection/compliance rings, policy, sources, cluster, job activity.'),
+    ('<b>Applications</b> : une ligne par namespace. Sélectionnez, puis agissez en haut à droite : <b>Sauvegarder · Restaurer · Définir la politique · Vérifier</b>. Bascule <b>Cluster actif / Tous les clusters</b> (regroupés par workspace NKP).', '<b>Applications</b>: one row per namespace. Select, then act at the top right: <b>Back up · Restore · Set Policy · Verify</b>. <b>Active cluster / All clusters</b> toggle (grouped by NKP workspace).'),
+    ('<b>Politiques</b> : sauvegarde automatique de la configuration (fréquence, rétention) + politiques HYCU.', '<b>Policies</b>: automatic configuration backup (frequency, retention) + HYCU policies.'),
+    ('<b>Tâches</b> : historique (succès/échec/simulation), cluster de chaque tâche, boutons <b>Rapport HTML/CSV</b>.', '<b>Jobs</b>: history (success/failed/simulation), cluster of each job, <b>HTML/CSV report</b> buttons.'),
+    ("<b>Le bandeau Simulation</b> : tant qu'il est activé, AUCUNE commande destructive n'est exécutée — l'outil montre ce qu'il ferait. Désactivez-le seulement au moment d'agir.", '<b>The Simulation banner</b>: while it is on, NO destructive command runs — the tool shows what it would do. Turn it off only when ready to act.'),
+    ('Clusters Kubernetes (multi-cluster & NKP)', 'Kubernetes clusters (multi-cluster & NKP)'),
+    ('Le <b>cluster local</b> vient de la configuration (kubeconfig/contexte — ⚙ → Réglages).', 'The <b>local cluster</b> comes from the configuration (kubeconfig/context — ⚙ → Settings).'),
+    ("<b>Ajouter un cluster</b> : ⚙ → Sources → <b>Ajouter un cluster Kubernetes</b> → chargez ou collez son kubeconfig → <b>Tester &amp; ajouter</b>. L'outil analyse l'authentification (jeton expiré, plugin exec…) et vous avertit.", '<b>Add a cluster</b>: ⚙ → Sources → <b>Add a Kubernetes cluster</b> → load or paste its kubeconfig → <b>Test &amp; add</b>. The tool analyses the authentication (expired token, exec plugin…) and warns you.'),
+    ('<b>NKP</b> : rendez le cluster de management actif, puis Sources → <b>Découvrir les workspaces NKP</b> → cochez les clusters → <b>Importer</b> (droits élevés requis, avertissement explicite).', '<b>NKP</b>: make the management cluster active, then Sources → <b>Discover NKP workspaces</b> → tick the clusters → <b>Import</b> (elevated rights required, explicit warning).'),
+    ("Les sauvegardes de chaque cluster sont rangées <b>séparément</b>, et une sauvegarde ne se restaure que sur son cluster d'origine.", "Each cluster's backups are stored <b>separately</b>, and a backup only restores onto its source cluster."),
+    ('Les kubeconfigs sont des <b>secrets</b> : mémoire de session + coffre chiffré (jamais en clair sur disque).', 'Kubeconfigs are <b>secrets</b>: session memory + encrypted vault (never in clear on disk).'),
+    ('Sauvegarder', 'Back up'),
+    ('<b>Applications → Sauvegarder</b> : exporte et nettoie les manifestes <b>PV/PVC</b> (la « recette » du restore) + un <b>instantané des autres objets</b> (Deployments, Services, ConfigMaps, Secrets…) dans <code>resources.json</code> — les données des Secrets sont <b>chiffrées</b> (<code>secrets.enc</code>, phrase du coffre) ; sans coffre déverrouillé ni <code>HYCU_VAULT_PASSPHRASE</code>, elles restent en clair et la sauvegarde le signale (réglage <code>backup_secrets</code>).', '<b>Applications → Back up</b>: exports and cleans the <b>PV/PVC</b> manifests (the restore “recipe”) + a <b>snapshot of the other objects</b> (Deployments, Services, ConfigMaps, Secrets…) into <code>resources.json</code> — Secret data is <b>encrypted</b> (<code>secrets.enc</code>, vault passphrase); without an unlocked vault or <code>HYCU_VAULT_PASSPHRASE</code> it stays in clear and the backup says so (<code>backup_secrets</code> setting).'),
+    ("<b>Sauvegarder tous (filtrés)</b> : tous les namespaces autorisés d'un coup ; un namespace sans PVC est ignoré.", '<b>Back up all (filtered)</b>: every allowed namespace at once; a namespace without PVCs is skipped.'),
+    ("Dossier par défaut : <code>hycu-backups/</code> — <b>copiez-le hors du cluster</b> (téléchargement .zip dans l'assistant de restauration, ou export S3 automatique, voir plus bas).", 'Default folder: <code>hycu-backups/</code> — <b>copy it off the cluster</b> (.zip download in the restore wizard, or automatic S3 export, see below).'),
+    ("Le filtre des namespaces (entonnoir) et le <b>sélecteur d'étiquettes</b> (Réglages) bornent ce que l'outil voit et touche.", 'The namespace filter (funnel) and the <b>label selector</b> (Settings) bound what the tool sees and touches.'),
+    ('Sauvegarde automatique & rétention', 'Automatic backup & retention'),
+    ("Page <b>Politiques</b> : activez la sauvegarde automatique (intervalle en heures). Elle couvre <b>tous les clusters connus</b>, tant que l'outil tourne ; un passage manqué est rattrapé au démarrage.", '<b>Policies</b> page: enable the automatic backup (interval in hours). It covers <b>all known clusters</b> while the tool runs; a missed run is caught up at startup.'),
+    ('<b>Rétention</b> : « N versions » (défaut), ou <b>GFS</b> — la plus récente de chaque jour / semaine / mois (7 j / 4 sem / 12 mois par défaut).', '<b>Retention</b>: “N versions” (default), or <b>GFS</b> — the most recent of each day / week / month (7 d / 4 wk / 12 mo by default).'),
+    ("La sauvegarde d'une restauration en cours n'est jamais supprimée par la rétention.", 'The backup of an in-progress restore is never pruned by retention.'),
+    ("<b>Garde-fous du stockage</b> (Réglages) : plancher d'espace libre (sauvegarde refusée en dessous), quota global optionnel (purge des plus anciennes au-delà), historique des tâches borné (31 j par défaut). La tuile <b>Stockage</b> du tableau de bord surveille le disque.", "<b>Storage guardrails</b> (Settings): free-space floor (backups refused below it), optional global quota (oldest pruned above it), bounded job history (31 d by default). The dashboard's <b>Storage</b> tile watches the disk."),
+    ("<b>Applications → Définir la politique</b> : l'outil associe chaque PVC à son <b>Volume Group</b> HYCU (correspondance par UUID), assigne une politique HYCU et peut lancer une sauvegarde.", '<b>Applications → Set Policy</b>: the tool matches each PVC to its HYCU <b>Volume Group</b> (UUID match), assigns a HYCU policy and can start a backup.'),
+    ("Une correspondance « par nom » doit être <b>confirmée</b> (case à cocher) ; une ambiguïté n'est jamais tranchée automatiquement.", 'A “by name” match must be <b>confirmed</b> (checkbox); an ambiguity is never resolved automatically.'),
+    ('Restaurer — les 5 parcours', 'Restore — the 5 flows'),
+    ("<b>Restaurer toute l'application (copie)</b> : volumes + objets vers le même namespace (suffixe) ou un autre. L'original n'est pas modifié. Idéal pour vérifier une sauvegarde.", '<b>Restore the whole application (copy)</b>: volumes + objects into the same namespace (suffix) or another one. The original is untouched. Ideal to verify a backup.'),
+    ("<b>Restaurer le stockage sur place</b> : HYCU restaure les données <b>dans</b> les volumes d'origine ; l'application est arrêtée puis redémarrée. Choisissez un point de restauration par volume (le plus récent est présélectionné).", '<b>Restore storage in place</b>: HYCU restores the data <b>into</b> the original volumes; the application is stopped then restarted. Pick a restore point per volume (most recent pre-selected).'),
+    ("<b>Restaurer le stockage vers de nouveaux volumes</b> : de nouveaux Volume Groups sont clonés, l'application y est rattachée ; les volumes d'origine sont conservés.", '<b>Restore storage to new volumes</b>: new Volume Groups are cloned and the application re-attached; original volumes are kept.'),
+    ("<b>Restaurer des objets de configuration</b> : ré-applique des objets choisis depuis l'instantané d'une sauvegarde, avec <b>aperçu des différences</b> avant tout apply. Ne touche ni aux volumes ni aux données.", '<b>Restore configuration objects</b>: re-applies selected objects from a backup snapshot, with a <b>diff preview</b> before any apply. Volumes and data untouched.'),
+    ("Déroulé conseillé : lancez d'abord en <b>simulation</b> (plan affiché, aucun effet), relisez le récapitulatif, puis désactivez la simulation et relancez. En mode réel, l'outil demande de <b>retaper le nom du cluster</b>. Après une restauration réelle, la <b>Vérification</b> s'ouvre automatiquement (PVC Bound, pods Running).", 'Recommended flow: run in <b>simulation</b> first (plan shown, no effect), review the summary, then turn simulation off and relaunch. In real mode the tool asks you to <b>retype the cluster name</b>. After a real restore, <b>Verification</b> opens automatically (PVC Bound, pods Running).'),
+    ("Si une étape échoue, la séquence <b>s'arrête</b> et l'application reste arrêtée (jamais redémarrée sur des volumes incohérents). Corrigez puis <b>relancez</b> : la reprise est idempotente et les réplicas d'origine sont mémorisés.", 'If a step fails, the sequence <b>stops</b> and the application stays stopped (never restarted on inconsistent volumes). Fix then <b>relaunch</b>: resumption is idempotent and original replicas are remembered.'),
+    ('Export S3 (optionnel)', 'S3 export (optional)'),
+    ('Restauration en masse (même cluster)', 'Bulk restore (same cluster)'),
+    ("<li><b>Applications → Restaurer en masse</b> : recrée d'un coup <b>tous les namespaces supprimés</b> du cluster actif depuis leur dernière sauvegarde antérieure à un <b>instant de référence</b> (namespace, PV/PVC, workloads, dépendances, Secrets si le coffre est déverrouillé, Volume Groups restaurés par HYCU s'ils ont disparu, applications stateless). Les namespaces <b>encore présents</b> sont ignorés : une application vivante se restaure depuis sa propre ligne.</li>", '<li><b>Applications → Bulk restore</b>: recreates at once <b>every deleted namespace</b> of the active cluster from its latest backup prior to a <b>reference time</b> (namespace, PV/PVC, workloads, dependencies, Secrets when the vault is unlocked, Volume Groups restored by HYCU if they are gone, stateless applications). Namespaces <b>still present</b> are skipped: a live application is restored from its own row.</li>'),
+    ('<li><b>Préparer le plan</b> montre, avant tout, les namespaces retenus (sauvegarde choisie, contenu, avertissements : Secrets masqués ou chiffrés avec coffre verrouillé, sauvegarde partielle, sans instantané) et ceux ignorés, avec la raison.</li>', '<li><b>Prepare the plan</b> first shows the selected namespaces (chosen backup, content, warnings: redacted Secrets or encrypted with a locked vault, partial backup, no snapshot) and the skipped ones, with the reason.</li>'),
+    ("<li><b>Simuler</b> exécute le plan en simulation, en arrière-plan, avec un journal par namespace ; <b>Lancer (réel)</b> n'est possible qu'après une simulation complète et sans échec du <b>même</b> plan, bandeau Simulation désactivé, et confirmation du cluster.</li>", '<li><b>Simulate</b> runs the plan in simulation, in the background, with a journal per namespace; <b>Start (real)</b> is only possible after a complete, failure-free simulation of the <b>same</b> plan, with the Simulation banner off and the cluster confirmed.</li>'),
+    ("<li>Exécution <b>séquentielle</b> (les restaurations HYCU durent des minutes chacune : comptez des heures pour des centaines de namespaces) ; <b>Arrêter</b> termine le namespace en cours ; <b>Reprendre</b> rejoue seulement les namespaces restants ou en échec — un namespace déjà recréé n'est jamais refait. Le journal (<code>_bulk_restore.json</code>) survit à un redémarrage ; la sauvegarde automatique est suspendue pendant le run.</li>", '<li><b>Sequential</b> execution (each HYCU restore takes minutes: expect hours for hundreds of namespaces); <b>Stop</b> finishes the current namespace; <b>Resume</b> replays only the remaining or failed namespaces — a namespace already recreated is never redone. The journal (<code>_bulk_restore.json</code>) survives a restart; the automatic backup is suspended during the run.</li>'),
+    ("⚙ → Sources → <b>Stockage objet S3</b> : endpoint compatible S3 (Nutanix Objects, MinIO, AWS…), bucket, clés d'accès → <b>Tester &amp; connecter</b>.", '⚙ → Sources → <b>S3 object storage</b>: S3-compatible endpoint (Nutanix Objects, MinIO, AWS…), bucket, access keys → <b>Test &amp; connect</b>.'),
+    ('Cochez <b>Export automatique</b> : chaque sauvegarde réussie part aussi en <code>.zip</code> vers le bucket — le filet de sécurité vit hors du cluster.', 'Tick <b>Automatic export</b>: every successful backup also goes as a <code>.zip</code> to the bucket — the safety net lives off-cluster.'),
+    ("Option <b>chiffrement</b> : les objets sont chiffrés avant l'envoi ; déchiffrement : <code>python3 hycu_k8s_nutanix.py --decrypt fichier.zip.enc</code>.", 'Optional <b>encryption</b>: objects are encrypted before upload; decryption: <code>python3 hycu_k8s_nutanix.py --decrypt file.zip.enc</code>.'),
+    ('Rapport & supervision', 'Report & monitoring'),
+    ('Page <b>Tâches</b> → <b>Rapport HTML</b> (conformité : applications, RPO, santé des clusters, tâches) ou <b>CSV</b> (Excel).', '<b>Jobs</b> page → <b>HTML report</b> (compliance: applications, RPO, cluster health, jobs) or <b>CSV</b> (Excel).'),
+    ('<code>GET /metrics</code> : métriques Prometheus (local uniquement) — outil actif, sauvegarde auto, clusters joignables, connexions.', '<code>GET /metrics</code>: Prometheus metrics (local only) — tool up, auto backup, reachable clusters, connections.'),
+    ('La <b>santé des clusters</b> est contrôlée périodiquement (pastilles dans Sources).', '<b>Cluster health</b> is checked periodically (dots in Sources).'),
+    ('Sécurité en bref', 'Security in short'),
+    ("Serveur sur <b>127.0.0.1 uniquement</b>, anti-CSRF, mode simulation par défaut, confirmation du cluster avant toute action réelle, journal d'audit complet.", 'Server on <b>127.0.0.1 only</b>, anti-CSRF, simulation mode by default, cluster confirmation before any real action, full audit log.'),
+    ('Identifiants et kubeconfigs : <b>mémoire de session</b> (verrouillés à chaque nouvelle session navigateur), coffre chiffré optionnel (phrase secrète maîtresse).', 'Credentials and kubeconfigs: <b>session memory</b> (locked at each new browser session), optional encrypted vault (master passphrase).'),
+    ("En mode Kubernetes, la frontière de sécurité est le <b>RBAC du namespace</b> de l'outil : qui peut faire un port-forward est opérateur.", "In Kubernetes mode, the security boundary is the tool's <b>namespace RBAC</b>: whoever can port-forward is an operator."),
+    ('Dépannage express', 'Quick troubleshooting'),
+    ('<th>Symptôme</th><th>Piste</th>', '<th>Symptom</th><th>Lead</th>'),
+    ('« Contexte : indisponible »</td><td>kubectl absent du PATH ou contexte non configuré (⚙ → Réglages).', '“Context: unavailable”</td><td>kubectl missing from PATH or context not configured (⚙ → Settings).'),
+    ("« Namespace non autorisé »</td><td>Hors du filtre des namespaces (entonnoir) ou du sélecteur d'étiquettes.", '“Namespace not allowed”</td><td>Outside the namespace filter (funnel) or the label selector.'),
+    ('Les connexions redemandent le déverrouillage</td><td>Normal : nouvelle session navigateur = identifiants verrouillés. Saisissez la phrase du coffre.', 'Connections ask to be unlocked again</td><td>Expected: new browser session = credentials locked. Enter the vault passphrase.'),
+    ('« Cluster « x » inconnu »</td><td>Cluster retiré ou session verrouillée : déverrouillez le coffre ou re-choisissez un cluster (barre du haut).', '“Cluster « x » unknown”</td><td>Cluster removed or session locked: unlock the vault or pick a cluster again (top bar).'),
+    ("« Cette sauvegarde provient du cluster « x » »</td><td>Sélectionnez le cluster d'origine de la sauvegarde dans la barre du haut.", "“This backup comes from cluster « x »”</td><td>Select the backup's source cluster in the top bar."),
+    ("Séquence « interrompue »</td><td>Lisez l'étape en échec dans le journal, corrigez, relancez (reprise idempotente).", '“Interrupted” sequence</td><td>Read the failing step in the log, fix, relaunch (idempotent resumption).'),
+    ('Export S3 en 403</td><td>Clés refusées, ou horloge du serveur décalée (SigV4 exige une heure juste).', 'S3 export fails with 403</td><td>Keys refused, or server clock skewed (SigV4 requires accurate time).'),
+    (' · les ', ' · showing the '),
+    (' plus récentes affichées sur ', ' most recent of '),
+    (' · historique conservé ', ' · history kept '),
+    (' j (Réglages)', ' d (Settings)'),
+    ('Historique des tâches (jours ; 0 = illimité)', 'Job history (days; 0 = unlimited)'),
     ('"Pas encore contrôlé"', '"Not checked yet"'),
-    (">Gérer les clusters</a>", ">Manage clusters</a>"),
-    ("Dossier absent : ", "Folder missing: "),
-    (">disque presque plein<", ">disk almost full<"),
+    ('>Gérer les clusters</a>', '>Manage clusters</a>'),
+    ('Dossier absent : ', 'Folder missing: '),
+    ('>disque presque plein<', '>disk almost full<'),
     ('"Disque rempli à "', '"Disk "'),
-    ("% utilisé · ", "% used · "),
-    (" libres sur ", " free of "),
-    (" versions · ", " versions · "),
-    ("<span class=\"k\">Journal d'audit</span>", "<span class=\"k\">Audit log</span>"),
-    ("Plancher d'espace libre (Mo ; 0 = désactivé)", "Free-space floor (MB; 0 = disabled)"),
+    ('% utilisé · ', '% used · '),
+    (' libres sur ', ' free of '),
+    ('<span class="k">Journal d\'audit</span>', '<span class="k">Audit log</span>'),
+    ("Plancher d'espace libre (Mo ; 0 = désactivé)", 'Free-space floor (MB; 0 = disabled)'),
     ('<span class="k">Sauvegardes</span>', '<span class="k">Backups</span>'),
-    ("Cette sauvegarde a été prise sur le contexte kubectl « ", "This backup was taken on kubectl context « "),
-    ("Quota des sauvegardes (Go ; 0 = illimité)", "Backup quota (GB; 0 = unlimited)"),
-    ("Sous le plancher, toute sauvegarde est refusée ; au-delà du quota, les plus anciennes sont purgées (la plus récente de chaque application est toujours gardée).",
-     "Below the floor, every backup is refused; above the quota, the oldest are pruned (the most recent of each application is always kept)."),
-    ("Garde-fou : sauvegarde refusée sous ", "Guardrail: backup refused below "),
-    (" Mo libres.", " MB free."),
+    ('Cette sauvegarde a été prise sur le contexte kubectl « ', 'This backup was taken on kubectl context « '),
+    ('Quota des sauvegardes (Go ; 0 = illimité)', 'Backup quota (GB; 0 = unlimited)'),
+    ('Sous le plancher, toute sauvegarde est refusée ; au-delà du quota, les plus anciennes sont purgées (la plus récente de chaque application est toujours gardée).', 'Below the floor, every backup is refused; above the quota, the oldest are pruned (the most recent of each application is always kept).'),
+    ('Garde-fou : sauvegarde refusée sous ', 'Guardrail: backup refused below '),
+    (' Mo libres.', ' MB free.'),
     ('"Quota dépassé : purge des plus anciennes au prochain passage"', '"Quota exceeded: oldest pruned at next pass"'),
-    ('<span class="k">Quota</span>', '<span class="k">Quota</span>'),
-    ("Espace disque insuffisant sous ", "Not enough disk space under "),
-    (" Mo libres (plancher : ", " MB free (floor: "),
-    # ---- Reprise d'activité (DR) + import S3 ----
-    ("Restauration DR (autre cluster / contexte)", "DR restore (another cluster / context)"),
-    ("Reprise d'activité : recrée une application sur CE cluster depuis une sauvegarde d'un cluster disparu (ou importée du bucket S3). Sources lues depuis la seule sauvegarde. Nécessite le réglage « Autoriser la restauration DR ».",
-     "Disaster recovery: recreates an application on THIS cluster from a backup of a lost cluster (or imported from the S3 bucket). Sources read from the backup alone. Requires the “Allow DR restore” setting."),
-    ("La <b>restauration DR</b> est désactivée. Activez « <b>Autoriser la restauration DR</b> » dans ⚙ → Réglages (le temps de l'exercice ou du sinistre), puis revenez ici.",
-     "<b>DR restore</b> is disabled. Enable “<b>Allow DR restore</b>” in ⚙ → Settings (for the duration of the drill or disaster), then come back here."),
-    ("Mode <b>reprise d'activité</b> : la garde inter-cluster est levée pour CETTE opération. Toutes les sources proviennent de la sauvegarde choisie ; le cluster cible est le <b>cluster actif</b> (",
-     "<b>Disaster recovery</b> mode: the cross-cluster guard is lifted for THIS operation. Every source comes from the selected backup; the target is the <b>active cluster</b> ("),
-    ("). Restaurez d'abord les Volume Groups dans HYCU vers le site cible, puis collez leurs UUID.",
-     "). First restore the Volume Groups in HYCU to the target site, then paste their UUIDs."),
-    ("Sauvegarde source (tous clusters / imports S3)", "Source backup (all clusters / S3 imports)"),
+    ('Espace disque insuffisant sous ', 'Not enough disk space under '),
+    (' Mo libres (plancher : ', ' MB free (floor: '),
+    ('Restauration DR (autre cluster / contexte)', 'DR restore (another cluster / context)'),
+    ("Reprise d'activité : recrée une application sur CE cluster depuis une sauvegarde d'un cluster disparu (ou importée du bucket S3). Sources lues depuis la seule sauvegarde. Nécessite le réglage « Autoriser la restauration DR ».", 'Disaster recovery: recreates an application on THIS cluster from a backup of a lost cluster (or imported from the S3 bucket). Sources read from the backup alone. Requires the “Allow DR restore” setting.'),
+    ("La <b>restauration DR</b> est désactivée. Activez « <b>Autoriser la restauration DR</b> » dans ⚙ → Réglages (le temps de l'exercice ou du sinistre), puis revenez ici.", '<b>DR restore</b> is disabled. Enable “<b>Allow DR restore</b>” in ⚙ → Settings (for the duration of the drill or disaster), then come back here.'),
+    ("Mode <b>reprise d'activité</b> : la garde inter-cluster est levée pour CETTE opération. Toutes les sources proviennent de la sauvegarde choisie ; le cluster cible est le <b>cluster actif</b> (", '<b>Disaster recovery</b> mode: the cross-cluster guard is lifted for THIS operation. Every source comes from the selected backup; the target is the <b>active cluster</b> ('),
+    ("). Restaurez d'abord les Volume Groups dans HYCU vers le site cible, puis collez leurs UUID.", '). First restore the Volume Groups in HYCU to the target site, then paste their UUIDs.'),
+    ('Sauvegarde source (tous clusters / imports S3)', 'Source backup (all clusters / S3 imports)'),
     ('<label class="fld">Namespace cible</label><input type="text" id="drTargetNs"', '<label class="fld">Target namespace</label><input type="text" id="drTargetNs"'),
-    ("StorageClass cible (vide = inchangée)", "Target StorageClass (empty = unchanged)"),
-    ("Recréer les dépendances depuis la sauvegarde (Secrets non masqués, ConfigMaps, ServiceAccounts, Services)",
-     "Recreate dependencies from the backup (non-redacted Secrets, ConfigMaps, ServiceAccounts, Services)"),
-    ("Volumes — collez l'UUID du VG restauré/cloné sur le site cible", "Volumes — paste the UUID of the VG restored/cloned on the target site"),
+    ('StorageClass cible (vide = inchangée)', 'Target StorageClass (empty = unchanged)'),
+    ('Recréer les dépendances depuis la sauvegarde (Secrets non masqués, ConfigMaps, ServiceAccounts, Services)', 'Recreate dependencies from the backup (non-redacted Secrets, ConfigMaps, ServiceAccounts, Services)'),
+    ("Volumes — collez l'UUID du VG restauré/cloné sur le site cible", 'Volumes — paste the UUID of the VG restored/cloned on the target site'),
     ('"Restaurer (simulation)"', '"Restore (simulation)"'),
     ('"Restaurer (réel)"', '"Restore (real)"'),
-    ("Restauration DR RÉELLE", "REAL DR restore"),
-    ("Sauvegarde source : <b>", "Source backup: <b>"),
-    ("Cluster CIBLE : <b>", "TARGET cluster: <b>"),
-    ("</b> · namespace cible : <b>", "</b> · target namespace: <b>"),
-    ("La garde inter-cluster est LEVÉE pour cette opération : l'application sera recréée sur ce cluster depuis la sauvegarde (PV/PVC, workloads, dépendances non masquées).",
-     "The cross-cluster guard is LIFTED for this operation: the application will be recreated on this cluster from the backup (PV/PVC, workloads, non-redacted dependencies)."),
-    ("Restauration DR…", "DR restore…"),
-    (" · import S3", " · S3 import"),
-    ("Aucun volume dans cette sauvegarde.", "No volume in this backup."),
-    ("<b>Autoriser la restauration DR</b> (inter-cluster / inter-contexte)", "<b>Allow DR restore</b> (cross-cluster / cross-context)"),
-    ("À activer le temps d'un exercice ou d'un sinistre. Chaque restauration DR reste explicite : sources lues depuis la seule sauvegarde, avertissement, re-saisie du cluster cible, audit dédié.",
-     "Enable it for the duration of a drill or a disaster. Each DR restore stays explicit: sources read from the backup alone, warning, target cluster retyped, dedicated audit."),
-    ("Importer depuis le bucket (reprise / DR)", "Import from the bucket (recovery / DR)"),
-    ("Phrase de déchiffrement (objets .enc uniquement)", "Decryption passphrase (.enc objects only)"),
-    ("Les exports rapatriés vont dans <code>hycu-backups/_imports/…</code> ; ils se restaurent via la <b>Restauration DR</b> de l'assistant (ou sur leur cluster d'origine).",
-     "Repatriated exports go to <code>hycu-backups/_imports/…</code>; they are restored through the wizard's <b>DR restore</b> (or on their source cluster)."),
-    ("Liste du bucket…", "Listing bucket…"),
+    ('Restauration DR RÉELLE', 'REAL DR restore'),
+    ('Sauvegarde source : <b>', 'Source backup: <b>'),
+    ('Cluster CIBLE : <b>', 'TARGET cluster: <b>'),
+    ('</b> · namespace cible : <b>', '</b> · target namespace: <b>'),
+    ("La garde inter-cluster est LEVÉE pour cette opération : l'application sera recréée sur ce cluster depuis la sauvegarde (PV/PVC, workloads, dépendances non masquées).", 'The cross-cluster guard is LIFTED for this operation: the application will be recreated on this cluster from the backup (PV/PVC, workloads, non-redacted dependencies).'),
+    ('Restauration DR…', 'DR restore…'),
+    (' · import S3', ' · S3 import'),
+    ('Aucun volume dans cette sauvegarde.', 'No volume in this backup.'),
+    ('<b>Autoriser la restauration DR</b> (inter-cluster / inter-contexte)', '<b>Allow DR restore</b> (cross-cluster / cross-context)'),
+    ("À activer le temps d'un exercice ou d'un sinistre. Chaque restauration DR reste explicite : sources lues depuis la seule sauvegarde, avertissement, re-saisie du cluster cible, audit dédié.", 'Enable it for the duration of a drill or a disaster. Each DR restore stays explicit: sources read from the backup alone, warning, target cluster retyped, dedicated audit.'),
+    ('Importer depuis le bucket (reprise / DR)', 'Import from the bucket (recovery / DR)'),
+    ('Phrase de déchiffrement (objets .enc uniquement)', 'Decryption passphrase (.enc objects only)'),
+    ("Les exports rapatriés vont dans <code>hycu-backups/_imports/…</code> ; ils se restaurent via la <b>Restauration DR</b> de l'assistant (ou sur leur cluster d'origine).", "Repatriated exports go to <code>hycu-backups/_imports/…</code>; they are restored through the wizard's <b>DR restore</b> (or on their source cluster)."),
+    ('Liste du bucket…', 'Listing bucket…'),
     ('<th>Chiffré</th>', '<th>Encrypted</th>'),
-    (" fichier(s)", " file(s)"),
+    (' fichier(s)', ' file(s)'),
     ('"Import S3 (rapatriement)"', '"S3 import (repatriation)"'),
     ('"Restauration d\'objets de configuration"', '"Configuration objects restore"'),
-    (" » — aucune lecture du cluster d'origine.", " » — no read from the origin cluster."),
-    ("StorageClass remappée vers « ", "StorageClass remapped to « "),
-    (" » sur les PV/PVC recréés.", " » on the recreated PV/PVCs."),
-    ("Instantané resources.json vide ou absent : seuls PV et PVC seront recréés.",
-     "resources.json snapshot empty or missing: only PV and PVC will be recreated."),
-    ("Restauration DR : choisissez une sauvegarde source.", "DR restore: choose a source backup."),
-    # ---- Applications supprimées mais sauvegardées (récupération même cluster) ----
-    ("Supprimée — restaurable", "Deleted — restorable"),
-    ("Application supprimée (sauvegardes conservées)", "Deleted application (backups kept)"),
-    # Applications dans les namespaces (stateful / stateless)
-    ("volumes sans workload", "volumes without workload"),
+    (" » — aucune lecture du cluster d'origine.", ' » — no read from the origin cluster.'),
+    ('StorageClass remappée vers « ', 'StorageClass remapped to « '),
+    (' » sur les PV/PVC recréés.', ' » on the recreated PV/PVCs.'),
+    ('Instantané resources.json vide ou absent : seuls PV et PVC seront recréés.', 'resources.json snapshot empty or missing: only PV and PVC will be recreated.'),
+    ('Restauration DR : choisissez une sauvegarde source.', 'DR restore: choose a source backup.'),
+    ('Supprimée — restaurable', 'Deleted — restorable'),
+    ('Application supprimée (sauvegardes conservées)', 'Deleted application (backups kept)'),
+    ('volumes sans workload', 'volumes without workload'),
     ('<h2 class="dtitle">Tâches</h2>', '<h2 class="dtitle">Jobs</h2>'),
-    ("Restaurer le namespace", "Restore the namespace"),
-    (">tout le namespace</a>", ">whole namespace</a>"),
-    # Clone d'une application stateless
-    ("Vérifier la copie", "Check the copy"),
-    ("Workloads sans volume de l'application « ", "Workloads without volume of the application « "),
-    ("Workloads sans volume du namespace copiés aussi : ", "Workloads without volume of the namespace copied too: "),
-    (" » copiés aussi : ", " » copied too: "),
-    # Secrets sauvegardés (chiffrés / clair / masqués)
-    ("Secrets sauvegardés EN CLAIR (aucune phrase de coffre disponible) : déverrouillez le coffre (⚙ → Sources) ou fournissez HYCU_VAULT_PASSPHRASE pour les chiffrer.",
-     "Secrets backed up IN CLEAR (no vault passphrase available): unlock the vault (⚙ → Sources) or provide HYCU_VAULT_PASSPHRASE to encrypt them."),
-    ("Secret chiffré — déverrouillez le coffre", "Secret encrypted — unlock the vault"),
-    # Restauration en masse (même cluster)
+    ('Restaurer le namespace', 'Restore the namespace'),
+    ('>tout le namespace</a>', '>whole namespace</a>'),
+    ('Vérifier la copie', 'Check the copy'),
+    ("Workloads sans volume de l'application « ", 'Workloads without volume of the application « '),
+    ('Workloads sans volume du namespace copiés aussi : ', 'Workloads without volume of the namespace copied too: '),
+    (' » copiés aussi : ', ' » copied too: '),
+    ('Secrets sauvegardés EN CLAIR (aucune phrase de coffre disponible) : déverrouillez le coffre (⚙ → Sources) ou fournissez HYCU_VAULT_PASSPHRASE pour les chiffrer.', 'Secrets backed up IN CLEAR (no vault passphrase available): unlock the vault (⚙ → Sources) or provide HYCU_VAULT_PASSPHRASE to encrypt them.'),
+    ('Secret chiffré — déverrouillez le coffre', 'Secret encrypted — unlock the vault'),
     ('title="Recréer tous les namespaces supprimés du cluster actif depuis leurs sauvegardes"', 'title="Recreate every deleted namespace of the active cluster from its backups"'),
-    ("<span>Restaurer en masse</span>", "<span>Bulk restore</span>"),
-    ("<h2>Restauration en masse</h2>", "<h2>Bulk restore</h2>"),
-    ("Recrée <b>tous les namespaces supprimés</b> du cluster actif (<b id=\"bulkCluster\"></b>) depuis leur dernière sauvegarde antérieure à l'instant de référence : namespace, PV/PVC, workloads, dépendances, Secrets (coffre déverrouillé), Volume Groups restaurés par HYCU s'ils ont disparu, applications stateless. Les namespaces <b>encore présents</b> sont ignorés : une application vivante se restaure depuis sa propre ligne. Exécution séquentielle et journalisée, reprise possible ; <b>simulation obligatoire</b> avant le réel.",
-     "Recreates <b>every deleted namespace</b> of the active cluster (<b id=\"bulkCluster\"></b>) from its latest backup prior to the reference time: namespace, PV/PVC, workloads, dependencies, Secrets (vault unlocked), Volume Groups restored by HYCU if they are gone, stateless applications. Namespaces <b>still present</b> are skipped: a live application is restored from its own row. Sequential, journaled, resumable; <b>simulation is mandatory</b> before the real run."),
-    ("Instant de référence</label>", "Reference time</label>"),
-    ("Namespaces à exclure (virgules, optionnel)", "Namespaces to exclude (comma-separated, optional)"),
-    (">Préparer le plan<", ">Prepare the plan<"),
-    (">Arrêter<", ">Stop<"),
-    (">Reprendre<", ">Resume<"),
-    (">Simuler<", ">Simulate<"),
-    (">Lancer (réel)<", ">Start (real)<"),
-    ("Désactivez le bandeau Simulation pour lancer le réel.", "Turn off the Simulation banner to start the real run."),
-    ("Simulez d'abord ce plan (sans échec).", "Simulate this plan first (without failure)."),
-    ("Analyse des sauvegardes et du cluster…", "Analysing backups and cluster…"),
-    (" namespace(s) à recréer sur <b>", " namespace(s) to recreate on <b>"),
-    ("</b> · instant de référence ", "</b> · reference time "),
-    (" avec avertissement</span>", " with a warning</span>"),
-    (">coffre verrouillé<", ">vault locked<"),
-    ("HYCU non connecté : les Volume Groups disparus ne seront pas restaurés", "HYCU not connected: vanished Volume Groups will not be restored"),
-    ("<th>Sauvegarde</th><th>Contenu</th><th>Avertissements</th>", "<th>Backup</th><th>Content</th><th>Warnings</th>"),
-    (">partielle<", ">partial<"),
-    ("Aucun namespace supprimé avec une sauvegarde antérieure à l'instant de référence.", "No deleted namespace with a backup prior to the reference time."),
-    (" namespace(s) ignoré(s)</summary>", " namespace(s) skipped</summary>"),
-    ("Restauration en masse RÉELLE", "REAL bulk restore"),
-    ("</b> namespace(s) seront RECRÉÉS sur <b>", "</b> namespace(s) will be RECREATED on <b>"),
-    ("</b> depuis leurs sauvegardes.", "</b> from their backups."),
-    ("Exécution séquentielle et journalisée ; les Volume Groups disparus seront restaurés par HYCU (opérations réelles).", "Sequential, journaled execution; vanished Volume Groups will be restored by HYCU (real operations)."),
-    ("Les namespaces présents ne sont pas touchés.", "Present namespaces are left untouched."),
-    ("Reprendre la restauration en masse (RÉEL)", "Resume the bulk restore (REAL)"),
-    ("Les namespaces restants (en attente, arrêtés ou en échec) seront recréés ; ceux déjà recréés ne sont pas refaits.", "The remaining namespaces (pending, stopped or failed) will be recreated; those already recreated are not redone."),
+    ('<span>Restaurer en masse</span>', '<span>Bulk restore</span>'),
+    ('<h2>Restauration en masse</h2>', '<h2>Bulk restore</h2>'),
+    ('Recrée <b>tous les namespaces supprimés</b> du cluster actif (<b id="bulkCluster"></b>) depuis leur dernière sauvegarde antérieure à l\'instant de référence : namespace, PV/PVC, workloads, dépendances, Secrets (coffre déverrouillé), Volume Groups restaurés par HYCU s\'ils ont disparu, applications stateless. Les namespaces <b>encore présents</b> sont ignorés : une application vivante se restaure depuis sa propre ligne. Exécution séquentielle et journalisée, reprise possible ; <b>simulation obligatoire</b> avant le réel.', 'Recreates <b>every deleted namespace</b> of the active cluster (<b id="bulkCluster"></b>) from its latest backup prior to the reference time: namespace, PV/PVC, workloads, dependencies, Secrets (vault unlocked), Volume Groups restored by HYCU if they are gone, stateless applications. Namespaces <b>still present</b> are skipped: a live application is restored from its own row. Sequential, journaled, resumable; <b>simulation is mandatory</b> before the real run.'),
+    ('Instant de référence</label>', 'Reference time</label>'),
+    ('Namespaces à exclure (virgules, optionnel)', 'Namespaces to exclude (comma-separated, optional)'),
+    ('>Préparer le plan<', '>Prepare the plan<'),
+    ('>Arrêter<', '>Stop<'),
+    ('>Reprendre<', '>Resume<'),
+    ('>Simuler<', '>Simulate<'),
+    ('>Lancer (réel)<', '>Start (real)<'),
+    ('Désactivez le bandeau Simulation pour lancer le réel.', 'Turn off the Simulation banner to start the real run.'),
+    ("Simulez d'abord ce plan (sans échec).", 'Simulate this plan first (without failure).'),
+    ('Analyse des sauvegardes et du cluster…', 'Analysing backups and cluster…'),
+    (' namespace(s) à recréer sur <b>', ' namespace(s) to recreate on <b>'),
+    ('</b> · instant de référence ', '</b> · reference time '),
+    (' avec avertissement</span>', ' with a warning</span>'),
+    ('>coffre verrouillé<', '>vault locked<'),
+    ('HYCU non connecté : les Volume Groups disparus ne seront pas restaurés', 'HYCU not connected: vanished Volume Groups will not be restored'),
+    ('<th>Sauvegarde</th><th>Contenu</th><th>Avertissements</th>', '<th>Backup</th><th>Content</th><th>Warnings</th>'),
+    ('>partielle<', '>partial<'),
+    ("Aucun namespace supprimé avec une sauvegarde antérieure à l'instant de référence.", 'No deleted namespace with a backup prior to the reference time.'),
+    (' namespace(s) ignoré(s)</summary>', ' namespace(s) skipped</summary>'),
+    ('Restauration en masse RÉELLE', 'REAL bulk restore'),
+    ('</b> namespace(s) seront RECRÉÉS sur <b>', '</b> namespace(s) will be RECREATED on <b>'),
+    ('</b> depuis leurs sauvegardes.', '</b> from their backups.'),
+    ('Exécution séquentielle et journalisée ; les Volume Groups disparus seront restaurés par HYCU (opérations réelles).', 'Sequential, journaled execution; vanished Volume Groups will be restored by HYCU (real operations).'),
+    ('Les namespaces présents ne sont pas touchés.', 'Present namespaces are left untouched.'),
+    ('Reprendre la restauration en masse (RÉEL)', 'Resume the bulk restore (REAL)'),
+    ('Les namespaces restants (en attente, arrêtés ou en échec) seront recréés ; ceux déjà recréés ne sont pas refaits.', 'The remaining namespaces (pending, stopped or failed) will be recreated; those already recreated are not redone.'),
     ('<span class="spin"></span> En cours', '<span class="spin"></span> Running'),
     ('"Arrêtée" : j.done ? (c.failed ? "Terminée avec échecs" : "Terminée") : "Interrompue"', '"Stopped" : j.done ? (c.failed ? "Finished with failures" : "Finished") : "Interrupted"'),
     (' échec(s)) · instant de référence ', ' failure(s)) · reference time '),
     ('" · démarrée "', '" · started "'),
-    ("<th>Namespace</th><th>État</th><th>Détail</th>", "<th>Namespace</th><th>State</th><th>Detail</th>"),
-    (" étape(s)</summary>", " step(s)</summary>"),
-    ("Instant de référence invalide : « ", "Invalid reference time: « "),
-    (" » (format AAAA-MM-JJTHH:MM).", " » (format YYYY-MM-DDTHH:MM)."),
-    ("Liste des namespaces du cluster impossible (", "Cannot list the cluster's namespaces ("),
-    (") : plan refusé par prudence.", "): plan refused out of caution."),
-    ("exclu par l'opérateur", "excluded by the operator"),
-    ("aucune sauvegarde antérieure à l'instant de référence", "no backup prior to the reference time"),
-    ("présent sur le cluster — se restaure depuis sa propre ligne (Applications)", "present on the cluster — restore it from its own row (Applications)"),
-    ("sauvegarde sans volume ni workload : rien à recréer", "backup without volume or workload: nothing to recreate"),
-    ("sauvegarde PARTIELLE (un PV était illisible) : seule version antérieure à l'instant de référence", "PARTIAL backup (a PV was unreadable): only version prior to the reference time"),
-    ("sans instantané de ressources : volumes seuls, workloads et dépendances à recréer à la main", "no resource snapshot: volumes only, workloads and dependencies to recreate by hand"),
-    ("Secrets masqués dans cette sauvegarde : à recréer à la main après la restauration", "Secrets redacted in this backup: recreate them by hand after the restore"),
-    ("Secrets chiffrés et coffre VERROUILLÉ : ils ne seront pas recréés — déverrouillez le coffre avant de lancer", "Secrets encrypted and vault LOCKED: they will not be recreated — unlock the vault before starting"),
-    ("Une restauration en masse est déjà en cours.", "A bulk restore is already running."),
-    ("Aucune restauration en masse en cours.", "No bulk restore is running."),
-    ("Aucun journal à reprendre.", "No journal to resume."),
-    ("Rien à reprendre : tous les namespaces du journal sont déjà recréés.", "Nothing to resume: every namespace of the journal is already recreated."),
-    ("Ce journal est une simulation : lancez le réel depuis le plan, pas par reprise.", "This journal is a simulation: start the real run from the plan, not by resuming."),
-    ("Rien à restaurer : aucun namespace supprimé avec une sauvegarde antérieure à l'instant de référence.", "Nothing to restore: no deleted namespace with a backup prior to the reference time."),
-    ("Lancez d'abord une SIMULATION complète et sans échec de ce plan (mêmes namespaces, même instant de référence) avant le réel.", "First run a complete SIMULATION without failure of this plan (same namespaces, same reference time) before the real run."),
-    ("Les <b>Secrets</b> de cette sauvegarde sont <b>masqués</b> : ils ne seront pas recréés (à recréer à la main après la restauration).",
-     "The <b>Secrets</b> of this backup are <b>redacted</b>: they will not be recreated (recreate them by hand after the restore)."),
-    ("Les <b>Secrets</b> de cette sauvegarde sont <b>chiffrés</b> avec la phrase du coffre : déverrouillez le coffre (⚙ → Sources) avant de lancer, sinon ils ne seront pas recréés.",
-     "The <b>Secrets</b> of this backup are <b>encrypted</b> with the vault passphrase: unlock the vault (⚙ → Sources) before starting, otherwise they will not be recreated."),
-    # Grands clusters
-    (" (liste cluster-wide refusée ; repli par namespace non tenté au-delà de ", " (cluster-wide list refused; per-namespace fallback not attempted beyond "),
-    (" namespaces — accordez un droit de liste cluster-wide)", " namespaces — grant a cluster-wide list permission)"),
+    ('<th>Namespace</th><th>État</th><th>Détail</th>', '<th>Namespace</th><th>State</th><th>Detail</th>'),
+    (' étape(s)</summary>', ' step(s)</summary>'),
+    ('Instant de référence invalide : « ', 'Invalid reference time: « '),
+    (' » (format AAAA-MM-JJTHH:MM).', ' » (format YYYY-MM-DDTHH:MM).'),
+    ('Liste des namespaces du cluster impossible (', "Cannot list the cluster's namespaces ("),
+    (') : plan refusé par prudence.', '): plan refused out of caution.'),
+    ("exclu par l'opérateur", 'excluded by the operator'),
+    ("aucune sauvegarde antérieure à l'instant de référence", 'no backup prior to the reference time'),
+    ('présent sur le cluster — se restaure depuis sa propre ligne (Applications)', 'present on the cluster — restore it from its own row (Applications)'),
+    ('sauvegarde sans volume ni workload : rien à recréer', 'backup without volume or workload: nothing to recreate'),
+    ("sauvegarde PARTIELLE (un PV était illisible) : seule version antérieure à l'instant de référence", 'PARTIAL backup (a PV was unreadable): only version prior to the reference time'),
+    ('sans instantané de ressources : volumes seuls, workloads et dépendances à recréer à la main', 'no resource snapshot: volumes only, workloads and dependencies to recreate by hand'),
+    ('Secrets masqués dans cette sauvegarde : à recréer à la main après la restauration', 'Secrets redacted in this backup: recreate them by hand after the restore'),
+    ('Secrets chiffrés et coffre VERROUILLÉ : ils ne seront pas recréés — déverrouillez le coffre avant de lancer', 'Secrets encrypted and vault LOCKED: they will not be recreated — unlock the vault before starting'),
+    ('Une restauration en masse est déjà en cours.', 'A bulk restore is already running.'),
+    ('Aucune restauration en masse en cours.', 'No bulk restore is running.'),
+    ('Aucun journal à reprendre.', 'No journal to resume.'),
+    ('Rien à reprendre : tous les namespaces du journal sont déjà recréés.', 'Nothing to resume: every namespace of the journal is already recreated.'),
+    ('Ce journal est une simulation : lancez le réel depuis le plan, pas par reprise.', 'This journal is a simulation: start the real run from the plan, not by resuming.'),
+    ("Rien à restaurer : aucun namespace supprimé avec une sauvegarde antérieure à l'instant de référence.", 'Nothing to restore: no deleted namespace with a backup prior to the reference time.'),
+    ("Lancez d'abord une SIMULATION complète et sans échec de ce plan (mêmes namespaces, même instant de référence) avant le réel.", 'First run a complete SIMULATION without failure of this plan (same namespaces, same reference time) before the real run.'),
+    ('Les <b>Secrets</b> de cette sauvegarde sont <b>masqués</b> : ils ne seront pas recréés (à recréer à la main après la restauration).', 'The <b>Secrets</b> of this backup are <b>redacted</b>: they will not be recreated (recreate them by hand after the restore).'),
+    ('Les <b>Secrets</b> de cette sauvegarde sont <b>chiffrés</b> avec la phrase du coffre : déverrouillez le coffre (⚙ → Sources) avant de lancer, sinon ils ne seront pas recréés.', 'The <b>Secrets</b> of this backup are <b>encrypted</b> with the vault passphrase: unlock the vault (⚙ → Sources) before starting, otherwise they will not be recreated.'),
+    (' (liste cluster-wide refusée ; repli par namespace non tenté au-delà de ', ' (cluster-wide list refused; per-namespace fallback not attempted beyond '),
+    (' namespaces — accordez un droit de liste cluster-wide)', ' namespaces — grant a cluster-wide list permission)'),
     ('title="Page précédente"', 'title="Previous page"'),
-    ("<li><b>Grands clusters</b> : chaque dossier de sauvegardes porte un catalogue <code>_catalog.json</code> (résumé dérivé, reconstruit s'il manque — la restauration lit toujours <code>index.json</code>), l'inventaire est mis en cache quelques dizaines de secondes (<b>Actualiser</b> force le recalcul), la page est paginée par 100 et un passage « tous les namespaces » lit les PV une fois et travaille en parallèle. Réglages : <code>apps_fallback_max</code>, <code>apps_cache_ttl_s</code>, <code>backup_parallel</code>.</li>",
-     "<li><b>Large clusters</b>: each backup folder carries a <code>_catalog.json</code> catalog (derived summary, rebuilt if missing — restores always read <code>index.json</code>), the inventory is cached for a few dozen seconds (<b>Refresh</b> forces a recompute), the page is paginated by 100 and an “all namespaces” pass reads PVs once and works in parallel. Settings: <code>apps_fallback_max</code>, <code>apps_cache_ttl_s</code>, <code>backup_parallel</code>.</li>"),
+    ("<li><b>Grands clusters</b> : chaque dossier de sauvegardes porte un catalogue <code>_catalog.json</code> (résumé dérivé, reconstruit s'il manque — la restauration lit toujours <code>index.json</code>), l'inventaire est mis en cache quelques dizaines de secondes (<b>Actualiser</b> force le recalcul), la page est paginée par 100 et un passage « tous les namespaces » lit les PV une fois et travaille en parallèle. Réglages : <code>apps_fallback_max</code>, <code>apps_cache_ttl_s</code>, <code>backup_parallel</code>.</li>", '<li><b>Large clusters</b>: each backup folder carries a <code>_catalog.json</code> catalog (derived summary, rebuilt if missing — restores always read <code>index.json</code>), the inventory is cached for a few dozen seconds (<b>Refresh</b> forces a recompute), the page is paginated by 100 and an “all namespaces” pass reads PVs once and works in parallel. Settings: <code>apps_fallback_max</code>, <code>apps_cache_ttl_s</code>, <code>backup_parallel</code>.</li>'),
     ('title="Page suivante"', 'title="Next page"'),
-    ("Application stateless : aucun volume à choisir.", "Stateless application: no volume to choose."),
-    ("</b> : <b>stateless</b>, aucun volume à restaurer. La copie recrée ses workloads (", "</b>: <b>stateless</b>, no volume to restore. The copy recreates its workloads ("),
-    (") et leurs dépendances depuis le cluster.", ") and their dependencies from the cluster."),
-    ("Lecture des workloads de « ", "Reading the workloads of « "),
-    (" » impossible : ", " » failed: "),
-    (" » introuvable dans le namespace « ", " » not found in namespace « "),
-    (" » (aucun workload).", " » (no workload)."),
-    (" » monte le(s) volume(s) ", " » mounts volume(s) "),
-    (" : ce n'est pas une application stateless — sélectionnez ses volumes pour la cloner.", ": it is not a stateless application — select its volumes to clone it."),
-    ("Application stateless « ", "Stateless application « "),
-    (" » : aucun volume — seuls ses workloads (", " »: no volume — only its workloads ("),
-    (") et leurs dépendances sont copiés.", ") and their dependencies are copied."),
-    ("Aucun workload sans volume", "No workload without volume"),
-    (" pour l'application « ", " for the application « "),
+    ('Application stateless : aucun volume à choisir.', 'Stateless application: no volume to choose.'),
+    ('</b> : <b>stateless</b>, aucun volume à restaurer. La copie recrée ses workloads (', '</b>: <b>stateless</b>, no volume to restore. The copy recreates its workloads ('),
+    (') et leurs dépendances depuis le cluster.', ') and their dependencies from the cluster.'),
+    ('Lecture des workloads de « ', 'Reading the workloads of « '),
+    (' » impossible : ', ' » failed: '),
+    (' » introuvable dans le namespace « ', ' » not found in namespace « '),
+    (' » (aucun workload).', ' » (no workload).'),
+    (' » monte le(s) volume(s) ', ' » mounts volume(s) '),
+    (" : ce n'est pas une application stateless — sélectionnez ses volumes pour la cloner.", ': it is not a stateless application — select its volumes to clone it.'),
+    ('Application stateless « ', 'Stateless application « '),
+    (' » : aucun volume — seuls ses workloads (', ' »: no volume — only its workloads ('),
+    (') et leurs dépendances sont copiés.', ') and their dependencies are copied.'),
+    ('Aucun workload sans volume', 'No workload without volume'),
+    (" pour l'application « ", ' for the application « '),
     (" » dans l'instantané de cette sauvegarde : rien à recréer.", " » in this backup's snapshot: nothing to recreate."),
     (" dans l'instantané de cette sauvegarde : rien à recréer.", " in this backup's snapshot: nothing to recreate."),
-    ("Restaurer plutôt <b>tout le namespace « ", "Rather restore <b>the whole namespace « "),
-    (" »</b> (toutes ses applications)</a>", " »</b> (all its applications)</a>"),
+    ('Restaurer plutôt <b>tout le namespace « ', 'Rather restore <b>the whole namespace « '),
+    (' »</b> (toutes ses applications)</a>', ' »</b> (all its applications)</a>'),
     ("Aucun PVC ni workload dans le namespace '", "No PVC nor workload in namespace '"),
     ("' : rien à sauvegarder.", "': nothing to back up."),
-    ("Aucun volume sélectionné et aucun workload dans l'instantané de cette sauvegarde : rien à recréer.",
-     "No volume selected and no workload in this backup's snapshot: nothing to recreate."),
-    ("Sauvegarde sans volume (application stateless) : seuls les workloads et leurs dépendances sont recréés depuis l'instantané.",
-     "Backup without volume (stateless application): only the workloads and their dependencies are recreated from the snapshot."),
-    ("<b>Applications</b> : une ligne par <b>application</b> (un namespace peut en contenir plusieurs : les workloads sont regroupés par étiquette <code>app.kubernetes.io/instance</code>, <code>app.kubernetes.io/name</code> ou <code>app</code>), avec son namespace et son <b>type</b> : <b>Stateful</b> (monte des volumes) ou <b>Stateless</b> (configuration seule). Sélectionnez, puis agissez en haut à droite : <b>Sauvegarder · Restaurer · Définir la politique · Vérifier</b>. La sauvegarde reste <b>par namespace</b> (une seule recette cohérente) ; Restaurer cible l'application choisie. Bascule <b>Cluster actif / Tous les clusters</b> (regroupés par workspace NKP).",
-     "<b>Applications</b>: one row per <b>application</b> (a namespace can hold several: workloads are grouped by the <code>app.kubernetes.io/instance</code>, <code>app.kubernetes.io/name</code> or <code>app</code> label), with its namespace and its <b>type</b>: <b>Stateful</b> (mounts volumes) or <b>Stateless</b> (configuration only). Select, then act at the top right: <b>Back up · Restore · Set Policy · Verify</b>. Backups stay <b>per namespace</b> (one consistent recipe); Restore targets the chosen application. <b>Active cluster / All clusters</b> toggle (grouped by NKP workspace)."),
-    ("<b>Sauvegarder tous (filtrés)</b> : tous les namespaces autorisés d'un coup ; un namespace sans PVC <b>ni workload</b> est ignoré. Un namespace <b>stateless</b> (workloads sans volume) est sauvegardé : son instantané suffit à le restaurer.",
-     "<b>Back up all (filtered)</b>: every allowed namespace at once; a namespace with no PVC <b>and no workload</b> is skipped. A <b>stateless</b> namespace (workloads without volume) is backed up: its snapshot is enough to restore it."),
-    ("<div class=\"tip\"><b>Application stateless (sans volume) ?</b> Cliquez <b>Restaurer</b> sur sa ligne : l'assistant ne propose que deux parcours — <b>copie</b> (clone de ses workloads et dépendances, même namespace avec suffixe ou autre namespace, comme pour une application stateful) et <b>objets de configuration</b> (présélectionné) avec <b>ses</b> objets précochés (workloads, Services, ConfigMaps/Secrets référencés) — les autres applications du namespace ne sont pas touchées. Pour une application <b>stateful</b>, seuls <b>ses</b> volumes sont présélectionnés dans les parcours de stockage. <b>Tout le namespace</b> (ex. mariadb + wordpress découpés par leurs étiquettes) : cochez plusieurs applications du même namespace puis <b>Restaurer le namespace</b>, ou cliquez le lien « tout le namespace » dans l'assistant.</div>",
-     "<div class=\"tip\"><b>Stateless application (no volume)?</b> Click <b>Restore</b> on its row: the wizard offers only two paths — <b>copy</b> (clone of its workloads and dependencies, same namespace with suffix or another namespace, as for a stateful application) and <b>configuration objects</b> (preselected) with <b>its</b> objects pre-ticked (workloads, Services, referenced ConfigMaps/Secrets) — the other applications of the namespace are left untouched. For a <b>stateful</b> application, only <b>its</b> volumes are preselected in the storage paths. <b>The whole namespace</b> (e.g. mariadb + wordpress split by their labels): tick several applications of the same namespace then <b>Restore the namespace</b>, or click the “whole namespace” link in the wizard.</div>"),
-    ("Volume(s) absent(s) de la dernière sauvegarde : ", "Volume(s) missing from the latest backup: "),
-    (" — relancez une sauvegarde", " — run a backup again"),
-    (" sauvegarde(s) de configuration du namespace", " configuration backup(s) of the namespace"),
-    ("(namespace entier)", "(whole namespace)"),
-    ("· sans workload", "· no workload"),
-    (">Vide<", ">Empty<"),
-    ("</b> : <b>stateless</b> (aucun volume). Sa restauration = ré-appliquer ses objets de configuration (workloads, Services, ConfigMaps…) depuis l'instantané d'une sauvegarde — parcours <b>« objets de configuration »</b>, présélectionné.",
-     "</b>: <b>stateless</b> (no volume). Restoring it = re-applying its configuration objects (workloads, Services, ConfigMaps…) from a backup snapshot — the <b>“configuration objects”</b> path, preselected."),
-    ("</b> : <b>stateful</b> — ses volumes (", "</b>: <b>stateful</b> — its volumes ("),
-    (") seront présélectionnés ; les autres volumes du namespace restent décochés.",
-     ") will be preselected; the other volumes of the namespace stay unticked."),
+    ("Aucun volume sélectionné et aucun workload dans l'instantané de cette sauvegarde : rien à recréer.", "No volume selected and no workload in this backup's snapshot: nothing to recreate."),
+    ("Sauvegarde sans volume (application stateless) : seuls les workloads et leurs dépendances sont recréés depuis l'instantané.", 'Backup without volume (stateless application): only the workloads and their dependencies are recreated from the snapshot.'),
+    ("<b>Applications</b> : une ligne par <b>application</b> (un namespace peut en contenir plusieurs : les workloads sont regroupés par étiquette <code>app.kubernetes.io/instance</code>, <code>app.kubernetes.io/name</code> ou <code>app</code>), avec son namespace et son <b>type</b> : <b>Stateful</b> (monte des volumes) ou <b>Stateless</b> (configuration seule). Sélectionnez, puis agissez en haut à droite : <b>Sauvegarder · Restaurer · Définir la politique · Vérifier</b>. La sauvegarde reste <b>par namespace</b> (une seule recette cohérente) ; Restaurer cible l'application choisie. Bascule <b>Cluster actif / Tous les clusters</b> (regroupés par workspace NKP).", '<b>Applications</b>: one row per <b>application</b> (a namespace can hold several: workloads are grouped by the <code>app.kubernetes.io/instance</code>, <code>app.kubernetes.io/name</code> or <code>app</code> label), with its namespace and its <b>type</b>: <b>Stateful</b> (mounts volumes) or <b>Stateless</b> (configuration only). Select, then act at the top right: <b>Back up · Restore · Set Policy · Verify</b>. Backups stay <b>per namespace</b> (one consistent recipe); Restore targets the chosen application. <b>Active cluster / All clusters</b> toggle (grouped by NKP workspace).'),
+    ("<b>Sauvegarder tous (filtrés)</b> : tous les namespaces autorisés d'un coup ; un namespace sans PVC <b>ni workload</b> est ignoré. Un namespace <b>stateless</b> (workloads sans volume) est sauvegardé : son instantané suffit à le restaurer.", '<b>Back up all (filtered)</b>: every allowed namespace at once; a namespace with no PVC <b>and no workload</b> is skipped. A <b>stateless</b> namespace (workloads without volume) is backed up: its snapshot is enough to restore it.'),
+    ('<div class="tip"><b>Application stateless (sans volume) ?</b> Cliquez <b>Restaurer</b> sur sa ligne : l\'assistant ne propose que deux parcours — <b>copie</b> (clone de ses workloads et dépendances, même namespace avec suffixe ou autre namespace, comme pour une application stateful) et <b>objets de configuration</b> (présélectionné) avec <b>ses</b> objets précochés (workloads, Services, ConfigMaps/Secrets référencés) — les autres applications du namespace ne sont pas touchées. Pour une application <b>stateful</b>, seuls <b>ses</b> volumes sont présélectionnés dans les parcours de stockage. <b>Tout le namespace</b> (ex. mariadb + wordpress découpés par leurs étiquettes) : cochez plusieurs applications du même namespace puis <b>Restaurer le namespace</b>, ou cliquez le lien « tout le namespace » dans l\'assistant.</div>', '<div class="tip"><b>Stateless application (no volume)?</b> Click <b>Restore</b> on its row: the wizard offers only two paths — <b>copy</b> (clone of its workloads and dependencies, same namespace with suffix or another namespace, as for a stateful application) and <b>configuration objects</b> (preselected) with <b>its</b> objects pre-ticked (workloads, Services, referenced ConfigMaps/Secrets) — the other applications of the namespace are left untouched. For a <b>stateful</b> application, only <b>its</b> volumes are preselected in the storage paths. <b>The whole namespace</b> (e.g. mariadb + wordpress split by their labels): tick several applications of the same namespace then <b>Restore the namespace</b>, or click the “whole namespace” link in the wizard.</div>'),
+    ('Volume(s) absent(s) de la dernière sauvegarde : ', 'Volume(s) missing from the latest backup: '),
+    (' — relancez une sauvegarde', ' — run a backup again'),
+    (' sauvegarde(s) de configuration du namespace', ' configuration backup(s) of the namespace'),
+    ('(namespace entier)', '(whole namespace)'),
+    ('· sans workload', '· no workload'),
+    ('>Vide<', '>Empty<'),
+    ("</b> : <b>stateless</b> (aucun volume). Sa restauration = ré-appliquer ses objets de configuration (workloads, Services, ConfigMaps…) depuis l'instantané d'une sauvegarde — parcours <b>« objets de configuration »</b>, présélectionné.", '</b>: <b>stateless</b> (no volume). Restoring it = re-applying its configuration objects (workloads, Services, ConfigMaps…) from a backup snapshot — the <b>“configuration objects”</b> path, preselected.'),
+    ('</b> : <b>stateful</b> — ses volumes (', '</b>: <b>stateful</b> — its volumes ('),
+    (') seront présélectionnés ; les autres volumes du namespace restent décochés.', ') will be preselected; the other volumes of the namespace stay unticked.'),
     (" Seulement les objets de l'application", " Only the application's objects"),
-    (" de l'application « ", " of the application « "),
-    ("autre application / partagé", "other application / shared"),
-    ("Sauvegarde <b>stateless</b> (aucun volume) : les workloads", "<b>Stateless</b> backup (no volume): the workloads"),
-    (" et leurs dépendances seront recréés depuis l'instantané.", " and their dependencies will be recreated from the snapshot."),
-    ("Namespace supprimé du cluster", "Namespace deleted from the cluster"),
-    ("Restaurer l'application supprimée « ", "Restore the deleted application « "),
-    ("Ce namespace n'existe plus sur le cluster <b id=\"drClusterRec\"></b> : l'application va être <b>recréée depuis sa sauvegarde</b> (namespace, PV/PVC, workloads, dépendances non masquées), en réutilisant ses volumes d'origine — ou, s'ils ont été supprimés avec le namespace, en les restaurant automatiquement depuis HYCU (« Protected deleted »). Dans le cas courant, rien à saisir : vérifiez la sauvegarde et lancez la restauration.",
-     "This namespace no longer exists on cluster <b id=\"drClusterRec\"></b>: the application will be <b>recreated from its backup</b> (namespace, PV/PVC, workloads, non-redacted dependencies), reusing its original volumes — or, if they were deleted with the namespace, restoring them automatically from HYCU (“Protected deleted”). In the common case, nothing to enter: check the backup and start the restore."),
-    ("Restauration d'une application SUPPRIMÉE", "Restore of a DELETED application"),
-    ("L'application sera RECRÉÉE sur ce cluster depuis la sauvegarde (namespace, PV/PVC, workloads, dépendances non masquées).",
-     "The application will be RECREATED on this cluster from the backup (namespace, PV/PVC, workloads, non-redacted dependencies)."),
+    (" de l'application « ", ' of the application « '),
+    ('autre application / partagé', 'other application / shared'),
+    ('Sauvegarde <b>stateless</b> (aucun volume) : les workloads', '<b>Stateless</b> backup (no volume): the workloads'),
+    (" et leurs dépendances seront recréés depuis l'instantané.", ' and their dependencies will be recreated from the snapshot.'),
+    ('Namespace supprimé du cluster', 'Namespace deleted from the cluster'),
+    ("Restaurer l'application supprimée « ", 'Restore the deleted application « '),
+    ('Ce namespace n\'existe plus sur le cluster <b id="drClusterRec"></b> : l\'application va être <b>recréée depuis sa sauvegarde</b> (namespace, PV/PVC, workloads, dépendances non masquées), en réutilisant ses volumes d\'origine — ou, s\'ils ont été supprimés avec le namespace, en les restaurant automatiquement depuis HYCU (« Protected deleted »). Dans le cas courant, rien à saisir : vérifiez la sauvegarde et lancez la restauration.', 'This namespace no longer exists on cluster <b id="drClusterRec"></b>: the application will be <b>recreated from its backup</b> (namespace, PV/PVC, workloads, non-redacted dependencies), reusing its original volumes — or, if they were deleted with the namespace, restoring them automatically from HYCU (“Protected deleted”). In the common case, nothing to enter: check the backup and start the restore.'),
+    ("Restauration d'une application SUPPRIMÉE", 'Restore of a DELETED application'),
+    ("L'application sera RECRÉÉE sur ce cluster depuis la sauvegarde (namespace, PV/PVC, workloads, dépendances non masquées).", 'The application will be RECREATED on this cluster from the backup (namespace, PV/PVC, workloads, non-redacted dependencies).'),
     ("Réutiliser les volumes d'origine de l'application ", "Reuse the application's original volumes "),
-    ("Rien à saisir : l'application est rebranchée sur ses volumes Nutanix d'origine (leurs identifiants sont dans la sauvegarde). Décochez seulement si vous avez restauré les données sur de <b>nouveaux</b> volumes dans HYCU.",
-     "Nothing to enter: the application is reconnected to its original Nutanix volumes (their IDs are in the backup). Only untick if you restored the data onto <b>new</b> volumes in HYCU."),
-    ("Nouveaux volumes — collez l'identifiant (UUID) fourni par HYCU", "New volumes — paste the ID (UUID) provided by HYCU"),
-    ("Créer les volumes automatiquement via HYCU", "Create the volumes automatically via HYCU"),
-    # (paires historiques conservées : certaines clés ne sont visibles qu'à l'exécution)
+    ("Rien à saisir : l'application est rebranchée sur ses volumes Nutanix d'origine (leurs identifiants sont dans la sauvegarde). Décochez seulement si vous avez restauré les données sur de <b>nouveaux</b> volumes dans HYCU.", 'Nothing to enter: the application is reconnected to its original Nutanix volumes (their IDs are in the backup). Only untick if you restored the data onto <b>new</b> volumes in HYCU.'),
+    ("Nouveaux volumes — collez l'identifiant (UUID) fourni par HYCU", 'New volumes — paste the ID (UUID) provided by HYCU'),
+    ('Créer les volumes automatiquement via HYCU', 'Create the volumes automatically via HYCU'),
     ('Phrase secrète maîtresse', 'Master passphrase'),
     ('Sauvegarde &amp; restauration guidées · Nutanix', 'Guided backup &amp; restore · Nutanix'),
     ('Contexte kubectl : ', 'kubectl context: '),
@@ -13904,13 +18760,11 @@ I18N_EN += [
     ('" dernières versions par namespace."', '" versions per namespace."'),
     ('À propos de cet outil', 'About this tool'),
     ('Cluster Kubernetes ciblé (contexte kubectl) — cliquer pour le changer', 'Target Kubernetes cluster (kubectl context) — click to change it'),
-    ('Sources (HYCU, Prism Central, Prism Element)', 'Sources (HYCU, Prism Central, Prism Element)'),
     ('<span class="nl">Réglages</span>', '<span class="nl">Settings</span>'),
     ('<h2 class="dtitle">Politique ', '<h2 class="dtitle">Policy '),
     ('<h2 class="dtitle">Tâches ', '<h2 class="dtitle">Jobs '),
     ('>Contexte kubectl</div>', '>kubectl context</div>'),
     ('<td>Application Kubernetes</td>', '<td>Kubernetes application</td>'),
-    (' versions</td>', ' versions</td>'),
     ("Enregistrez ici les systèmes utilisés par l'outil. Les identifiants restent en mémoire le temps de la session (ou dans le coffre chiffré si vous le choisissez).", 'Register here the systems used by the tool. Credentials stay in memory for the session (or in the encrypted vault if you choose it).'),
     ('Sources (HYCU, Prism Central, Prism Element, clusters Kubernetes)', 'Sources (HYCU, Prism Central, Prism Element, Kubernetes clusters)'),
     ('"Cluster introuvable."', '"Cluster not found."'),
@@ -13919,7 +18773,6 @@ I18N_EN += [
     ("Comparaison avec l'état live…", 'Comparing with the live state…'),
     ('" — sauvegarde"', '" — backup"'),
     ('+++ sauvegarde', '+++ backup'),
-    ('--- live', '--- live'),
     ('<b>activée</b>sauvegarde automatique</span>', '<b>enabled</b>automatic backup</span>'),
     ('<b>désactivée</b>sauvegarde automatique</span>', '<b>disabled</b>automatic backup</span>'),
     ('Stockage objet S3 : activé (chiffré).', 'S3 object storage: enabled (encrypted).'),
@@ -13936,7 +18789,6 @@ I18N_EN += [
     ("Restauration DR terminée. Vérifiez l'application, puis re-protégez ses Volume Groups dans HYCU.", 'DR restore finished. Verify the application, then re-protect its Volume Groups in HYCU.'),
     ("Aucun export de l'outil dans ce bucket.", 'No export from this tool in that bucket.'),
     ("<b>Application supprimée du cluster ?</b> Tant que ses sauvegardes existent, elle reste listée dans <b>Applications</b> avec le badge « Supprimée — restaurable ». Cliquez <b>Restaurer</b> : le parcours de récupération recrée tout (namespace, PV/PVC, workloads, dépendances non masquées) depuis la sauvegarde choisie — restaurez d'abord ses Volume Groups dans HYCU et collez leurs UUID. Aucune dérogation DR n'est requise : la récupération reste sur le même cluster/contexte.", '<b>Application deleted from the cluster?</b> As long as its backups exist, it stays listed under <b>Applications</b> with the “Deleted — restorable” badge. Click <b>Restore</b>: the recovery flow recreates everything (namespace, PV/PVC, workloads, non-redacted dependencies) from the selected backup — first restore its Volume Groups in HYCU and paste their UUIDs. No DR override is required: the recovery stays on the same cluster/context.'),
-    # ---- correctifs (lots 1-3) : nouveaux messages serveur/UI ----
     (" inconnu (retiré, ou session verrouillée) : sélectionnez un cluster dans la barre du haut. Aucune commande n'a été exécutée.", ' unknown (removed, or session locked): select a cluster in the top bar. No command was executed.'),
     (" ») : cette commande doit être installée là où tourne l'outil (absente de l'image conteneur par défaut) ; elle peut aussi ouvrir un navigateur (OIDC) que l'outil ne peut pas piloter.", ' »): this command must be installed where the tool runs (absent from the default container image); it may also open a browser (OIDC) that the tool cannot drive.'),
     (') : mécanisme déprécié, jeton OIDC à durée de vie courte — prévoyez un jeton de ServiceAccount pour un usage durable.', '): deprecated mechanism, short-lived OIDC token — use a ServiceAccount token for long-term use.'),
@@ -13966,114 +18818,129 @@ I18N_EN += [
     ('<h2 class="dtitle">Santé des clusters</h2>', '<h2 class="dtitle">Cluster health</h2>'),
     ('" j / "', '" d / "'),
     ('>recommandé<', '>recommended<'),
-    ("Aucun volume à provisionner.", "No volume to provision."),
-    ("Aucun volume à restaurer.", "No volume to restore."),
-    (" : restauration HYCU refusée : ", ": HYCU restore refused: "),
-    (" : clone HYCU refusé : ", ": HYCU clone refused: "),
-    ("Impossible de vérifier l'existence du namespace « ", "Cannot verify that namespace « "),
-    ("Référence invalide pour ", "Invalid reference for "),
-    ("Référence identique au VG SOURCE pour ", "Reference identical to the SOURCE VG for "),
-    ("Sauvegarde PARTIELLE de « ", "PARTIAL backup of « "),
-    (" » : manifeste de PV illisible pour ", " »: PV manifest unreadable for "),
-    ("REDÉMARRAGE INCOMPLET", "INCOMPLETE RESTART"),
-    ("Volumes restaurés mais redémarrage incomplet — relancez à la main : ",
-     "Volumes restored but restart incomplete — restart manually: "),
-    (" non lié (aucun volumeHandle observé)", " not bound (no volumeHandle observed)"),
-    ("archive rejetée : taille décompressée annoncée ", "archive rejected: announced uncompressed size "),
-    ("archive rejetée : contenu décompressé supérieur à ", "archive rejected: uncompressed content larger than "),
-    ("En-tête Content-Length invalide.", "Invalid Content-Length header."),
-    ("Pré-vol impossible (liste des PV : ", "Pre-flight impossible (PV list: "),
-    (") — rien n'a été créé.", ") — nothing was created."),
-    ("Volume Group ", "Volume Group "),
-    (" déjà pointé par le PV ", " already pointed to by PV "),
-    ("PV de ", "PV of "),
-    (" re-pointé sur le VG cloné par HYCU", " re-pointed to the VG cloned by HYCU"),
-    (" » — rien n'a été créé.", " » — nothing was created."),
-    ("Volume Group du volume « ", "Volume Group of volume « "),
-    ("disque introuvable pour le Volume Group de ", "disk not found for the Volume Group of "),
-    ("illimitée (pas de compteur)", "unlimited (no counter)"),
-    ("Les nouveaux identifiants seront inscrits automatiquement dans la grille.", "The new IDs will be filled into the grid automatically."),
-    ("Si un volume d'origine a disparu du cluster, HYCU le RESTAURERA automatiquement (opération HYCU réelle) avant la recréation.",
-     "If an original volume has disappeared from the cluster, HYCU will RESTORE it automatically (real HYCU operation) before the recreation."),
-    ("Référence provisoire (VG source) inscrite pour la simulation — remplacée par le VG cloné en réel.",
-     "Provisional reference (source VG) filled in for the simulation — replaced by the cloned VG in real mode."),
-    ("Rétention avant sauvegarde : ", "Retention before backup: "),
-    ("Simulation du clone automatique via HYCU (aucun clone réel lancé).",
-     "Simulation of the automatic clone via HYCU (no real clone launched)."),
-    ("Restauration HYCU (sur place) lancée pour ", "HYCU restore (in place) started for "),
-    ("Le VG est recréé à son UUID d'origine : ", "The VG is recreated at its original UUID: "),
-    ("Volume Group restauré à son identité d'origine pour ", "Volume Group restored to its original identity for "),
-    ("UUID conservé : ", "UUID preserved: "),
-    ("Identité HYCU du VG résolue pour ", "VG HYCU identity resolved for "),
-    ("Volume d'origine de ", "Original volume of "),
-    (" : source HYCU ", ": HYCU source "),
-    (" (identité HYCU résolue depuis ", " (HYCU identity resolved from "),
-    (", point de restauration ", ", restore point "),
-    (", nouveau VG ", ", new VG "),
-    ("HYCU clone les Volume Groups et l'outil récupère les nouveaux identifiants — aucune saisie. En simulation, seul le plan est affiché.",
-     "HYCU clones the Volume Groups and the tool retrieves the new IDs — nothing to enter. In simulation, only the plan is shown."),
-    ("UUID du VG source absent de la sauvegarde : automatisation impossible, saisissez les UUID manuellement.",
-     "Source VG UUID missing from the backup: automation not possible, enter the UUIDs manually."),
-    ("HYCU : création des volumes…", "HYCU: creating the volumes…"),
-    ("UUID du Volume Group (8-4-4-4-12)", "Volume Group UUID (8-4-4-4-12)"),
-    ("UUID du VG restauré/cloné sur le site cible (8-4-4-4-12)", "UUID of the VG restored/cloned on the target site (8-4-4-4-12)"),
-    ("Cette sauvegarde ne contient <b>que les volumes</b> (pas d'instantané des workloads/dépendances) : elle est antérieure à cette fonction, ou la sauvegarde de config étendue était désactivée. La restauration recréera <b>les volumes (PV/PVC)</b> ; recréez les workloads depuis une sauvegarde plus récente ou manuellement.",
-     "This backup contains <b>only the volumes</b> (no snapshot of workloads/dependencies): it predates this feature, or extended config backup was disabled. The restore will recreate <b>the volumes (PV/PVC)</b>; recreate the workloads from a more recent backup or manually."),
-    ("Nom de StorageClass cible invalide : « ", "Invalid target StorageClass name: « "),
-    ("Restauration DR : ", "DR restore: "),
-    ("Liste du bucket impossible : ", "Cannot list the bucket: "),
-    ("Réponse du bucket illisible (XML) : ", "Unreadable bucket response (XML): "),
-    ("l'objet n'est pas un zip valide (mauvaise phrase de déchiffrement ?)", "the object is not a valid zip (wrong decryption passphrase?)"),
-    ("archive rejetée : chemin hors zone (« ", "archive rejected: path outside the target area (« "),
-    ("objet chiffré : renseignez la phrase de déchiffrement", "encrypted object: provide the decryption passphrase"),
-    ("déchiffrement impossible (phrase incorrecte ou objet altéré)", "decryption failed (wrong passphrase or corrupted object)"),
-    ("clé invalide", "invalid key"),
-    ("Aucun export importé.", "No export imported."),
-    # aide (nouvelles entrées)
-    ("<b>Importer depuis le bucket</b> (même carte) : rapatrie des exports vers <code>hycu-backups/_imports/…</code> — le chemin retour, indispensable en reprise d'activité.",
-     "<b>Import from the bucket</b> (same card): repatriates exports to <code>hycu-backups/_imports/…</code> — the return path, essential for disaster recovery."),
-    ("Reprise d'activité (DR)", "Disaster recovery (DR)"),
-    ("<b>Application supprimée du cluster ?</b> Tant que ses sauvegardes existent, elle reste listée dans <b>Applications</b> avec le badge « Supprimée — restaurable ». Cliquez <b>Restaurer</b> : le parcours de récupération recrée tout (namespace, PV/PVC, workloads, dépendances non masquées) depuis la sauvegarde choisie, en <b>réutilisant les volumes d'origine</b> — rien à saisir. Si un Volume Group a été supprimé avec le namespace mais reste « Protected deleted » dans HYCU, il est <b>restauré automatiquement</b> (HYCU connecté). Décochez « réutiliser » seulement si vous avez restauré les données sur de nouveaux volumes. Aucune dérogation DR n'est requise : la récupération reste sur le même cluster/contexte.",
-     "<b>Application deleted from the cluster?</b> As long as its backups exist, it stays listed under <b>Applications</b> with the “Deleted — restorable” badge. Click <b>Restore</b>: the recovery flow recreates everything (namespace, PV/PVC, workloads, non-redacted dependencies) from the selected backup, <b>reusing the original volumes</b> — nothing to enter. If a Volume Group was deleted with the namespace but remains “Protected deleted” in HYCU, it is <b>restored automatically</b> (HYCU connected). Untick “reuse” only if you restored the data onto new volumes. No DR override is required: the recovery stays on the same cluster/context."),
-    ("Namespace détruit, application absente ?</td><td>Elle reste listée tant qu'une sauvegarde existe (badge « Supprimée — restaurable ») : bouton Restaurer → récupération depuis la sauvegarde.",
-     "Namespace destroyed, application gone?</td><td>It stays listed as long as a backup exists (“Deleted — restorable” badge): Restore button → recovery from the backup."),
-    ("<b>Préparez le retour</b> : activez l'export S3 automatique (chiffré de préférence) — le filet de sécurité doit vivre hors du cluster. Gardez en lieu sûr : <code>hycu_config.json</code>, <code>hycu_secrets.enc</code>, la phrase du coffre et celle des exports (kit DR).",
-     "<b>Prepare the way back</b>: enable the automatic S3 export (preferably encrypted) — the safety net must live off-cluster. Keep safe: <code>hycu_config.json</code>, <code>hycu_secrets.enc</code>, the vault passphrase and the export passphrase (DR kit)."),
-    ("<b>Le jour J</b> : relancez l'outil (poste ou cluster de secours), reconnectez HYCU/Prism, ajoutez le cluster CIBLE (⚙ → Sources) et rendez-le actif. Rapatriez les sauvegardes : carte S3 → <b>Importer depuis le bucket</b>.",
-     "<b>On the day</b>: relaunch the tool (workstation or standby cluster), reconnect HYCU/Prism, add the TARGET cluster (⚙ → Sources) and make it active. Repatriate the backups: S3 card → <b>Import from the bucket</b>."),
-    ("<b>Restaurez les données</b> : dans HYCU, restaurez/clonez les Volume Groups de l'application vers le site cible, et notez leurs UUID.",
-     "<b>Restore the data</b>: in HYCU, restore/clone the application's Volume Groups to the target site, and note their UUIDs."),
-    ("<b>Activez la dérogation</b> : ⚙ → Réglages → <b>Autoriser la restauration DR</b> (le temps de l'opération).",
-     "<b>Enable the override</b>: ⚙ → Settings → <b>Allow DR restore</b> (for the duration of the operation)."),
-    ("<b>Sans saisie (HYCU connecté)</b> : le bouton <b>« Créer les volumes automatiquement via HYCU »</b> clone les Volume Groups depuis leurs sauvegardes HYCU et inscrit tout seul les nouveaux identifiants — plus aucun UUID à recopier. En simulation, seul le plan est affiché.",
-     "<b>No manual entry (HYCU connected)</b>: the <b>“Create the volumes automatically via HYCU”</b> button clones the Volume Groups from their HYCU backups and fills in the new IDs itself — no UUID to copy anymore. In simulation, only the plan is shown."),
-    ("<b>Assistant → Restauration DR</b> : choisissez la sauvegarde source (cluster disparu ou import S3), le namespace cible, collez l'UUID de chaque VG restauré, remappez la StorageClass si le site cible en utilise une autre — simulation d'abord, puis réel (re-saisie du cluster cible).",
-     "<b>Wizard → DR restore</b>: pick the source backup (lost cluster or S3 import), the target namespace, paste each restored VG's UUID, remap the StorageClass if the target site uses another one — simulation first, then real (target cluster retyped)."),
-    ("<b>Après</b> : vérifiez l'application, re-protégez ses Volume Groups dans HYCU, désactivez la dérogation DR.",
-     "<b>Afterwards</b>: verify the application, re-protect its Volume Groups in HYCU, disable the DR override."),
-    ("Tout le reste du temps, laissez « Autoriser la restauration DR » désactivé : la garde inter-cluster/contexte protège contre les restaurations croisées accidentelles. Un Secret masqué à la sauvegarde n'est jamais restauré : re-provisionnez-le depuis sa source. Un Secret <b>chiffré</b> est recréé dès que le coffre est déverrouillé.",
-     "The rest of the time, keep “Allow DR restore” disabled: the cross-cluster/context guard protects against accidental crossed restores. A Secret redacted at backup time is never restored: re-provision it from its source. An <b>encrypted</b> Secret is recreated as soon as the vault is unlocked."),
-    ("Guide complet : fichiers <code>README.md</code> / <code>README.fr.md</code> du dépôt (installation, configuration détaillée, déploiement Kubernetes).",
-     "Full guide: the repository's <code>README.md</code> / <code>README.fr.md</code> (installation, detailed configuration, Kubernetes deployment)."),
-    ("<th>État</th>", "<th>Status</th>"),
-    ("Réponse inattendue du serveur (", "Unexpected server response ("),
-    (") — rechargez la page (Ctrl+Shift+R).", ") — reload the page (Ctrl+Shift+R)."),
-    ("Serveur injoignable : ", "Server unreachable: "),
-    (". L'outil est-il toujours lancé ?", ". Is the tool still running?"),
-    (" » introuvable dans la liste — actualisez les Applications (kubectl indisponible ?).",
-     " » not found in the list — refresh Applications (kubectl unavailable?)."),
+    ('Aucun volume à provisionner.', 'No volume to provision.'),
+    ('Aucun volume à restaurer.', 'No volume to restore.'),
+    (' : restauration HYCU refusée : ', ': HYCU restore refused: '),
+    (' : clone HYCU refusé : ', ': HYCU clone refused: '),
+    ("Impossible de vérifier l'existence du namespace « ", 'Cannot verify that namespace « '),
+    ('Référence invalide pour ', 'Invalid reference for '),
+    ('Référence identique au VG SOURCE pour ', 'Reference identical to the SOURCE VG for '),
+    ('Sauvegarde PARTIELLE de « ', 'PARTIAL backup of « '),
+    (' » : manifeste de PV illisible pour ', ' »: PV manifest unreadable for '),
+    ('REDÉMARRAGE INCOMPLET', 'INCOMPLETE RESTART'),
+    ('Volumes restaurés mais redémarrage incomplet — relancez à la main : ', 'Volumes restored but restart incomplete — restart manually: '),
+    (' non lié (aucun volumeHandle observé)', ' not bound (no volumeHandle observed)'),
+    ('archive rejetée : taille décompressée annoncée ', 'archive rejected: announced uncompressed size '),
+    ('archive rejetée : contenu décompressé supérieur à ', 'archive rejected: uncompressed content larger than '),
+    ('En-tête Content-Length invalide.', 'Invalid Content-Length header.'),
+    ('Pré-vol impossible (liste des PV : ', 'Pre-flight impossible (PV list: '),
+    (") — rien n'a été créé.", ') — nothing was created.'),
+    (' déjà pointé par le PV ', ' already pointed to by PV '),
+    ('PV de ', 'PV of '),
+    (' re-pointé sur le VG cloné par HYCU', ' re-pointed to the VG cloned by HYCU'),
+    (" » — rien n'a été créé.", ' » — nothing was created.'),
+    ('Volume Group du volume « ', 'Volume Group of volume « '),
+    ('disque introuvable pour le Volume Group de ', 'disk not found for the Volume Group of '),
+    ('illimitée (pas de compteur)', 'unlimited (no counter)'),
+    ('Les nouveaux identifiants seront inscrits automatiquement dans la grille.', 'The new IDs will be filled into the grid automatically.'),
+    ("Si un volume d'origine a disparu du cluster, HYCU le RESTAURERA automatiquement (opération HYCU réelle) avant la recréation.", 'If an original volume has disappeared from the cluster, HYCU will RESTORE it automatically (real HYCU operation) before the recreation.'),
+    ('Référence provisoire (VG source) inscrite pour la simulation — remplacée par le VG cloné en réel.', 'Provisional reference (source VG) filled in for the simulation — replaced by the cloned VG in real mode.'),
+    ('Rétention avant sauvegarde : ', 'Retention before backup: '),
+    ('Simulation du clone automatique via HYCU (aucun clone réel lancé).', 'Simulation of the automatic clone via HYCU (no real clone launched).'),
+    ('Restauration HYCU (sur place) lancée pour ', 'HYCU restore (in place) started for '),
+    ("Le VG est recréé à son UUID d'origine : ", 'The VG is recreated at its original UUID: '),
+    ("Volume Group restauré à son identité d'origine pour ", 'Volume Group restored to its original identity for '),
+    ('UUID conservé : ', 'UUID preserved: '),
+    ('Identité HYCU du VG résolue pour ', 'VG HYCU identity resolved for '),
+    ("Volume d'origine de ", 'Original volume of '),
+    (' : source HYCU ', ': HYCU source '),
+    (' (identité HYCU résolue depuis ', ' (HYCU identity resolved from '),
+    (', point de restauration ', ', restore point '),
+    (', nouveau VG ', ', new VG '),
+    ("HYCU clone les Volume Groups et l'outil récupère les nouveaux identifiants — aucune saisie. En simulation, seul le plan est affiché.", 'HYCU clones the Volume Groups and the tool retrieves the new IDs — nothing to enter. In simulation, only the plan is shown.'),
+    ('UUID du VG source absent de la sauvegarde : automatisation impossible, saisissez les UUID manuellement.', 'Source VG UUID missing from the backup: automation not possible, enter the UUIDs manually.'),
+    ('HYCU : création des volumes…', 'HYCU: creating the volumes…'),
+    ('UUID du Volume Group (8-4-4-4-12)', 'Volume Group UUID (8-4-4-4-12)'),
+    ('UUID du VG restauré/cloné sur le site cible (8-4-4-4-12)', 'UUID of the VG restored/cloned on the target site (8-4-4-4-12)'),
+    ("Cette sauvegarde ne contient <b>que les volumes</b> (pas d'instantané des workloads/dépendances) : elle est antérieure à cette fonction, ou la sauvegarde de config étendue était désactivée. La restauration recréera <b>les volumes (PV/PVC)</b> ; recréez les workloads depuis une sauvegarde plus récente ou manuellement.", 'This backup contains <b>only the volumes</b> (no snapshot of workloads/dependencies): it predates this feature, or extended config backup was disabled. The restore will recreate <b>the volumes (PV/PVC)</b>; recreate the workloads from a more recent backup or manually.'),
+    ('Nom de StorageClass cible invalide : « ', 'Invalid target StorageClass name: « '),
+    ('Restauration DR : ', 'DR restore: '),
+    ('Liste du bucket impossible : ', 'Cannot list the bucket: '),
+    ('Réponse du bucket illisible (XML) : ', 'Unreadable bucket response (XML): '),
+    ("l'objet n'est pas un zip valide (mauvaise phrase de déchiffrement ?)", 'the object is not a valid zip (wrong decryption passphrase?)'),
+    ('archive rejetée : chemin hors zone (« ', 'archive rejected: path outside the target area (« '),
+    ('objet chiffré : renseignez la phrase de déchiffrement', 'encrypted object: provide the decryption passphrase'),
+    ('déchiffrement impossible (phrase incorrecte ou objet altéré)', 'decryption failed (wrong passphrase or corrupted object)'),
+    ('clé invalide', 'invalid key'),
+    ('Aucun export importé.', 'No export imported.'),
+    ("<b>Importer depuis le bucket</b> (même carte) : rapatrie des exports vers <code>hycu-backups/_imports/…</code> — le chemin retour, indispensable en reprise d'activité.", '<b>Import from the bucket</b> (same card): repatriates exports to <code>hycu-backups/_imports/…</code> — the return path, essential for disaster recovery.'),
+    ("Reprise d'activité (DR)", 'Disaster recovery (DR)'),
+    ("<b>Application supprimée du cluster ?</b> Tant que ses sauvegardes existent, elle reste listée dans <b>Applications</b> avec le badge « Supprimée — restaurable ». Cliquez <b>Restaurer</b> : le parcours de récupération recrée tout (namespace, PV/PVC, workloads, dépendances non masquées) depuis la sauvegarde choisie, en <b>réutilisant les volumes d'origine</b> — rien à saisir. Si un Volume Group a été supprimé avec le namespace mais reste « Protected deleted » dans HYCU, il est <b>restauré automatiquement</b> (HYCU connecté). Décochez « réutiliser » seulement si vous avez restauré les données sur de nouveaux volumes. Aucune dérogation DR n'est requise : la récupération reste sur le même cluster/contexte.", '<b>Application deleted from the cluster?</b> As long as its backups exist, it stays listed under <b>Applications</b> with the “Deleted — restorable” badge. Click <b>Restore</b>: the recovery flow recreates everything (namespace, PV/PVC, workloads, non-redacted dependencies) from the selected backup, <b>reusing the original volumes</b> — nothing to enter. If a Volume Group was deleted with the namespace but remains “Protected deleted” in HYCU, it is <b>restored automatically</b> (HYCU connected). Untick “reuse” only if you restored the data onto new volumes. No DR override is required: the recovery stays on the same cluster/context.'),
+    ("Namespace détruit, application absente ?</td><td>Elle reste listée tant qu'une sauvegarde existe (badge « Supprimée — restaurable ») : bouton Restaurer → récupération depuis la sauvegarde.", 'Namespace destroyed, application gone?</td><td>It stays listed as long as a backup exists (“Deleted — restorable” badge): Restore button → recovery from the backup.'),
+    ("<b>Préparez le retour</b> : activez l'export S3 automatique (chiffré de préférence) — le filet de sécurité doit vivre hors du cluster. Gardez en lieu sûr : <code>hycu_config.json</code>, <code>hycu_secrets.enc</code>, la phrase du coffre et celle des exports (kit DR).", '<b>Prepare the way back</b>: enable the automatic S3 export (preferably encrypted) — the safety net must live off-cluster. Keep safe: <code>hycu_config.json</code>, <code>hycu_secrets.enc</code>, the vault passphrase and the export passphrase (DR kit).'),
+    ("<b>Le jour J</b> : relancez l'outil (poste ou cluster de secours), reconnectez HYCU/Prism, ajoutez le cluster CIBLE (⚙ → Sources) et rendez-le actif. Rapatriez les sauvegardes : carte S3 → <b>Importer depuis le bucket</b>.", '<b>On the day</b>: relaunch the tool (workstation or standby cluster), reconnect HYCU/Prism, add the TARGET cluster (⚙ → Sources) and make it active. Repatriate the backups: S3 card → <b>Import from the bucket</b>.'),
+    ("<b>Restaurez les données</b> : dans HYCU, restaurez/clonez les Volume Groups de l'application vers le site cible, et notez leurs UUID.", "<b>Restore the data</b>: in HYCU, restore/clone the application's Volume Groups to the target site, and note their UUIDs."),
+    ("<b>Activez la dérogation</b> : ⚙ → Réglages → <b>Autoriser la restauration DR</b> (le temps de l'opération).", '<b>Enable the override</b>: ⚙ → Settings → <b>Allow DR restore</b> (for the duration of the operation).'),
+    ('<b>Sans saisie (HYCU connecté)</b> : le bouton <b>« Créer les volumes automatiquement via HYCU »</b> clone les Volume Groups depuis leurs sauvegardes HYCU et inscrit tout seul les nouveaux identifiants — plus aucun UUID à recopier. En simulation, seul le plan est affiché.', '<b>No manual entry (HYCU connected)</b>: the <b>“Create the volumes automatically via HYCU”</b> button clones the Volume Groups from their HYCU backups and fills in the new IDs itself — no UUID to copy anymore. In simulation, only the plan is shown.'),
+    ("<b>Assistant → Restauration DR</b> : choisissez la sauvegarde source (cluster disparu ou import S3), le namespace cible, collez l'UUID de chaque VG restauré, remappez la StorageClass si le site cible en utilise une autre — simulation d'abord, puis réel (re-saisie du cluster cible).", "<b>Wizard → DR restore</b>: pick the source backup (lost cluster or S3 import), the target namespace, paste each restored VG's UUID, remap the StorageClass if the target site uses another one — simulation first, then real (target cluster retyped)."),
+    ("<b>Après</b> : vérifiez l'application, re-protégez ses Volume Groups dans HYCU, désactivez la dérogation DR.", '<b>Afterwards</b>: verify the application, re-protect its Volume Groups in HYCU, disable the DR override.'),
+    ("Tout le reste du temps, laissez « Autoriser la restauration DR » désactivé : la garde inter-cluster/contexte protège contre les restaurations croisées accidentelles. Un Secret masqué à la sauvegarde n'est jamais restauré : re-provisionnez-le depuis sa source. Un Secret <b>chiffré</b> est recréé dès que le coffre est déverrouillé.", 'The rest of the time, keep “Allow DR restore” disabled: the cross-cluster/context guard protects against accidental crossed restores. A Secret redacted at backup time is never restored: re-provision it from its source. An <b>encrypted</b> Secret is recreated as soon as the vault is unlocked.'),
+    ('Guide complet : fichiers <code>README.md</code> / <code>README.fr.md</code> du dépôt (installation, configuration détaillée, déploiement Kubernetes).', "Full guide: the repository's <code>README.md</code> / <code>README.fr.md</code> (installation, detailed configuration, Kubernetes deployment)."),
+    ('<th>État</th>', '<th>Status</th>'),
+    ('Réponse inattendue du serveur (', 'Unexpected server response ('),
+    (') — rechargez la page (Ctrl+Shift+R).', ') — reload the page (Ctrl+Shift+R).'),
+    ('Serveur injoignable : ', 'Server unreachable: '),
+    (". L'outil est-il toujours lancé ?", '. Is the tool still running?'),
+    (' » introuvable dans la liste — actualisez les Applications (kubectl indisponible ?).', ' » not found in the list — refresh Applications (kubectl unavailable?).'),
+    ('Dans le même namespace (suffixe)', 'Into the same namespace (suffix)'),
+    ("La copie est créée à côté de l'application d'origine : chaque objet reçoit un suffixe (ex. <code>-clone</code>). Pratique pour vérifier une restauration sans rien déplacer.", 'The copy is created next to the original application: every object gets a suffix (e.g. <code>-clone</code>). Handy to verify a restore without moving anything.'),
+    ('Vers un autre namespace', 'Into another namespace'),
+    ("La copie est créée dans un namespace cible (créé s'il n'existe pas), avec ses dépendances (Secrets, ConfigMaps, ServiceAccount, Services). Les noms d'origine sont conservés.", 'The copy is created in a target namespace (created if missing), with its dependencies (Secrets, ConfigMaps, ServiceAccount, Services). Original names are kept.'),
+    (' (Prism Central requis) —', ' (Prism Central required) —'),
+    ("Anneau extérieur : namespaces ayant au moins une sauvegarde de configuration (protection). Anneau intérieur : sauvegarde récente, dans l'intervalle de la politique (conformité).", 'Outer ring: namespaces with at least one configuration backup (protection). Inner ring: recent backup, within the policy interval (compliance).'),
+    ('Politique de sauvegarde automatique de la configuration (manifestes PV/PVC et ressources).', 'Automatic configuration backup policy (PV/PVC manifests and resources).'),
+    ("Systèmes enregistrés via l'engrenage en haut à droite : HYCU, Prism Element, Prism Central.", 'Systems registered via the gear at the top right: HYCU, Prism Element, Prism Central.'),
+    ('Cluster Kubernetes ciblé par kubectl.', 'Kubernetes cluster targeted by kubectl.'),
+    ("Opérations des 7 derniers jours (sauvegardes, restaurations, clones), d'après le journal d'audit.", 'Operations over the last 7 days (backups, restores, clones), from the audit log.'),
+    ('Cluster introuvable.', 'Cluster not found.'),
+    ('https://hycu.exemple.com:8443', 'https://hycu.example.com:8443'),
+    ('https://prism-central.exemple.com:9440', 'https://prism-central.example.com:9440'),
+    ('https://prism-element.exemple.com:9440', 'https://prism-element.example.com:9440'),
+    ('>3 · Vérifier &amp; lancer<', '>3 · Verify &amp; run<'),
+    ('>4 · Suivi<', '>4 · Follow-up<'),
+    (">Arrêter après l'étape en cours<", '>Stop after the current step<'),
+    ('MODE RÉEL · ', 'LIVE MODE · '),
+    ('>MODE RÉEL<', '>LIVE MODE<'),
+    ("Serveur injoignable — vérifiez que l'outil tourne (ou le port-forward), puis rechargez.", 'Server unreachable — check the tool is running (or the port-forward), then reload.'),
+    ('Serveur injoignable (réseau ou outil arrêté).', 'Server unreachable (network or tool stopped).'),
+    ('Délai dépassé : le serveur ne répond pas.', 'Timeout: the server is not responding.'),
+    ('réponse illisible', 'unreadable response'),
+    ("Arrêt demandé — fin de l'étape en cours…", 'Stop requested — finishing the current step…'),
+    ('Arrêt impossible', 'Cannot stop'),
+    ('Une opération est en cours', 'An operation is running'),
+    ('>Suivre<', '>Follow<'),
+    ('Opération terminée.', 'Operation finished.'),
+    ('Opération terminée avec des erreurs.', 'Operation finished with errors.'),
+    ("Suivi de l'opération interrompu (l'opération continue peut-être côté serveur).", 'Operation tracking interrupted (the operation may still be running server-side).'),
+    ('Opération en cours : elle continue côté serveur. Vous pourrez reprendre le suivi depuis le bandeau en haut de page.', 'Operation in progress: it keeps running server-side. You can resume tracking from the banner at the top of the page.'),
+    ('"Étape "+done+" · "', '"Step "+done+" · "'),
+    ('textContent="Démarrage…"', 'textContent="Starting…"'),
+    ('"Interrompue" : (r.ok ? "Terminée" : "Terminée avec erreurs")', '"Interrupted" : (r.ok ? "Completed" : "Completed with errors")'),
+    ('<b>Préflight</b> — ', '<b>Preflight</b> — '),
+    (' contrôles passés</summary>', ' checks passed</summary>'),
+    ('ok===false?"Échec":"OK"', 'ok===false?"Failed":"OK"'),
+    ('ST_LABEL={ok:"OK", ko:"Échec", wn:"Avertissement", na:"Inconnu", sim:"Simulation", run:"En cours"}', 'ST_LABEL={ok:"OK", ko:"Failed", wn:"Warning", na:"Unknown", sim:"Simulation", run:"Running"}'),
+    (">Langue par défaut de l'interface<", '>Default interface language<'),
+    ('<option value="fr">Français</option>', '<option value="fr">French</option>'),
+    ('>Tableau de bord</h1>', '>Dashboard</h1>'),
+    ('aria-label="Étapes de la restauration"', 'aria-label="Restore steps"'),
+    ("> Proposer le mode simulation (interrupteur dans le bandeau ; sinon l'outil travaille en mode réel)<", '> Offer the simulation mode (switch in the banner; otherwise the tool works in live mode)<'),
+    (">Noms d'hôte autorisés pour accéder à l'interface (vide = boucle locale uniquement)<", '>Host names allowed to reach the interface (empty = loopback only)<'),
+    ("Nom DNS d'un Ingress ou d'un reverse-proxy. L'outil n'a pas d'authentification : placez une authentification (SSO, oauth2-proxy, liste d'IP) et TLS devant lui dès qu'il quitte la boucle locale.", 'DNS name of an Ingress or reverse proxy. The tool has no authentication: put authentication (SSO, oauth2-proxy, IP allowlist) and TLS in front of it as soon as it leaves the loopback.'),
+    ('<h2 class="dtitle">Politique</h2>', '<h2 class="dtitle">Policy</h2>'),
+    ('<h2 class="dtitle">Stockage</h2>', '<h2 class="dtitle">Storage</h2>'),
 ]
-
-
-I18N_EN += [
-    ("Dans le même namespace (suffixe)", "Into the same namespace (suffix)"),
-    ("La copie est créée à côté de l'application d'origine : chaque objet reçoit un suffixe (ex. <code>-clone</code>). Pratique pour vérifier une restauration sans rien déplacer.",
-     "The copy is created next to the original application: every object gets a suffix (e.g. <code>-clone</code>). Handy to verify a restore without moving anything."),
-    ("Vers un autre namespace", "Into another namespace"),
-    ("La copie est créée dans un namespace cible (créé s'il n'existe pas), avec ses dépendances (Secrets, ConfigMaps, ServiceAccount, Services). Les noms d'origine sont conservés.",
-     "The copy is created in a target namespace (created if missing), with its dependencies (Secrets, ConfigMaps, ServiceAccount, Services). Original names are kept."),
-]
-
+# <<< I18N-END
 _I18N_SORTED = None          # (fr, en) triés du plus long au plus court
 _HTML_EN = None              # cache de la page traduite
 
@@ -14094,17 +18961,21 @@ def _tr_en(s):
 
 
 def _html_for_lang(lang):
+    """Page dans la langue demandée. La version anglaise est PRÉ-RENDUE au build
+    (HTML_EN) ; repli sur la traduction à l'exécution si elle est absente (dev)."""
     global _HTML_EN
     if lang != "en":
         return HTML
     if _HTML_EN is None:
-        _HTML_EN = _tr_en(HTML)
+        _HTML_EN = HTML_EN if (globals().get("HTML_EN") or "").strip() else _tr_en(HTML)
     return _HTML_EN
 
 
 # Clés JSON dont la valeur est du texte destiné à l'écran (jamais des données).
+# `cmd` n'est PAS traduit : c'est la commande exécutée (données : noms d'hôtes, de
+# ressources), où un fragment pourrait altérer une valeur.
 _TR_TEXT_KEYS = frozenset(("error", "warning", "warn", "label", "message", "hint",
-                           "detail", "stdout", "stderr", "cmd",
+                           "detail", "stdout", "stderr",
                            "planned_steps", "warnings", "last_summary"))
 
 
@@ -14139,6 +19010,12 @@ def _port_in_use(host, port):
 
 
 def main():
+    # Console Windows en cp1252 : les messages (⚠, accents) ne doivent jamais faire planter le démarrage.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
     load_config()
     os.makedirs(CONFIG["backup_root"], exist_ok=True)
     host, port = CONFIG["host"], CONFIG["port"]
@@ -14161,6 +19038,9 @@ def main():
     print("  (Ctrl+C pour arrêter)")
     print("  Sauvegardes & audit écrits dans : %s" % CONFIG["backup_root"])
     print("  Configuration : %s" % CONFIG_PATH)
+    if CONFIG.get("allowed_hosts"):
+        print("  ⚠ Noms d'hôte autorisés (exposition hors boucle locale) : %s" % ", ".join(CONFIG["allowed_hosts"]))
+        print("    L'outil n'a PAS d'authentification : protégez l'accès (SSO / oauth2-proxy, IP, TLS).")
     print("  Astuce : au 1er affichage, faites Ctrl+Shift+R pour vider le cache.")
     print("=" * 64)
     # Déverrouillage automatique du coffre au démarrage (phrase secrète via
@@ -14183,10 +19063,30 @@ def main():
     socketserver.ThreadingTCPServer.daemon_threads = True   # arrêt propre (Ctrl+C) sans thread bloquant
     try:
         with socketserver.ThreadingTCPServer((host, port), Handler) as httpd:
+            # Arrêt propre sur SIGTERM (kubectl delete pod, docker stop) : on arrête
+            # d'accepter des requêtes, on laisse finir une opération destructive en
+            # cours (au plus wait_timeout + marge), puis atexit nettoie les kubeconfigs.
+            import signal
+
+            def _stop(signum, _frame):
+                print("Signal %s reçu : arrêt du serveur…" % signum, flush=True)
+                threading.Thread(target=httpd.shutdown, daemon=True).start()
+            for sig in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGINT", None)):
+                if sig is not None:
+                    try:
+                        signal.signal(sig, _stop)
+                    except (ValueError, OSError):
+                        pass
             try:
                 httpd.serve_forever()
             except KeyboardInterrupt:
-                print("\nArrêt.")
+                pass
+            deadline = time.time() + int(CONFIG["wait_timeout"]) + int(CONFIG["subprocess_margin"])
+            while (ACTION_LOCK.locked() or _operations_running()) and time.time() < deadline:
+                print("  … une opération est en cours, attente avant l'arrêt.", flush=True)
+                time.sleep(2)
+            audit("shutdown")
+            print("\nArrêt.")
     except OSError as e:
         print("Impossible de démarrer le serveur sur %s : %s" % (url, e))
         print("Le port est peut-être déjà utilisé. Fermez l'autre instance et relancez.")

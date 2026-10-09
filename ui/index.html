@@ -1,0 +1,802 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="csrf-token" content="__CSRF_TOKEN__">
+<title>HYCU · Kubernetes sur Nutanix</title>
+<style>
+/* @@STYLES@@ */
+</style>
+</head>
+<body>
+<div class="realbar"></div>
+<!-- ===================== MODALE DE CONFIRMATION (actions destructives) ===================== -->
+<div id="dangerModal" class="modal-bg" style="display:none">
+  <div class="modal">
+    <h3 id="dmTitle">Confirmer l'action réelle</h3>
+    <div id="dmBody"></div>
+    <div id="dmConfirmWrap" class="dm-need" style="display:none">
+      <label class="fld">Pour confirmer, retapez <b id="dmWord"></b></label>
+      <input type="text" id="dmInput" autocomplete="off">
+    </div>
+    <div class="modal-actions">
+      <button class="btn ghost" id="dmCancel">Annuler</button>
+      <button class="btn danger" id="dmOk">Confirmer en mode réel</button>
+    </div>
+  </div>
+</div>
+<!-- ===================== ASSISTANT (1er lancement) ===================== -->
+<div id="wizard" class="wiz" style="display:none">
+  <div class="wiz-card">
+    <div class="wiz-head">
+      <div class="wiz-brand"><svg width="22" height="22" viewBox="0 0 38 38" aria-hidden="true" style="vertical-align:-5px;margin-right:8px">
+        <rect x="1" y="1" width="36" height="36" rx="9" fill="#5B18C0"></rect>
+        <path d="M19 8 L28 11 V19 C28 24.5 24 28.5 19 30.5 C14 28.5 10 24.5 10 19 V11 Z" fill="#ADFF00"></path>
+        <path d="M14.7 18.6 l3 3 l6.6 -7.6" fill="none" stroke="#1B0C33" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"></path>
+      </svg>HYCU</div>
+      <h2 id="wizTitle">Configuration initiale</h2>
+      <div class="wiz-bar"><span id="wizBar"></span></div>
+    </div>
+    <div class="wiz-body" id="wizBody"></div>
+    <div class="wiz-foot">
+      <button class="btn ghost" id="wizBack">Précédent</button>
+      <span class="hint" id="wizStep" style="margin:0"></span>
+      <button class="btn" id="wizNext">Suivant</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===================== DÉVERROUILLAGE (coffre présent) ===================== -->
+<div id="unlock" class="wiz" style="display:none">
+  <div class="wiz-card">
+    <div class="wiz-head">
+      <div class="wiz-brand"><svg width="22" height="22" viewBox="0 0 38 38" aria-hidden="true" style="vertical-align:-5px;margin-right:8px">
+        <rect x="1" y="1" width="36" height="36" rx="9" fill="#5B18C0"></rect>
+        <path d="M19 8 L28 11 V19 C28 24.5 24 28.5 19 30.5 C14 28.5 10 24.5 10 19 V11 Z" fill="#ADFF00"></path>
+        <path d="M14.7 18.6 l3 3 l6.6 -7.6" fill="none" stroke="#1B0C33" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"></path>
+      </svg>HYCU</div>
+      <h2>Déverrouiller les connexions</h2>
+    </div>
+    <div class="wiz-body">
+      <p class="q">Un coffre d'identifiants chiffré a été trouvé. Saisissez la phrase secrète maîtresse
+        pour reconnecter automatiquement HYCU / Nutanix.</p>
+      <label class="fld">Phrase secrète</label>
+      <input type="password" id="unlockPass" autocomplete="off">
+      <div id="unlockErr"></div>
+    </div>
+    <div class="wiz-foot">
+      <button class="btn ghost" id="unlockSkip">Plus tard</button>
+      <button class="btn" id="unlockGo">Déverrouiller</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===================== À PROPOS ===================== -->
+<div id="aboutModal" class="wiz" style="display:none">
+  <div class="wiz-card" style="max-width:560px">
+    <div class="wiz-head dark">
+      <div class="wiz-brand">__LOGO__</div>
+      <h2 style="margin-top:10px">Protection Kubernetes sur Nutanix</h2>
+      <div style="color:#B8B4FC;font-weight:700;font-size:13px;margin-top:2px">Plugin pour HYCU Enterprise Cloud</div>
+      <div style="font-style:italic;margin-top:6px;font-size:12px;color:#fff">Plugin gratuit, fourni « tel quel », sans aucune garantie ni engagement de HYCU.</div>
+    </div>
+    <div class="wiz-body" style="font-size:13px">
+      <div style="display:grid;grid-template-columns:auto 1fr;gap:6px 14px;align-items:baseline">
+        <b>Version :</b><code>__VERSION__</code>
+        <b>Journal d'audit :</b><code id="aboutAudit" style="word-break:break-all">…</code>
+        <b>Configuration :</b><code id="aboutCfg" style="word-break:break-all">…</code>
+        <b>Sauvegardes :</b><code id="aboutBk" style="word-break:break-all">…</code>
+      </div>
+    </div>
+    <div class="wiz-foot">
+      <span></span>
+      <button class="btn" id="aboutClose">Fermer</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===================== FILTRE DES NAMESPACES ===================== -->
+<div id="nsFilter" class="wiz" style="display:none">
+  <div class="wiz-card">
+    <div class="wiz-head">
+      <div class="wiz-brand">HYCU</div>
+      <h2>Filtrer les namespaces</h2>
+    </div>
+    <div class="wiz-body">
+      <label class="wiz-opt" id="nsAllOpt" style="cursor:pointer">
+        <input type="checkbox" id="nsAll" style="width:auto;margin-right:8px">
+        <b>Toutes les namespaces (aucun filtre)</b>
+        <div class="d">Affiche toutes les namespaces, y compris celles créées plus tard.</div>
+      </label>
+      <div id="nsPick">
+        <input type="text" id="nsSearch" placeholder="rechercher une namespace…">
+        <div style="display:flex;gap:8px;margin:8px 0">
+          <button class="btn ghost" id="nsCheckAll" type="button">Tout cocher (visibles)</button>
+          <button class="btn ghost" id="nsUncheckAll" type="button">Tout décocher (visibles)</button>
+        </div>
+        <div id="nsList" style="max-height:260px;overflow:auto"></div>
+      </div>
+      <div id="nsFilterErr"></div>
+    </div>
+    <div class="wiz-foot">
+      <button class="btn ghost" id="nsCancel">Annuler</button>
+      <span class="hint" id="nsCount" style="margin:0"></span>
+      <button class="btn" id="nsSave">Enregistrer le filtre</button>
+    </div>
+  </div>
+</div>
+
+<header class="topbar">
+  <a class="tb-brand" id="tbHome" href="#" title="Tableau de bord">__LOGO__<span class="tb-word">HYCU<sup>®</sup></span><span class="tb-prod">Kubernetes · Nutanix</span></a>
+  <div class="tb-right">
+    <span id="tbReal" class="tb-real" role="status">MODE RÉEL</span>
+    <span id="hdrConn" class="hdrconn" title="État des sources — cliquer pour ouvrir les Sources"></span>
+    <button class="tb-link" id="ctxLink" type="button" title="Cluster Kubernetes actif — cliquer pour en choisir un autre"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="16" height="6.5" rx="1.3"/><rect x="4" y="13.5" width="16" height="6.5" rx="1.3"/><path d="M7.6 7.25h.01M7.6 16.75h.01"/></svg><u id="ctx">…</u><span id="ctxWarn"></span><svg class="caret" width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M2.5 4.5l3.5 3.5 3.5-3.5" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round"/></svg></button>
+    <button class="tb-ico" id="srcBtn" type="button" title="Sources & Réglages"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></button>
+    <button class="tb-ico" id="aboutBtn" type="button" title="Aide &amp; À propos"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9.4"/><path d="M9.6 9.4a2.5 2.5 0 0 1 4.9.8c0 1.7-2.5 2.1-2.5 3.8"/><circle cx="12" cy="17.1" r=".7" fill="currentColor" stroke="none"/></svg></button>
+    <button id="langBtn" class="tb-lang" type="button" title="Afficher l'interface en anglais">EN</button>
+  </div>
+</header>
+<div id="clMenu" class="clmenu" role="menu"></div>
+<div id="helpMenu" class="clmenu" role="menu" style="min-width:210px">
+  <a class="cli" href="/help" target="_blank" rel="noopener" role="menuitem" style="text-decoration:none"><span class="chk"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 4.5h6a2.5 2.5 0 0 1 2.5 2.5v12.5a2 2 0 0 0-2-2H5z"/><path d="M19 4.5h-5.5A2.5 2.5 0 0 0 11 7v12.5a2 2 0 0 1 2-2h6z" transform="scale(-1,1) translate(-24,0)" display="none"/><path d="M19 4.5h-6v13h6z" display="none"/></svg></span><span>Aide (guide)</span></a>
+  <div class="cli" data-act="about" role="menuitem"><span class="chk"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 11v6"/><circle cx="12" cy="7.6" r=".8" fill="currentColor" stroke="none"/></svg></span><span>À propos</span></div>
+</div>
+<div id="gearMenu" class="clmenu" role="menu" style="min-width:210px">
+  <div class="cli" data-act="sources" role="menuitem"><span class="chk"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></svg></span><span>Sources</span></div>
+  <div class="cli" data-act="settings" role="menuitem"><span class="chk"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 20v-5M5 11V4M12 20v-8M12 8V4M19 20v-3M19 13V4"/><path d="M3 15h4M10 8h4M17 17h4"/></svg></span><span>Réglages</span></div>
+</div>
+
+<div class="shell">
+<nav class="sidebar" role="tablist" aria-label="Sections de l'outil">
+  <button class="on" role="tab" aria-selected="true" data-tab="dashboard"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4.2 17.5a8.6 8.6 0 1 1 15.6 0"/><path d="M12 13.4l4.2-4.2"/><circle cx="12" cy="13.6" r="1.4"/></svg><span class="nl">Tableau de bord</span></button>
+  <div class="sb-sep"></div>
+  <button role="tab" aria-selected="false" data-tab="apps"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3.5" y="3.5" width="7" height="7" rx="1.2"/><rect x="13.5" y="3.5" width="7" height="7" rx="1.2"/><rect x="3.5" y="13.5" width="7" height="7" rx="1.2"/><circle cx="17" cy="17" r="3.6"/></svg><span class="nl">Applications</span></button>
+  <div class="sb-sep"></div>
+  <button role="tab" aria-selected="false" data-tab="policies"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l7.5 3v5.4c0 4.6-3.2 8.3-7.5 9.6-4.3-1.3-7.5-5-7.5-9.6V6z"/><path d="M8.6 12.1l2.4 2.4 4.4-4.8"/></svg><span class="nl">Politiques</span></button>
+  <div class="sb-sep"></div>
+  <button role="tab" aria-selected="false" data-tab="jobs"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4.5" y="3.5" width="15" height="17" rx="1.6"/><path d="M8 8.5h8M8 12h8M8 15.5h5"/></svg><span class="nl">Tâches</span></button>
+  <div class="sb-foot"><button class="sb-col" id="sbCol" type="button" title="Réduire / déployer le menu"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg></button><span class="ver">v__VERSION__</span></div>
+</nav>
+<main class="wrap">
+  <div id="netBanner" class="err" style="display:none" role="alert">Serveur injoignable — vérifiez que l'outil tourne (ou le port-forward), puis rechargez.</div>
+  <div id="opBanner" style="display:none"></div>
+  <div id="kubeBanner"></div>
+  <div class="dry" id="dryBar">
+    <label class="switch"><input type="checkbox" id="dry" checked role="switch" aria-checked="true" aria-labelledby="dryLabel"><span class="slider"></span></label>
+    <div><b id="dryLabel">Mode simulation activé</b> — aucune commande destructive n'est exécutée.
+      Désactivez-le seulement quand vous êtes prêt à agir réellement.</div>
+  </div>
+
+
+  <!-- ===================== TABLEAU DE BORD ===================== -->
+  <section id="tab-dashboard">
+    <div class="pagehead"><h1 class="ptitle">Tableau de bord</h1></div>
+    <div class="dgrid">
+      <div><h2 class="dtitle">Applications</h2><div class="dcard" id="dbApps"></div></div>
+      <div><h2 class="dtitle">Politique</h2><div class="dcard" id="dbPolicy"></div></div>
+      <div><h2 class="dtitle">Sources</h2><div class="dcard" id="dbSources"></div></div>
+      <div><h2 class="dtitle">Cluster</h2><div class="dcard" id="dbCluster"></div></div>
+      <div><h2 class="dtitle">Stockage</h2><div class="dcard" id="dbStorage"></div></div>
+      <div><h2 class="dtitle">Tâches</h2><div class="dcard" id="dbJobs"></div></div>
+      <div><h2 class="dtitle">Dernières tâches</h2><div class="dcard" id="dbLast"></div></div>
+      <div><h2 class="dtitle">Santé des clusters</h2><div class="dcard" id="dbHealth"></div></div>
+    </div>
+  </section>
+  <!-- ===================== APPLICATIONS ===================== -->
+  <section id="tab-apps" style="display:none">
+    <div class="pagehead"><h1 class="ptitle">Applications <button class="refresh" id="appsRefresh" type="button" title="Actualiser"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19.4 12.6a7.5 7.5 0 1 1-2.3-5.9"/><path d="M19.6 4.4v4h-4"/></svg></button></h1>
+      <div class="pacts">
+        <button class="pact" id="actBackup" type="button" disabled><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19.6 12.5a7.6 7.6 0 1 1-2.1-5.8"/><path d="M19.8 4.3v3.9h-3.9"/><path d="M12 8.3v4l2.6 1.9"/></svg><span>Sauvegarder</span></button>
+        <button class="pact" id="actRestore" type="button" disabled><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4.4 12.5a7.6 7.6 0 1 0 2.1-5.8"/><path d="M4.2 4.3v3.9h3.9"/><path d="M12 8.3v4l2.6 1.9"/></svg><span>Restaurer</span></button>
+        <button class="pact" id="actPolicy" type="button" disabled><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l7.5 3v5.4c0 4.6-3.2 8.3-7.5 9.6-4.3-1.3-7.5-5-7.5-9.6V6z"/><path d="M12 8.8v6.4M8.8 12h6.4"/></svg><span>Définir la politique</span></button>
+        <button class="pact" id="actVerify" type="button" disabled><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="8.6"/><path d="M8.3 12.2l2.5 2.5 5-5.3"/></svg><span>Vérifier</span></button>
+        <button class="pact" id="actBulk" type="button" title="Recréer tous les namespaces supprimés du cluster actif depuis leurs sauvegardes"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3.5" y="4" width="17" height="5" rx="1.2"/><rect x="3.5" y="11" width="17" height="5" rx="1.2"/><path d="M6 18.5h12M4.4 21a7 7 0 0 0 1.9-5.3"/><path d="M4.2 13.2v3.6h3.6"/></svg><span>Restaurer en masse</span></button>
+      </div></div>
+    <div class="tcard">
+      <div class="tbar"><div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap"><input type="text" id="appsSearch" placeholder="Rechercher" autocomplete="off">
+        <div class="seg" id="appsScope" style="display:none"><button class="on" type="button" data-scope="one">Cluster actif</button><button type="button" data-scope="all">Tous les clusters</button></div></div>
+        <div style="display:flex;align-items:center;gap:14px"><span class="tinfo" id="appsInfo"></span><span class="tinfo" id="appsPager" style="display:none"></span>
+          <button class="pact nsEdit" type="button" title="Filtrer la liste des namespaces"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5h16l-6.2 7.4V19l-3.6-1.8v-4.8z"/></svg></button></div></div>
+      <table class="ht" id="appsTable"><thead><tr><th class="cb"><input type="checkbox" id="appsAll" title="Tout sélectionner"></th>
+        <th>Nom</th><th>Namespace</th><th class="mc">Workspace</th><th class="mc">Cluster</th><th>Type</th><th>Politique</th><th class="ctr">Conformité</th><th class="ctr">Protection</th>
+        <th>Dernière sauvegarde</th><th class="ctr">Versions</th></tr></thead>
+        <tbody id="appsBody"><tr><td colspan="11" class="tempty"><span class="spin"></span></td></tr></tbody></table>
+    </div>
+  </section>
+  <!-- ===================== POLITIQUES ===================== -->
+  <section id="tab-policies" style="display:none">
+    <div class="pagehead"><h1 class="ptitle">Politiques</h1></div>
+    <div class="tcard" style="margin-bottom:16px">
+      <table class="ht"><thead><tr><th>Nom</th><th>Objet protégé</th><th>Fréquence</th><th>Rétention</th><th>Cible</th><th class="ctr">État</th></tr></thead>
+        <tbody id="polBody"></tbody></table>
+    </div>
+    <div class="card">
+      <h3><span class="step-no">⏱</span>Sauvegarde automatique de la configuration (PV/PVC)</h3>
+      <p class="sub">Sauvegarde régulièrement les <b>manifestes PV/PVC</b> (la « recette » du restore) de tous les
+        namespaces autorisés par le filtre — tant que l'outil est lancé. <b>Pas les données</b> des volumes :
+        elles sont protégées par HYCU (<b>Applications → Définir la politique</b>).</p>
+      <div class="row">
+        <div style="flex:none"><label class="fld">Sauvegarde automatique</label>
+          <div style="display:flex;align-items:center;gap:10px;min-height:38px">
+            <label class="switch onoff"><input type="checkbox" id="abEnabled"><span class="slider"></span></label>
+            <b id="abEnabledLbl" style="font-size:13px;color:var(--muted)">Désactivée</b>
+          </div></div>
+        <div style="flex:none;width:140px"><label class="fld">Intervalle (heures)</label>
+          <input type="number" id="abInterval" min="1" step="1" value="24"></div>
+        <div style="flex:none;width:150px"><label class="fld">Rétention</label>
+          <select id="abRet"><option value="count">N versions</option><option value="gfs">GFS (j/sem/mois)</option></select></div>
+        <div style="flex:none;width:150px" id="abKeepWrap"><label class="fld">Versions à conserver</label>
+          <input type="number" id="abKeep" min="1" step="1" value="15"></div>
+        <div style="flex:none;display:none;gap:8px" id="abGfsWrap">
+          <div style="width:86px"><label class="fld">Jours</label><input type="number" id="abGfsD" min="0" value="7"></div>
+          <div style="width:86px"><label class="fld">Semaines</label><input type="number" id="abGfsW" min="0" value="4"></div>
+          <div style="width:86px"><label class="fld">Mois</label><input type="number" id="abGfsM" min="0" value="12"></div>
+        </div>
+        <div><label class="fld">Dossier de destination (optionnel)</label>
+          <input type="text" id="abDest" placeholder="Vide = hycu-backups/"></div>
+        <div style="flex:none;align-self:flex-end"><button class="btn" id="abSave">Enregistrer</button></div>
+      </div>
+      <div class="hint" id="abStatus" style="margin-top:8px"></div>
+    </div>
+
+    <div class="card" id="polHycuCard">
+      <h3>Politiques HYCU (données des volumes)</h3>
+      <p class="sub">Politiques définies dans HYCU, assignables aux Volume Groups d'une application via
+        <b>Applications → Définir la politique</b>.</p>
+      <div id="polHycu"></div>
+    </div>
+  </section>
+  <!-- ===================== TÂCHES ===================== -->
+  <section id="tab-jobs" style="display:none">
+    <div class="pagehead"><h1 class="ptitle">Tâches <button class="refresh" id="jobsRefresh" type="button" title="Actualiser"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19.4 12.6a7.5 7.5 0 1 1-2.3-5.9"/><path d="M19.6 4.4v4h-4"/></svg></button></h1>
+      <div class="pacts">
+        <a class="pact" href="/api/report?format=html" download title="Rapport de conformité (HTML autonome) : applications, RPO, santé des clusters, tâches"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 3.5h9l4 4V20.5H6z"/><path d="M14.5 3.5v4.5H19"/><path d="M9 13h7M9 16.5h5"/></svg><span>Rapport HTML</span></a>
+        <a class="pact" href="/api/report?format=csv" download title="Export CSV des applications (Excel)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 3.5h9l4 4V20.5H6z"/><path d="M14.5 3.5v4.5H19"/><path d="M9 12.5l2.2 5M11.2 12.5L9 17.5M14 12.5v5h2.6"/></svg><span>CSV</span></a>
+      </div></div>
+    <div class="tcard" style="margin-bottom:16px;padding:14px 16px"><div class="jcounts" id="jobsCounts" style="margin-top:0"></div></div>
+    <div class="tcard">
+      <div class="tbar"><input type="text" id="jobsSearch" placeholder="Rechercher" autocomplete="off"><span class="tinfo" id="jobsInfo"></span></div>
+      <table class="ht"><thead><tr><th>Tâche</th><th>Application</th><th>Cluster</th><th>Détail</th><th>Démarrée</th><th class="ctr">État</th></tr></thead>
+        <tbody id="jobsBody"><tr><td colspan="6" class="tempty"><span class="spin"></span></td></tr></tbody></table>
+    </div>
+  </section>
+
+  <!-- ===================== VÉRIFICATION ===================== -->
+  <section id="tab-verify" style="display:none">
+    <div class="pagehead"><h1 class="ptitle"><a class="crumb" data-go="apps">Applications</a><span class="sep">›</span>Vérification</h1></div>
+    <div class="card">
+      <h3><span class="step-no">3</span>Vérifier l'état d'un namespace</h3>
+      <p class="sub">Confirme que les PVC sont liés (Bound) et que les pods tournent.</p>
+      <label class="fld">Namespace</label>
+      <div class="row">
+        <div><select id="vfNs"></select></div>
+        <div style="flex:none"><button class="btn ghost nsEdit" title="Filtrer la liste des namespaces">✎ Filtrer</button></div>
+        <div style="flex:none"><button class="btn" id="vfRun">Vérifier</button></div>
+        <div style="flex:none"><button class="btn ghost" id="vfAuto" title="Rafraîchit la vérification toutes les ~3 s et s'arrête dès que tous les PVC sont Bound et les pods Running (10 min max) ; recliquez pour arrêter">Suivi auto (jusqu'à stable)</button></div>
+      </div>
+      <div id="vfOut"></div>
+    </div>
+  </section>
+
+  <!-- ===================== RÉGLAGES ===================== -->
+  <section id="tab-settings" style="display:none">
+    <div class="pagehead"><h1 class="ptitle">Réglages</h1></div>
+    <div class="card">
+      <h3><span class="step-no">⎈</span>Cluster local (contexte kubectl)</h3>
+      <p class="sub">Choisissez explicitement le cluster, au lieu de suivre le contexte courant.
+        L'outil ajoute <code>--context</code> (et <code>--kubeconfig</code>) à chaque commande kubectl.
+        Les clusters <b>supplémentaires</b> (kubeconfig importé, workspaces NKP) se gèrent depuis <b>⚙ Sources</b>.</p>
+      <label class="fld">Fichier kubeconfig (vide = défaut ~/.kube/config)</label>
+      <input type="text" id="cfgKubeconfig" placeholder="%USERPROFILE%\.kube\config">
+      <div class="row" style="margin-top:6px">
+        <div><label class="fld">Contexte</label><select id="cfgContext"></select></div>
+        <div style="flex:none;align-self:flex-end"><button class="btn ghost" id="ctxList">Lister les contextes</button></div>
+      </div>
+      <div style="margin-top:12px"><button class="btn" id="ctxApply">Utiliser ce contexte</button>
+        <span class="hint" id="ctxMsg" style="margin:0"></span></div>
+    </div>
+
+    <div class="card">
+      <h3><span class="step-no">⚙</span>Réglages (adaptation par client)</h3>
+      <p class="sub">Ces réglages sont enregistrés dans <code>hycu_config.json</code> à côté du programme.
+        Laissez vide ce que vous ne voulez pas contraindre.</p>
+      <div class="row">
+        <div><label class="fld">Binaire kubectl</label><input type="text" id="cfgKubectl" placeholder="kubectl"></div>
+        <div><label class="fld">Préfixe volumeHandle (vide = auto)</label><input type="text" id="cfgVhPrefix" placeholder="auto-détecté"></div>
+      </div>
+      <div class="row">
+        <div><label class="fld">Contextes / clusters autorisés (séparés par des virgules ; vide = tous)</label><input type="text" id="cfgCtx" placeholder="prod-cluster, dr-cluster"></div>
+        <div><label class="fld">Namespaces autorisés — cluster local (vide = tous)</label><input type="text" id="cfgNs" placeholder="wordpress, bo-dev"></div>
+      </div>
+      <div class="row">
+        <div><label class="fld">Sélecteur d'étiquettes des namespaces (vide = inactif ; s'applique à tous les clusters)</label><input type="text" id="cfgLabelSel" placeholder="hycu.io/backup=true  ou  env in (prod,preprod)"></div>
+        <div style="flex:none;width:230px"><label class="fld">Historique des tâches (jours ; 0 = illimité)</label><input type="number" id="cfgAuditDays" min="0" step="1" placeholder="31"></div>
+      </div>
+      <div class="row">
+        <div style="flex:none;width:250px"><label class="fld">Plancher d'espace libre (Mo ; 0 = désactivé)</label><input type="number" id="cfgMinFree" min="0" step="100" placeholder="500"></div>
+        <div style="flex:none;width:280px"><label class="fld">Quota des sauvegardes (Go ; 0 = illimité)</label><input type="number" id="cfgQuota" min="0" step="1" placeholder="0"></div>
+        <div style="align-self:flex-end" class="hint">Sous le plancher, toute sauvegarde est refusée ; au-delà du quota, les plus anciennes sont purgées (la plus récente de chaque application est toujours gardée).</div>
+      </div>
+      <div class="row">
+        <div><label class="fld"><input type="checkbox" id="cfgDr" style="width:auto"> <b>Autoriser la restauration DR</b> (inter-cluster / inter-contexte)</label>
+        <div class="hint">À activer le temps d'un exercice ou d'un sinistre. Chaque restauration DR reste explicite : sources lues depuis la seule sauvegarde, avertissement, re-saisie du cluster cible, audit dédié.</div></div>
+        <div><label class="fld">Noms d'hôte autorisés pour accéder à l'interface (vide = boucle locale uniquement)</label><input type="text" id="cfgHosts" placeholder="hycu.interne.exemple.fr">
+          <div class="hint" style="margin-top:4px">Nom DNS d'un Ingress ou d'un reverse-proxy. L'outil n'a pas d'authentification : placez une authentification (SSO, oauth2-proxy, liste d'IP) et TLS devant lui dès qu'il quitte la boucle locale.</div></div>
+      </div>
+      <div class="row">
+        <div><label class="fld">Timeout d'attente (s)</label><input type="text" id="cfgWait" placeholder="120"></div>
+        <div><label class="fld">Suffixe de nom de clone</label><input type="text" id="cfgSuffix" placeholder="0000"></div>
+      </div>
+      <label class="fld" style="margin-top:14px"><input type="checkbox" id="cfgConfirm" style="width:auto"> Exiger la confirmation du contexte avant toute action réelle</label>
+      <label class="fld"><input type="checkbox" id="cfgStrip" style="width:auto"> Retirer entièrement claimRef du PV (laisser le PVC rebinder)</label>
+      <label class="fld"><input type="checkbox" id="cfgSim" style="width:auto"> Proposer le mode simulation (interrupteur dans le bandeau ; sinon l'outil travaille en mode réel)</label>
+      <div class="row" style="margin-top:6px">
+        <div style="flex:none;width:260px"><label class="fld">Langue par défaut de l'interface</label>
+          <select id="cfgLang"><option value="en">English</option><option value="fr">Français</option></select></div>
+      </div>
+      <div style="margin-top:14px"><button class="btn" id="cfgSave">Enregistrer les réglages</button> <span class="hint" id="cfgMsg"></span></div>
+    </div>
+  </section>
+</main>
+</div>
+
+<div id="mBackup" class="hmodal-bg" style="display:none">
+  <div class="hmodal" style="max-width:640px">
+    <div class="hm-head"><h2 id="mBackupTitle">Sauvegarde de configuration</h2><div class="hm-ico"><button type="button" data-close="mBackup" title="Fermer">✕</button></div></div>
+    <div class="hm-body">
+    <div class="card">
+      <h3><span class="step-no">1</span>Sauvegarder les volumes d'un namespace</h3>
+      <p class="sub">Exporte et nettoie automatiquement tous les PV et PVC du namespace.
+        Équivaut aux boucles kubectl + nettoyage manuel des manifestes.</p>
+      <div id="bkNsRow"><label class="fld">Namespace</label>
+      <div class="row">
+        <div><select id="bkNs"></select></div>
+        <div style="flex:none"><button class="btn ghost nsEdit" title="Filtrer la liste des namespaces">✎ Filtrer</button></div>
+        <div style="flex:none"><button class="btn" id="bkRun">Sauvegarder ce namespace</button></div>
+        <div style="flex:none"><button class="btn ghost" id="bkRunAll" title="Sauvegarder tous les namespaces autorisés par le filtre (tous si aucun filtre)">Sauvegarder tous (filtrés)</button></div>
+      </div></div>
+      <div id="bkSelInfo" style="display:none"><label class="fld">Namespaces sélectionnés</label><div class="fbox" id="bkSelList"></div></div>
+      <label class="fld" style="margin-top:10px">Dossier de destination (optionnel)</label>
+      <input type="text" id="bkDest" placeholder="Vide = hycu-backups/ (à côté du programme). Ex. D:\sauvegardes\hycu  ou  /mnt/backups">
+      <div class="hint" style="margin-top:4px">Chemin sur la machine qui exécute l'outil. Le sous-dossier &lt;namespace&gt;/&lt;horodatage&gt; est créé automatiquement.</div>
+      <div id="bkOut"></div>
+    </div>
+
+    </div>
+    <div class="hm-foot" id="mBackupFoot"><button class="lnk" type="button" data-close="mBackup">Fermer</button><button class="btn" id="bkRunSel" type="button" style="display:none">Sauvegarder la sélection</button></div>
+  </div>
+</div>
+<div id="mBulk" class="hmodal-bg" style="display:none">
+  <div class="hmodal" style="max-width:860px">
+    <div class="hm-head"><h2>Restauration en masse</h2><div class="hm-ico"><button type="button" data-close="mBulk" title="Fermer">✕</button></div></div>
+    <div class="hm-body">
+      <div class="note">Recrée <b>tous les namespaces supprimés</b> du cluster actif (<b id="bulkCluster"></b>) depuis leur dernière sauvegarde antérieure à l'instant de référence : namespace, PV/PVC, workloads, dépendances, Secrets (coffre déverrouillé), Volume Groups restaurés par HYCU s'ils ont disparu, applications stateless. Les namespaces <b>encore présents</b> sont ignorés : une application vivante se restaure depuis sa propre ligne. Exécution séquentielle et journalisée, reprise possible ; <b>simulation obligatoire</b> avant le réel.</div>
+      <div class="row" style="margin-top:10px">
+        <div style="flex:none;width:230px"><label class="fld">Instant de référence</label><input type="datetime-local" id="bulkAsOf"></div>
+        <div><label class="fld">Namespaces à exclure (virgules, optionnel)</label><input type="text" id="bulkExclude" placeholder="kube-system, monitoring" autocomplete="off"></div>
+        <div style="flex:none;align-self:flex-end"><button class="btn ghost" id="bulkPlanBtn" type="button">Préparer le plan</button></div>
+      </div>
+      <div id="bulkPlanOut" style="margin-top:10px"></div>
+      <div id="bulkRunOut" style="margin-top:10px"></div>
+    </div>
+    <div class="hm-foot"><button class="lnk" type="button" data-close="mBulk">Fermer</button>
+      <button class="btn ghost" id="bulkStop" type="button" style="display:none">Arrêter</button>
+      <button class="btn ghost" id="bulkResume" type="button" style="display:none">Reprendre</button>
+      <button class="btn" id="bulkSim" type="button" disabled>Simuler</button>
+      <button class="btn danger" id="bulkReal" type="button" disabled>Lancer (réel)</button></div>
+  </div>
+</div>
+<div id="mPolicy" class="hmodal-bg" style="display:none">
+  <div class="hmodal" style="max-width:700px">
+    <div class="hm-head"><h2 id="mPolicyTitle">Définir la politique</h2><div class="hm-ico"><button type="button" data-close="mPolicy" title="Fermer">✕</button></div></div>
+    <div class="hm-body">
+    <div class="card" id="bkProtectCard">
+      <h3><span class="step-no">2</span>Protéger les données dans HYCU</h3>
+      <p class="sub">L'export ci-dessus ne sauvegarde que les <b>manifestes</b> (la « recette » du restore).
+        Les <b>données</b> vivent dans les Volume Groups Nutanix : seul HYCU les sauvegarde réellement.
+        Ici, on associe les PVC du namespace aux Volume Groups HYCU, on assigne une politique, et on lance
+        une sauvegarde.</p>
+      <div id="bkProtectOff" class="warnbox">Enregistrez la source HYCU (⚙ en haut à droite) pour activer cette section.</div>
+      <div id="bkProtectOn" style="display:none">
+        <button class="btn ghost" id="bkMatch">Analyser la correspondance PVC ↔ Volume Group HYCU</button>
+        <div id="bkMatchOut"></div>
+        <div id="bkProtectForm" style="display:none">
+          <label class="fld">Politique HYCU à assigner (optionnel)</label>
+          <select id="bkPolicy"></select>
+          <label class="fld" style="margin-top:10px"><input type="checkbox" id="bkForceFull" style="width:auto"> Sauvegarde complète (forceFull)</label>
+          <div style="margin-top:12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+            <button class="btn" id="bkProtect">Assigner + sauvegarder maintenant</button>
+            <span class="hint" id="bkProtectHint" style="margin:0"></span>
+          </div>
+          <div id="bkProtectLog"></div>
+        </div>
+      </div>
+    </div>
+    </div>
+    <div class="hm-foot" id="mPolicyFoot"><button class="lnk" type="button" data-close="mPolicy">Fermer</button></div>
+  </div>
+</div>
+<div id="mRestore" class="hmodal-bg" style="display:none">
+  <div class="hmodal" style="max-width:760px">
+    <div class="hm-head"><h2 id="mRestoreTitle">Restauration de l'application</h2><div class="hm-ico"><button type="button" data-close="mRestore" title="Fermer">✕</button></div></div>
+    <div class="hm-body">
+  <!-- ===================== RESTAURATION ===================== -->
+  <section id="tab-restore">
+    <div class="stepper" id="rsStepper" aria-label="Étapes de la restauration">
+      <span class="st on" data-st="1">1 · Type</span>
+      <span class="st" data-st="2">2 · Options</span>
+      <span class="st" data-st="3">3 · Vérifier &amp; lancer</span>
+      <span class="st" data-st="4">4 · Suivi</span>
+    </div>
+    <div id="rsPgType">
+      <div class="note" id="rsAppNote" style="display:none;margin-bottom:10px"></div>
+      <div class="opt" data-kind="cloneapp"><svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="4" y="27" width="16" height="16" rx="2"/><circle cx="35.5" cy="35" r="8.5"/><path d="M27.5 12.5a8.3 8.3 0 1 1 3 6.3"/><path d="M27 6.8v5.4h5.4"/></svg><div><b>Restaurer toute l'application (copie)</b><span>Restaure le stockage et les objets de l'application (workloads, dépendances) dans le même namespace (suffixe) ou dans un autre. L'original n'est pas modifié.</span></div></div>
+      <div class="opt" data-kind="inplace"><svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="19" cy="10.5" rx="12" ry="4.5"/><path d="M7 10.5v25c0 2.5 5.4 4.5 12 4.5"/><path d="M31 10.5v10"/><path d="M7 23c0 2.5 5.4 4.5 12 4.5"/><path d="M27.3 36.3a8.2 8.2 0 1 0 2.4-5.8"/><path d="M27 26.6v4.9h4.9"/></svg><div><b>Restaurer le stockage sur place</b><span>Restaure les données dans les volumes d'origine. L'application est arrêtée puis redémarrée.</span></div></div>
+      <div class="opt" data-kind="reattach"><svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="16" cy="10.5" rx="11" ry="4.3"/><path d="M5 10.5v25c0 2.4 4.9 4.3 11 4.3s11-1.9 11-4.3v-25"/><path d="M5 23c0 2.4 4.9 4.3 11 4.3s11-1.9 11-4.3"/><path d="M32 23.5h11M38.5 18.5l5 5-5 5"/></svg><div><b>Restaurer le stockage vers de nouveaux volumes</b><span>Restaure vers de nouveaux Volume Groups et y rattache l'application. Les volumes d'origine sont conservés.</span></div></div>
+      <div class="opt" data-kind="dr"><svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M24 5l17 8v10c0 10.5-7.2 18.6-17 21-9.8-2.4-17-10.5-17-21V13z"/><path d="M24 15v10M24 30.5h.01"/></svg><div><b>Restauration DR (autre cluster / contexte)</b><span>Reprise d'activité : recrée une application sur CE cluster depuis une sauvegarde d'un cluster disparu (ou importée du bucket S3). Sources lues depuis la seule sauvegarde. Nécessite le réglage « Autoriser la restauration DR ».</span></div></div>
+      <div class="opt" data-kind="objects"><svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="6" width="26" height="34" rx="3"/><path d="M11 14h14M11 20h14M11 26h9"/><path d="M28.5 36.5a8.2 8.2 0 1 0 2.4-5.8"/><path d="M28.2 26.8v4.9h4.9"/></svg><div><b>Restaurer des objets de configuration</b><span>Ré-applique des objets choisis (Deployments, Services, ConfigMaps…) depuis l'instantané d'une sauvegarde, avec aperçu des différences. Ne touche ni aux volumes ni aux données.</span></div></div>
+    </div>
+    <div id="rsPgDr" style="display:none">
+      <div id="drGate" style="display:none"><div class="warnbox">La <b>restauration DR</b> est désactivée. Activez « <b>Autoriser la restauration DR</b> » dans ⚙ → Réglages (le temps de l'exercice ou du sinistre), puis revenez ici.</div>
+        <div style="margin-top:10px"><button class="btn ghost" id="drOpenCfg" type="button">Ouvrir les réglages</button></div></div>
+      <div id="drForm" style="display:none">
+        <div class="warnbox" id="drWarnDr">Mode <b>reprise d'activité</b> : la garde inter-cluster est levée pour CETTE opération. Toutes les sources proviennent de la sauvegarde choisie ; le cluster cible est le <b>cluster actif</b> (<b id="drCluster"></b>). Restaurez d'abord les Volume Groups dans HYCU vers le site cible, puis collez leurs UUID.</div>
+        <div class="note" id="drWarnRec" style="display:none">Ce namespace n'existe plus sur le cluster <b id="drClusterRec"></b> : l'application va être <b>recréée depuis sa sauvegarde</b> (namespace, PV/PVC, workloads, dépendances non masquées), en réutilisant ses volumes d'origine — ou, s'ils ont été supprimés avec le namespace, en les restaurant automatiquement depuis HYCU (« Protected deleted »). Dans le cas courant, rien à saisir : vérifiez la sauvegarde et lancez la restauration.</div>
+        <div class="row" style="margin-top:10px">
+          <div><label class="fld">Sauvegarde source (tous clusters / imports S3)</label><select id="drBackupSel"></select></div>
+          <div style="flex:none;width:220px"><label class="fld">Namespace cible</label><input type="text" id="drTargetNs" autocomplete="off"></div>
+        </div>
+        <div class="row">
+          <div style="flex:none;width:260px"><label class="fld">StorageClass cible (vide = inchangée)</label><input type="text" id="drSc" placeholder="nutanix-volume" autocomplete="off"></div>
+          <div style="align-self:flex-end"><label class="fld"><input type="checkbox" id="drRefs" checked style="width:auto"> Recréer les dépendances depuis la sauvegarde (Secrets non masqués, ConfigMaps, ServiceAccounts, Services)</label></div>
+        </div>
+        <div class="note" id="drSecretsNote" style="display:none;margin:8px 0"></div>
+        <div class="note" id="drNoRes" style="display:none;margin:8px 0">Cette sauvegarde ne contient <b>que les volumes</b> (pas d'instantané des workloads/dépendances) : elle est antérieure à cette fonction, ou la sauvegarde de config étendue était désactivée. La restauration recréera <b>les volumes (PV/PVC)</b> ; recréez les workloads depuis une sauvegarde plus récente ou manuellement.</div>
+        <div id="drReuseWrap" style="display:none;margin:6px 0 4px">
+          <label class="fld" style="display:flex;gap:9px;align-items:flex-start;cursor:pointer;font-weight:600">
+            <input type="checkbox" id="drReuse" checked style="width:auto;margin-top:2px">
+            <span>Réutiliser les volumes d'origine de l'application <span class="badge sim">recommandé</span>
+            <span class="hint" style="display:block;font-weight:400;margin-top:3px">Rien à saisir : l'application est rebranchée sur ses volumes Nutanix d'origine (leurs identifiants sont dans la sauvegarde). Décochez seulement si vous avez restauré les données sur de <b>nouveaux</b> volumes dans HYCU.</span></span>
+          </label>
+        </div>
+        <label class="fld" id="drVolsLabel">Volumes — collez l'UUID du VG restauré/cloné sur le site cible</label>
+        <div id="drVols"></div>
+        <div id="drAutoWrap" style="display:none;margin:8px 0 2px">
+          <button class="btn ghost" id="drAuto" type="button">Créer les volumes automatiquement via HYCU</button>
+          <span class="hint" style="margin-left:8px">HYCU clone les Volume Groups et l'outil récupère les nouveaux identifiants — aucune saisie. En simulation, seul le plan est affiché.</span>
+        </div>
+        <div id="drLog" style="margin-top:10px"></div>
+        <div id="drErr"></div>
+      </div>
+    </div>
+    <div id="rsPgObjects" style="display:none">
+      <div class="row" style="margin-bottom:4px">
+        <div><label class="fld" style="margin-top:0">Application</label><div class="fbox" id="objApp"></div></div>
+        <div><label class="fld" style="margin-top:0">Sauvegarde (instantané de config)</label><select id="objBackupSel"></select></div>
+      </div>
+      <div id="objPick">
+        <label class="fld" style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">Objets à restaurer <span class="hint" id="objInfo"></span>
+          <span id="objOnlyAppWrap" style="display:none;font-weight:400;margin-left:auto"><input type="checkbox" id="objOnlyApp" checked style="width:auto"> Seulement les objets de l'application</span></label>
+        <div class="tcard" style="box-shadow:none;border:1px solid var(--rule)">
+          <table class="ht"><thead><tr><th class="cb"><input type="checkbox" id="objAll"></th><th>Type</th><th>Nom</th><th>Note</th></tr></thead>
+          <tbody id="objBody"></tbody></table></div>
+      </div>
+      <div id="objDiffWrap" style="display:none">
+        <label class="fld">Aperçu des différences (live → sauvegarde)</label>
+        <div id="objDiff"></div>
+      </div>
+      <div id="objLog" style="margin-top:10px"></div>
+      <div id="objErr"></div>
+    </div>
+    <div id="rsPgTarget" style="display:none">
+      <div class="opt" data-nsmode="same"><svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="6" y="6" width="24" height="24" rx="3"/><rect x="18" y="18" width="24" height="24" rx="3"/><path d="M25 30h10M30 25v10"/></svg><div><b>Dans le même namespace (suffixe)</b><span>La copie est créée à côté de l'application d'origine : chaque objet reçoit un suffixe (ex. <code>-clone</code>). Pratique pour vérifier une restauration sans rien déplacer.</span></div></div>
+      <div class="opt" data-nsmode="other"><svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="12" width="17" height="24" rx="3"/><rect x="30" y="12" width="14" height="24" rx="3" stroke-dasharray="4 3"/><path d="M21 24h11M27.5 19.5l4.5 4.5-4.5 4.5"/></svg><div><b>Vers un autre namespace</b><span>La copie est créée dans un namespace cible (créé s'il n'existe pas), avec ses dépendances (Secrets, ConfigMaps, ServiceAccount, Services). Les noms d'origine sont conservés.</span></div></div>
+    </div>
+    <div id="rsPgForm" style="display:none">
+      <div class="row" style="margin-bottom:4px">
+        <div><label class="fld" style="margin-top:0">Application</label><div class="fbox" id="rsWizApp"></div></div>
+        <div><label class="fld" style="margin-top:0">Cluster cible</label><div class="fbox" id="rsWizCluster"></div></div>
+      </div>
+    <div class="card">
+      <h3><span class="step-no">1</span>Choisir le namespace et les volumes</h3>
+      <p class="sub">Cochez le(s) volume(s) à restaurer — plusieurs volumes = une seule transaction.</p>
+      <div id="rsNsRow" style="display:none"><label class="fld">Namespace</label>
+      <div class="row">
+        <div><select id="rsNs"></select></div>
+        <div style="flex:none;align-self:flex-end"><button class="btn ghost nsEdit" title="Filtrer la liste des namespaces">✎ Filtrer</button></div>
+      </div></div>
+      <label class="fld" id="rsCustomDirLbl" style="margin-top:8px"><input type="checkbox" id="rsCustomDir" style="width:auto"> Lire les sauvegardes depuis un dossier personnalisé</label>
+      <div id="rsCustomDirWrap" style="display:none;margin-top:4px">
+        <input type="text" id="rsBackupRoot" placeholder="Ex. D:\sauvegardes\hycu  ou  /mnt/backups  (dossier contenant &lt;namespace&gt;/&lt;horodatage&gt;/)">
+        <div class="hint" style="margin-top:4px">Les sauvegardes lues (et utilisées pour la restauration) seront cherchées ici, au lieu de <code>hycu-backups/</code>.</div>
+      </div>
+      <div id="rsBackupSelWrap" style="display:none;margin-top:8px">
+        <label class="fld">Sauvegarde de configuration à restaurer</label>
+        <select id="rsBackupSel"></select>
+        <div class="hint" style="margin-top:4px">Manifestes PV/PVC (le « squelette ») — indépendant du point de restauration HYCU des <b>données</b>.<a id="rsBackupDl" href="#" download style="display:none;margin-left:6px;text-decoration:none">⬇ Télécharger (.zip)</a></div>
+      </div>
+      <div id="rsModeRow" style="display:none"><label class="fld">Type d'opération</label>
+      <div class="seg" id="rsMode">
+        <button class="on" data-mode="clone">Clone (nouveau VG)</button>
+        <button data-mode="inplace">Restauration sur place</button>
+      </div></div>
+      <div id="rsCloneSubWrap">
+        <label class="fld" style="display:none">Que faire du clone ?</label>
+        <div class="seg" id="rsCloneSub" style="display:none">
+          <button class="on" data-sub="reattach">Rattacher à l'app existante</button>
+          <button data-sub="cloneapp">Cloner l'application</button>
+        </div>
+        <div id="rsCloneAppWrap" style="display:none">
+          <label class="fld">Cible du clone d'application</label>
+          <div class="seg" id="rsCloneNsMode">
+            <button class="on" data-nsmode="same">Même namespace (suffixe)</button>
+            <button data-nsmode="other">Autre namespace</button>
+          </div>
+          <div class="row" style="margin-top:6px">
+            <div id="rsCloneSuffixWrap"><label class="fld">Suffixe appliqué aux copies</label><input type="text" id="rsCloneSuffix" value="-clone"></div>
+            <div id="rsCloneTargetWrap" style="display:none"><label class="fld">Namespace cible</label><input type="text" id="rsCloneTargetNs" placeholder="bo-dev-restore"></div>
+          </div>
+          <label class="fld" id="rsCloneRefsWrap" style="margin-top:8px;display:none"><input type="checkbox" id="rsCloneRefs" checked style="width:auto">
+            Cloner aussi les dépendances (Secrets, ConfigMaps, ServiceAccount, Services qui ciblent l'app)
+            <span class="hint">— nécessaire pour que les pods démarrent dans l'autre namespace</span></label>
+        </div>
+      </div>
+      <label class="fld">Volumes à restaurer</label>
+      <ul class="pvc-list" id="rsPvcs" style="margin-top:12px"></ul>
+    </div>
+
+    <div class="card" id="rsConfig" style="display:none">
+      <h3><span class="step-no">2</span>Restaurer les données (Volume Groups)</h3>
+      <div id="rsFlowGuide" class="rsGuide"></div>
+      <div id="rsVolCfgs"></div>
+      <div id="rsHyActions"></div>
+      <div id="rsInplaceRunWrap" style="display:none;margin-top:14px;border-top:1px solid var(--line);padding-top:12px">
+        <p class="sub" style="margin:4px 0 8px"><b>Arrêt de l'application → restore in-place HYCU → redémarrage.</b> Aucune référence à saisir.</p>
+        <button class="btn" id="rsInplaceRun" disabled>Lancer la restauration sur place</button>
+        <span class="hint" id="rsInplaceHint" style="margin:0"></span>
+        <div aria-live="polite" id="rsInplaceLog"></div>
+      </div>
+      <div id="rsContinueWrap" style="margin-top:14px">
+        <button class="btn" id="rsPreview">Continuer : vérifier et lancer →</button>
+      </div>
+      <div id="rsErr"></div>
+    </div>
+
+    <details class="rsAdv" id="rsAdvWrap"><summary class="rsAdvSum">Avancé — dossier de sauvegardes personnalisé</summary><div id="rsAdvBody"></div></details>
+    </div>
+    <div id="rsPgPlan" style="display:none">
+    <div class="card" id="rsPlan" style="display:none">
+      <h3><span class="step-no">3</span>Vérifier puis lancer</h3>
+      <p class="sub">Vérifiez les remplacements dérivés et la séquence, puis lancez.</p>
+      <div id="rsRepl"></div>
+      <div><b style="font-size:13px">Séquence prévue</b><ol class="plan" id="rsSteps"></ol></div>
+      <div id="rsCtxConfirm" style="display:none;margin-top:14px">
+        <label class="fld">Confirmation du contexte cible (mode réel)</label>
+        <input type="text" id="rsCtxInput" placeholder="retapez le nom du contexte kubectl">
+      </div>
+      <div style="margin-top:16px;display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+        <button class="btn" id="rsGo">Lancer la restauration</button>
+        <span class="hint" id="rsGoHint"></span>
+      </div>
+      <div id="rsProgress" class="progress" style="display:none">
+        <div class="progress-head"><span id="rsProgressTxt"></span><button class="btn ghost" type="button" id="rsCancel" style="display:none">Arrêter après l'étape en cours</button></div>
+        <div class="progress-track"><div class="progress-bar" id="rsProgressBar"></div></div>
+      </div>
+      <div id="rsLog" aria-live="polite"></div>
+    </div>
+    </div>
+    <div class="nextbar" id="rsNextBar"><span id="rsNextTxt"></span><button class="btn" id="rsNextBtn"></button></div>
+  </section>
+
+    </div>
+    <div class="hm-foot" id="mRestoreFoot"><span id="rsWizMode" class="badge" style="margin-right:auto"></span><button class="lnk" type="button" data-close="mRestore">Fermer</button><button class="btn ghost" type="button" id="rsWizBack">Retour</button><button class="btn" type="button" id="rsWizGo">Suivant</button></div>
+  </div>
+</div>
+<div id="mSources" class="hmodal-bg" style="display:none">
+  <div class="hmodal" style="max-width:860px">
+    <div class="hm-head"><h2 id="mSourcesTitle">Sources</h2><div class="hm-ico"><button type="button" data-close="mSources" title="Fermer">✕</button></div></div>
+    <div class="hm-body">
+      <p class="hint" style="margin:0 0 12px">Enregistrez ici les systèmes utilisés par l'outil — HYCU, Nutanix et vos clusters Kubernetes. Les identifiants et kubeconfigs restent en mémoire le temps de la session (ou dans le coffre chiffré si vous le choisissez).</p>
+      <div class="srctools">
+        <button class="pact" id="clAddBtn" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="16" height="6.5" rx="1.3"/><rect x="4" y="13.5" width="10" height="6.5" rx="1.3"/><path d="M18.5 14.5v5M16 17h5"/></svg><span>Ajouter un cluster Kubernetes</span></button>
+        <button class="pact" id="nkpBtn" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3.5" y="3.5" width="7" height="7" rx="1.2"/><rect x="13.5" y="3.5" width="7" height="7" rx="1.2"/><rect x="3.5" y="13.5" width="7" height="7" rx="1.2"/><circle cx="16.6" cy="16.6" r="3"/><path d="M18.8 18.8l2 2"/></svg><span>Découvrir les workspaces NKP</span></button>
+      </div>
+      <div class="tcard" style="box-shadow:none;border:1px solid var(--rule);margin-bottom:14px">
+        <table class="ht"><thead><tr><th>Nom</th><th>Type</th><th>URL / serveur</th><th class="ctr">État</th></tr></thead><tbody id="srcBody"></tbody></table>
+      </div>
+  <!-- ===================== CONNEXIONS ===================== -->
+  <section id="tab-connect">
+    <div class="card" data-card="hycu">
+      <h3><span class="step-no">H</span>HYCU — connexion</h3>
+      <p class="sub">Pour lister les points de restauration et orchestrer le clone/restore d'un Volume Group
+        depuis l'assistant de restauration (<b>Applications → Restaurer</b>). Les identifiants restent <b>en mémoire</b> le temps de la session — jamais écrits sur disque.</p>
+      <label class="fld">URL HYCU (port 8443)</label>
+      <input type="text" id="hyUrl" placeholder="https://hycu.exemple.com:8443">
+      <label class="fld">Authentification</label>
+      <div class="seg" id="hyAuthMode">
+        <button class="on" data-mode="basic">Basic (utilisateur)</button>
+        <button data-mode="apikey">Clé API</button>
+      </div>
+      <div id="hyBasicFields" class="row">
+        <div><label class="fld">Identifiant</label><input type="text" id="hyUser" autocomplete="off"></div>
+        <div><label class="fld">Mot de passe</label><input type="password" id="hyPass" autocomplete="off"></div>
+      </div>
+      <div id="hyApiField" style="display:none">
+        <label class="fld">Clé API <span class="hint">(HYCU : Aide → API Keys)</span></label>
+        <input type="password" id="hyApiKey" autocomplete="off">
+      </div>
+      <label class="fld" style="margin-top:10px"><input type="checkbox" id="hyTls" style="width:auto"> Vérifier le certificat TLS (décoché = certificat auto-signé accepté)</label>
+      <div style="margin-top:12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <button class="btn" id="hyConnect">Tester &amp; connecter</button>
+        <button class="btn ghost" id="hyDisconnect">Déconnecter</button>
+        <span class="hint" id="hyStatus" style="margin:0"><span class="conn-dot"></span>non connecté</span>
+      </div>
+      <div id="hyErr"></div>
+    </div>
+
+    <div class="card" data-card="nutanix">
+      <h3><span class="step-no">N</span>Nutanix Prism Element — connexion</h3>
+      <p class="sub">Récupère automatiquement la référence (UUID) du Volume Group cloné (lecture seule, API v2)
+        dans l'assistant de restauration. Identifiants en mémoire de session uniquement.</p>
+      <label class="fld">URL Prism Element</label>
+      <input type="text" id="ntUrl" placeholder="https://prism-element.exemple.com:9440">
+      <div class="row">
+        <div><label class="fld">Identifiant</label><input type="text" id="ntUser" autocomplete="off"></div>
+        <div><label class="fld">Mot de passe</label><input type="password" id="ntPass" autocomplete="off"></div>
+      </div>
+      <label class="fld" style="margin-top:10px"><input type="checkbox" id="ntTls" style="width:auto"> Vérifier le certificat TLS</label>
+      <div style="margin-top:12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <button class="btn" id="ntConnect">Tester &amp; connecter</button>
+        <button class="btn ghost" id="ntDisconnect">Déconnecter</button>
+        <span class="hint" id="ntStatus" style="margin:0"><span class="conn-dot"></span>non connecté</span>
+      </div>
+      <div id="ntErr"></div>
+    </div>
+
+    <div class="card" data-card="prismcentral">
+      <h3><span class="step-no">PC</span>Nutanix Prism Central — connexion</h3>
+      <p class="sub">Alternative multi-cluster (API v3). Sert aussi à récupérer la référence (UUID) du Volume Group
+        cloné si vous n'utilisez pas Prism Element. Identifiants en mémoire de session uniquement.</p>
+      <label class="fld">URL Prism Central</label>
+      <input type="text" id="pcUrl" placeholder="https://prism-central.exemple.com:9440">
+      <div class="row">
+        <div><label class="fld">Identifiant</label><input type="text" id="pcUser" autocomplete="off"></div>
+        <div><label class="fld">Mot de passe</label><input type="password" id="pcPass" autocomplete="off"></div>
+      </div>
+      <label class="fld" style="margin-top:10px"><input type="checkbox" id="pcTls" style="width:auto"> Vérifier le certificat TLS</label>
+      <div style="margin-top:12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <button class="btn" id="pcConnect">Tester &amp; connecter</button>
+        <button class="btn ghost" id="pcDisconnect">Déconnecter</button>
+        <span class="hint" id="pcStatus" style="margin:0"><span class="conn-dot"></span>non connecté</span>
+      </div>
+      <div id="pcErr"></div>
+    </div>
+
+    <div class="card" data-card="s3">
+      <h3><span class="step-no">S3</span>Stockage objet S3 — export des sauvegardes (optionnel)</h3>
+      <p class="sub">Copie chaque sauvegarde de configuration (<code>.zip</code>) vers un bucket <b>compatible S3</b>
+        (Nutanix Objects, MinIO, AWS S3…) : le filet de sécurité vit alors <b>hors du cluster</b> qu'il protège.
+        Clés d'accès en <b>mémoire</b> le temps de la session (coffre chiffré en option).</p>
+      <div class="row">
+        <div><label class="fld">Endpoint S3</label><input type="text" id="s3Url" placeholder="https://objects.exemple.com"></div>
+        <div><label class="fld">Bucket</label><input type="text" id="s3Bucket" placeholder="hycu-backups" autocomplete="off"></div>
+      </div>
+      <div class="row">
+        <div><label class="fld">Clé d'accès (Access key)</label><input type="text" id="s3Access" autocomplete="off"></div>
+        <div><label class="fld">Clé secrète (Secret key)</label><input type="password" id="s3Secret" autocomplete="off"></div>
+      </div>
+      <div class="row">
+        <div><label class="fld">Région (signature)</label><input type="text" id="s3Region" placeholder="us-east-1"></div>
+        <div style="align-self:flex-end">
+          <label class="fld"><input type="checkbox" id="s3PathStyle" checked style="width:auto"> URL de type chemin (Objects / MinIO)</label>
+          <label class="fld"><input type="checkbox" id="s3Tls" style="width:auto"> Vérifier le certificat TLS</label>
+        </div>
+      </div>
+      <label class="fld" style="margin-top:10px"><input type="checkbox" id="s3Auto" style="width:auto">
+        <b>Export automatique</b> : envoyer chaque sauvegarde réussie (manuelle et planifiée) vers le bucket</label>
+      <label class="fld"><input type="checkbox" id="s3Enc" style="width:auto">
+        <b>Chiffrer les exports</b> (option) : les objets envoyés sont chiffrés — le bucket peut être un stockage non maîtrisé</label>
+      <div id="s3EncWrap" style="display:none"><label class="fld">Phrase de chiffrement des exports (à conserver : elle sert au déchiffrement)</label>
+        <input type="password" id="s3EncPass" autocomplete="off">
+        <div class="hint" style="margin-top:4px">Déchiffrement hors interface : <code>python3 hycu_k8s_nutanix.py --decrypt fichier.zip.enc</code></div></div>
+      <div style="margin-top:12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <button class="btn" id="s3Connect">Tester &amp; connecter</button>
+        <button class="btn ghost" id="s3Disconnect">Déconnecter</button>
+        <span class="hint" id="s3Status" style="margin:0"><span class="conn-dot"></span>non connecté</span>
+      </div>
+      <div class="hint" style="margin-top:8px">Test en lecture seule (liste du bucket, 1 objet). Objets créés :
+        <code>&lt;préfixe&gt;/&lt;cluster&gt;/&lt;namespace&gt;/&lt;horodatage&gt;.zip</code>. L'échec d'un export
+        n'échoue jamais la sauvegarde locale (visible dans les Tâches).</div>
+      <div id="s3Err"></div>
+      <div style="margin-top:14px;border-top:1px solid var(--line);padding-top:12px">
+        <button class="pact" id="s3ListBtn" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12M7.5 10.5L12 15l4.5-4.5"/><path d="M4 17v2.5h16V17"/></svg><span>Importer depuis le bucket (reprise / DR)</span></button>
+        <div id="s3ImportWrap" style="display:none;margin-top:10px">
+          <div id="s3ListOut"></div>
+          <div class="row" style="margin-top:8px">
+            <div><label class="fld">Phrase de déchiffrement (objets .enc uniquement)</label><input type="password" id="s3ImpPass" autocomplete="off"></div>
+            <div style="flex:none;align-self:flex-end"><button class="btn" id="s3ImportBtn" type="button" disabled>Importer la sélection</button></div>
+          </div>
+          <div class="hint" style="margin-top:4px">Les exports rapatriés vont dans <code>hycu-backups/_imports/…</code> ; ils se restaurent via la <b>Restauration DR</b> de l'assistant (ou sur leur cluster d'origine).</div>
+          <div id="s3ImpRes"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card" data-card="vault">
+      <h3><span class="step-no">🔒</span>Mémoriser les connexions (chiffré)</h3>
+      <p class="sub">Option : enregistrer les identifiants saisis (et les kubeconfigs des clusters ajoutés) dans un coffre <b>chiffré</b>
+        (<code>hycu_secrets.enc</code>), protégé par une <b>phrase secrète maîtresse</b> — jamais stockée.
+        Par défaut, rien n'est écrit (RAM seulement), le choix le plus sûr.</p>
+      <label class="fld">Phrase secrète (≥ 8 caractères)</label>
+      <input type="password" id="vaultPass" autocomplete="off">
+      <div style="margin-top:12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <button class="btn" id="vaultSave">Enregistrer (chiffrer)</button>
+        <button class="btn ghost" id="vaultLoad">Charger (déchiffrer)</button>
+        <button class="btn danger" id="vaultForget">Oublier</button>
+        <span class="hint" id="vaultStatus" style="margin:0"><span class="conn-dot"></span>aucun coffre</span>
+      </div>
+      <div class="hint" style="margin-top:8px">MD5 n'étant pas réversible, le coffre utilise un chiffrement
+        par phrase secrète (PBKDF2-HMAC-SHA256 + scellé d'intégrité).</div>
+      <div id="vaultErr"></div>
+    </div>
+
+    <div class="card" data-card="cluster-add">
+      <h3><span class="step-no">K</span>Ajouter un cluster Kubernetes</h3>
+      <p class="sub">Chargez le <b>kubeconfig</b> du cluster (fichier ou copier-coller). Comme un mot de passe, il reste
+        <b>en mémoire</b> le temps de la session, et n'est écrit sur disque que <b>chiffré</b> si vous utilisez le coffre.
+        Les sauvegardes de chaque cluster sont rangées séparément.</p>
+      <div class="row">
+        <div><label class="fld">Nom du cluster</label><input type="text" id="clName" placeholder="prod-paris" autocomplete="off"></div>
+        <div><label class="fld">Fichier kubeconfig</label><input type="file" id="clFile"></div>
+      </div>
+      <label class="fld">…ou collez son contenu (YAML ou JSON)</label>
+      <textarea id="clKc" class="kc" spellcheck="false" autocomplete="off" placeholder="apiVersion: v1&#10;kind: Config&#10;clusters: …"></textarea>
+      <div id="clCtxWrap" style="display:none"><label class="fld">Contexte</label><select id="clCtx"></select><div id="clCtxInfo"></div></div>
+      <div style="margin-top:12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <button class="btn" id="clAdd" type="button">Tester &amp; ajouter</button>
+        <span class="hint" style="margin:0">Test de connexion en lecture seule (liste des namespaces, 10 s max).</span>
+      </div>
+      <div id="clErr"></div>
+    </div>
+
+    <div class="card" data-card="cluster">
+      <h3><span class="step-no">K</span><span id="clDTitle">Cluster</span></h3>
+      <div id="clDBody"></div>
+      <div style="margin-top:12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <button class="btn" id="clUse" type="button">Définir comme cluster actif</button>
+        <button class="btn ghost" id="clLocalCfg" type="button">Ouvrir les réglages</button>
+        <button class="btn danger" id="clRemove" type="button">Retirer</button>
+      </div>
+      <div id="clDErr"></div>
+    </div>
+
+    <div class="card" data-card="nkp">
+      <h3><span class="step-no">W</span>Découverte des workspaces NKP (optionnel)</h3>
+      <p class="sub">Depuis le <b>cluster de management</b> NKP, liste les <b>workspaces</b> et leurs clusters, puis importe
+        leurs kubeconfigs. Cluster interrogé : <b id="nkpMgmt">—</b> (le cluster actif — choisissez le cluster de management
+        dans la barre du haut).</p>
+      <div class="warnbox">⚠ <b>Droits élevés requis</b> sur le cluster de management : lecture des Workspaces, des
+        KommanderClusters et des <b>Secrets</b> kubeconfig des namespaces de workspace. Les kubeconfigs importés donnent
+        souvent un accès <b>administrateur</b> aux clusters : ils restent en mémoire (coffre chiffré en option), jamais en clair sur disque.</div>
+      <div style="margin-top:12px"><button class="btn" id="nkpDiscover" type="button">Découvrir</button></div>
+      <div id="nkpOut"></div>
+      <div id="nkpImportWrap" style="display:none;margin-top:10px">
+        <label class="fld"><input type="checkbox" id="nkpAck" style="width:auto"> J'ai compris : importer les kubeconfigs des clusters cochés</label>
+        <button class="btn" id="nkpImport" type="button" disabled>Importer la sélection</button>
+      </div>
+      <div id="nkpRes"></div>
+    </div>
+  </section>
+
+    </div>
+    <div class="hm-foot" id="mSourcesFoot"><button class="lnk" type="button" data-close="mSources">Fermer</button></div>
+  </div>
+</div>
+
+<script>
+// @@SCRIPT@@
+</script>
+</body>
+</html>

@@ -16,13 +16,19 @@ la **même image**. Plusieurs opérateurs peuvent l'utiliser (chacun via son `po
   - le **cluster où il tourne** (cas courant), **ou**
   - un **autre cluster** (ex. l'outil sur un cluster *d'administration*, et il pilote un
     cluster *de production* distant).
-- **Accès = `kubectl port-forward`** (pas d'Ingress : une protection interne n'accepte que
-  les accès en boucle locale).
+- **Accès = `kubectl port-forward`** par défaut. Pour exposer l'outil sous un **nom DNS**
+  (Ingress, reverse-proxy), déclarez ce nom dans `HYCU_ALLOWED_HOSTS` (ou `allowed_hosts`
+  dans Réglages), ouvrez la NetworkPolicy au contrôleur d'Ingress et protégez l'Ingress par
+  une authentification (SSO, oauth2-proxy, liste d'IP) et TLS : exemple commenté dans
+  `deploy/k8s/hycu.yaml`. Tout autre nom d'hôte est refusé.
 - **Tout persiste sur un PVC** : configuration, coffre chiffré des identifiants, et
   sauvegardes. Le Pod peut redémarrer sans rien perdre.
-- **Accès = sécurité** : il n'y a pas d'authentification applicative. La frontière réelle,
-  c'est le **RBAC** du namespace `hycu` : quiconque peut `port-forward`/`exec` vers le Pod
-  devient **opérateur complet**.
+- **Accès = sécurité** : il n'y a pas d'authentification applicative. Deux frontières :
+  la **NetworkPolicy** du manifeste (aucun trafic entrant depuis le réseau de pods ; seul
+  `kubectl port-forward` passe) et le **RBAC** du namespace `hycu` : quiconque peut
+  `port-forward`/`exec` vers le Pod devient **opérateur complet**. Ne retirez pas la
+  NetworkPolicy : sans elle, tout pod du cluster pourrait piloter l'outil.
+- **Sondes** : `GET /healthz` (déjà configuré dans le manifeste) ; ne sondez jamais `/`.
 
 ---
 
@@ -56,11 +62,17 @@ la **même image**. Plusieurs opérateurs peuvent l'utiliser (chacun via son `po
 kubectl create namespace hycu
 ```
 
-**2. Monter ton kubeconfig (sous forme de Secret) :**
+**2. Monter un kubeconfig (sous forme de Secret) :**
+
+> ⚠️ **Ne montez pas votre kubeconfig personnel** (souvent `cluster-admin`, parfois avec un
+> plugin `exec` qui ne fonctionne pas en conteneur). Créez l'identité dédiée à moindre
+> privilège (`deploy/k8s/rbac.yaml` + `deploy/k8s/make-kubeconfig.sh`, jeton borné dans le
+> temps, à renouveler) et montez **ce** kubeconfig :
 ```bash
-kubectl -n hycu create secret generic hycu-kubeconfig --from-file=config=<chemin-vers-ton-kubeconfig>
+kubectl apply -f deploy/k8s/rbac.yaml            # ServiceAccount + droits (voir les RoleBindings Secrets par namespace)
+./deploy/k8s/make-kubeconfig.sh                  # écrit ./kubeconfig (umask 077, jeton 1 an par défaut)
+kubectl -n hycu create secret generic hycu-kubeconfig --from-file=config=./kubeconfig
 ```
-*(Windows : `--from-file=config=C:\Users\<toi>\.kube\config`.)*
 
 **3. Déployer l'outil.** L'image est tirée **automatiquement depuis ghcr.io**
 (`ghcr.io/cabsalon93/hycu-nkp-plugin:latest`, publique) — rien à construire. Deux façons

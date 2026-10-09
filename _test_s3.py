@@ -12,6 +12,9 @@ import tempfile
 import threading
 import zipfile
 import hycu_k8s_nutanix as H
+# Isolation : le contexte kubectl du poste (s'il existe) ne doit pas changer la clé
+# d'objet attendue (« local »). Aucun kubectl réel n'est sollicité.
+H._local_context_name = lambda *a, **k: None
 
 passed = failed = 0
 def check(c, m):

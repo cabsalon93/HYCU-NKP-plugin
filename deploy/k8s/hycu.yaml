@@ -9,15 +9,44 @@
 # Appliquer :
 #   kubectl apply -f deploy/k8s/hycu.yaml
 #
-# Accéder (PAS d'Ingress — cf. spec) :
+# Accéder, par défaut (sans Ingress) :
 #   kubectl -n hycu port-forward svc/hycu 8765:8765   ->   http://127.0.0.1:8765
 #
-# Sécurité : la frontière d'accès réelle est le RBAC sur ce namespace —
-#   quiconque peut port-forward/exec ici = opérateur complet (kubectl puissant).
+# Exposer sous un NOM DNS (optionnel) : ajoutez le nom à `HYCU_ALLOWED_HOSTS` (ou à la clé
+#   `allowed_hosts` de la configuration), créez un Ingress (exemple commenté en bas de ce
+#   fichier) et ouvrez la NetworkPolicy au contrôleur d'Ingress. Tout autre en-tête Host
+#   reste refusé (anti-DNS-rebinding).
+#   ⚠ L'outil n'a PAS d'authentification applicative : derrière un nom DNS, placez une
+#   authentification (SSO / oauth2-proxy / liste d'IP) et TLS sur l'Ingress.
+#
+# Sécurité : le serveur écoute sur toutes les interfaces du Pod (HYCU_HOST=0.0.0.0 dans
+#   l'image) et sa garde « Host » ne repose que sur les en-têtes HTTP. La NetworkPolicy
+#   ci-dessous refuse donc le trafic entrant vers le Pod sauf celui que vous autorisez
+#   explicitement (contrôleur d'Ingress) : `kubectl port-forward` passe par le kubelet et
+#   n'est pas concerné. Le RBAC du namespace `hycu` reste la seconde frontière : quiconque
+#   peut port-forward/exec ici est opérateur complet.
 apiVersion: v1
 kind: Namespace
 metadata:
   name: hycu
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: hycu-deny-ingress
+  namespace: hycu
+spec:
+  podSelector:
+    matchLabels: { app: hycu }
+  policyTypes: ["Ingress"]
+  ingress: []                       # aucun trafic entrant depuis le réseau de pods
+  # Exposition DNS : remplacez `ingress: []` par une règle vers votre contrôleur d'Ingress, ex. :
+  # ingress:
+  #   - from:
+  #       - namespaceSelector:
+  #           matchLabels: { kubernetes.io/metadata.name: ingress-nginx }
+  #     ports:
+  #       - { protocol: TCP, port: 8765 }
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -46,34 +75,55 @@ spec:
     metadata:
       labels: { app: hycu }
     spec:
+      automountServiceAccountToken: false   # l'outil n'utilise jamais le SA du Pod (kubeconfig monté)
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
         fsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
       containers:
         - name: hycu
           # Image VERSIONNÉE (un tag git v<version> publie ghcr.io/...:v<version>).
           # Montée de version : kubectl -n hycu set image deployment/hycu hycu=...:vNOUVELLE
           # Retour arrière   : kubectl -n hycu rollout undo deployment hycu
-          image: ghcr.io/cabsalon93/hycu-nkp-plugin:v20260928-2000
+          image: ghcr.io/cabsalon93/hycu-nkp-plugin:v20261009-2300
           ports:
             - containerPort: 8765
           env:
             - { name: TZ, value: "Europe/Paris" }
+            - { name: PYTHONUNBUFFERED, value: "1" }     # journaux visibles dans kubectl logs
+            # Exposition DNS : noms d'hôte acceptés en plus de la boucle locale (virgules).
+            # - { name: HYCU_ALLOWED_HOSTS, value: "hycu.interne.exemple.fr" }
+            - { name: KUBECACHEDIR, value: "/tmp/kubecache" }   # ~/.kube est en lecture seule
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
           volumeMounts:
             - { name: data, mountPath: /data }
             - { name: kubeconfig, mountPath: /home/app/.kube, readOnly: true }
+            - { name: tmp, mountPath: /tmp }
+            - { name: shm, mountPath: /dev/shm }        # kubeconfigs temporaires en RAM (0600)
           resources:
             requests: { cpu: "50m", memory: "64Mi" }
             limits:   { cpu: "500m", memory: "256Mi" }   # grands clusters (centaines de namespaces) : 512Mi conseillé
           readinessProbe:
-            tcpSocket: { port: 8765 }   # TCP : la garde Host de l'app rejette un httpGet sondé par IP
+            httpGet:
+              path: /healthz                  # aucune logique de session sur ce chemin
+              port: 8765
+              httpHeaders:
+                - { name: Host, value: "127.0.0.1" }   # garde Host de l'application
             initialDelaySeconds: 5
             periodSeconds: 15
           livenessProbe:
-            tcpSocket: { port: 8765 }
+            httpGet:
+              path: /healthz
+              port: 8765
+              httpHeaders:
+                - { name: Host, value: "127.0.0.1" }
             initialDelaySeconds: 10
             periodSeconds: 30
+      terminationGracePeriodSeconds: 180   # laisse finir une restauration en cours (SIGTERM géré)
       volumes:
         - name: data
           persistentVolumeClaim:
@@ -83,6 +133,10 @@ spec:
             secretName: hycu-kubeconfig
             items:
               - { key: config, path: config }
+        - name: tmp
+          emptyDir: {}
+        - name: shm
+          emptyDir: { medium: Memory, sizeLimit: 16Mi }
 ---
 apiVersion: v1
 kind: Service
@@ -90,8 +144,33 @@ metadata:
   name: hycu
   namespace: hycu
 spec:
-  type: ClusterIP                   # accès par `kubectl port-forward` ; PAS d'Ingress
+  type: ClusterIP                   # accès par `kubectl port-forward`, ou via l'Ingress ci-dessous
   selector: { app: hycu }
   ports:
     - port: 8765
       targetPort: 8765
+# ---
+# Exemple d'Ingress (optionnel) — à adapter : nom DNS, classe, TLS, et SURTOUT une
+# authentification devant l'outil (annotations oauth2-proxy / SSO, ou liste d'IP).
+# apiVersion: networking.k8s.io/v1
+# kind: Ingress
+# metadata:
+#   name: hycu
+#   namespace: hycu
+#   annotations:
+#     nginx.ingress.kubernetes.io/auth-url: "https://oauth2-proxy.exemple.fr/oauth2/auth"
+#     nginx.ingress.kubernetes.io/auth-signin: "https://oauth2-proxy.exemple.fr/oauth2/start?rd=$scheme://$host$request_uri"
+#     nginx.ingress.kubernetes.io/whitelist-source-range: "10.0.0.0/8"
+# spec:
+#   ingressClassName: nginx
+#   tls:
+#     - hosts: ["hycu.interne.exemple.fr"]
+#       secretName: hycu-tls
+#   rules:
+#     - host: hycu.interne.exemple.fr
+#       http:
+#         paths:
+#           - path: /
+#             pathType: Prefix
+#             backend:
+#               service: { name: hycu, port: { number: 8765 } }

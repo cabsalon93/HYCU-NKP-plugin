@@ -1,21 +1,27 @@
-# Identité « autonome » pour l'outil : un ServiceAccount + ses droits RBAC + un token
-# long-lived (k8s >= 1.24 ne génère plus de token automatiquement). On en fabrique
-# ensuite un kubeconfig SANS exec-plugin (cf. make-kubeconfig.sh).
+# Identité « autonome » pour l'outil : un ServiceAccount + ses droits RBAC. Le jeton est
+# fabriqué à la demande (TokenRequest borné dans le temps, cf. make-kubeconfig.sh) et
+# transformé en kubeconfig SANS exec-plugin.
 #
 # Prérequis : le namespace `hycu` doit exister (kubectl create namespace hycu).
-# Ajustez les verbes selon votre politique de moindre privilège ; pour un essai rapide,
-# vous pouvez à la place lier le SA à `cluster-admin` (déconseillé en prod).
+#
+# Moindre privilège : les règles ci-dessous correspondent EXACTEMENT aux appels kubectl
+# de l'outil (lecture des manifestes pour la sauvegarde étendue, séquence de restauration,
+# clone d'application, pré-vol). Les Secrets ne sont lus qu'au niveau NAMESPACE : un
+# RoleBinding par namespace applicatif (voir le bloc « hycu-app-secrets » en bas),
+# jamais cluster-wide.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: hycu-operator
   namespace: hycu
+automountServiceAccountToken: false
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
   name: hycu-operator
 rules:
+  # --- Séquence de restauration (PV cluster-scoped, PVC, pods, VolumeAttachment) ---
   - apiGroups: [""]
     resources: ["persistentvolumes"]
     verbs: ["get", "list", "watch", "create", "patch", "delete"]
@@ -25,18 +31,43 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["volumeattachments", "storageclasses"]
+    verbs: ["get", "list"]                       # pré-vol : détachement confirmé, StorageClass présente
   - apiGroups: [""]
     resources: ["namespaces"]
-    verbs: ["get", "list", "create"]            # clone cross-namespace : création du ns cible
-  - apiGroups: [""]
-    resources: ["secrets", "configmaps", "serviceaccounts", "services"]
-    verbs: ["get", "list", "create"]            # clone d'application : lecture + création des dépendances
+    verbs: ["get", "list", "create"]             # clone cross-namespace : création du ns cible
+  # --- Workloads : lecture (sauvegarde étendue), scale (restauration), création (clone) ---
   - apiGroups: ["apps"]
-    resources: ["deployments", "statefulsets"]
-    verbs: ["get", "list", "watch", "patch", "update"]
+    resources: ["deployments", "statefulsets", "daemonsets"]
+    verbs: ["get", "list", "watch", "create", "patch", "update"]
   - apiGroups: ["apps"]
     resources: ["deployments/scale", "statefulsets/scale"]
-    verbs: ["get", "update", "patch"]           # scale-down/up de l'application
+    verbs: ["get", "update", "patch"]
+  # --- Dépendances clonées (ConfigMaps, ServiceAccounts, Services) ---
+  - apiGroups: [""]
+    resources: ["configmaps", "serviceaccounts", "services"]
+    verbs: ["get", "list", "create"]
+  # --- Sauvegarde de configuration ÉTENDUE : lecture seule des kinds exportés ---
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["get", "list"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses", "networkpolicies"]
+    verbs: ["get", "list"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles", "rolebindings"]
+    verbs: ["get", "list"]
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
+    verbs: ["get", "list"]
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "list"]
+  # --- Pré-vol : vérification des droits (kubectl auth can-i) ---
+  - apiGroups: ["authorization.k8s.io"]
+    resources: ["selfsubjectaccessreviews"]
+    verbs: ["create"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -51,11 +82,29 @@ subjects:
     name: hycu-operator
     namespace: hycu
 ---
-apiVersion: v1
-kind: Secret
+# Secrets : lecture + création LIMITÉES aux namespaces applicatifs protégés. Dupliquez
+# le RoleBinding ci-dessous pour chaque namespace de `namespace_filter` (remplacez
+# `wordpress`). Sans ce binding, la sauvegarde étendue signale les Secrets comme
+# « non exportés » (resources_skipped) et le clone cross-namespace ne copie pas les Secrets.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
 metadata:
-  name: hycu-operator-token
-  namespace: hycu
-  annotations:
-    kubernetes.io/service-account.name: hycu-operator
-type: kubernetes.io/service-account-token
+  name: hycu-app-secrets
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: hycu-app-secrets
+  namespace: wordpress                # <- un RoleBinding par namespace applicatif
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: hycu-app-secrets
+subjects:
+  - kind: ServiceAccount
+    name: hycu-operator
+    namespace: hycu
