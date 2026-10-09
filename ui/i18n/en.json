@@ -3750,5 +3750,13 @@
 [
 "> Proposer le mode simulation (interrupteur dans le bandeau ; sinon l'outil travaille en mode réel)<",
 "> Offer the simulation mode (switch in the banner; otherwise the tool works in live mode)<"
+],
+[
+">Noms d'hôte autorisés pour accéder à l'interface (vide = boucle locale uniquement)<",
+">Host names allowed to reach the interface (empty = loopback only)<"
+],
+[
+"Nom DNS d'un Ingress ou d'un reverse-proxy. L'outil n'a pas d'authentification : placez une authentification (SSO, oauth2-proxy, liste d'IP) et TLS devant lui dès qu'il quitte la boucle locale.",
+"DNS name of an Ingress or reverse proxy. The tool has no authentication: put authentication (SSO, oauth2-proxy, IP allowlist) and TLS in front of it as soon as it leaves the loopback."
 ]
 ]

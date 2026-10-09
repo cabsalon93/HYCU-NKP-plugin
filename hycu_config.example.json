@@ -6,6 +6,7 @@
   "kube_context": "",
   "kubeconfig_path": "",
   "allowed_contexts": [],
+  "allowed_hosts": [],
   "namespace_filter": [],
   "cluster_namespace_filters": {},
 

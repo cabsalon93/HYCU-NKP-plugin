@@ -135,3 +135,34 @@ def test_op_cancel(H):
             break
         time.sleep(0.05)
     assert st["done"] and st["result"]["error"] == "annulé"
+
+
+def test_allowed_hosts_dns_exposure(H):
+    """Un nom DNS configuré (Ingress / reverse-proxy) est accepté pour Host et Origin ;
+    tout autre nom reste refusé (anti-DNS-rebinding)."""
+    c = _run(H, "GET", "/api/context", {"Host": "hycu.interne.exemple.fr"})
+    assert c["code"] == 403
+    ok, err = H.save_config({"allowed_hosts": "hycu.interne.exemple.fr, Hycu-DR.exemple.fr"}, source="api")
+    assert ok, err
+    c = _run(H, "GET", "/api/context", {"Host": "hycu.interne.exemple.fr:443"})
+    assert c["code"] == 200
+    c = _run(H, "GET", "/api/context", {"Host": "HYCU-DR.exemple.fr"})
+    assert c["code"] == 200
+    c = _run(H, "GET", "/api/context", {"Host": "autre.exemple.fr"})
+    assert c["code"] == 403
+    # Origin : le nom autorisé passe, un tiers non
+    c = _run(H, "POST", "/api/op_cancel", {"Host": "hycu.interne.exemple.fr", "Origin": "https://hycu.interne.exemple.fr",
+                                           "X-CSRF-Token": H.CSRF_TOKEN}, {"id": "x"})
+    assert c["code"] == 200
+    c = _run(H, "POST", "/api/op_cancel", {"Host": "hycu.interne.exemple.fr", "Origin": "https://attaquant.exemple.fr",
+                                           "X-CSRF-Token": H.CSRF_TOKEN}, {"id": "x"})
+    assert c["code"] == 403
+    # valeur invalide refusée
+    assert not H.save_config({"allowed_hosts": ["pas un hôte !"]}, source="api")[0]
+
+
+def test_allowed_hosts_from_env(H, monkeypatch):
+    monkeypatch.setenv("HYCU_ALLOWED_HOSTS", "hycu.exemple.fr,backup.exemple.fr")
+    H.load_config()
+    assert H.CONFIG["allowed_hosts"] == ["hycu.exemple.fr", "backup.exemple.fr"]
+    assert H._host_is_local("backup.exemple.fr:8765")

@@ -1252,6 +1252,7 @@ async function loadConfig(){
   $("#cfgKubectl").value=c.kubectl_path||""; $("#cfgVhPrefix").value=c.volume_handle_prefix||"";
   $("#cfgCtx").value=(c.allowed_contexts||[]).join(", ");
   $("#cfgNs").value=(c.namespace_filter||[]).join(", ");
+  $("#cfgHosts").value=(c.allowed_hosts||[]).join(", ");
   $("#cfgWait").value=c.wait_timeout; $("#cfgSuffix").value=c.clone_name_suffix||"";
   $("#cfgConfirm").checked=!!c.require_context_confirm; $("#cfgStrip").checked=!!c.strip_claimref;
   $("#cfgSim").checked=!!c.simulation_mode_available; $("#cfgLang").value=c.default_lang||"en";
@@ -1280,7 +1281,7 @@ function csv(s){return (s||"").split(",").map(x=>x.trim()).filter(Boolean);}
 $("#cfgSave").onclick=async()=>{
   const cfg={kubectl_path:$("#cfgKubectl").value.trim()||"kubectl",
     volume_handle_prefix:$("#cfgVhPrefix").value.trim(),
-    allowed_contexts:csv($("#cfgCtx").value), namespace_filter:csv($("#cfgNs").value),
+    allowed_contexts:csv($("#cfgCtx").value), namespace_filter:csv($("#cfgNs").value), allowed_hosts:csv($("#cfgHosts").value),
     wait_timeout:parseInt($("#cfgWait").value)||120, clone_name_suffix:$("#cfgSuffix").value.trim()||"0000",
     require_context_confirm:$("#cfgConfirm").checked, strip_claimref:$("#cfgStrip").checked,
     simulation_mode_available:$("#cfgSim").checked, default_lang:$("#cfgLang").value};

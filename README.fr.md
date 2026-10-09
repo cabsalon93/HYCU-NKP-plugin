@@ -354,6 +354,11 @@ Running ; plafond ~10 min — recliquez pour arrêter).
   (seul `kubectl port-forward`, qui passe par le kubelet, atteint le Pod).
 - Protection **anti-CSRF / anti-DNS-rebinding** : vérification des en-têtes `Host`
   et `Origin`/`Referer`, et **jeton anti-CSRF** exigé sur chaque action.
+- **Exposition sous un nom DNS** possible : `allowed_hosts` (ou `HYCU_ALLOWED_HOSTS`)
+  liste les noms d'hôte acceptés en plus de la boucle locale ; tout autre en-tête `Host`
+  ou `Origin` reste refusé (anti-DNS-rebinding). L'outil n'ayant **pas d'authentification
+  applicative**, placez une authentification (SSO, oauth2-proxy, liste d'IP) et TLS devant
+  lui (Ingress, reverse-proxy) dès qu'il quitte la boucle locale.
 - **Mode réel par défaut**, avec préflight et confirmation du cluster/contexte ciblé
   avant toute action destructive ; mode simulation proposé si `simulation_mode_available`.
 - **Sondes et outils** : `GET /healthz` (et `/readyz`) répond sans toucher à la session ;
@@ -402,6 +407,7 @@ la page **Réglages** de l'interface. Toutes les clés sont optionnelles.
 | `kube_context` / `kubeconfig_path` | `""` | Contexte et fichier kubeconfig du cluster **local** (vide = résolution kubectl par défaut). |
 | `backup_root` | `./hycu-backups` | Dossier des sauvegardes, du journal d'audit et des transactions de restauration (`HYCU_BACKUP_ROOT` en conteneur). |
 | `logo_path` | `""` | Chemin explicite d'un logo à afficher dans l'en-tête (sinon `hycu_logo.*` ou l'asset HYCU à côté du programme). |
+| `allowed_hosts` | `[]` | Noms d'hôte (DNS) sous lesquels l'interface peut être servie **en plus** de la boucle locale (Ingress, reverse-proxy). Vide = boucle locale uniquement. À protéger par une authentification en amont. |
 | `allowed_contexts` | `[]` | Liste blanche de contextes kubectl (ou de noms de clusters ajoutés dans ⚙ Sources). `[]` = tous. En mode réel, un contexte hors liste est **refusé**. |
 | `namespace_filter` | `[]` | Liste blanche de namespaces du cluster **local**. `[]` = tous. |
 | `cluster_namespace_filters` | `{}` | Listes blanches de namespaces des clusters **ajoutés dans ⚙ Sources**, par nom de cluster : `{"prod-paris": ["shop"]}`. Tenu à jour par l'éditeur de filtre. |
@@ -464,6 +470,7 @@ la page **Réglages** de l'interface. Toutes les clés sont optionnelles.
 | `HYCU_OPEN_BROWSER` | `open_browser` | `0` en conteneur. |
 | `HYCU_BACKUP_ROOT` | `backup_root` | `/data/hycu-backups` dans l'image. |
 | `HYCU_KUBECTL_PATH` | `kubectl_path` | Binaire kubectl de l'image. |
+| `HYCU_ALLOWED_HOSTS` | `allowed_hosts` | Noms DNS autorisés (séparés par des virgules) pour une exposition via Ingress / reverse-proxy. |
 
 Les surcharges d'environnement ne sont **jamais** écrites dans `hycu_config.json`.
 Sondes : `GET /healthz`. Alertes Prometheus prêtes à l'emploi : `deploy/k8s/alerts-prometheus.yaml`.

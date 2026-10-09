@@ -110,6 +110,12 @@ DEFAULT_CONFIG = {
     "kubeconfig_path": "",          # fichier kubeconfig (vide = résolution par défaut)
     "backup_root": os.path.join(os.getcwd(), "hycu-backups"),
     "allowed_contexts": [],         # [] = tout contexte (mais confirmation demandée)
+    # Noms d'hôte sous lesquels l'interface peut être servie EN PLUS de la boucle locale
+    # (anti-DNS-rebinding : tout autre en-tête Host/Origin est refusé). Permet au client
+    # d'exposer l'outil sous un nom DNS (Ingress, reverse-proxy), ex. ["hycu.interne.fr"].
+    # ⚠ L'outil n'a pas d'authentification applicative : placez une authentification
+    # (oauth2-proxy, SSO, liste d'IP) et TLS devant lui dès qu'il quitte la boucle locale.
+    "allowed_hosts": [],
     "namespace_filter": [],         # [] = tous les namespaces ; sinon liste blanche
     # Filtres de namespaces des clusters AJOUTÉS depuis l'interface (⚙ Sources) :
     # { "<nom du cluster>": ["ns1", "ns2"] }. Le cluster local utilise namespace_filter.
@@ -212,6 +218,7 @@ CONFIG_SCHEMA = {
     "kubeconfig_path": (str, None),
     "backup_root": (str, None),
     "allowed_contexts": (list, _is_str_list),
+    "allowed_hosts": (list, lambda v: _is_str_list(v) and all(re.match(r"^[A-Za-z0-9.\-]+$", x) for x in v)),
     "namespace_filter": (list, _is_str_list),
     "cluster_namespace_filters": (dict, lambda v: all(isinstance(x, list) and _is_str_list(x) for x in v.values())),
     "wait_timeout": (int, lambda v: 1 <= v <= 86400),
@@ -336,7 +343,8 @@ def _env_overrides():
     Priorité : env > hycu_config.json > défauts (ex. HYCU_HOST=0.0.0.0,
     HYCU_OPEN_BROWSER=0, HYCU_BACKUP_ROOT=/data/hycu-backups)."""
     mapping = {"HYCU_HOST": "host", "HYCU_PORT": "port", "HYCU_OPEN_BROWSER": "open_browser",
-               "HYCU_BACKUP_ROOT": "backup_root", "HYCU_KUBECTL_PATH": "kubectl_path"}
+               "HYCU_BACKUP_ROOT": "backup_root", "HYCU_KUBECTL_PATH": "kubectl_path",
+               "HYCU_ALLOWED_HOSTS": "allowed_hosts"}   # liste séparée par des virgules
     out = {}
     for env, key in mapping.items():
         val = os.environ.get(env)
@@ -464,9 +472,20 @@ UI_SESSION = {"id": None}
 ALLOWED_HOSTS = ("127.0.0.1", "localhost", "::1")
 
 
+def _host_allowed(name):
+    """Vrai si `name` (nom d'hôte sans port, minuscules) est la boucle locale ou un nom
+    autorisé par la configuration (allowed_hosts : nom DNS d'un Ingress / reverse-proxy)."""
+    if not name:
+        return False
+    n = name.strip().lower().rstrip(".")
+    if n in ALLOWED_HOSTS:
+        return True
+    return any(n == (x or "").strip().lower().rstrip(".") for x in (CONFIG.get("allowed_hosts") or []))
+
+
 def _host_is_local(hostport):
     """Extrait le nom d'hôte d'un en-tête Host (gère « host:port » et « [::1]:port »)
-    et vérifie qu'il désigne la boucle locale."""
+    et vérifie qu'il est autorisé (boucle locale ou allowed_hosts)."""
     if not hostport:
         return False
     h = hostport.strip()
@@ -475,7 +494,7 @@ def _host_is_local(hostport):
         h = h[1:end] if end != -1 else h[1:]
     elif h.count(":") == 1:                     # host:port (IPv4 / nom)
         h = h.rsplit(":", 1)[0]
-    return h in ALLOWED_HOSTS
+    return _host_allowed(h)
 
 # Sérialise les opérations destructives : un seul restore/backup à la fois.
 ACTION_LOCK = threading.Lock()
@@ -5244,7 +5263,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     name = urllib.parse.urlparse(val).hostname
                 except Exception:
                     return False
-                if name not in ALLOWED_HOSTS:
+                if not _host_allowed(name):
                     return False
         if require_origin and not seen:
             return False
@@ -6190,6 +6209,10 @@ HTML = r"""<!DOCTYPE html>
       <div class="row">
         <div><label class="fld">Contextes / clusters autorisés (séparés par des virgules ; vide = tous)</label><input type="text" id="cfgCtx" placeholder="prod-cluster, dr-cluster"></div>
         <div><label class="fld">Namespaces autorisés — cluster local (vide = tous)</label><input type="text" id="cfgNs" placeholder="wordpress, bo-dev"></div>
+      </div>
+      <div class="row">
+        <div><label class="fld">Noms d'hôte autorisés pour accéder à l'interface (vide = boucle locale uniquement)</label><input type="text" id="cfgHosts" placeholder="hycu.interne.exemple.fr">
+          <div class="hint" style="margin-top:4px">Nom DNS d'un Ingress ou d'un reverse-proxy. L'outil n'a pas d'authentification : placez une authentification (SSO, oauth2-proxy, liste d'IP) et TLS devant lui dès qu'il quitte la boucle locale.</div></div>
       </div>
       <div class="row">
         <div><label class="fld">Timeout d'attente (s)</label><input type="text" id="cfgWait" placeholder="120"></div>
@@ -7787,6 +7810,7 @@ async function loadConfig(){
   $("#cfgKubectl").value=c.kubectl_path||""; $("#cfgVhPrefix").value=c.volume_handle_prefix||"";
   $("#cfgCtx").value=(c.allowed_contexts||[]).join(", ");
   $("#cfgNs").value=(c.namespace_filter||[]).join(", ");
+  $("#cfgHosts").value=(c.allowed_hosts||[]).join(", ");
   $("#cfgWait").value=c.wait_timeout; $("#cfgSuffix").value=c.clone_name_suffix||"";
   $("#cfgConfirm").checked=!!c.require_context_confirm; $("#cfgStrip").checked=!!c.strip_claimref;
   $("#cfgSim").checked=!!c.simulation_mode_available; $("#cfgLang").value=c.default_lang||"en";
@@ -7815,7 +7839,7 @@ function csv(s){return (s||"").split(",").map(x=>x.trim()).filter(Boolean);}
 $("#cfgSave").onclick=async()=>{
   const cfg={kubectl_path:$("#cfgKubectl").value.trim()||"kubectl",
     volume_handle_prefix:$("#cfgVhPrefix").value.trim(),
-    allowed_contexts:csv($("#cfgCtx").value), namespace_filter:csv($("#cfgNs").value),
+    allowed_contexts:csv($("#cfgCtx").value), namespace_filter:csv($("#cfgNs").value), allowed_hosts:csv($("#cfgHosts").value),
     wait_timeout:parseInt($("#cfgWait").value)||120, clone_name_suffix:$("#cfgSuffix").value.trim()||"0000",
     require_context_confirm:$("#cfgConfirm").checked, strip_claimref:$("#cfgStrip").checked,
     simulation_mode_available:$("#cfgSim").checked, default_lang:$("#cfgLang").value};
@@ -9470,6 +9494,10 @@ HTML_EN = r"""<!DOCTYPE html>
         <div><label class="fld">Allowed namespaces — local cluster (empty = all)</label><input type="text" id="cfgNs" placeholder="wordpress, bo-dev"></div>
       </div>
       <div class="row">
+        <div><label class="fld">Host names allowed to reach the interface (empty = loopback only)</label><input type="text" id="cfgHosts" placeholder="hycu.interne.exemple.fr">
+          <div class="hint" style="margin-top:4px">DNS name of an Ingress or reverse proxy. The tool has no authentication: put authentication (SSO, oauth2-proxy, IP allowlist) and TLS in front of it as soon as it leaves the loopback.</div></div>
+      </div>
+      <div class="row">
         <div><label class="fld">Wait timeout (s)</label><input type="text" id="cfgWait" placeholder="120"></div>
         <div><label class="fld">Clone name suffix</label><input type="text" id="cfgSuffix" placeholder="0000"></div>
       </div>
@@ -11065,6 +11093,7 @@ async function loadConfig(){
   $("#cfgKubectl").value=c.kubectl_path||""; $("#cfgVhPrefix").value=c.volume_handle_prefix||"";
   $("#cfgCtx").value=(c.allowed_contexts||[]).join(", ");
   $("#cfgNs").value=(c.namespace_filter||[]).join(", ");
+  $("#cfgHosts").value=(c.allowed_hosts||[]).join(", ");
   $("#cfgWait").value=c.wait_timeout; $("#cfgSuffix").value=c.clone_name_suffix||"";
   $("#cfgConfirm").checked=!!c.require_context_confirm; $("#cfgStrip").checked=!!c.strip_claimref;
   $("#cfgSim").checked=!!c.simulation_mode_available; $("#cfgLang").value=c.default_lang||"en";
@@ -11093,7 +11122,7 @@ function csv(s){return (s||"").split(",").map(x=>x.trim()).filter(Boolean);}
 $("#cfgSave").onclick=async()=>{
   const cfg={kubectl_path:$("#cfgKubectl").value.trim()||"kubectl",
     volume_handle_prefix:$("#cfgVhPrefix").value.trim(),
-    allowed_contexts:csv($("#cfgCtx").value), namespace_filter:csv($("#cfgNs").value),
+    allowed_contexts:csv($("#cfgCtx").value), namespace_filter:csv($("#cfgNs").value), allowed_hosts:csv($("#cfgHosts").value),
     wait_timeout:parseInt($("#cfgWait").value)||120, clone_name_suffix:$("#cfgSuffix").value.trim()||"0000",
     require_context_confirm:$("#cfgConfirm").checked, strip_claimref:$("#cfgStrip").checked,
     simulation_mode_available:$("#cfgSim").checked, default_lang:$("#cfgLang").value};
@@ -13026,6 +13055,8 @@ I18N_EN = [
     ('>Tableau de bord</h1>', '>Dashboard</h1>'),
     ('aria-label="Étapes de la restauration"', 'aria-label="Restore steps"'),
     ("> Proposer le mode simulation (interrupteur dans le bandeau ; sinon l'outil travaille en mode réel)<", '> Offer the simulation mode (switch in the banner; otherwise the tool works in live mode)<'),
+    (">Noms d'hôte autorisés pour accéder à l'interface (vide = boucle locale uniquement)<", '>Host names allowed to reach the interface (empty = loopback only)<'),
+    ("Nom DNS d'un Ingress ou d'un reverse-proxy. L'outil n'a pas d'authentification : placez une authentification (SSO, oauth2-proxy, liste d'IP) et TLS devant lui dès qu'il quitte la boucle locale.", 'DNS name of an Ingress or reverse proxy. The tool has no authentication: put authentication (SSO, oauth2-proxy, IP allowlist) and TLS in front of it as soon as it leaves the loopback.'),
 ]
 # <<< I18N-END
 
@@ -13127,6 +13158,9 @@ def main():
     print("  (Ctrl+C pour arrêter)")
     print("  Sauvegardes & audit écrits dans : %s" % CONFIG["backup_root"])
     print("  Configuration : %s" % CONFIG_PATH)
+    if CONFIG.get("allowed_hosts"):
+        print("  ⚠ Noms d'hôte autorisés (exposition hors boucle locale) : %s" % ", ".join(CONFIG["allowed_hosts"]))
+        print("    L'outil n'a PAS d'authentification : protégez l'accès (SSO / oauth2-proxy, IP, TLS).")
     print("  Astuce : au 1er affichage, faites Ctrl+Shift+R pour vider le cache.")
     print("=" * 64)
     # Sauvegarde automatique planifiée : le thread tourne en permanence et ne fait

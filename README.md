@@ -339,6 +339,11 @@ refreshes every ~3 s until the state is stable (all PVCs Bound, pods Running;
   the kubelet, reaches the Pod).
 - **Anti-CSRF / anti-DNS-rebinding** protection: `Host` and `Origin`/`Referer`
   header checks, and an **anti-CSRF token** required on every action.
+- **DNS exposure** is possible: `allowed_hosts` (or `HYCU_ALLOWED_HOSTS`) lists the host
+  names accepted in addition to the loopback; any other `Host` or `Origin` header is still
+  refused (anti-DNS-rebinding). The tool has **no application-level authentication**: put
+  authentication (SSO, oauth2-proxy, IP allowlist) and TLS in front of it (Ingress, reverse
+  proxy) as soon as it leaves the loopback.
 - **Live mode by default**, with a preflight and confirmation of the target cluster/context
   before any destructive action; a simulation mode is offered when `simulation_mode_available` is true.
 - **Probes and tooling**: `GET /healthz` (and `/readyz`) answer without touching the session;
@@ -410,6 +415,7 @@ Copy `hycu_config.example.json` → `hycu_config.json`. Also editable via the
 | `hycu_test_path` | `/volumegroups` | GET endpoint used to test the connection (look it up in the REST API Explorer). |
 | `hycu_ca_bundle` / `nutanix_ca_bundle` / `prismcentral_ca_bundle` | `""` | Path of a CA bundle (PEM) used when `*_verify_tls` is true: internal PKI or exported self-signed certificate, without disabling verification. |
 | `hycu_job_timeout` | `1800` | Maximum wait (s) for a HYCU job (clone, restore, backup). |
+| `allowed_hosts` | `[]` | Host names (DNS) under which the UI may be served **in addition to** the loopback (Ingress, reverse proxy); `HYCU_ALLOWED_HOSTS` in a container. Empty = loopback only. Protect with upstream authentication. |
 | `default_lang` | `"en"` | Interface language when the browser has not chosen yet (FR/EN button): `en` or `fr`. |
 | `simulation_mode_available` | `false` | `true` = offer the "Simulation mode" switch in the banner (checked by default); `false` = live mode directly, banner hidden. |
 | `kube_context` / `kubeconfig_path` | `""` | Context and kubeconfig file of the **local** cluster (empty = kubectl default resolution). |

@@ -290,6 +290,10 @@
         <div><label class="fld">Namespaces autorisés — cluster local (vide = tous)</label><input type="text" id="cfgNs" placeholder="wordpress, bo-dev"></div>
       </div>
       <div class="row">
+        <div><label class="fld">Noms d'hôte autorisés pour accéder à l'interface (vide = boucle locale uniquement)</label><input type="text" id="cfgHosts" placeholder="hycu.interne.exemple.fr">
+          <div class="hint" style="margin-top:4px">Nom DNS d'un Ingress ou d'un reverse-proxy. L'outil n'a pas d'authentification : placez une authentification (SSO, oauth2-proxy, liste d'IP) et TLS devant lui dès qu'il quitte la boucle locale.</div></div>
+      </div>
+      <div class="row">
         <div><label class="fld">Timeout d'attente (s)</label><input type="text" id="cfgWait" placeholder="120"></div>
         <div><label class="fld">Suffixe de nom de clone</label><input type="text" id="cfgSuffix" placeholder="0000"></div>
       </div>
