@@ -109,7 +109,7 @@ check(H._hycu_job_id({}) is None and H._hycu_job_id({"entities": []}) is None, "
 print("\n== Sauvegarde de TOUS les namespaces filtrés (nouvelle fonctionnalité) ==")
 _ns_orig, _bk_orig = H.action_namespaces, H.action_backup
 H.action_namespaces = lambda: {"ok": True, "namespaces": ["wordpress", "vide", "shop"], "error": None}
-def _fake_bk(ns, dest=None):
+def _fake_bk(ns, dest=None, **kw):
     if ns == "vide":
         return {"ok": False, "error": "Aucun PVC trouvé dans le namespace 'vide'."}
     return {"ok": True, "dir": "/b/" + ns, "count": 2 if ns == "wordpress" else 3}

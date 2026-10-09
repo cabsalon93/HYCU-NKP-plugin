@@ -1,0 +1,34 @@
+# Règles d'alerte Prometheus pour l'outil HYCU · Kubernetes sur Nutanix (endpoint /metrics,
+# à scruter via la loopback du Pod ou un sidecar — jamais directement sur le réseau).
+# À charger dans votre PrometheusRule / fichier de règles.
+groups:
+  - name: hycu-nkp-plugin
+    rules:
+      - alert: HycuToolDown
+        expr: absent(hycu_up) or hycu_up == 0
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: "L'outil HYCU · Kubernetes n'expose plus ses métriques"
+          description: "Aucune métrique hycu_up depuis 5 minutes : Pod arrêté ou port-forward/sidecar interrompu."
+      - alert: HycuAutoBackupStale
+        expr: hycu_auto_backup_enabled == 1 and (time() - hycu_auto_backup_last_run_timestamp_seconds) > 25 * 3600
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Sauvegarde automatique de configuration en retard"
+          description: "Dernier passage il y a plus de 25 h alors que la sauvegarde automatique est activée."
+      - alert: HycuAutoBackupFailed
+        expr: hycu_auto_backup_enabled == 1 and hycu_auto_backup_last_success == 0
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Dernier passage de sauvegarde automatique en échec"
+          description: "Consultez la page Tâches (journal d'audit) pour le détail du namespace en erreur."
+      - alert: HycuOperationStuck
+        expr: hycu_operation_running == 1
+        for: 2h
+        labels: { severity: warning }
+        annotations:
+          summary: "Une opération destructive est en cours depuis plus de 2 h"
+          description: "Restauration/clone bloqué (attente kubectl, job HYCU) : vérifiez la page Tâches et le journal."

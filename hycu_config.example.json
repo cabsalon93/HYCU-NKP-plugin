@@ -64,5 +64,13 @@
   "nutanix_verify_tls": false,
   "prismcentral_url": "",
   "prismcentral_api_base": "/api/nutanix/v3",
-  "prismcentral_verify_tls": false
+  "prismcentral_verify_tls": false,
+  "hycu_ca_bundle": "",
+  "nutanix_ca_bundle": "",
+  "prismcentral_ca_bundle": "",
+  "hycu_job_timeout": 1800,
+
+  "_section_interface": "— Interface —",
+  "default_lang": "en",
+  "simulation_mode_available": false
 }

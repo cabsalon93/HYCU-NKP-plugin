@@ -121,7 +121,8 @@ try:
     r = H.action_clusters_add({"name": "Prod", "kubeconfig": multi, "context": "prod"})
     check(r["ok"] and r["cluster"]["id"] == "prod" and r["cluster"]["context"] == "prod", "cluster « Prod » ajouté")
     kc_file = H._get_cluster("prod")["kc_path"]
-    check(oct(os.stat(kc_file).st_mode & 0o777) == "0o600", "kubeconfig stocké en 0600")
+    if os.name != "nt":   # permissions POSIX : sans objet sous Windows (ACL NTFS)
+        check(oct(os.stat(kc_file).st_mode & 0o777) == "0o600", "kubeconfig stocké en 0600")
     check(not H.action_clusters_add({"name": "prod", "kubeconfig": multi, "context": "prod"})["ok"], "doublon refusé")
     check(not H.action_clusters_add({"name": "local", "kubeconfig": multi, "context": "prod"})["ok"], "nom « local » réservé")
     check(not H.action_clusters_add({"name": "local-ctx", "kubeconfig": multi, "context": "prod"})["ok"],

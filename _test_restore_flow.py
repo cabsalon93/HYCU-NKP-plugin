@@ -30,9 +30,12 @@ PVC = {"apiVersion": "v1", "kind": "PersistentVolumeClaim",
 # Neutraliser tout accès cluster.
 H._load_old_pv = lambda ns, pvc, bp, root=None: (json.loads(json.dumps(REAL_PV)), PV_NAME)
 H._load_backup_pvc = lambda bp, pvc, root=None: json.loads(json.dumps(PVC))
-H._resolve_workloads = lambda ns: ([], [])
+H._resolve_workloads = lambda ns, txn=None: ([], [], None)   # nouvelle signature (courants, cibles, erreur)
 H._namespace_allowed = lambda ns: True
 H.kubectl_json = lambda args: ({}, None)
+# Aucun sous-processus réel (le préflight interroge kubectl : auth can-i, version) :
+H.run = lambda cmd, dry=False, label=None, timeout=None: {"ok": True, "dry": bool(dry), "cmd": " ".join(cmd),
+                                                          "stdout": "yes", "stderr": "", "rc": 0, "label": label or ""}
 
 payload = {"namespace": "wordpress", "dry": True, "mode": "clone",
            "items": [{"pvc": "mariadb-pvc", "new_ref": NEW_VG_UUID, "new_name": "pvc-clone-0000"}]}

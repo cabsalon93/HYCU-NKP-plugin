@@ -12,12 +12,27 @@
 # Accéder (PAS d'Ingress — cf. spec) :
 #   kubectl -n hycu port-forward svc/hycu 8765:8765   ->   http://127.0.0.1:8765
 #
-# Sécurité : la frontière d'accès réelle est le RBAC sur ce namespace —
-#   quiconque peut port-forward/exec ici = opérateur complet (kubectl puissant).
+# Sécurité : le serveur écoute sur toutes les interfaces du Pod (HYCU_HOST=0.0.0.0 dans
+#   l'image) et sa garde « Host local » ne repose que sur les en-têtes HTTP. La NetworkPolicy
+#   ci-dessous refuse donc TOUT trafic entrant vers le Pod : seul `kubectl port-forward`
+#   (qui passe par le kubelet, pas par le réseau de pods) atteint l'interface. Le RBAC du
+#   namespace `hycu` reste la seconde frontière : quiconque peut port-forward/exec ici est
+#   opérateur complet.
 apiVersion: v1
 kind: Namespace
 metadata:
   name: hycu
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: hycu-deny-ingress
+  namespace: hycu
+spec:
+  podSelector:
+    matchLabels: { app: hycu }
+  policyTypes: ["Ingress"]
+  ingress: []                       # aucun trafic entrant depuis le réseau de pods
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -46,31 +61,51 @@ spec:
     metadata:
       labels: { app: hycu }
     spec:
+      automountServiceAccountToken: false   # l'outil n'utilise jamais le SA du Pod (kubeconfig monté)
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
         fsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
       containers:
         - name: hycu
+          # Épinglez une version (vX.Y.Z@sha256:…) en production : `latest` suit la branche principale.
           image: ghcr.io/cabsalon93/hycu-nkp-plugin:latest
           ports:
             - containerPort: 8765
           env:
             - { name: TZ, value: "Europe/Paris" }
+            - { name: PYTHONUNBUFFERED, value: "1" }     # journaux visibles dans kubectl logs
+            - { name: KUBECACHEDIR, value: "/tmp/kubecache" }   # ~/.kube est en lecture seule
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
           volumeMounts:
             - { name: data, mountPath: /data }
             - { name: kubeconfig, mountPath: /home/app/.kube, readOnly: true }
+            - { name: tmp, mountPath: /tmp }
+            - { name: shm, mountPath: /dev/shm }        # kubeconfigs temporaires en RAM (0600)
           resources:
             requests: { cpu: "50m", memory: "64Mi" }
             limits:   { cpu: "500m", memory: "256Mi" }
           readinessProbe:
-            tcpSocket: { port: 8765 }   # TCP : la garde Host de l'app rejette un httpGet sondé par IP
+            httpGet:
+              path: /healthz                  # aucune logique de session sur ce chemin
+              port: 8765
+              httpHeaders:
+                - { name: Host, value: "127.0.0.1" }   # garde Host de l'application
             initialDelaySeconds: 5
             periodSeconds: 15
           livenessProbe:
-            tcpSocket: { port: 8765 }
+            httpGet:
+              path: /healthz
+              port: 8765
+              httpHeaders:
+                - { name: Host, value: "127.0.0.1" }
             initialDelaySeconds: 10
             periodSeconds: 30
+      terminationGracePeriodSeconds: 180   # laisse finir une restauration en cours (SIGTERM géré)
       volumes:
         - name: data
           persistentVolumeClaim:
@@ -80,6 +115,10 @@ spec:
             secretName: hycu-kubeconfig
             items:
               - { key: config, path: config }
+        - name: tmp
+          emptyDir: {}
+        - name: shm
+          emptyDir: { medium: Memory, sizeLimit: 16Mi }
 ---
 apiVersion: v1
 kind: Service

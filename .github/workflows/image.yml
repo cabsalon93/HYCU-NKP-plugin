@@ -1,21 +1,43 @@
 name: build-image
 
-# Construit l'image (multi-arch) et la pousse sur ghcr.io :
-#  - push / merge dans `main`            -> reconstruit :latest (+ :main)
-#  - tag `vX.Y.Z`                        -> image versionnée :vX.Y.Z + tarball air-gap
-#  - « Run workflow » (workflow_dispatch) -> build à la demande sur n'importe quelle branche
+# 1) Tests + lint + vérification du build de l'interface, sur chaque push / PR.
+# 2) Image (multi-arch) poussée sur ghcr.io :
+#  - push / merge dans `main`            -> :main et :latest (latest = branche par défaut UNIQUEMENT)
+#  - tag `vX.Y.Z`                        -> :vX.Y.Z (+ tarball air-gap), jamais :latest
+#  - « Run workflow » (workflow_dispatch) -> :<branche> seulement (ne peut PAS écraser :latest)
+# 3) Scan de vulnérabilités (Trivy) bloquant sur CRITICAL/HIGH, signature cosign (keyless).
 on:
   push:
     branches: ["main"]
     tags: ["v*"]
+  pull_request:
   workflow_dispatch:
 
 permissions:
   contents: read
   packages: write
+  id-token: write          # signature cosign keyless (OIDC)
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Lint (ruff, erreurs uniquement)
+        run: |
+          pip install ruff pytest
+          ruff check --select E9,F63,F7,F82 hycu_k8s_nutanix.py build.py tests
+      - name: Le fichier livré est bien la sortie du build de l'interface
+        run: python build.py --check
+      - name: Tests
+        run: python -m pytest -q tests
+
   image:
+    needs: test
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -29,33 +51,52 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Métadonnées
+      - name: Métadonnées (tags)
         id: meta
-        run: |
-          echo "img=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
-          ref="${GITHUB_REF_NAME:-manual}"
-          ref="${ref//\//-}"   # un ref de branche peut contenir « / », interdit dans un tag Docker
-          echo "tag=${ref}" >> "$GITHUB_OUTPUT"
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build & push (amd64 + arm64)
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
           file: deploy/Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: |
-            ${{ steps.meta.outputs.img }}:${{ steps.meta.outputs.tag }}
-            ${{ steps.meta.outputs.img }}:latest
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          sbom: true
+          provenance: mode=max
 
-      - name: Tarball air-gap (amd64)
+      - name: Scan de vulnérabilités (Trivy)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ghcr.io/${{ github.repository }}@${{ steps.build.outputs.digest }}
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          severity: CRITICAL,HIGH
+
+      - uses: sigstore/cosign-installer@v3
+      - name: Signature de l'image (cosign keyless)
+        run: cosign sign --yes ghcr.io/${{ github.repository }}@${{ steps.build.outputs.digest }}
+
+      - name: Tarball air-gap (amd64, tags vX.Y.Z uniquement)
+        if: startsWith(github.ref, 'refs/tags/v')
         run: |
           docker buildx build --platform linux/amd64 --file deploy/Dockerfile \
-            --tag hycu-nkp:${{ steps.meta.outputs.tag }} --load .
-          docker save hycu-nkp:${{ steps.meta.outputs.tag }} \
-            | gzip > hycu-nkp-${{ steps.meta.outputs.tag }}-amd64.tar.gz
+            --tag hycu-nkp:${{ github.ref_name }} --load .
+          docker save hycu-nkp:${{ github.ref_name }} \
+            | gzip > hycu-nkp-${{ github.ref_name }}-amd64.tar.gz
 
       - uses: actions/upload-artifact@v4
+        if: startsWith(github.ref, 'refs/tags/v')
         with:
           name: hycu-nkp-image-tarball
           path: hycu-nkp-*.tar.gz

@@ -13,9 +13,13 @@ NKP : le VG est attaché directement à la VM worker, **plus d'IQN**), un
 `volumeHandle`, ou un **IQN** (clusters iSCSI hérités) ; l'outil en dérive le
 `volumeHandle`.
 
-> ⚠️ **Outil destructif.** Il supprime et recrée des PV/PVC. Le mode **Simulation
-> (dry-run) est activé par défaut**. Testez toujours sur un namespace de test avant
-> la production, et relisez l'aperçu avant de désactiver la simulation.
+> ⚠️ **Outil destructif.** Il supprime et recrée des PV/PVC. Par défaut l'interface
+> travaille **en mode réel** (indicateur rouge « MODE RÉEL · cluster » dans la barre du
+> haut) avec des garde-fous : **préflight** avant tout arrêt de l'application,
+> confirmation par ressaisie du nom du cluster, Retain systématique des Volume Groups.
+> Un **mode simulation** (dry-run) peut être proposé dans le bandeau en l'activant dans
+> **Réglages → Proposer le mode simulation** (`simulation_mode_available`). Testez
+> toujours sur un namespace de test avant la production.
 
 ---
 
@@ -46,8 +50,11 @@ L'outil n'invente rien : il **orchestre `kubectl`** (manifestes JSON) et les **A
 HYCU / Prism** (stdlib Python uniquement, aucune dépendance). La **sauvegarde de
 configuration** (Applications → Sauvegarder) fournit le « squelette » PV/PVC ; **HYCU fournit les données**
 (les Volume Groups). Chaque étape est journalisée, la séquence s'arrête au premier
-échec (l'app reste arrêtée, jamais redémarrée à 0 réplica), et le **mode simulation**
-(défaut) montre toute la séquence sans rien exécuter.
+échec (l'app reste arrêtée, jamais redémarrée à 0 réplica, et la restauration est
+**reprenable** : les volumes déjà restaurés sont ignorés à la relance). Un **préflight**
+(droits RBAC, StorageClass, disques du VG cloné, workloads gérés par un opérateur, pods
+non gérés) s'exécute **avant** tout arrêt de l'application. Le **mode simulation**,
+s'il est activé dans les Réglages, montre toute la séquence sans rien exécuter.
 
 ## 2. Prérequis
 
@@ -340,10 +347,25 @@ Running ; plafond ~10 min — recliquez pour arrêter).
 
 ## 5. Sécurité
 
-- Le serveur **n'écoute que sur `127.0.0.1`** (jamais exposé au réseau).
+- En mode **Python**, le serveur **n'écoute que sur `127.0.0.1`**. En **conteneur**
+  (`HYCU_HOST=0.0.0.0` dans l'image), il écoute sur toutes les interfaces du Pod et sa
+  garde « hôte local » ne repose que sur les en-têtes HTTP : le manifeste
+  `deploy/k8s/hycu.yaml` ajoute donc une **NetworkPolicy** qui refuse tout trafic entrant
+  (seul `kubectl port-forward`, qui passe par le kubelet, atteint le Pod).
 - Protection **anti-CSRF / anti-DNS-rebinding** : vérification des en-têtes `Host`
   et `Origin`/`Referer`, et **jeton anti-CSRF** exigé sur chaque action.
-- **Dry-run par défaut** ; confirmation du cluster/contexte ciblé avant toute action réelle.
+- **Mode réel par défaut**, avec préflight et confirmation du cluster/contexte ciblé
+  avant toute action destructive ; mode simulation proposé si `simulation_mode_available`.
+- **Sondes et outils** : `GET /healthz` (et `/readyz`) répond sans toucher à la session ;
+  charger `/` sans cookie depuis un **navigateur** ouvre une nouvelle session (identifiants
+  effacés), jamais pendant une opération en cours, et jamais pour une sonde (`Accept`
+  sans `text/html`).
+- **Arrêt propre** : SIGTERM (`kubectl delete pod`, `docker stop`) laisse finir une
+  opération en cours (jusqu'à `wait_timeout` + marge) puis nettoie les kubeconfigs temporaires.
+- **Configuration validée** : chaque clé a un type et des bornes (`CONFIG_SCHEMA`) ; une
+  valeur invalide est refusée, jamais persistée. En conteneur, `kubectl_path`,
+  `kubeconfig_path`, `backup_root`, `logo_path`, `host` et `port` ne sont modifiables que
+  par le fichier ou les variables `HYCU_*`, pas par l'API.
 - **Identifiants liés à la session navigateur** : les identifiants HYCU/Nutanix sont
   liés à **une session de navigateur** (cookie de session `hycu_sess`). Ouvrir la page
   depuis un navigateur relancé, un autre navigateur ou une fenêtre privée **verrouille
@@ -376,7 +398,10 @@ la page **Réglages** de l'interface. Toutes les clés sont optionnelles.
 
 | Clé | Défaut | Rôle |
 |---|---|---|
-| `kubectl_path` | `"kubectl"` | Binaire kubectl. Ex. `"microk8s kubectl"`, `"k3s kubectl"`, ou chemin complet. |
+| `kubectl_path` | `"kubectl"` | Binaire kubectl. Ex. `"microk8s kubectl"`, `"k3s kubectl"`, ou chemin complet (les espaces d'un chemin Windows sont acceptés). Seuls les binaires `kubectl`, `microk8s`, `k3s`, `oc` sont acceptés. |
+| `kube_context` / `kubeconfig_path` | `""` | Contexte et fichier kubeconfig du cluster **local** (vide = résolution kubectl par défaut). |
+| `backup_root` | `./hycu-backups` | Dossier des sauvegardes, du journal d'audit et des transactions de restauration (`HYCU_BACKUP_ROOT` en conteneur). |
+| `logo_path` | `""` | Chemin explicite d'un logo à afficher dans l'en-tête (sinon `hycu_logo.*` ou l'asset HYCU à côté du programme). |
 | `allowed_contexts` | `[]` | Liste blanche de contextes kubectl (ou de noms de clusters ajoutés dans ⚙ Sources). `[]` = tous. En mode réel, un contexte hors liste est **refusé**. |
 | `namespace_filter` | `[]` | Liste blanche de namespaces du cluster **local**. `[]` = tous. |
 | `cluster_namespace_filters` | `{}` | Listes blanches de namespaces des clusters **ajoutés dans ⚙ Sources**, par nom de cluster : `{"prod-paris": ["shop"]}`. Tenu à jour par l'éditeur de filtre. |
@@ -384,10 +409,16 @@ la page **Réglages** de l'interface. Toutes les clés sont optionnelles.
 | `subprocess_margin` | `30` | Marge (s) du timeout subprocess au-dessus de `wait_timeout` (pour ne pas tuer `kubectl wait` avant son verdict). |
 | `clone_name_suffix` | `"0000"` | Convention HYCU pour le nom du PV cloné (suggestion pré-remplie, modifiable). |
 | `volume_handle_prefix` | `""` | **Vide = auto-détecté** depuis le PV existant (suit le driver CSI du client). Ne renseigner que pour forcer un préfixe. |
-| `strip_claimref` | `false` | `true` = retirer entièrement `claimRef` du PV (laisse le PVC recréé rebinder). `false` = conserver `claimRef` (name+namespace) sans uid/resourceVersion. |
+| `strip_claimref` | `false` | `true` = retirer entièrement `claimRef` du PV (laisse le PVC recréé rebinder). `false` = conserver `claimRef` (name+namespace) sans uid/resourceVersion. Ignoré par le clone d'application (claimRef toujours posé). |
+| `clone_strip_runtime_attrs` | `true` | Purger les attributs runtime du PV cloné (`hypervisorAttachedDiskUUIDs` du disque source). |
+| `clone_fix_disk_uuids` | `true` | Réécrire `hypervisorAttachedDiskUUIDs` avec le disque du VG **cloné**, lu via Prism Central v4 (sinon le CSI tente l'attach iSCSI et échoue). |
+| `clone_require_disk_uuids` | `true` | En réel, abandonner (au préflight, avant tout arrêt) si le disque du VG cloné est introuvable. |
+| `backup_before_restore` | `true` | Sauvegarde de sécurité des manifestes (`kind: pre_restore`, jamais purgée) avant toute restauration réelle. |
+| `inplace_refresh_pv_disk` | `true` | Après un restore sur place, recréer le PV avec le disque à jour si HYCU l'a remplacé. |
+| `retain_source_pv` | `true` | Conservé pour compatibilité : le passage en **Retain** des PV source, courant et nouveau est désormais **systématique** pendant une restauration. |
 | `auto_backup_enabled` | `false` | Sauvegarde automatique planifiée de tous les namespaces autorisés par le filtre, tant que l'outil tourne. |
 | `auto_backup_interval_hours` | `24` | Intervalle entre deux sauvegardes automatiques (heures, minimum 0,25). |
-| `auto_backup_keep` | `15` | Rétention : nombre de versions conservées par namespace (les plus anciennes sont supprimées après chaque passage automatique). |
+| `auto_backup_keep` | `15` | Rétention : nombre de versions **automatiques** conservées par namespace. Les sauvegardes manuelles et les sauvegardes de sécurité pré-restauration ne sont jamais purgées ; un dossier référencé par une restauration en cours non plus. |
 | `config_backup_full` | `true` | Capturer aussi les ressources non-PV/PVC du namespace (Deployments, Services, Secrets…) dans `resources.json`. |
 | `config_backup_kinds` | *(liste par défaut)* | Types de ressources namespacées exportés par l'instantané de config étendue. |
 | `config_backup_include_secret_data` | `false` | `false` = données des Secrets masquées sur disque ; `true` = conservées en clair (uniquement si le dossier de sauvegarde est lui-même protégé). |
@@ -397,8 +428,12 @@ la page **Réglages** de l'interface. Toutes les clés sont optionnelles.
 | `open_browser` | `true` | Ouvrir le navigateur au démarrage. |
 | `hycu_url` | `""` | URL du contrôleur HYCU, ex. `https://hycu.exemple.com:8443` (port 8443). Vide = connecteur HYCU désactivé. |
 | `hycu_api_base` | `/rest/v1.0` | Base de l'API REST HYCU (**dépend de la version** — voir §9). |
-| `hycu_test_path` | `/vms` | Endpoint GET utilisé pour tester la connexion (relevez-le dans le REST API Explorer). |
+| `hycu_test_path` | `/volumegroups` | Endpoint GET utilisé pour tester la connexion (relevez-le dans le REST API Explorer). |
 | `hycu_verify_tls` | `false` | Vérifier le certificat TLS HYCU (souvent auto-signé → `false`). |
+| `hycu_ca_bundle` / `nutanix_ca_bundle` / `prismcentral_ca_bundle` | `""` | Chemin d'un bundle CA (PEM) utilisé quand `*_verify_tls` est vrai : PKI interne ou certificat auto-signé exporté, sans désactiver la vérification. |
+| `hycu_job_timeout` | `1800` | Délai max (s) d'attente d'un job HYCU (clone, restore, sauvegarde). |
+| `default_lang` | `"en"` | Langue de l'interface quand le navigateur n'a pas encore choisi (bouton FR/EN) : `en` ou `fr`. |
+| `simulation_mode_available` | `false` | `true` = proposer l'interrupteur « Mode simulation » dans le bandeau (coché par défaut) ; `false` = mode réel direct, bandeau masqué. |
 | `nutanix_url` | `""` | URL de Prism **Element**, ex. `https://prism.exemple.com:9440`. Vide = désactivé. |
 | `nutanix_api_base` | `/PrismGateway/services/rest/v2.0` | Base de l'API Prism Element v2. |
 | `nutanix_verify_tls` | `false` | Vérifier le certificat TLS Prism Element. |
@@ -419,6 +454,29 @@ la page **Réglages** de l'interface. Toutes les clés sont optionnelles.
   "require_context_confirm": true
 }
 ```
+
+### Mode conteneur (variables `HYCU_*`)
+
+| Variable | Clé | Rôle |
+|---|---|---|
+| `HYCU_HOST` | `host` | Interface d'écoute (`0.0.0.0` dans l'image, publiée sur la loopback de l'hôte en Docker ; NetworkPolicy en K8s). |
+| `HYCU_PORT` | `port` | Port d'écoute. |
+| `HYCU_OPEN_BROWSER` | `open_browser` | `0` en conteneur. |
+| `HYCU_BACKUP_ROOT` | `backup_root` | `/data/hycu-backups` dans l'image. |
+| `HYCU_KUBECTL_PATH` | `kubectl_path` | Binaire kubectl de l'image. |
+
+Les surcharges d'environnement ne sont **jamais** écrites dans `hycu_config.json`.
+Sondes : `GET /healthz`. Alertes Prometheus prêtes à l'emploi : `deploy/k8s/alerts-prometheus.yaml`.
+
+### Développement : interface et tests
+
+L'interface est maintenue dans `ui/` (`index.html`, `styles.css`, `app.js`,
+`i18n/en.json`) et **assemblée** dans le fichier unique par `python build.py` (la page
+anglaise est pré-rendue au build). `python build.py --check` vérifie que le `.py`
+livré est à jour, `python build.py --lint` contrôle le dictionnaire i18n (fragments
+orphelins, identités). Mode développement sans build : `HYCU_DEV_UI=1 python hycu_k8s_nutanix.py`.
+Tests : `python -m pytest -q tests` (suites historiques `_test_*.py` incluses, exécutées
+dans un dossier temporaire avec un faux `kubectl` ; aucun cluster réel n'est touché).
 
 ## 7. À valider sur le cluster du client avant la prod
 

@@ -22,3 +22,8 @@ venv/
 # Documentation générée localement (livrable hors-repo) + ses générateurs
 build_doc*.py
 *.docx
+
+# Tests / outillage
+.pytest_cache/
+# Vidéo de présentation générée localement (brag-output/, ~250 Mo)
+brag-output/

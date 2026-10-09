@@ -4,11 +4,13 @@
 #
 # Build (le contexte DOIT être la racine du dépôt) :
 #   docker build -f deploy/Dockerfile -t hycu-nkp:local .
+# Image de base épinglée par tag ; pour une reproductibilité stricte, ajoutez le digest
+# (FROM python:3.12-slim@sha256:…) et mettez-le à jour via Renovate/Dependabot.
 FROM python:3.12-slim
 
 # kubectl épinglé (>= 1.23 requis par l'outil). TARGETARCH est fourni par buildx
 # (amd64 / arm64) ; checksum vérifié depuis le .sha256 officiel.
-ARG KUBECTL_VERSION=v1.30.0
+ARG KUBECTL_VERSION=v1.33.4     # règle de skew ±1 mineur vs l'API server : à suivre avec vos clusters
 ARG TARGETARCH=amd64
 RUN set -eux; \
     apt-get update; \

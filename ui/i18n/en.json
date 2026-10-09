@@ -1,0 +1,3754 @@
+[
+[
+"<html lang=\"fr\">",
+"<html lang=\"en\">"
+],
+[
+"<title>HYCU · Kubernetes sur Nutanix</title>",
+"<title>HYCU · Kubernetes on Nutanix</title>"
+],
+[
+"Confirmer l'action réelle",
+"Confirm the real action"
+],
+[
+"Pour confirmer, retapez <b",
+"To confirm, retype <b"
+],
+[
+">Annuler<",
+">Cancel<"
+],
+[
+"Confirmer en mode réel",
+"Confirm in real mode"
+],
+[
+"Configuration initiale",
+"Initial setup"
+],
+[
+">Précédent<",
+">Back<"
+],
+[
+"Suivant",
+"Next"
+],
+[
+"Déverrouiller les connexions",
+"Unlock saved connections"
+],
+[
+"Un coffre d'identifiants chiffré a été trouvé. Saisissez la phrase secrète maîtresse",
+"An encrypted credentials vault was found. Enter the master passphrase"
+],
+[
+"pour reconnecter automatiquement HYCU / Nutanix.",
+"to reconnect HYCU / Nutanix automatically."
+],
+[
+"Phrase secrète (≥ 8 caractères)",
+"Passphrase (≥ 8 characters)"
+],
+[
+"Phrase secrète",
+"Passphrase"
+],
+[
+">Plus tard<",
+">Later<"
+],
+[
+"Déverrouiller",
+"Unlock"
+],
+[
+"Connexions rechargées : ",
+"Connections reloaded: "
+],
+[
+"Filtrer les namespaces",
+"Filter namespaces"
+],
+[
+"Toutes les namespaces (aucun filtre)",
+"All namespaces (no filter)"
+],
+[
+"Affiche toutes les namespaces, y compris celles créées plus tard.",
+"Shows every namespace, including ones created later."
+],
+[
+"rechercher une namespace…",
+"search for a namespace…"
+],
+[
+"Tout cocher (visibles)",
+"Check all (visible)"
+],
+[
+"Tout décocher (visibles)",
+"Uncheck all (visible)"
+],
+[
+"Enregistrer le filtre",
+"Save filter"
+],
+[
+"textContent=\"toutes\"",
+"textContent=\"all\""
+],
+[
+"\" sélectionnée(s)\"",
+"\" selected\""
+],
+[
+"\" · futures namespaces exclues (cochez « Toutes »)\"",
+"\" · future namespaces excluded (tick « All »)\""
+],
+[
+"Aucune namespace ne correspond.",
+"No namespace matches."
+],
+[
+" — impossible de charger la liste ; sauvegarde désactivée.",
+" — could not load the list; saving disabled."
+],
+[
+"'kubectl indisponible'",
+"'kubectl unavailable'"
+],
+[
+"||'erreur'",
+"||'error'"
+],
+[
+"Protection Kubernetes sur Nutanix",
+"Kubernetes Protection on Nutanix"
+],
+[
+"Contexte kubectl détecté : <b>",
+"Detected kubectl context: <b>"
+],
+[
+"title=\"Afficher l'interface en anglais\">EN</button>",
+"title=\"Passer en français / Switch to French\">FR</button>"
+],
+[
+"const PAGE_LANG=\"fr\"",
+"const PAGE_LANG=\"en\""
+],
+[
+"⚠ hors liste autorisée",
+"⚠ not in allowed list"
+],
+[
+"Mode simulation activé",
+"Simulation mode on"
+],
+[
+" — aucune commande destructive n'est exécutée.",
+" — no destructive command is executed."
+],
+[
+"Désactivez-le seulement quand vous êtes prêt à agir réellement.",
+"Turn it off only when you are ready to act for real."
+],
+[
+"\"MODE RÉEL — les commandes seront exécutées\"",
+"\"REAL MODE — commands will be executed\""
+],
+[
+"aria-label=\"Sections de l'outil\"",
+"aria-label=\"Tool sections\""
+],
+[
+"Sauvegarder les volumes d'un namespace",
+"Back up a namespace's volumes"
+],
+[
+"Exporte et nettoie automatiquement tous les PV et PVC du namespace.",
+"Automatically exports and cleans all PVs and PVCs in the namespace."
+],
+[
+"Équivaut aux boucles kubectl + nettoyage manuel des manifestes.",
+"Equivalent to the kubectl loops + manual manifest cleanup."
+],
+[
+"title=\"Filtrer la liste des namespaces\"",
+"title=\"Filter the namespace list\""
+],
+[
+">✎ Filtrer<",
+">✎ Filter<"
+],
+[
+"Sauvegarder ce namespace",
+"Back up this namespace"
+],
+[
+"Sauvegarder tous les namespaces autorisés par le filtre (tous si aucun filtre)",
+"Back up all namespaces allowed by the filter (all if no filter)"
+],
+[
+"Sauvegarder tous (filtrés)",
+"Back up all (filtered)"
+],
+[
+"Dossier de destination (optionnel)",
+"Destination folder (optional)"
+],
+[
+"Vide = hycu-backups/ (à côté du programme). Ex. D:\\sauvegardes\\hycu  ou  /mnt/backups",
+"Empty = hycu-backups/ (next to the program). E.g. D:\\backups\\hycu  or  /mnt/backups"
+],
+[
+"Chemin sur la machine qui exécute l'outil. Le sous-dossier &lt;namespace&gt;/&lt;horodatage&gt; est créé automatiquement.",
+"Path on the machine running the tool. The &lt;namespace&gt;/&lt;timestamp&gt; subfolder is created automatically."
+],
+[
+"Protéger les données dans HYCU",
+"Protect the data in HYCU"
+],
+[
+"L'export ci-dessus ne sauvegarde que les <b>manifestes</b> (la « recette » du restore).",
+"The export above only saves the <b>manifests</b> (the restore “recipe”)."
+],
+[
+"Les <b>données</b> vivent dans les Volume Groups Nutanix : seul HYCU les sauvegarde réellement.",
+"The <b>data</b> lives in Nutanix Volume Groups: only HYCU actually backs it up."
+],
+[
+"Ici, on associe les PVC du namespace aux Volume Groups HYCU, on assigne une politique, et on lance",
+"Here we match the namespace's PVCs to HYCU Volume Groups, assign a policy, and trigger"
+],
+[
+"une sauvegarde.</p>",
+"a backup.</p>"
+],
+[
+"Enregistrez la source HYCU (⚙ en haut à droite) pour activer cette section.",
+"Register the HYCU source (⚙ at the top right) to enable this section."
+],
+[
+"Analyser la correspondance PVC ↔ Volume Group HYCU",
+"Analyze the PVC ↔ HYCU Volume Group mapping"
+],
+[
+"Politique HYCU à assigner (optionnel)",
+"HYCU policy to assign (optional)"
+],
+[
+"Sauvegarde complète (forceFull)",
+"Full backup (forceFull)"
+],
+[
+"Assigner + sauvegarder maintenant",
+"Assign + back up now"
+],
+[
+"</span>Sauvegarde…",
+"</span>Backing up…"
+],
+[
+" volume(s) sauvegardé(s) dans",
+" volume(s) backed up to"
+],
+[
+" ressource(s) de config (Deployments, Services, Secrets…)",
+" config resource(s) (Deployments, Services, Secrets…)"
+],
+[
+"(IQN détecté)",
+"(IQN detected)"
+],
+[
+"⚠ Récupérez cette sauvegarde <b>hors du cluster</b> via ⬇ Télécharger (.zip) — ou copiez le dossier vers un autre stockage : c'est votre filet de sécurité en cas de sinistre.",
+"⚠ Get this backup <b>off the cluster</b> via ⬇ Download (.zip) — or copy the folder to other storage: it is your safety net in a disaster."
+],
+[
+"⚠ Récupérez ces sauvegardes <b>hors du cluster</b> via ⬇ Télécharger — ou copiez les dossiers vers un autre stockage : c'est votre filet de sécurité en cas de sinistre.",
+"⚠ Get these backups <b>off the cluster</b> via ⬇ Download — or copy the folders to other storage: it is your safety net in a disaster."
+],
+[
+"'Tout télécharger (.zip)'",
+"'Download all (.zip)'"
+],
+[
+"'Télécharger (.zip)'",
+"'Download (.zip)'"
+],
+[
+"⬇ Télécharger (.zip)",
+"⬇ Download (.zip)"
+],
+[
+"'Télécharger'",
+"'Download'"
+],
+[
+" — aucun PVC (ignoré)",
+" — no PVC (skipped)"
+],
+[
+"||'échec'",
+"||'failed'"
+],
+[
+" namespace(s) sauvegardé(s) · ",
+" namespace(s) backed up · "
+],
+[
+" volume(s) au total ",
+" volume(s) in total "
+],
+[
+"\"namespaces du filtre\"",
+"\"namespaces in the filter\""
+],
+[
+"\"tous les namespaces du cluster\"",
+"\"all cluster namespaces\""
+],
+[
+"Mode simulation (bandeau du haut) : montre les appels HYCU.",
+"Simulation mode (banner at top): shows the HYCU calls."
+],
+[
+"Mode réel : exécute sur HYCU.",
+"Real mode: executes on HYCU."
+],
+[
+"Cochez au moins un Volume Group (les correspondances « par nom » doivent être confirmées).",
+"Check at least one Volume Group (“by name” matches must be confirmed)."
+],
+[
+"Protection HYCU RÉELLE",
+"REAL HYCU protection"
+],
+[
+"Assigner la politique puis <b>sauvegarder</b>",
+"Assign the policy then <b>back up</b>"
+],
+[
+":\"<b>Sauvegarder</b>\")",
+":\"<b>Back up</b>\")"
+],
+[
+"\" ces Volume Groups :\"",
+"\" these Volume Groups:\""
+],
+[
+"Simulation — appels qui seraient envoyés à HYCU :",
+"Simulation — calls that would be sent to HYCU:"
+],
+[
+"Politique assignée / sauvegarde HYCU déclenchée.",
+"Policy assigned / HYCU backup triggered."
+],
+[
+"Échec — voir le détail.",
+"Failed — see details."
+],
+[
+"par nom — à confirmer",
+"by name — to be confirmed"
+],
+[
+"ambigu : plusieurs Volume Groups correspondent — vérifiez dans HYCU",
+"ambiguous: several Volume Groups match — check in HYCU"
+],
+[
+"aucun Volume Group HYCU trouvé",
+"no HYCU Volume Group found"
+],
+[
+">conforme<",
+">compliant<"
+],
+[
+">non conforme<",
+">non-compliant<"
+],
+[
+">à sauvegarder<",
+">to back up<"
+],
+[
+">non protégé<",
+">not protected<"
+],
+[
+"· politique : <b>",
+"· policy: <b>"
+],
+[
+"· backups : ",
+"· backups: "
+],
+[
+"?'oui':'non'",
+"?'yes':'no'"
+],
+[
+"Aucun PVC dans ce namespace.",
+"No PVC in this namespace."
+],
+[
+" par nom (à confirmer) · ",
+" by name (to confirm) · "
+],
+[
+" ambigu(s) · ",
+" ambiguous · "
+],
+[
+" non trouvé(s)",
+" not found"
+],
+[
+"(ne pas changer la politique)",
+"(do not change the policy)"
+],
+[
+"Analyse en cours…",
+"Analyzing…"
+],
+[
+"Choisir le namespace et les volumes",
+"Choose the namespace and volumes"
+],
+[
+"Lire les sauvegardes depuis un dossier personnalisé",
+"Read backups from a custom folder"
+],
+[
+"Ex. D:\\sauvegardes\\hycu  ou  /mnt/backups  (dossier contenant &lt;namespace&gt;/&lt;horodatage&gt;/)",
+"E.g. D:\\backups\\hycu  or  /mnt/backups  (folder containing &lt;namespace&gt;/&lt;timestamp&gt;/)"
+],
+[
+"Les sauvegardes lues (et utilisées pour la restauration) seront cherchées ici, au lieu de <code>hycu-backups/</code>.",
+"Backups will be read (and used for the restore) from here instead of <code>hycu-backups/</code>."
+],
+[
+"Sauvegarde de configuration à restaurer",
+"Configuration backup to restore"
+],
+[
+">Clone (nouveau VG)<",
+">Clone (new VG)<"
+],
+[
+">Restauration sur place<",
+">Restore in place<"
+],
+[
+"Que faire du clone ?",
+"What to do with the clone?"
+],
+[
+">Rattacher à l'app existante<",
+">Reattach to the existing app<"
+],
+[
+">Cloner l'application<",
+">Clone the application<"
+],
+[
+"Cible du clone d'application",
+"Application clone target"
+],
+[
+">Même namespace (suffixe)<",
+">Same namespace (suffix)<"
+],
+[
+">Autre namespace<",
+">Other namespace<"
+],
+[
+"Suffixe appliqué aux copies",
+"Suffix applied to the copies"
+],
+[
+"Namespace cible",
+"Target namespace"
+],
+[
+"Cloner aussi les dépendances (Secrets, ConfigMaps, ServiceAccount, Services qui ciblent l'app)",
+"Also clone the dependencies (Secrets, ConfigMaps, ServiceAccount, Services targeting the app)"
+],
+[
+"— nécessaire pour que les pods démarrent dans l'autre namespace",
+"— required for the pods to start in the other namespace"
+],
+[
+"Restauration sur place orchestrée",
+"Orchestrated in-place restore"
+],
+[
+"Lancer la restauration sur place",
+"Launch the in-place restore"
+],
+[
+"Vérifier puis lancer",
+"Review then launch"
+],
+[
+"Vérifiez les remplacements dérivés et la séquence, puis lancez.",
+"Review the derived replacements and the sequence, then launch."
+],
+[
+"Séquence prévue",
+"Planned sequence"
+],
+[
+"Confirmation du contexte cible (mode réel)",
+"Target context confirmation (real mode)"
+],
+[
+"retapez le nom du contexte kubectl",
+"retype the kubectl context name"
+],
+[
+"Lancer la restauration",
+"Launch the restore"
+],
+[
+" (la plus récente)",
+" (most recent)"
+],
+[
+"\"dossier personnalisé\"",
+"\"custom folder\""
+],
+[
+"\"sauvegarde (dossier perso)\"",
+"\"backup (custom folder)\""
+],
+[
+"\"dernière sauvegarde\"",
+"\"latest backup\""
+],
+[
+"\"sauvegarde choisie\"",
+"\"selected backup\""
+],
+[
+"phase:\"sauvegardé\"",
+"phase:\"backed up\""
+],
+[
+"Aucun volume. Sauvegardez d'abord la configuration de cette application (Applications → Sauvegarder).",
+"No volume. First back up this application's configuration (Applications → Back up)."
+],
+[
+"· source : ",
+"· source: "
+],
+[
+"Rechercher le VG dans Prism",
+"Search for the VG in Prism"
+],
+[
+"(UUID du VG, ou NutanixVolumes-&lt;uuid&gt;, ou IQN legacy)",
+"(VG UUID, or NutanixVolumes-&lt;uuid&gt;, or legacy IQN)"
+],
+[
+"Recherche du Volume Group HYCU…",
+"Searching for the HYCU Volume Group…"
+],
+[
+"(correspondance '",
+"(match '"
+],
+[
+"' — à vérifier)<",
+"' — to verify)<"
+],
+[
+"placeholder=\"auto-détecté\"",
+"placeholder=\"auto-detected\""
+],
+[
+"Point de restauration",
+"Restore point"
+],
+[
+"Nom du VG cloné",
+"Cloned VG name"
+],
+[
+"Simulation — appel HYCU qui serait envoyé :",
+"Simulation — HYCU call that would be sent:"
+],
+[
+" volume(s) prêt(s)",
+" volume(s) ready"
+],
+[
+"\" · MODE RÉEL\"",
+"\" · REAL MODE\""
+],
+[
+"Sélectionnez un point de restauration par volume.",
+"Select a restore point for each volume."
+],
+[
+"Restauration SUR PLACE RÉELLE",
+"REAL IN-PLACE restore"
+],
+[
+"\"Namespace : <b>\"",
+"\"Namespace: <b>\""
+],
+[
+"L'application sera <b>ARRÊTÉE</b>, les volumes restaurés <b>in-place</b> dans HYCU (données écrasées par le point choisi), puis l'application <b>REDÉMARRÉE</b>.",
+"The application will be <b>STOPPED</b>, the volumes restored <b>in-place</b> in HYCU (data overwritten by the chosen point), then the application <b>RESTARTED</b>."
+],
+[
+"</span>Orchestration…",
+"</span>Orchestrating…"
+],
+[
+"</span> Démarrage…",
+"</span> Starting…"
+],
+[
+"</span> Orchestration en cours…",
+"</span> Orchestration in progress…"
+],
+[
+"Simulation — séquence et appels HYCU qui seraient exécutés.",
+"Simulation — sequence and HYCU calls that would be executed."
+],
+[
+"<b>Séquence interrompue</b> — l\\'application est restée arrêtée. Voir le détail.",
+"<b>Sequence aborted</b> — the application was left stopped. See details."
+],
+[
+"Restauration sur place terminée.",
+"In-place restore complete."
+],
+[
+"Des étapes ont échoué — voir le détail.",
+"Some steps failed — see details."
+],
+[
+">Des étapes ont échoué.<",
+">Some steps failed.<"
+],
+[
+"Aperçu prêt. Vérifiez ci-dessous, puis cliquez « <b>Lancer le clone de l'application (réel)</b> » en bas pour créer la copie.",
+"Preview ready. Review below, then click “<b>Launch the application clone (real)</b>” at the bottom to create the copy."
+],
+[
+"L'application d'origine n'est pas touchée.",
+"The original application is untouched."
+],
+[
+"Clone d'application → namespace <b>",
+"Application clone → namespace <b>"
+],
+[
+"'(même namespace, suffixe)':'(autre namespace)'",
+"'(same namespace, suffix)':'(other namespace)'"
+],
+[
+">PV créés</span>",
+">PVs created</span>"
+],
+[
+">PVC créés</span>",
+">PVCs created</span>"
+],
+[
+">Applications clonées</span>",
+">Cloned applications</span>"
+],
+[
+">Dépendances clonées</span>",
+">Cloned dependencies</span>"
+],
+[
+"||'aucune'",
+"||'none'"
+],
+[
+"||\"aucune\"",
+"||\"none\""
+],
+[
+"Voir les manifestes des applications clonées",
+"View the cloned applications' manifests"
+],
+[
+"<li>Créer le namespace cible (si « autre »)</li><li>Créer les PV/PVC clonés (sur le VG cloné)</li><li>Créer les applications clonées (elles démarrent automatiquement)</li><li>L\\'application d\\'origine n\\'est PAS modifiée ni arrêtée</li>",
+"<li>Create the target namespace (if “other”)</li><li>Create the cloned PVs/PVCs (on the cloned VG)</li><li>Create the cloned applications (they start automatically)</li><li>The original application is NOT modified or stopped</li>"
+],
+[
+"Cochez au moins un PVC.",
+"Tick at least one PVC."
+],
+[
+"Indiquez le namespace cible.",
+"Provide the target namespace."
+],
+[
+"Aucun changement de chaîne.",
+"No string change."
+],
+[
+"volumeHandle dérivé",
+"derived volumeHandle"
+],
+[
+"Voir le manifeste complet du nouveau PV",
+"View the full manifest of the new PV"
+],
+[
+"Corrigez les volumes en erreur avant de lancer.",
+"Fix the volumes in error before launching."
+],
+[
+"\"Mode réel : ces opérations seront exécutées sur le cluster.\"",
+"\"Real mode: these operations will be executed on the cluster.\""
+],
+[
+"\"Mode simulation : rien ne sera modifié.\"",
+"\"Simulation mode: nothing will be changed.\""
+],
+[
+"\"la restauration sur place (flux manuel)\"",
+"\"the in-place restore (manual flow)\""
+],
+[
+"\"le clone de l'application\"",
+"\"the application clone\""
+],
+[
+"= \"le clone\";",
+"= \"the clone\";"
+],
+[
+"\"Lancer \" : \"Simuler \"",
+"\"Launch \" : \"Simulate \""
+],
+[
+"\" (réel)\"",
+"\" (real)\""
+],
+[
+"Clone d'application RÉEL",
+"REAL application clone"
+],
+[
+"Une <b>COPIE</b> de l'application sera créée",
+"A <b>COPY</b> of the application will be created"
+],
+[
+"\" dans le <b>même namespace</b> (avec suffixe)\"",
+"\" in the <b>same namespace</b> (with a suffix)\""
+],
+[
+"\" dans le namespace cible <b>\"",
+"\" in the target namespace <b>\""
+],
+[
+"L'application d'origine n'est <b>PAS</b> modifiée ni arrêtée.",
+"The original application is <b>NOT</b> modified or stopped."
+],
+[
+"</span> Clonage en cours…",
+"</span> Cloning in progress…"
+],
+[
+"Simulation — ressources qui seraient créées (l\\'app d\\'origine reste intacte).",
+"Simulation — resources that would be created (the original app stays intact)."
+],
+[
+"Clone d\\'application créé. L\\'application d\\'origine est intacte.",
+"Application clone created. The original application is intact."
+],
+[
+"Restauration RÉELLE",
+"REAL restore"
+],
+[
+"L'application sera <b>arrêtée</b>, les anciens PVC/PV <b>supprimés</b> puis recréés sur le(s) Volume Group(s) restauré(s).",
+"The application will be <b>stopped</b>, the old PVCs/PVs <b>deleted</b> then recreated on the restored Volume Group(s)."
+],
+[
+"</span>Exécution…",
+"</span>Executing…"
+],
+[
+"</span> Exécution en cours…",
+"</span> Execution in progress…"
+],
+[
+"Simulation terminée — voici ce qui serait exécuté en mode réel.",
+"Simulation complete — here is what would be executed in real mode."
+],
+[
+"<b>Séquence interrompue</b> — l\\'application est restée arrêtée pour éviter un redémarrage incohérent. Voir le détail.",
+"<b>Sequence aborted</b> — the application was left stopped to avoid an inconsistent restart. See details."
+],
+[
+"Restauration terminée.",
+"Restore complete."
+],
+[
+"Des étapes ont échoué — voir ci-dessous.",
+"Some steps failed — see below."
+],
+[
+"⚠ <b>Re-protection HYCU requise.</b> Le(s) Volume Group(s) cloné(s) ci-dessous",
+"⚠ <b>HYCU re-protection required.</b> The cloned Volume Group(s) below"
+],
+[
+"ne sont <b>pas encore protégés</b> par HYCU (la politique de l'app pointait l'ancien VG).",
+"are <b>not yet protected</b> by HYCU (the app's policy pointed at the old VG)."
+],
+[
+"Re-protéger maintenant dans HYCU",
+"Re-protect now in HYCU"
+],
+[
+"Vérifier l'état d'un namespace",
+"Verify a namespace's state"
+],
+[
+"Confirme que les PVC sont liés (Bound) et que les pods tournent.",
+"Confirms that the PVCs are Bound and the pods are running."
+],
+[
+">Vérifier<",
+">Verify<"
+],
+[
+"Rafraîchit la vérification toutes les ~3 s et s'arrête dès que tous les PVC sont Bound et les pods Running (10 min max) ; recliquez pour arrêter",
+"Re-runs the check every ~3 s and stops as soon as all PVCs are Bound and pods are Running (10 min max); click again to stop"
+],
+[
+"Suivi auto (jusqu'à stable)",
+"Auto-track (until stable)"
+],
+[
+"■ Arrêter le suivi",
+"■ Stop tracking"
+],
+[
+"État stable : tous les PVC sont Bound et les pods Running.",
+"Stable state: all PVCs are Bound and pods are Running."
+],
+[
+">Aucun PVC.<",
+">No PVC.<"
+],
+[
+"· prêts ",
+"· ready "
+],
+[
+">Aucun pod.<",
+">No pods.<"
+],
+[
+"Choisissez explicitement le cluster, au lieu de suivre le contexte courant.",
+"Choose the cluster explicitly instead of following the current context."
+],
+[
+"L'outil ajoute <code>--context</code> (et <code>--kubeconfig</code>) à chaque commande kubectl.",
+"The tool adds <code>--context</code> (and <code>--kubeconfig</code>) to every kubectl command."
+],
+[
+"Fichier kubeconfig (vide = défaut ~/.kube/config)",
+"kubeconfig file (empty = default ~/.kube/config)"
+],
+[
+">Contexte<",
+">Context<"
+],
+[
+"Lister les contextes",
+"List contexts"
+],
+[
+"Utiliser ce contexte",
+"Use this context"
+],
+[
+"Réglages (adaptation par client)",
+"Settings (per-customer adaptation)"
+],
+[
+"Ces réglages sont enregistrés dans <code>hycu_config.json</code> à côté du programme.",
+"These settings are saved in <code>hycu_config.json</code> next to the program."
+],
+[
+"Laissez vide ce que vous ne voulez pas contraindre.",
+"Leave blank anything you don't want to constrain."
+],
+[
+"Binaire kubectl",
+"kubectl binary"
+],
+[
+"Préfixe volumeHandle (vide = auto)",
+"volumeHandle prefix (empty = auto)"
+],
+[
+"Timeout d'attente (s)",
+"Wait timeout (s)"
+],
+[
+"Suffixe de nom de clone",
+"Clone name suffix"
+],
+[
+"Exiger la confirmation du contexte avant toute action réelle",
+"Require context confirmation before any real action"
+],
+[
+"Retirer entièrement claimRef du PV (laisser le PVC rebinder)",
+"Strip claimRef entirely from the PV (let the PVC rebind)"
+],
+[
+"Enregistrer les réglages",
+"Save settings"
+],
+[
+"(contexte courant du kubeconfig)",
+"(current kubeconfig context)"
+],
+[
+" contexte(s) trouvé(s)",
+" context(s) found"
+],
+[
+"\"Contexte « \"",
+"\"Context « \""
+],
+[
+"\" » appliqué.\"",
+"\" » applied.\""
+],
+[
+"\"Contexte courant utilisé.\"",
+"\"Current context in use.\""
+],
+[
+"\"Enregistré.\"",
+"\"Saved.\""
+],
+[
+"\"Erreur : \"",
+"\"Error: \""
+],
+[
+"HYCU — connexion",
+"HYCU — connection"
+],
+[
+"Pour lister les points de restauration et orchestrer le clone/restore d'un Volume Group",
+"To list restore points and orchestrate the clone/restore of a Volume Group"
+],
+[
+"depuis l'assistant de restauration (<b>Applications → Restaurer</b>). Les identifiants restent <b>en mémoire</b> le temps de la session — jamais écrits sur disque.",
+"from the restore wizard (<b>Applications → Restore</b>). Credentials stay <b>in memory</b> for the session — never written to disk."
+],
+[
+"URL HYCU (port 8443)",
+"HYCU URL (port 8443)"
+],
+[
+"Authentification",
+"Authentication"
+],
+[
+">Basic (utilisateur)<",
+">Basic (user)<"
+],
+[
+">Clé API<",
+">API key<"
+],
+[
+">Identifiant<",
+">Username<"
+],
+[
+">Mot de passe<",
+">Password<"
+],
+[
+">Clé API <",
+">API key <"
+],
+[
+"(HYCU : Aide → API Keys)",
+"(HYCU: Help → API Keys)"
+],
+[
+"Vérifier le certificat TLS (décoché = certificat auto-signé accepté)",
+"Verify the TLS certificate (unchecked = self-signed accepted)"
+],
+[
+"Vérifier le certificat TLS",
+"Verify the TLS certificate"
+],
+[
+"Tester &amp; connecter",
+"Test &amp; connect"
+],
+[
+">Déconnecter<",
+">Disconnect<"
+],
+[
+"</span>non connecté",
+"</span>not connected"
+],
+[
+"?\"connecté\":\"non connecté\"",
+"?\"connected\":\"not connected\""
+],
+[
+"Nutanix Prism Element — connexion",
+"Nutanix Prism Element — connection"
+],
+[
+"Récupère automatiquement la référence (UUID) du Volume Group cloné (lecture seule, API v2)",
+"Automatically fetches the cloned Volume Group's reference (UUID) (read-only, API v2)"
+],
+[
+"dans l'assistant de restauration. Identifiants en mémoire de session uniquement.",
+"in the restore wizard. Credentials kept in session memory only."
+],
+[
+"URL Prism Element",
+"Prism Element URL"
+],
+[
+"Nutanix Prism Central — connexion",
+"Nutanix Prism Central — connection"
+],
+[
+"Alternative multi-cluster (API v3). Sert aussi à récupérer la référence (UUID) du Volume Group",
+"Multi-cluster alternative (API v3). Also used to fetch the reference (UUID) of the Volume Group"
+],
+[
+"cloné si vous n'utilisez pas Prism Element. Identifiants en mémoire de session uniquement.",
+"cloned if you do not use Prism Element. Credentials kept in session memory only."
+],
+[
+"URL Prism Central",
+"Prism Central URL"
+],
+[
+"Mémoriser les connexions (chiffré)",
+"Remember connections (encrypted)"
+],
+[
+"(<code>hycu_secrets.enc</code>), protégé par une <b>phrase secrète maîtresse</b> — jamais stockée.",
+"(<code>hycu_secrets.enc</code>), protected by a <b>master passphrase</b> — never stored."
+],
+[
+"Par défaut, rien n'est écrit (RAM seulement), le choix le plus sûr.",
+"By default nothing is written (RAM only), the safest choice."
+],
+[
+"Enregistrer (chiffrer)",
+"Save (encrypt)"
+],
+[
+"Charger (déchiffrer)",
+"Load (decrypt)"
+],
+[
+">Oublier<",
+">Forget<"
+],
+[
+"</span>aucun coffre",
+"</span>no vault"
+],
+[
+"\"coffre présent\"",
+"\"vault present\""
+],
+[
+"\"aucun coffre\"",
+"\"no vault\""
+],
+[
+"MD5 n'étant pas réversible, le coffre utilise un chiffrement",
+"The vault uses passphrase-based encryption"
+],
+[
+"par phrase secrète (PBKDF2-HMAC-SHA256 + scellé d'intégrité).",
+"(PBKDF2-HMAC-SHA256 + integrity seal)."
+],
+[
+"Supprimer le coffre chiffré du disque ?",
+"Delete the encrypted vault from disk?"
+],
+[
+"Connexions chiffrées : ",
+"Connections encrypted: "
+],
+[
+"Connexions chargées : ",
+"Connections loaded: "
+],
+[
+"Coffre supprimé.",
+"Vault deleted."
+],
+[
+"Renseignez l\\'URL.",
+"Enter the URL."
+],
+[
+"Première configuration",
+"First-time setup"
+],
+[
+"Langue de l'interface",
+"Interface language"
+],
+[
+"Aucun fichier <code>hycu_config.json</code> n'a été trouvé. Quelques questions",
+"No <code>hycu_config.json</code> file was found. A few questions"
+],
+[
+"pour le générer — vous pourrez tout modifier ensuite dans la page Réglages.",
+"to generate it — you can change everything later in the Settings page."
+],
+[
+"Quel binaire kubectl utiliser ?",
+"Which kubectl binary should be used?"
+],
+[
+"Choisissez la distribution, ou saisissez une commande / un chemin personnalisé.",
+"Pick the distribution, or enter a custom command / path."
+],
+[
+"Commande kubectl",
+"kubectl command"
+],
+[
+"Verrouiller le(s) cluster(s) ?",
+"Lock down the cluster(s)?"
+],
+[
+"Restreindre l'outil à des contextes kubectl précis évite d'agir par erreur sur le mauvais cluster.",
+"Restricting the tool to specific kubectl contexts avoids acting on the wrong cluster by mistake."
+],
+[
+">Tous les contextes</b>",
+">All contexts</b>"
+],
+[
+"Aucune restriction.",
+"No restriction."
+],
+[
+">Restreindre</b>",
+">Restrict</b>"
+],
+[
+"N'autoriser que les contextes listés.",
+"Allow only the listed contexts."
+],
+[
+"Contextes autorisés (virgules)",
+"Allowed contexts (commas)"
+],
+[
+"Limiter aux namespaces concernés ?",
+"Limit to the relevant namespaces?"
+],
+[
+"Vous pouvez n'exposer que les namespaces applicatifs protégés par HYCU.",
+"You can expose only the application namespaces protected by HYCU."
+],
+[
+">Tous les namespaces</b>",
+">All namespaces</b>"
+],
+[
+"Lister tous les namespaces du cluster.",
+"List every namespace in the cluster."
+],
+[
+"N'afficher que les namespaces listés.",
+"Show only the listed namespaces."
+],
+[
+"Namespaces autorisés (virgules)",
+"Allowed namespaces (commas)"
+],
+[
+"Garde-fou avant action réelle",
+"Safety check before real actions"
+],
+[
+"Recommandé : exiger de retaper le nom du contexte avant toute restauration réelle.",
+"Recommended: require retyping the context name before any real restore."
+],
+[
+"Exiger la confirmation du contexte",
+"Require context confirmation"
+],
+[
+"L'opérateur retape le contexte cible avant d'agir.",
+"The operator retypes the target context before acting."
+],
+[
+"Réglages avancés (facultatif)",
+"Advanced settings (optional)"
+],
+[
+"Les valeurs par défaut conviennent à la plupart des environnements.",
+"The defaults suit most environments."
+],
+[
+"Suffixe nom de clone",
+"Clone name suffix"
+],
+[
+"Préfixe volumeHandle (vide = auto-détecté)",
+"volumeHandle prefix (empty = auto-detected)"
+],
+[
+"auto-détecté depuis le PV existant",
+"auto-detected from the existing PV"
+],
+[
+"Créer la configuration",
+"Create the configuration"
+],
+[
+"Vérifiez puis créez <code>hycu_config.json</code> (modifiable ensuite dans ⚙ Réglages).",
+"Review then create <code>hycu_config.json</code> (editable later in ⚙ Settings)."
+],
+[
+"Étape ${wizStep+1} / ${wizSteps.length}",
+"Step ${wizStep+1} / ${wizSteps.length}"
+],
+[
+"</span>Création…",
+"</span>Creating…"
+],
+[
+">Échec : ",
+">Failed: "
+],
+[
+"|| \"indisponible\"",
+"|| \"unavailable\""
+],
+[
+"||\"indisponible\"",
+"||\"unavailable\""
+],
+[
+"<b>kubectl introuvable.</b> Installez kubectl et ajoutez-le au PATH, ou indiquez son binaire/chemin dans ⚙ Réglages (ex. « microk8s kubectl »).",
+"<b>kubectl not found.</b> Install kubectl and add it to PATH, or set its binary/path in ⚙ Settings (e.g. “microk8s kubectl”)."
+],
+[
+"<b>Aucun contexte kubectl sélectionné.</b> Choisissez le cluster cible : <code>kubectl config use-context &lt;nom&gt;</code>, puis rechargez la page.",
+"<b>No kubectl context selected.</b> Choose the target cluster: <code>kubectl config use-context &lt;name&gt;</code>, then reload the page."
+],
+[
+"<b>Aucune configuration kubectl trouvée.</b> Vérifiez <code>%USERPROFILE%\\\\.kube\\\\config</code> (ou la variable <code>KUBECONFIG</code>), puis rechargez.",
+"<b>No kubectl configuration found.</b> Check <code>%USERPROFILE%\\\\.kube\\\\config</code> (or the <code>KUBECONFIG</code> variable), then reload."
+],
+[
+"<b>Cluster injoignable via kubectl.</b> Vérifiez la connectivité réseau et vos droits (RBAC) sur l'API server.",
+"<b>Cluster unreachable via kubectl.</b> Check network connectivity and your RBAC rights on the API server."
+],
+[
+"Les opérations <b>Sauvegarder</b>, <b>Restaurer</b> (séquence Kubernetes) et <b>Vérifier</b> nécessitent kubectl. Les connexions <b>HYCU / Nutanix</b> fonctionnent, elles, sans kubectl.",
+"The <b>Back up</b>, <b>Restore</b> (Kubernetes sequence) and <b>Verify</b> operations require kubectl. The <b>HYCU / Nutanix</b> connections work without kubectl."
+],
+[
+"Chargement des Volume Groups…",
+"Loading Volume Groups…"
+],
+[
+"rechercher le VG cloné par nom…",
+"search the cloned VG by name…"
+],
+[
+"Aucun Volume Group ne correspond.",
+"No Volume Group matches."
+],
+[
+"} sur ${ntAllVgs.length}",
+"} of ${ntAllVgs.length}"
+],
+[
+"' (200 affichés — affinez)'",
+"' (200 shown — refine the search)'"
+],
+[
+"UUID du VG indisponible.",
+"VG UUID unavailable."
+],
+[
+"Référence du VG (UUID) remplie depuis Nutanix.",
+"VG reference (UUID) filled from Nutanix."
+],
+[
+"Suivi du job indisponible : ",
+"Job tracking unavailable: "
+],
+[
+"Job terminé avec succès.",
+"Job finished successfully."
+],
+[
+"Job en échec — vérifiez dans HYCU.",
+"Job failed — check in HYCU."
+],
+[
+"Suivi interrompu (délai) — le job continue côté HYCU.",
+"Tracking stopped (timeout) — the job continues on the HYCU side."
+],
+[
+"\"Démarrage de l'opération impossible.\"",
+"\"Could not start the operation.\""
+],
+[
+"\"Opération terminée sans résultat.\"",
+"\"Operation finished with no result.\""
+],
+[
+"\"Délai de suivi dépassé (l'opération continue peut-être côté serveur).\"",
+"\"Tracking timed out (the operation may still be running server-side).\""
+],
+[
+"Identifiants refusés — vérifiez l'utilisateur/mot de passe, ou la clé API HYCU (Aide → API Keys, requise si 2FA).",
+"Credentials rejected — check the username/password, or the HYCU API key (Help → API Keys, required with 2FA)."
+],
+[
+"Accès refusé — droits insuffisants (RBAC / rôle sur l'API).",
+"Access denied — insufficient rights (RBAC / API role)."
+],
+[
+"Endpoint introuvable — vérifiez l'URL de base et la version d'API (⚙ Réglages).",
+"Endpoint not found — check the base URL and the API version (⚙ Settings)."
+],
+[
+"Certificat TLS — cochez/décochez « Vérifier le certificat TLS » dans Connexions selon votre PKI.",
+"TLS certificate — tick/untick “Verify the TLS certificate” in Connections to match your PKI."
+],
+[
+"Hôte injoignable — vérifiez l'URL:port (HYCU 8443, Prism 9440), le réseau et le pare-feu.",
+"Host unreachable — check the URL:port (HYCU 8443, Prism 9440), the network and the firewall."
+],
+[
+"Enregistrez d'abord la source (⚙ en haut à droite).",
+"Register the source first (⚙ at the top right)."
+],
+[
+"Namespace hors liste autorisée — voir ⚙ Réglages → namespaces autorisés.",
+"Namespace not in the allowed list — see ⚙ Settings → allowed namespaces."
+],
+[
+"Contexte kubectl hors liste autorisée — voir ⚙ Réglages.",
+"kubectl context not in the allowed list — see ⚙ Settings."
+],
+[
+"Retapez le nom exact du contexte cible pour confirmer (mode réel).",
+"Retype the exact target context name to confirm (real mode)."
+],
+[
+"Rechargez la page (Ctrl+Shift+R) : le jeton de sécurité a expiré.",
+"Reload the page (Ctrl+Shift+R): the security token has expired."
+],
+[
+"Une autre opération est déjà en cours. Réessayez.",
+"Another operation is already running. Try again."
+],
+[
+"Opération inconnue ou expirée.",
+"Unknown or expired operation."
+],
+[
+"Erreur interne : ",
+"Internal error: "
+],
+[
+"Erreur interne.",
+"Internal error."
+],
+[
+"Commande introuvable : '",
+"Command not found: '"
+],
+[
+"' est-il installé et dans le PATH ?",
+"' — is it installed and in the PATH?"
+],
+[
+"Délai dépassé (",
+"Timeout exceeded ("
+],
+[
+"Réponse JSON illisible : ",
+"Unreadable JSON response: "
+],
+[
+"Référence de volume invalide : impossible d'en extraire l'UUID du Volume Group.",
+"Invalid volume reference: could not extract the Volume Group UUID from it."
+],
+[
+"Collez l'UUID du VG (8-4-4-4-12), un volumeHandle « NutanixVolumes-<uuid> »,",
+"Paste the VG UUID (8-4-4-4-12), a volumeHandle « NutanixVolumes-<uuid> »,"
+],
+[
+"ou (clusters iSCSI hérités) l'IQN complet du VG cloné.",
+"or (legacy iSCSI clusters) the full IQN of the cloned VG."
+],
+[
+"UUID du VG",
+"VG UUID"
+],
+[
+"Nom de PV invalide : '",
+"Invalid PV name: '"
+],
+[
+"' (RFC 1123 attendu).",
+"' (RFC 1123 expected)."
+],
+[
+"nom du PV",
+"PV name"
+],
+[
+"Dossier de destination inutilisable (",
+"Unusable destination folder ("
+],
+[
+"Le chemin de destination n'est pas un dossier : ",
+"The destination path is not a folder: "
+],
+[
+" » introuvable dans le kubeconfig.",
+" » not found in the kubeconfig."
+],
+[
+"' non autorisé par la configuration.",
+"' not allowed by the configuration."
+],
+[
+"' non autorisé.",
+"' not allowed."
+],
+[
+"Aucun PVC trouvé dans le namespace '",
+"No PVC found in namespace '"
+],
+[
+"Liste des namespaces indisponible.",
+"Namespace list unavailable."
+],
+[
+"Aucun namespace à sauvegarder.",
+"No namespace to back up."
+],
+[
+"Sauvegarde introuvable.",
+"Backup not found."
+],
+[
+"Sauvegarde trop volumineuse pour un téléchargement direct.",
+"Backup too large for a direct download."
+],
+[
+"Erreur lors de la création de l'archive.",
+"Error while creating the archive."
+],
+[
+"Jeton anti-CSRF invalide ou absent.",
+"CSRF token invalid or missing."
+],
+[
+"Charge trop volumineuse.",
+"Payload too large."
+],
+[
+"JSON invalide",
+"Invalid JSON"
+],
+[
+"Arrêt ",
+"Stopping "
+],
+[
+"arrêt de ",
+"stopping of "
+],
+[
+"Redémarrage ",
+"Restarting "
+],
+[
+"aucun contrôleur",
+"no controller"
+],
+[
+"Pods arrêtés",
+"Pods stopped"
+],
+[
+"(attente) pods montant les PVC",
+"(waiting) pods mounting the PVCs"
+],
+[
+"aucun pod ne monte les volumes ciblés",
+"no pod mounts the targeted volumes"
+],
+[
+"Pods encore présents",
+"Pods still present"
+],
+[
+"Délai dépassé, pods encore actifs : ",
+"Timeout exceeded, pods still active: "
+],
+[
+" déjà absent",
+" already absent"
+],
+[
+"rien à supprimer",
+"nothing to delete"
+],
+[
+"Attente suppression ",
+"Waiting for deletion of "
+],
+[
+"Déblocage finalizer ",
+"Unblocking finalizer "
+],
+[
+" non supprimé",
+" not deleted"
+],
+[
+"État : ",
+"State: "
+],
+[
+"Attente PVC ",
+"Waiting for PVC "
+],
+[
+" lié (Bound)",
+" to bind (Bound)"
+],
+[
+"Suppression PVC ",
+"Deleting PVC "
+],
+[
+"Suppression PV ",
+"Deleting PV "
+],
+[
+"Suppression ",
+"Deleting "
+],
+[
+"suppression du PVC ",
+"deletion of PVC "
+],
+[
+"suppression du PV ",
+"deletion of PV "
+],
+[
+"PVC manquant.",
+"Missing PVC."
+],
+[
+"Indiquez la référence du Volume Group cloné/restauré pour « ",
+"Provide the reference of the cloned/restored Volume Group for « "
+],
+[
+"(UUID du VG, volumeHandle, ou IQN).",
+"(VG UUID, volumeHandle, or IQN)."
+],
+[
+"Référence invalide pour « ",
+"Invalid reference for « "
+],
+[
+" » : aucun UUID détecté. Collez l'UUID du VG ",
+" »: no UUID detected. Paste the VG UUID "
+],
+[
+"(8-4-4-4-12), un volumeHandle « NutanixVolumes-<uuid> », ou l'IQN complet.",
+"(8-4-4-4-12), a volumeHandle « NutanixVolumes-<uuid> », or the full IQN."
+],
+[
+"Manifeste du PV introuvable pour « ",
+"PV manifest not found for « "
+],
+[
+" ». Sauvegardez d'abord ce namespace, ",
+" ». Back up this namespace first, "
+],
+[
+"ou vérifiez que le PV existe encore.",
+"or check that the PV still exists."
+],
+[
+"L'UUID fourni correspond au NOM du VG (« pvc-<uuid> », = UUID du PVC) et non à l'UUID",
+"The provided UUID matches the VG NAME (« pvc-<uuid> », = the PVC's UUID), not the UUID"
+],
+[
+"du Volume Group. Vous avez probablement saisi le nom du VG au lieu de son UUID —",
+"of the Volume Group. You probably entered the VG name instead of its UUID —"
+],
+[
+"utilisez « Rechercher le VG dans Prism » ou copiez l'UUID du VG (suffixe de NutanixVolumes-… / ntnx-k8s-…).",
+"use “Search for the VG in Prism” or copy the VG UUID (the suffix of NutanixVolumes-… / ntnx-k8s-…)."
+],
+[
+"L'UUID est identique à l'ancien : le clone n'a peut-être pas produit de nouveau VG",
+"The UUID is identical to the old one: the clone may not have produced a new VG"
+],
+[
+"(UUID du VG source saisi au lieu du VG cloné ?).",
+"(source VG UUID entered instead of the cloned VG?)."
+],
+[
+"Aucun changement détecté dans le manifeste : en restauration sur place avec le même VG,",
+"No change detected in the manifest: for an in-place restore with the same VG,"
+],
+[
+"un simple redémarrage des pods suffit à remonter les données restaurées.",
+"simply restarting the pods is enough to mount the restored data."
+],
+[
+"Un ou plusieurs volumes n'ont pas pu être préparés.",
+"One or more volumes could not be prepared."
+],
+[
+"Arrêter l'application (tous les Deployments/StatefulSets du namespace -> 0 réplica)",
+"Stop the application (all Deployments/StatefulSets in the namespace -> 0 replicas)"
+],
+[
+"Attendre l'arrêt effectif des pods qui montent les volumes ciblés",
+"Wait for the pods mounting the targeted volumes to actually stop"
+],
+[
+"Supprimer l'ancien PVC « ",
+"Delete the old PVC « "
+],
+[
+"Supprimer l'ancien PV « ",
+"Delete the old PV « "
+],
+[
+" » (+ déblocage finalizer si nécessaire)",
+" » (+ finalizer unblock if needed)"
+],
+[
+"Créer le nouveau PV « ",
+"Create the new PV « "
+],
+[
+"Recréer le PVC « ",
+"Recreate the PVC « "
+],
+[
+" » et le lier au nouveau PV, attendre l'état Bound",
+" » and bind it to the new PV, wait for Bound"
+],
+[
+"Redémarrer l'application (réplicas d'origine restaurés)",
+"Restart the application (original replicas restored)"
+],
+[
+"Vérifier : tous les PVC liés (Bound) et pods démarrés",
+"Verify: all PVCs Bound and pods started"
+],
+[
+"APRÈS : re-protéger le(s) nouveau(x) Volume Group(s) dans HYCU",
+"AFTER: re-protect the new Volume Group(s) in HYCU"
+],
+[
+"(politique / catégorie Prism) — non automatisé par cet outil",
+"(Prism policy / category) — not automated by this tool"
+],
+[
+"Contexte kubectl « ",
+"kubectl context « "
+],
+[
+" » non autorisé par la configuration",
+" » not allowed by the configuration"
+],
+[
+"Confirmation du contexte requise : retapez le nom du contexte ciblé",
+"Context confirmation required: retype the targeted context name"
+],
+[
+" ») pour confirmer.",
+" ») to confirm."
+],
+[
+"Reprise d'une restauration interrompue",
+"Resuming an interrupted restore"
+],
+[
+"Démarrée ",
+"Started "
+],
+[
+"Sauvegarde de sécurité du namespace avant restauration",
+"Safety backup of the namespace before the restore"
+],
+[
+"Sauvegarde de sécurité impossible (",
+"Safety backup failed ("
+],
+[
+") — restauration annulée pour ne pas",
+") — restore cancelled so as not to"
+],
+[
+"détruire sans filet. Corrigez puis relancez.",
+"destroy without a safety net. Fix the issue then retry."
+],
+[
+"Réplicas mémorisés",
+"Replicas recorded"
+],
+[
+"(lecture) réplicas cibles",
+"(read) target replicas"
+],
+[
+" (contrôleur : ",
+" (controller: "
+],
+[
+"attente de l'arrêt des pods",
+"waiting for the pods to stop"
+],
+[
+" (Prism Central requis) —",
+" (Prism Central required) —"
+],
+[
+"Protection du VG : PV ",
+"Protecting the VG: PV "
+],
+[
+"Évite que la suppression du PV/PVC ne supprime le Volume Group Nutanix",
+"Prevents the PV/PVC deletion from deleting the Nutanix Volume Group"
+],
+[
+"(reclaimPolicy=Delete par défaut).",
+"(reclaimPolicy=Delete by default)."
+],
+[
+"Création du nouveau PV ",
+"Creating the new PV "
+],
+[
+"protection (Retain) du PV ",
+"protection (Retain) of PV "
+],
+[
+" — suppression annulée pour",
+" — deletion cancelled to"
+],
+[
+"ne pas risquer la perte du Volume Group",
+"avoid risking the loss of the Volume Group"
+],
+[
+"création du nouveau PV ",
+"creation of the new PV "
+],
+[
+"Recréation du PVC ",
+"Recreating PVC "
+],
+[
+"recréation du PVC ",
+"recreation of PVC "
+],
+[
+"liaison (Bound) du PVC ",
+"binding (Bound) of PVC "
+],
+[
+" non recréé",
+" not recreated"
+],
+[
+"Manifeste du PVC introuvable (ni sauvegarde ni live) : le PVC sera recréé",
+"PVC manifest not found (neither backup nor live): the PVC will be recreated"
+],
+[
+"par votre déploiement applicatif (vérifiez ensuite qu'il devient Bound).",
+"by your application deployment (check afterwards that it becomes Bound)."
+],
+[
+"SÉQUENCE INTERROMPUE",
+"SEQUENCE ABORTED"
+],
+[
+"Échec à l'étape : ",
+"Failed at step: "
+],
+[
+"L'application reste ARRÊTÉE (réplicas à 0) pour éviter de redémarrer sur des",
+"The application stays STOPPED (replicas at 0) to avoid restarting on"
+],
+[
+"réplicas d'origine sont mémorisés), ou redémarrez manuellement :",
+"original replicas are recorded), or restart manually:"
+],
+[
+" lié à ",
+" bound to "
+],
+[
+" au lieu de ",
+" instead of "
+],
+[
+"Incohérence(s) : ",
+"Inconsistency(ies): "
+],
+[
+"volumeHandle conforme au VG attendu pour tous les volumes",
+"volumeHandle matches the expected VG for all volumes"
+],
+[
+"Vérification finale",
+"Final verification"
+],
+[
+"Schéma d'URL refusé (",
+"URL scheme refused ("
+],
+[
+") : seuls http/https sont autorisés.",
+"): only http/https are allowed."
+],
+[
+"Connexion impossible : ",
+"Connection failed: "
+],
+[
+"Erreur TLS : ",
+"TLS error: "
+],
+[
+" non configurée (⚙ Sources).",
+" not configured (⚙ Sources)."
+],
+[
+"Non connecté à ",
+"Not connected to "
+],
+[
+"Système inconnu.",
+"Unknown system."
+],
+[
+"Clé API requise.",
+"API key required."
+],
+[
+"Identifiant et mot de passe requis.",
+"Username and password required."
+],
+[
+"Authentification ",
+"Authentication "
+],
+[
+" refusée (HTTP ",
+" refused (HTTP "
+],
+[
+"Vérifiez les identifiants",
+"Check the credentials"
+],
+[
+"ou utilisez une clé API si le 2FA est activé",
+"or use an API key if 2FA is enabled"
+],
+[
+"la version de l'API v3/v4",
+"the API version v3/v4"
+],
+[
+"Connecté, mais l'endpoint de test « ",
+"Connected, but the test endpoint « "
+],
+[
+" » est introuvable (HTTP 404).",
+" » was not found (HTTP 404)."
+],
+[
+"Les chemins REST dépendent de la version : vérifiez ",
+"REST paths depend on the version: check "
+],
+[
+" et ajustez si besoin.",
+" and adjust if needed."
+],
+[
+"Échec de connexion ",
+"Connection failed for "
+],
+[
+"Cette URL est identique à celle de ",
+"This URL is identical to the one for "
+],
+[
+"Prism Element et Prism Central doivent pointer vers des hôtes différents.",
+"Prism Element and Prism Central must point to different hosts."
+],
+[
+"Attention : cette URL semble être un ",
+"Warning: this URL looks like a "
+],
+[
+", pas un ",
+", not a "
+],
+[
+" — vérifiez de ne pas avoir",
+" — make sure you did not"
+],
+[
+"inversé les deux connecteurs. La connexion est tout de même établie.",
+"swap the two connectors. The connection was still established."
+],
+[
+"Certificat TLS NON vérifié — les identifiants transitent vers un hôte non",
+"TLS certificate NOT verified — credentials are sent to an unauthenticated"
+],
+[
+"authentifié. N'utilisez ce mode que sur un réseau de gestion de confiance.",
+"host. Use this mode only on a trusted management network."
+],
+[
+"Choisissez une phrase secrète d'au moins 8 caractères.",
+"Choose a passphrase of at least 8 characters."
+],
+[
+"Connectez-vous d'abord à au moins un système.",
+"Connect to at least one system first."
+],
+[
+"Écriture du coffre impossible : ",
+"Could not write the vault: "
+],
+[
+"Aucune connexion mémorisée.",
+"No saved connections."
+],
+[
+"Lecture du coffre impossible : ",
+"Could not read the vault: "
+],
+[
+"Phrase secrète incorrecte (ou fichier altéré).",
+"Incorrect passphrase (or corrupted file)."
+],
+[
+"Données déchiffrées illisibles.",
+"Decrypted data unreadable."
+],
+[
+"Suppression impossible : ",
+"Deletion failed: "
+],
+[
+"Aucune connexion Nutanix (Prism Element ou Central).",
+"No Nutanix connection (Prism Element or Central)."
+],
+[
+"Erreur Nutanix.",
+"Nutanix error."
+],
+[
+"UUID de Volume Group manquant.",
+"Missing Volume Group UUID."
+],
+[
+"UUID introuvable dans la réponse Nutanix pour ce VG.",
+"UUID not found in the Nutanix response for this VG."
+],
+[
+"Le détachement automatique requiert Prism Element (API v2).",
+"Automatic detach requires Prism Element (API v2)."
+],
+[
+"Connectez Prism Element, ou détachez le VG de sa VM dans Prism.",
+"Connect Prism Element, or detach the VG from its VM in Prism."
+],
+[
+"Connectez Prism Central : l'API v4 Volumes (et le CSI) y sont servies.",
+"Connect Prism Central: the v4 Volumes API (and the CSI) are served there."
+],
+[
+"Renseigner hypervisorAttachedDiskUUIDs (disque du VG cloné ",
+"Set hypervisorAttachedDiskUUIDs (cloned VG disk "
+],
+[
+"Lu via Prism Central v4 ; sans lui le CSI tente l'attach iSCSI (échec).",
+"Read via Prism Central v4; without it the CSI attempts the iSCSI attach (fails)."
+],
+[
+"hypervisorAttachedDiskUUIDs NON renseigné (Prism Central non connecté)",
+"hypervisorAttachedDiskUUIDs NOT set (Prism Central not connected)"
+],
+[
+"Le CSI tentera l'attach iSCSI et l'attachement échouera. Connectez Prism Central.",
+"The CSI will attempt the iSCSI attach and the attachment will fail. Connect Prism Central."
+],
+[
+"hypervisorAttachedDiskUUIDs renseigné depuis le VG cloné",
+"hypervisorAttachedDiskUUIDs set from the cloned VG"
+],
+[
+"Disque(s) du VG cloné : ",
+"Cloned VG disk(s): "
+],
+[
+"hypervisorAttachedDiskUUIDs NON renseigné (disque introuvable)",
+"hypervisorAttachedDiskUUIDs NOT set (disk not found)"
+],
+[
+"Aucun disque lu pour le VG ",
+"No disk read for VG "
+],
+[
+"Le CSI tentera l'attach iSCSI ; vérifiez le VG cloné dans Prism.",
+"The CSI will attempt the iSCSI attach; check the cloned VG in Prism."
+],
+[
+"Disque du PV ",
+"Disk of PV "
+],
+[
+" non vérifié (Prism Central non connecté)",
+" not verified (Prism Central not connected)"
+],
+[
+"Si le pod reste en FailedMount («failed to get symlink»), connectez",
+"If the pod stays in FailedMount (“failed to get symlink”), connect"
+],
+[
+"Prism Central et relancez la restauration sur place.",
+"Prism Central and rerun the in-place restore."
+],
+[
+"Disque du VG remplacé par le restore in-place — rafraîchissement du PV ",
+"VG disk replaced by the in-place restore — refreshing PV "
+],
+[
+"Recréer le PV ",
+"Recreate PV "
+],
+[
+" avec le disque à jour (Retain -> delete -> apply)",
+" with the up-to-date disk (Retain -> delete -> apply)"
+],
+[
+"Rafraîchissement du PV interrompu : ",
+"PV refresh interrupted: "
+],
+[
+"Rafraîchissement du PV ",
+"Refresh of PV "
+],
+[
+" annulé : état du PV indéterminé (",
+" cancelled: PV state undetermined ("
+],
+[
+" — suppression refusée pour ne pas risquer la perte du",
+" — deletion refused to avoid risking the loss of the"
+],
+[
+"Volume Group. Vérifiez l'accès kubectl puis relancez.",
+"Volume Group. Check kubectl access then retry."
+],
+[
+"vérification de l'état du PV ",
+"checking the state of PV "
+],
+[
+" avant suppression",
+" before deletion"
+],
+[
+"Recréation du PV ",
+"Recreating PV "
+],
+[
+" (disque rafraîchi)",
+" (refreshed disk)"
+],
+[
+"recréation du PV ",
+"recreation of PV "
+],
+[
+"Point de restauration requis.",
+"Restore point required."
+],
+[
+"Simulation : aucun appel HYCU envoyé. Vérifiez l'appel ci-dessus,",
+"Simulation: no HYCU call sent. Review the call above,"
+],
+[
+"puis désactivez la simulation pour lancer réellement.",
+"then turn off simulation to launch for real."
+],
+[
+"Identifiant de job manquant.",
+"Missing job identifier."
+],
+[
+"Re-vérification de la correspondance impossible : ",
+"Could not re-verify the mapping: "
+],
+[
+"Volume Group(s) hors de la correspondance actuelle du namespace « ",
+"Volume Group(s) outside the current mapping of namespace « "
+],
+[
+"Aucun Volume Group HYCU à protéger",
+"No HYCU Volume Group to protect"
+],
+[
+"Assigner la politique",
+"Assign the policy"
+],
+[
+"Échec de l'assignation de politique : ",
+"Policy assignment failed: "
+],
+[
+"Lancer la sauvegarde maintenant",
+"Start the backup now"
+],
+[
+"Job HYCU non identifié — fin non confirmable.",
+"HYCU job not identified — completion cannot be confirmed."
+],
+[
+" terminé",
+" finished"
+],
+[
+" en échec",
+" failed"
+],
+[
+"Connectez-vous à HYCU pour orchestrer la restauration sur place.",
+"Connect to HYCU to orchestrate the in-place restore."
+],
+[
+"Aucun volume avec un point de restauration sélectionné.",
+"No volume with a selected restore point."
+],
+[
+"Une étape a échoué. L'application reste ARRÊTÉE pour éviter de redémarrer sur",
+"A step failed. The application stays STOPPED to avoid restarting on"
+],
+[
+"des données incohérentes. Corrigez puis relancez, ou redémarrez :",
+"inconsistent data. Fix the issue then retry, or restart manually:"
+],
+[
+"Un suffixe est requis pour cloner dans le même namespace.",
+"A suffix is required to clone within the same namespace."
+],
+[
+"Nom de namespace cible invalide : '",
+"Invalid target namespace name: '"
+],
+[
+"Aucun volume sélectionné.",
+"No volume selected."
+],
+[
+"Référence du VG cloné manquante/invalide pour « ",
+"Missing/invalid cloned VG reference for « "
+],
+[
+" » : la référence est identique au volume SOURCE — le clone",
+" »: the reference is identical to the SOURCE volume — the clone"
+],
+[
+"pointerait vers le même disque Nutanix que l'application d'origine (risque de",
+"would point to the same Nutanix disk as the original application (risk of"
+],
+[
+"multi-attach/corruption). Collez l'UUID du VG CLONÉ.",
+"multi-attach/corruption). Paste the UUID of the CLONED VG."
+],
+[
+" » : la référence correspond au NOM du Volume Group",
+" »: the reference matches the Volume Group NAME"
+],
+[
+"(« pvc-<uuid-du-PVC> ») et non à son UUID. Collez l'UUID du VG cloné.",
+"(« pvc-<PVC-uuid> ») and not its UUID. Paste the cloned VG UUID."
+],
+[
+"Manifeste du PVC introuvable pour « ",
+"PVC manifest not found for « "
+],
+[
+"Le nom du PV cloné doit différer de l'original « ",
+"The cloned PV name must differ from the original « "
+],
+[
+"Le workload « ",
+"The workload « "
+],
+[
+" » monte aussi le(s) PVC ",
+" » also mounts the PVC(s) "
+],
+[
+" non sélectionné(s) : ",
+" not selected: "
+],
+[
+"sélectionnez TOUS les volumes de cette application pour la cloner.",
+"select ALL the volumes of this application to clone it."
+],
+[
+" » utilise un sélecteur matchExpressions : le clone dans",
+" » uses a matchExpressions selector: cloning within"
+],
+[
+"le même namespace n'est pas supporté (risque de collision de pods). Choisissez « Autre namespace ».",
+"the same namespace is not supported (pod collision risk). Choose “Other namespace”."
+],
+[
+" » utilise des volumeClaimTemplates : son clone provisionnera de",
+" » uses volumeClaimTemplates: its clone will provision"
+],
+[
+"NOUVEAUX volumes (pas le VG cloné). À adapter manuellement.",
+"NEW volumes (not the cloned VG). Adapt it manually."
+],
+[
+"Dépendances clonées automatiquement vers « ",
+"Dependencies automatically cloned to « "
+],
+[
+"Référencé(s) par l'app mais INTROUVABLE(S) dans « ",
+"Referenced by the app but NOT FOUND in « "
+],
+[
+" » — à créer à la main : ",
+" » — create manually: "
+],
+[
+"Non clonés automatiquement : Ingress, NetworkPolicies et les liaisons RBAC",
+"Not cloned automatically: Ingress, NetworkPolicies and the RBAC bindings"
+],
+[
+"(RoleBindings) des ServiceAccounts — à recréer si l'app en dépend.",
+"(RoleBindings) of the ServiceAccounts — recreate them if the app depends on them."
+],
+[
+"Clone des dépendances DÉSACTIVÉ : à recréer manuellement dans « ",
+"Dependency cloning DISABLED: recreate manually in « "
+],
+[
+"Same-namespace : les Services / Ingress / NetworkPolicies de l'app NE sont PAS clonés et",
+"Same-namespace: the app's Services / Ingress / NetworkPolicies are NOT cloned and"
+],
+[
+"peuvent router vers les pods d'origine (labels hors-sélecteur conservés). À cloner/éditer séparément.",
+"may route to the original pods (non-selector labels kept). Clone/edit them separately."
+],
+[
+"Aucun Deployment/StatefulSet ne monte ces PVC : seuls le PV et le PVC clonés seront",
+"No Deployment/StatefulSet mounts these PVCs: only the cloned PV and PVC will be"
+],
+[
+"créés (déployez votre application dessus).",
+"created (deploy your application on top of them)."
+],
+[
+"Objet(s) déjà présent(s) — refus pour ne rien écraser : ",
+"Object(s) already present — refusing to overwrite anything: "
+],
+[
+"Changez le suffixe ou le namespace cible.",
+"Change the suffix or the target namespace."
+],
+[
+"Disque du VG cloné introuvable pour « ",
+"Cloned VG disk not found for « "
+],
+[
+" » (Prism Central requis) — ",
+" » (Prism Central required) — "
+],
+[
+"rien n'a été créé.",
+"nothing was created."
+],
+[
+"Namespace cible « ",
+"Target namespace « "
+],
+[
+" déjà présent — conservé",
+" already present — kept"
+],
+[
+"Non écrasé (la version existante de « ",
+"Not overwritten (the existing version of « "
+],
+[
+" » est gardée).",
+" » is kept)."
+],
+[
+"Dépendance clonée ",
+"Cloned dependency "
+],
+[
+"PV cloné ",
+"Cloned PV "
+],
+[
+"PVC cloné ",
+"Cloned PVC "
+],
+[
+"Application clonée ",
+"Cloned application "
+],
+[
+"État des sources — cliquer pour ouvrir les Sources",
+"Source status — click to open Sources"
+],
+[
+"Plan prêt — dernière étape :",
+"Plan ready — final step:"
+],
+[
+"Tous les points de restauration sont sélectionnés.",
+"All restore points are selected."
+],
+[
+" point(s) de restauration sélectionné(s).",
+" restore point(s) selected."
+],
+[
+"Toutes les références VG sont remplies.",
+"All VG references are filled."
+],
+[
+" référence(s) VG remplie(s).",
+" VG reference(s) filled."
+],
+[
+"Aller au lancement",
+"Go to launch"
+],
+[
+"Voir les volumes",
+"Show the volumes"
+],
+[
+"Vérifier l\\'application maintenant →",
+"Verify the application now →"
+],
+[
+"Ouverture de la vérification…",
+"Opening the verification…"
+],
+[
+"Cochez le(s) volume(s) à restaurer — plusieurs volumes = une seule transaction.",
+"Tick the volume(s) to restore — several volumes = a single transaction."
+],
+[
+"Manifestes PV/PVC (le « squelette ») — indépendant du point de restauration HYCU des <b>données</b>.",
+"PV/PVC manifests (the “skeleton”) — independent from the HYCU restore point of the <b>data</b>."
+],
+[
+"Type d'opération",
+"Operation type"
+],
+[
+"Restaurer les données (Volume Groups)",
+"Restore the data (Volume Groups)"
+],
+[
+"Arrêt de l'application → restore in-place HYCU → redémarrage.</b> Aucune référence à saisir.",
+"Stop the application → HYCU in-place restore → restart.</b> No reference to enter."
+],
+[
+"Continuer : vérifier et lancer",
+"Continue: review and launch"
+],
+[
+"Nom du nouveau PV",
+"New PV name"
+],
+[
+"Avancé (optionnel) — noms générés, saisie manuelle",
+"Advanced (optional) — generated names, manual entry"
+],
+[
+"Référence du VG (obligatoire) & noms générés",
+"VG reference (required) & generated names"
+],
+[
+"✓ référence remplie",
+"✓ reference filled"
+],
+[
+"— référence à remplir",
+"— reference to fill"
+],
+[
+"Choisissez un <b>point de restauration</b> par volume (le plus récent est pré-sélectionné), puis <b>Lancer la restauration sur place</b>.",
+"Choose a <b>restore point</b> per volume (the most recent is pre-selected), then <b>Launch the in-place restore</b>."
+],
+[
+"Restaurez le VG dans HYCU, collez son UUID par volume (volet <b>Avancé</b>), puis <b>",
+"Restore the VG in HYCU, paste its UUID per volume (<b>Advanced</b> section), then <b>"
+],
+[
+"Clonez chaque VG dans HYCU, collez son UUID par volume (volet <b>Avancé</b>), puis <b>",
+"Clone each VG in HYCU, paste its UUID per volume (<b>Advanced</b> section), then <b>"
+],
+[
+"Connectez HYCU pour automatiser.",
+"Connect HYCU to automate."
+],
+[
+"Choisissez un <b>point de restauration</b> par volume (le plus récent est pré-sélectionné), puis cliquez <b>Restaurer les VG depuis HYCU</b> — références et plan s'enchaînent automatiquement.",
+"Choose a <b>restore point</b> per volume (the most recent is pre-selected), then click <b>Restore the VGs from HYCU</b> — references and plan follow automatically."
+],
+[
+"points indisponibles",
+"restore points unavailable"
+],
+[
+"Aucun Volume Group HYCU associé — collez la référence dans « Avancé ».",
+"No HYCU Volume Group matched — paste the reference under “Advanced”."
+],
+[
+" (le plus récent)",
+" (most recent)"
+],
+[
+"Aucun point de restauration pour ce VG.",
+"No restore point for this VG."
+],
+[
+"→ VG HYCU <b>",
+"→ HYCU VG <b>"
+],
+[
+"Restaurer les VG depuis HYCU",
+"Restore the VGs from HYCU"
+],
+[
+"Clone les VG au point choisi et remplit les références — aucune donnée écrasée.",
+"Clones the VGs at the chosen point and fills the references — no data overwritten."
+],
+[
+"Connectez Nutanix (Prism) pour récupérer la référence automatiquement, ou utilisez le volet Avancé.",
+"Connect Nutanix (Prism) to fetch the reference automatically, or use the Advanced section."
+],
+[
+" » introuvable côté Nutanix — utilisez le volet Avancé.",
+" » not found on the Nutanix side — use the Advanced section."
+],
+[
+"?\"Aucun\":\"Plusieurs\")+\" VG nommé(s) exactement « ",
+"?\"No\":\"Multiple\")+\" VG named exactly « "
+],
+[
+" » — utilisez le volet Avancé pour choisir le bon.",
+" » — use the Advanced section to pick the right one."
+],
+[
+"VG trouvé mais UUID non exposé — utilisez le volet Avancé.",
+"VG found but UUID not exposed — use the Advanced section."
+],
+[
+"Clones HYCU RÉELS",
+"REAL HYCU clones"
+],
+[
+"Déclencher dans HYCU le <b>clone</b> de <b>",
+"Trigger in HYCU the <b>clone</b> of <b>"
+],
+[
+"</b> Volume Group(s) au point choisi ?",
+"</b> Volume Group(s) at the chosen point?"
+],
+[
+"Les VG sources ne sont <b>pas</b> modifiés — de <b>nouveaux</b> VG sont créés.",
+"The source VGs are <b>not</b> modified — <b>new</b> VGs are created."
+],
+[
+"Clones HYCU en cours…",
+"HYCU clones in progress…"
+],
+[
+"Clone HYCU…",
+"HYCU clone…"
+],
+[
+"Job HYCU non identifié — récupérez la référence via le volet Avancé une fois le clone terminé.",
+"HYCU job not identified — fetch the reference via the Advanced section once the clone completes."
+],
+[
+"✓ VG cloné — référence <code>",
+"✓ VG cloned — reference <code>"
+],
+[
+"</code> remplie.",
+"</code> filled."
+],
+[
+" » ajouté aux namespaces autorisés",
+" » added to the allowed namespaces"
+],
+[
+"Filtre mis à jour (⚙ Réglages) pour que Vérifier/Restaurer acceptent ce namespace.",
+"Filter updated (⚙ Settings) so Verify/Restore accept this namespace."
+],
+[
+"Autoriser « ",
+"Allow « "
+],
+[
+" » et réessayer",
+" » and retry"
+],
+[
+"Mise à jour du filtre impossible.",
+"Could not update the filter."
+],
+[
+"Sauvegarde automatique de la configuration (PV/PVC)",
+"Automatic configuration backup (PV/PVC manifests)"
+],
+[
+"Sauvegarde régulièrement les <b>manifestes PV/PVC</b> (la « recette » du restore) de tous les",
+"Regularly backs up the <b>PV/PVC manifests</b> (the restore “recipe”) of all"
+],
+[
+"namespaces autorisés par le filtre — tant que l'outil est lancé. <b>Pas les données</b> des volumes :",
+"namespaces allowed by the filter — while the tool is running. <b>Not the data</b> of the volumes:"
+],
+[
+"Sauvegarde automatique</label>",
+"Automatic backup</label>"
+],
+[
+"Intervalle (heures)",
+"Interval (hours)"
+],
+[
+"Versions à conserver",
+"Versions to keep"
+],
+[
+"? \"Activée\" : \"Désactivée\"",
+"? \"Enabled\" : \"Disabled\""
+],
+[
+">Désactivée</b>",
+">Disabled</b>"
+],
+[
+"\"Toutes les \"",
+"\"Every \""
+],
+[
+"\" h · conserve les \"",
+"\" h · keeps the last \""
+],
+[
+"\" dernières versions par namespace.\"",
+"\" versions per namespace.\""
+],
+[
+"Sauvegarde en cours…",
+"Backup in progress…"
+],
+[
+"\" Dernière : \"",
+"\" Last: \""
+],
+[
+"\" · Prochaine : \"",
+"\" · Next: \""
+],
+[
+"\" · Première exécution dans moins d'une minute.\"",
+"\" · First run in less than a minute.\""
+],
+[
+" namespace(s) sauvegardé(s), ",
+" namespace(s) backed up, "
+],
+[
+" ancienne(s) version(s) supprimée(s)",
+" old version(s) deleted"
+],
+[
+"À propos de cet outil",
+"About this tool"
+],
+[
+"Plugin pour HYCU Enterprise Cloud",
+"Plugin for HYCU Enterprise Cloud"
+],
+[
+"Plugin gratuit, fourni « tel quel », sans aucune garantie ni engagement de HYCU.",
+"This is a free plugin, provided as-is, without any warranty or engagement from HYCU."
+],
+[
+"<b>Version :</b>",
+"<b>Version:</b>"
+],
+[
+"<b>Journal d'audit :</b>",
+"<b>Audit log:</b>"
+],
+[
+"<b>Configuration :</b>",
+"<b>Configuration:</b>"
+],
+[
+"<b>Sauvegardes :</b>",
+"<b>Backups:</b>"
+],
+[
+">Fermer</button>",
+">Close</button>"
+],
+[
+"title=\"Tableau de bord\"",
+"title=\"Dashboard\""
+],
+[
+"<span class=\"nl\">Tableau de bord</span>",
+"<span class=\"nl\">Dashboard</span>"
+],
+[
+"<span class=\"nl\">Politiques</span>",
+"<span class=\"nl\">Policies</span>"
+],
+[
+"<span class=\"nl\">Tâches</span>",
+"<span class=\"nl\">Jobs</span>"
+],
+[
+"<span class=\"nl\">Réglages</span>",
+"<span class=\"nl\">Settings</span>"
+],
+[
+"Réduire / déployer le menu",
+"Collapse / expand the menu"
+],
+[
+"Sections de l'outil",
+"Tool sections"
+],
+[
+"title=\"Fermer\"",
+"title=\"Close\""
+],
+[
+"title=\"Actualiser\"",
+"title=\"Refresh\""
+],
+[
+"placeholder=\"Rechercher\"",
+"placeholder=\"Search\""
+],
+[
+"title=\"Tout sélectionner\"",
+"title=\"Select all\""
+],
+[
+"<h2 class=\"dtitle\">Politique ",
+"<h2 class=\"dtitle\">Policy "
+],
+[
+"<h2 class=\"dtitle\">Tâches ",
+"<h2 class=\"dtitle\">Jobs "
+],
+[
+"<h2 class=\"dtitle\">Dernières tâches</h2>",
+"<h2 class=\"dtitle\">Recent jobs</h2>"
+],
+[
+"Anneau extérieur : namespaces ayant au moins une sauvegarde de configuration (protection). Anneau intérieur : sauvegarde récente, dans l'intervalle de la politique (conformité).",
+"Outer ring: namespaces with at least one configuration backup (protection). Inner ring: recent backup, within the policy interval (compliance)."
+],
+[
+"Politique de sauvegarde automatique de la configuration (manifestes PV/PVC et ressources).",
+"Automatic configuration backup policy (PV/PVC manifests and resources)."
+],
+[
+"Systèmes enregistrés via l'engrenage en haut à droite : HYCU, Prism Element, Prism Central.",
+"Systems registered via the gear at the top right: HYCU, Prism Element, Prism Central."
+],
+[
+"Cluster Kubernetes ciblé par kubectl.",
+"Kubernetes cluster targeted by kubectl."
+],
+[
+"Opérations des 7 derniers jours (sauvegardes, restaurations, clones), d'après le journal d'audit.",
+"Operations over the last 7 days (backups, restores, clones), from the audit log."
+],
+[
+"\"Conformité\"",
+"\"Compliance\""
+],
+[
+"\"Connectées\"",
+"\"Connected\""
+],
+[
+"\"Configurées\"",
+"\"Configured\""
+],
+[
+"<span class=\"k\">Fréquence</span>",
+"<span class=\"k\">Frequency</span>"
+],
+[
+"<span class=\"k\">Rétention</span>",
+"<span class=\"k\">Retention</span>"
+],
+[
+"<span class=\"k\">Dernière exécution</span>",
+"<span class=\"k\">Last run</span>"
+],
+[
+"<span class=\"k\">Prochaine exécution</span>",
+"<span class=\"k\">Next run</span>"
+],
+[
+"\"Opérationnel\"",
+"\"Operational\""
+],
+[
+"\"Indisponible\"",
+"\"Unavailable\""
+],
+[
+"<span class=\"k\">Filtre des namespaces</span>",
+"<span class=\"k\">Namespace filter</span>"
+],
+[
+"? \"Actif\" : \"Aucun\"",
+"? \"Active\" : \"None\""
+],
+[
+"<span class=\"ko\">Réel</span>",
+"<span class=\"ko\">Real</span>"
+],
+[
+"Voir toutes les tâches",
+"View all jobs"
+],
+[
+"à l'instant",
+"just now"
+],
+[
+"\"il y a %d min\"",
+"\"%d min ago\""
+],
+[
+"\"il y a %d h\"",
+"\"%d h ago\""
+],
+[
+"\"il y a %d j\"",
+"\"%d d ago\""
+],
+[
+"<span>Sauvegarder</span>",
+"<span>Back up</span>"
+],
+[
+"<span>Restaurer</span>",
+"<span>Restore</span>"
+],
+[
+"<span>Vérifier</span>",
+"<span>Verify</span>"
+],
+[
+"Définir la politique",
+"Set Policy"
+],
+[
+"<th>Nom</th>",
+"<th>Name</th>"
+],
+[
+"<th>Politique</th>",
+"<th>Policy</th>"
+],
+[
+"<th class=\"ctr\">Conformité</th>",
+"<th class=\"ctr\">Compliance</th>"
+],
+[
+"<th>Dernière sauvegarde</th>",
+"<th>Last backup</th>"
+],
+[
+"<td>Application Kubernetes</td>",
+"<td>Kubernetes application</td>"
+],
+[
+"\"Configuration auto · \"",
+"\"Automatic configuration · \""
+],
+[
+": \"Aucune\";",
+": \"None\";"
+],
+[
+"Aucune application ne correspond à la recherche.",
+"No application matches the search."
+],
+[
+"Aucun namespace à afficher — vérifiez le contexte kubectl ou le filtre des namespaces.",
+"No namespace to display — check the kubectl context or the namespace filter."
+],
+[
+"Sauvegarde de configuration récente",
+"Recent configuration backup"
+],
+[
+"Dernière sauvegarde plus ancienne que ",
+"Last backup older than "
+],
+[
+"Jamais sauvegardée",
+"Never backed up"
+],
+[
+" sauvegarde(s) de configuration",
+" configuration backup(s)"
+],
+[
+"Aucune sauvegarde de configuration",
+"No configuration backup"
+],
+[
+">Jamais</span>",
+">Never</span>"
+],
+[
+"<h1 class=\"ptitle\">Politiques</h1>",
+"<h1 class=\"ptitle\">Policies</h1>"
+],
+[
+"<th>Objet protégé</th>",
+"<th>Protected object</th>"
+],
+[
+"<th>Fréquence</th>",
+"<th>Frequency</th>"
+],
+[
+"<th>Rétention</th>",
+"<th>Retention</th>"
+],
+[
+"<th>Cible</th>",
+"<th>Target</th>"
+],
+[
+"<th class=\"ctr\">État</th>",
+"<th class=\"ctr\">Status</th>"
+],
+[
+"Configuration Kubernetes",
+"Kubernetes configuration"
+],
+[
+"Manifestes PV/PVC et ressources des namespaces du filtre",
+"PV/PVC manifests and resources of the filtered namespaces"
+],
+[
+"\"Activée\")",
+"\"Enabled\")"
+],
+[
+"\"Désactivée\")",
+"\"Disabled\")"
+],
+[
+"Politiques HYCU (données des volumes)",
+"HYCU policies (volume data)"
+],
+[
+"Politiques définies dans HYCU, assignables aux Volume Groups d'une application via",
+"Policies defined in HYCU, assignable to an application's Volume Groups via"
+],
+[
+"elles sont protégées par HYCU (<b>Applications",
+"they are protected by HYCU (<b>Applications"
+],
+[
+"Aucune politique HYCU.",
+"No HYCU policy."
+],
+[
+"Enregistrez la source HYCU (⚙ en haut à droite) pour afficher ses politiques.",
+"Register the HYCU source (⚙ at the top right) to display its policies."
+],
+[
+"<h1 class=\"ptitle\">Tâches ",
+"<h1 class=\"ptitle\">Jobs "
+],
+[
+"<th>Tâche</th>",
+"<th>Job</th>"
+],
+[
+"<th>Détail</th>",
+"<th>Details</th>"
+],
+[
+"<th>Démarrée</th>",
+"<th>Started</th>"
+],
+[
+"\"Sauvegarde de configuration (lot)\"",
+"\"Configuration backup (batch)\""
+],
+[
+"Sauvegarde de configuration",
+"Configuration backup"
+],
+[
+"\"Sauvegarde automatique\"",
+"\"Automatic backup\""
+],
+[
+"\"Restauration Kubernetes (PV/PVC)\"",
+"\"Kubernetes restore (PV/PVC)\""
+],
+[
+"\"Clone d'application\"",
+"\"Application clone\""
+],
+[
+"\"Restauration sur place\"",
+"\"In-place restore\""
+],
+[
+"\"Restauration HYCU (Volume Group)\"",
+"\"HYCU restore (Volume Group)\""
+],
+[
+"\"Protection HYCU\"",
+"\"HYCU protection\""
+],
+[
+"\"Succès\"",
+"\"Success\""
+],
+[
+"\"Échec\"",
+"\"Failed\""
+],
+[
+"\"En cours\"",
+"\"In progress\""
+],
+[
+"\" tâche(s)\"",
+"\" job(s)\""
+],
+[
+"Aucune tâche enregistrée pour l'instant.",
+"No job recorded yet."
+],
+[
+"<span class=\"sep\">›</span>Vérification</h1>",
+"<span class=\"sep\">›</span>Verification</h1>"
+],
+[
+"<h1 class=\"ptitle\">Réglages</h1>",
+"<h1 class=\"ptitle\">Settings</h1>"
+],
+[
+"Restauration de l'application",
+"Application restore"
+],
+[
+"Sauvegarder la sélection",
+"Back up the selection"
+],
+[
+"<label class=\"fld\">Namespaces sélectionnés</label>",
+"<label class=\"fld\">Selected namespaces</label>"
+],
+[
+" namespace(s) sauvegardé(s).</div>",
+" namespace(s) backed up.</div>"
+],
+[
+"id=\"rsWizBack\">Retour</button>",
+"id=\"rsWizBack\">Back</button>"
+],
+[
+"id=\"rsWizGo\">Suivant</button>",
+"id=\"rsWizGo\">Next</button>"
+],
+[
+"\"Suivant\"",
+"\"Next\""
+],
+[
+"lbl=\"Restaurer\"",
+"lbl=\"Restore\""
+],
+[
+"|| \"Lancer\"",
+"|| \"Launch\""
+],
+[
+"\"Mode réel\"",
+"\"Real mode\""
+],
+[
+"Restaurer toute l'application (copie)",
+"Restore the whole application (copy)"
+],
+[
+"Restaurer le stockage sur place",
+"Restore storage in place"
+],
+[
+"Restaurer le stockage vers de nouveaux volumes",
+"Restore storage to new volumes"
+],
+[
+"Restaure le stockage et les objets de l'application (workloads, dépendances) dans le même namespace (suffixe) ou dans un autre. L'original n'est pas modifié.",
+"Restores the application storage and objects (workloads, dependencies) into the same namespace (suffix) or another one. The original is not modified."
+],
+[
+"Restaure les données dans les volumes d'origine. L'application est arrêtée puis redémarrée.",
+"Restores the data into the original volumes. The application is stopped, then restarted."
+],
+[
+"Restaure vers de nouveaux Volume Groups et y rattache l'application. Les volumes d'origine sont conservés.",
+"Restores to new Volume Groups and attaches the application to them. The original volumes are kept."
+],
+[
+">Cluster cible</label>",
+">Target cluster</label>"
+],
+[
+"<label class=\"fld\">Volumes à restaurer</label>",
+"<label class=\"fld\">Volumes to restore</label>"
+],
+[
+"Avancé — dossier de sauvegardes personnalisé",
+"Advanced — custom backup folder"
+],
+[
+"Chargement des volumes…",
+"Loading volumes…"
+],
+[
+"\"Sauvegarde & restauration (API REST)\"",
+"\"Backup & restore (REST API)\""
+],
+[
+"\"Nutanix — Volume Groups (API v2)\"",
+"\"Nutanix — Volume Groups (v2 API)\""
+],
+[
+"\"Nutanix — multi-cluster (API v3/v4)\"",
+"\"Nutanix — multi-cluster (v3/v4 API)\""
+],
+[
+"\"Coffre d'identifiants\"",
+"\"Credentials vault\""
+],
+[
+"\"Mémorisation chiffrée (optionnel)\"",
+"\"Encrypted storage (optional)\""
+],
+[
+"\"Coffre présent\"",
+"\"Vault present\""
+],
+[
+"\"Aucun coffre\"",
+"\"No vault\""
+],
+[
+"\"Connecté\"",
+"\"Connected\""
+],
+[
+"\"Configuré, non connecté\"",
+"\"Configured, not connected\""
+],
+[
+"\"Non configuré\"",
+"\"Not configured\""
+],
+[
+"Cluster Kubernetes actif — cliquer pour en choisir un autre",
+"Active Kubernetes cluster — click to choose another one"
+],
+[
+"\"Cluster Kubernetes actif\"+",
+"\"Active Kubernetes cluster\"+"
+],
+[
+"\" — cliquer pour en choisir un autre\"",
+"\" — click to choose another one\""
+],
+[
+"Sources (HYCU, Prism Central, Prism Element, clusters Kubernetes)",
+"Sources (HYCU, Prism Central, Prism Element, Kubernetes clusters)"
+],
+[
+"⚠ jeton expiré",
+"⚠ token expired"
+],
+[
+"\"configuration locale\"",
+"\"local configuration\""
+],
+[
+"\"kubeconfig importé\"",
+"\"imported kubeconfig\""
+],
+[
+"Gérer les clusters…",
+"Manage clusters…"
+],
+[
+"Ajouter un cluster Kubernetes",
+"Add a Kubernetes cluster"
+],
+[
+"Découvrir les workspaces NKP",
+"Discover NKP workspaces"
+],
+[
+"Enregistrez ici les systèmes utilisés par l'outil — HYCU, Nutanix et vos clusters Kubernetes. Les identifiants et kubeconfigs restent en mémoire le temps de la session (ou dans le coffre chiffré si vous le choisissez).",
+"Register here the systems used by the tool — HYCU, Nutanix and your Kubernetes clusters. Credentials and kubeconfigs stay in memory for the session (or in the encrypted vault if you choose so)."
+],
+[
+"<th>URL / serveur</th>",
+"<th>URL / server</th>"
+],
+[
+">Clusters Kubernetes<",
+">Kubernetes clusters<"
+],
+[
+"Kubernetes — configuration locale",
+"Kubernetes — local configuration"
+],
+[
+"Kubernetes — kubeconfig importé",
+"Kubernetes — imported kubeconfig"
+],
+[
+"\"kubeconfig par défaut\"",
+"\"default kubeconfig\""
+],
+[
+"class=\"tag\">ACTIF<",
+"class=\"tag\">ACTIVE<"
+],
+[
+"\"Contexte : \"+",
+"\"Context: \"+"
+],
+[
+"\"Authentification : \"+",
+"\"Authentication: \"+"
+],
+[
+"Option : enregistrer les identifiants saisis (et les kubeconfigs des clusters ajoutés) dans un coffre <b>chiffré</b>",
+"Optional: store the credentials entered (and the kubeconfigs of added clusters) in an <b>encrypted</b> vault"
+],
+[
+"Clusters Kubernetes rechargés : ",
+"Kubernetes clusters reloaded: "
+],
+[
+"Clusters Kubernetes chiffrés : ",
+"Kubernetes clusters encrypted: "
+],
+[
+"Clusters Kubernetes chargés : ",
+"Kubernetes clusters loaded: "
+],
+[
+"Chargez le <b>kubeconfig</b> du cluster (fichier ou copier-coller). Comme un mot de passe, il reste",
+"Load the cluster <b>kubeconfig</b> (file or copy-paste). Like a password, it stays"
+],
+[
+"<b>en mémoire</b> le temps de la session, et n'est écrit sur disque que <b>chiffré</b> si vous utilisez le coffre.",
+"<b>in memory</b> for the session, and is only written to disk <b>encrypted</b> if you use the vault."
+],
+[
+"Les sauvegardes de chaque cluster sont rangées séparément.",
+"Each cluster's backups are stored separately."
+],
+[
+"<label class=\"fld\">Nom du cluster</label>",
+"<label class=\"fld\">Cluster name</label>"
+],
+[
+"<label class=\"fld\">Fichier kubeconfig</label>",
+"<label class=\"fld\">Kubeconfig file</label>"
+],
+[
+"…ou collez son contenu (YAML ou JSON)",
+"…or paste its content (YAML or JSON)"
+],
+[
+"<label class=\"fld\">Contexte</label><select id=\"clCtx\">",
+"<label class=\"fld\">Context</label><select id=\"clCtx\">"
+],
+[
+"id=\"clAdd\" type=\"button\">Tester &amp; ajouter<",
+"id=\"clAdd\" type=\"button\">Test &amp; add<"
+],
+[
+"\"Tester & ajouter\"",
+"\"Test & add\""
+],
+[
+"Test de connexion en lecture seule (liste des namespaces, 10 s max).",
+"Read-only connection test (namespace list, 10 s max)."
+],
+[
+"Test de connexion…",
+"Testing connection…"
+],
+[
+"Chargez ou collez d'abord un kubeconfig.",
+"Load or paste a kubeconfig first."
+],
+[
+"Cluster ajouté. Choisissez « Définir comme cluster actif » pour l'utiliser, ou sélectionnez-le dans la barre du haut.",
+"Cluster added. Choose “Set as active cluster” to use it, or select it in the top bar."
+],
+[
+"Définir comme cluster actif",
+"Set as active cluster"
+],
+[
+"\"Cluster actif\"",
+"\"Active cluster\""
+],
+[
+"data-scope=\"one\">Cluster actif<",
+"data-scope=\"one\">Active cluster<"
+],
+[
+"Tous les clusters",
+"All clusters"
+],
+[
+"===\"*\"?\"Tous\":",
+"===\"*\"?\"All\":"
+],
+[
+"id=\"clLocalCfg\" type=\"button\">Ouvrir les réglages<",
+"id=\"clLocalCfg\" type=\"button\">Open settings<"
+],
+[
+"id=\"clRemove\" type=\"button\">Retirer<",
+"id=\"clRemove\" type=\"button\">Remove<"
+],
+[
+"li(\"Contexte kubectl\"",
+"li(\"kubectl context\""
+],
+[
+"li(\"Serveur API\"",
+"li(\"API server\""
+],
+[
+"li(\"Workspace NKP\"",
+"li(\"NKP workspace\""
+],
+[
+"li(\"Cluster de management\"",
+"li(\"Management cluster\""
+],
+[
+"li(\"Sauvegardes\"",
+"li(\"Backups\""
+],
+[
+"Serveur API",
+"API server"
+],
+[
+"Aucun contexte kubectl local : ajoutez un cluster avec son kubeconfig, ou configurez kubectl (Réglages).",
+"No local kubectl context: add a cluster with its kubeconfig, or configure kubectl (Settings)."
+],
+[
+"\"Retirer le cluster « \"",
+"\"Remove cluster « \""
+],
+[
+"\" » ? Son kubeconfig est oublié ; ses sauvegardes restent sur disque.\"",
+"\" »? Its kubeconfig is forgotten; its backups stay on disk.\""
+],
+[
+"Découverte des workspaces NKP (optionnel)",
+"NKP workspace discovery (optional)"
+],
+[
+"Depuis le <b>cluster de management</b> NKP, liste les <b>workspaces</b> et leurs clusters, puis importe",
+"From the NKP <b>management cluster</b>, lists the <b>workspaces</b> and their clusters, then imports"
+],
+[
+"leurs kubeconfigs. Cluster interrogé : ",
+"their kubeconfigs. Queried cluster: "
+],
+[
+"(le cluster actif — choisissez le cluster de management",
+"(the active cluster — choose the management cluster"
+],
+[
+"dans la barre du haut).",
+"in the top bar)."
+],
+[
+"<b>Droits élevés requis</b> sur le cluster de management : lecture des Workspaces, des",
+"<b>Elevated rights required</b> on the management cluster: read access to Workspaces,"
+],
+[
+"KommanderClusters et des <b>Secrets</b> kubeconfig des namespaces de workspace. Les kubeconfigs importés donnent",
+"KommanderClusters and kubeconfig <b>Secrets</b> in workspace namespaces. Imported kubeconfigs often grant"
+],
+[
+"souvent un accès <b>administrateur</b> aux clusters : ils restent en mémoire (coffre chiffré en option), jamais en clair sur disque.",
+"<b>administrator</b> access to the clusters: they stay in memory (optional encrypted vault), never in clear text on disk."
+],
+[
+"id=\"nkpDiscover\" type=\"button\">Découvrir<",
+"id=\"nkpDiscover\" type=\"button\">Discover<"
+],
+[
+"J'ai compris : importer les kubeconfigs des clusters cochés",
+"I understand: import the kubeconfigs of the checked clusters"
+],
+[
+"Importer la sélection",
+"Import selection"
+],
+[
+"Lecture des workspaces…",
+"Reading workspaces…"
+],
+[
+"Aucun cluster trouvé dans les workspaces.",
+"No cluster found in the workspaces."
+],
+[
+"Cluster de management (actif)",
+"Management cluster (active)"
+],
+[
+"\"Déjà importé (\"",
+"\"Already imported (\""
+],
+[
+"\"Importé sous « \"",
+"\"Imported as « \""
+],
+[
+"Clusters enregistrés",
+"Registered clusters"
+],
+[
+"\"Cluster ciblé : <b>\"",
+"\"Target cluster: <b>\""
+],
+[
+"Cluster local (contexte kubectl)",
+"Local cluster (kubectl context)"
+],
+[
+"Les clusters <b>supplémentaires</b> (kubeconfig importé, workspaces NKP) se gèrent depuis <b>⚙ Sources</b>.",
+"<b>Additional</b> clusters (imported kubeconfig, NKP workspaces) are managed from <b>⚙ Sources</b>."
+],
+[
+"Contextes / clusters autorisés (séparés par des virgules ; vide = tous)",
+"Allowed contexts / clusters (comma-separated; empty = all)"
+],
+[
+"Namespaces autorisés — cluster local (vide = tous)",
+"Allowed namespaces — local cluster (empty = all)"
+],
+[
+" inconnu (retiré, ou session verrouillée) : sélectionnez un cluster dans la barre du haut. Aucune commande n'a été exécutée.",
+" unknown (removed, or session locked): select a cluster in the top bar. No command was executed."
+],
+[
+"Authentification par plugin exec (« ",
+"Exec plugin authentication (« "
+],
+[
+" ») : cette commande doit être installée là où tourne l'outil (absente de l'image conteneur par défaut) ; elle peut aussi ouvrir un navigateur (OIDC) que l'outil ne peut pas piloter.",
+" »): this command must be installed where the tool runs (absent from the default container image); it may also open a browser (OIDC) that the tool cannot drive."
+],
+[
+"Authentification « auth-provider » (",
+"« auth-provider » authentication ("
+],
+[
+") : mécanisme déprécié, jeton OIDC à durée de vie courte — prévoyez un jeton de ServiceAccount pour un usage durable.",
+"): deprecated mechanism, short-lived OIDC token — use a ServiceAccount token for long-term use."
+],
+[
+"Le jeton est lu depuis un fichier local (",
+"The token is read from a local file ("
+],
+[
+") : il doit exister là où tourne l'outil.",
+"): it must exist where the tool runs."
+],
+[
+"Le jeton a EXPIRÉ : régénérez le kubeconfig.",
+"The token has EXPIRED: regenerate the kubeconfig."
+],
+[
+"Le jeton a EXPIRÉ (",
+"The token has EXPIRED ("
+],
+[
+") : régénérez le kubeconfig.",
+"): regenerate the kubeconfig."
+],
+[
+"Le jeton expire dans moins de 24 h (",
+"The token expires in less than 24 h ("
+],
+[
+") : les sauvegardes planifiées échoueront ensuite.",
+"): scheduled backups will fail afterwards."
+],
+[
+"Le certificat client est un fichier local (",
+"The client certificate is a local file ("
+],
+[
+"Authentification par identifiant/mot de passe (basic) : désactivée sur la plupart des clusters récents.",
+"Username/password (basic) authentication: disabled on most recent clusters."
+],
+[
+"Aucune information d'authentification reconnue pour ce contexte.",
+"No recognized authentication information for this context."
+],
+[
+"Vérification TLS du serveur DÉSACTIVÉE (insecure-skip-tls-verify).",
+"Server TLS verification DISABLED (insecure-skip-tls-verify)."
+],
+[
+"L'autorité de certification est un fichier local (",
+"The certificate authority is a local file ("
+],
+[
+"Kubeconfig vide.",
+"Empty kubeconfig."
+],
+[
+"Kubeconfig trop volumineux (1 Mo max).",
+"Kubeconfig too large (1 MB max)."
+],
+[
+"Kubeconfig invalide : ",
+"Invalid kubeconfig: "
+],
+[
+"Kubeconfig illisible : ",
+"Unreadable kubeconfig: "
+],
+[
+"kubectl config view a échoué",
+"kubectl config view failed"
+],
+[
+"Aucun contexte dans ce kubeconfig.",
+"No context in this kubeconfig."
+],
+[
+"Connexion établie, mais la liste des namespaces est refusée (RBAC) : l'outil ne verra que les namespaces explicitement autorisés.",
+"Connected, but listing namespaces is forbidden (RBAC): the tool will only see explicitly allowed namespaces."
+],
+[
+"Cluster injoignable.",
+"Cluster unreachable."
+],
+[
+"Nom de cluster invalide (1 à 63 caractères, lettres/chiffres/-/./_).",
+"Invalid cluster name (1 to 63 characters, letters/digits/-/./_)."
+],
+[
+"Ce nom est réservé au cluster local : choisissez-en un autre.",
+"This name is reserved for the local cluster: choose another one."
+],
+[
+"Un cluster nommé « ",
+"A cluster named « "
+],
+[
+" » est déjà enregistré.",
+" » is already registered."
+],
+[
+"Ce kubeconfig contient plusieurs contextes : choisissez-en un.",
+"This kubeconfig contains several contexts: choose one."
+],
+[
+" » introuvable dans ce kubeconfig.",
+" » not found in this kubeconfig."
+],
+[
+"Connexion au cluster impossible : ",
+"Cannot connect to the cluster: "
+],
+[
+"Le cluster local (configuration) ne peut pas être retiré ici : voir Réglages.",
+"The local cluster (configuration) cannot be removed here: see Settings."
+],
+[
+"Cluster inconnu.",
+"Unknown cluster."
+],
+[
+"Le cluster actif ne semble pas être un cluster de management NKP (ressource Workspace introuvable ou accès refusé) : ",
+"The active cluster does not look like an NKP management cluster (Workspace resource not found or access denied): "
+],
+[
+"Liste des clusters NKP (KommanderCluster) indisponible : ",
+"NKP cluster list (KommanderCluster) unavailable: "
+],
+[
+"Confirmez d'abord l'avertissement sur les privilèges requis.",
+"First acknowledge the warning about required privileges."
+],
+[
+"Nom invalide.",
+"Invalid name."
+],
+[
+" » illisible : ",
+" » unreadable: "
+],
+[
+"Aucun kubeconfig trouvé dans le Secret « ",
+"No kubeconfig found in Secret « "
+],
+[
+"Aucun cluster importé.",
+"No cluster imported."
+],
+[
+"Kubeconfig refusé : authentification par plugin exec (commande externe) non autorisée pour un kubeconfig importé automatiquement.",
+"Kubeconfig refused: exec plugin authentication (external command) is not allowed for an automatically imported kubeconfig."
+],
+[
+"Cette sauvegarde provient du cluster « ",
+"This backup comes from cluster « "
+],
+[
+" », alors que le cluster actif est « ",
+" », while the active cluster is « "
+],
+[
+" ». La restauration inter-clusters n'est pas prise en charge : sélectionnez le cluster d'origine dans la barre du haut.",
+" ». Cross-cluster restore is not supported: select the source cluster in the top bar."
+],
+[
+"Cluster local non configuré.",
+"Local cluster not configured."
+],
+[
+"aucun cluster disponible",
+"no cluster available"
+],
+[
+"Cluster introuvable.",
+"Cluster not found."
+],
+[
+"https://hycu.exemple.com:8443",
+"https://hycu.example.com:8443"
+],
+[
+"https://prism-central.exemple.com:9440",
+"https://prism-central.example.com:9440"
+],
+[
+"https://prism-element.exemple.com:9440",
+"https://prism-element.example.com:9440"
+],
+[
+">3 · Vérifier &amp; lancer<",
+">3 · Verify &amp; run<"
+],
+[
+">4 · Suivi<",
+">4 · Follow-up<"
+],
+[
+">Arrêter après l'étape en cours<",
+">Stop after the current step<"
+],
+[
+"MODE RÉEL · ",
+"LIVE MODE · "
+],
+[
+">MODE RÉEL<",
+">LIVE MODE<"
+],
+[
+"Serveur injoignable — vérifiez que l'outil tourne (ou le port-forward), puis rechargez.",
+"Server unreachable — check the tool is running (or the port-forward), then reload."
+],
+[
+"Serveur injoignable (réseau ou outil arrêté).",
+"Server unreachable (network or tool stopped)."
+],
+[
+"Délai dépassé : le serveur ne répond pas.",
+"Timeout: the server is not responding."
+],
+[
+"réponse illisible",
+"unreadable response"
+],
+[
+"Arrêt demandé — fin de l'étape en cours…",
+"Stop requested — finishing the current step…"
+],
+[
+"Arrêt impossible",
+"Cannot stop"
+],
+[
+"Une opération est en cours",
+"An operation is running"
+],
+[
+">Suivre<",
+">Follow<"
+],
+[
+"Opération terminée.",
+"Operation finished."
+],
+[
+"Opération terminée avec des erreurs.",
+"Operation finished with errors."
+],
+[
+"Suivi de l'opération interrompu (l'opération continue peut-être côté serveur).",
+"Operation tracking interrupted (the operation may still be running server-side)."
+],
+[
+"Opération en cours : elle continue côté serveur. Vous pourrez reprendre le suivi depuis le bandeau en haut de page.",
+"Operation in progress: it keeps running server-side. You can resume tracking from the banner at the top of the page."
+],
+[
+"\"Étape \"+done+\" · \"",
+"\"Step \"+done+\" · \""
+],
+[
+"textContent=\"Démarrage…\"",
+"textContent=\"Starting…\""
+],
+[
+"\"Interrompue\" : (r.ok ? \"Terminée\" : \"Terminée avec erreurs\")",
+"\"Interrupted\" : (r.ok ? \"Completed\" : \"Completed with errors\")"
+],
+[
+"<b>Préflight</b> — ",
+"<b>Preflight</b> — "
+],
+[
+" contrôles passés</summary>",
+" checks passed</summary>"
+],
+[
+"ok===false?\"Échec\":\"OK\"",
+"ok===false?\"Failed\":\"OK\""
+],
+[
+"ST_LABEL={ok:\"OK\", ko:\"Échec\", wn:\"Avertissement\", na:\"Inconnu\", sim:\"Simulation\", run:\"En cours\"}",
+"ST_LABEL={ok:\"OK\", ko:\"Failed\", wn:\"Warning\", na:\"Unknown\", sim:\"Simulation\", run:\"Running\"}"
+],
+[
+">Langue par défaut de l'interface<",
+">Default interface language<"
+],
+[
+"<option value=\"fr\">Français</option>",
+"<option value=\"fr\">French</option>"
+],
+[
+">Tableau de bord</h1>",
+">Dashboard</h1>"
+],
+[
+"aria-label=\"Étapes de la restauration\"",
+"aria-label=\"Restore steps\""
+],
+[
+"> Proposer le mode simulation (interrupteur dans le bandeau ; sinon l'outil travaille en mode réel)<",
+"> Offer the simulation mode (switch in the banner; otherwise the tool works in live mode)<"
+]
+]

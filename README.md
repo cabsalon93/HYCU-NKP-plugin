@@ -14,7 +14,8 @@ is attached directly to the worker VM, **no more IQN**), a `volumeHandle`, or
 an **IQN** (legacy iSCSI clusters); the tool derives the `volumeHandle` from it.
 
 > ⚠️ **Destructive tool.** It deletes and recreates PVs/PVCs. **Simulation
-> (dry-run) mode is enabled by default**. Always test on a test namespace before
+> (dry-run) mode can be offered from Settings (`simulation_mode_available`); by default the
+> UI works in live mode with a red "LIVE MODE · cluster" indicator**. Always test on a test namespace before
 > production, and review the preview before disabling simulation.
 
 ---
@@ -331,10 +332,31 @@ refreshes every ~3 s until the state is stable (all PVCs Bound, pods Running;
 
 ## 5. Security
 
-- The server **only listens on `127.0.0.1`** (never exposed to the network).
+- In **Python** mode the server **only listens on `127.0.0.1`**. In a **container**
+  (`HYCU_HOST=0.0.0.0` in the image) it listens on every Pod interface and its "local host"
+  guard relies on HTTP headers only: `deploy/k8s/hycu.yaml` therefore adds a
+  **NetworkPolicy** denying all ingress (only `kubectl port-forward`, which goes through
+  the kubelet, reaches the Pod).
 - **Anti-CSRF / anti-DNS-rebinding** protection: `Host` and `Origin`/`Referer`
   header checks, and an **anti-CSRF token** required on every action.
-- **Dry-run by default**; confirmation of the target cluster/context before any real action.
+- **Live mode by default**, with a preflight and confirmation of the target cluster/context
+  before any destructive action; a simulation mode is offered when `simulation_mode_available` is true.
+- **Probes and tooling**: `GET /healthz` (and `/readyz`) answer without touching the session;
+  loading `/` without a cookie from a **browser** opens a new session (credentials wiped),
+  never while an operation is running, and never for a probe (`Accept` without `text/html`).
+- **Graceful shutdown**: SIGTERM (`kubectl delete pod`, `docker stop`) lets a running operation
+  finish (up to `wait_timeout` + margin) then cleans temporary kubeconfigs.
+- **Validated configuration**: every key has a type and bounds (`CONFIG_SCHEMA`); an invalid
+  value is refused, never persisted. In a container, `kubectl_path`, `kubeconfig_path`,
+  `backup_root`, `logo_path`, `host` and `port` can only be set by the file or `HYCU_*`
+  variables, not by the API.
+- **Development**: the UI lives in `ui/` and is assembled into the single file by
+  `python build.py` (`--check` in CI, `--lint` for the i18n dictionary); tests run with
+  `python -m pytest -q tests` on a fake `kubectl`, never on a real cluster.
+- **Restore safety**: preflight (RBAC `auth can-i`, StorageClass, cloned VG disks, operator-owned
+  workloads, unmanaged pods) before stopping the application; Retain forced on source, current
+  and new PVs; finalizers never forced while a pod mounts the volume or a VolumeAttachment
+  remains; resumable transaction with per-volume status.
 - **Browser-session-bound credentials**: HYCU/Nutanix credentials are tied to
   **one browser session** (`hycu_sess` session cookie). Opening the page from a
   restarted browser, another browser, or a private window **locks the
@@ -385,7 +407,18 @@ Copy `hycu_config.example.json` → `hycu_config.json`. Also editable via the
 | `open_browser` | `true` | Open the browser at startup. |
 | `hycu_url` | `""` | HYCU controller URL, e.g. `https://hycu.example.com:8443` (port 8443). Empty = HYCU connector disabled. |
 | `hycu_api_base` | `/rest/v1.0` | HYCU REST API base (**version-dependent** — see §9). |
-| `hycu_test_path` | `/vms` | GET endpoint used to test the connection (look it up in the REST API Explorer). |
+| `hycu_test_path` | `/volumegroups` | GET endpoint used to test the connection (look it up in the REST API Explorer). |
+| `hycu_ca_bundle` / `nutanix_ca_bundle` / `prismcentral_ca_bundle` | `""` | Path of a CA bundle (PEM) used when `*_verify_tls` is true: internal PKI or exported self-signed certificate, without disabling verification. |
+| `hycu_job_timeout` | `1800` | Maximum wait (s) for a HYCU job (clone, restore, backup). |
+| `default_lang` | `"en"` | Interface language when the browser has not chosen yet (FR/EN button): `en` or `fr`. |
+| `simulation_mode_available` | `false` | `true` = offer the "Simulation mode" switch in the banner (checked by default); `false` = live mode directly, banner hidden. |
+| `kube_context` / `kubeconfig_path` | `""` | Context and kubeconfig file of the **local** cluster (empty = kubectl default resolution). |
+| `backup_root` | `./hycu-backups` | Folder for backups, the audit log and restore transactions (`HYCU_BACKUP_ROOT` in a container). |
+| `logo_path` | `""` | Explicit path of a logo for the header (otherwise `hycu_logo.*` or the HYCU asset next to the program). |
+| `clone_strip_runtime_attrs` / `clone_fix_disk_uuids` / `clone_require_disk_uuids` | `true` | Purge the source disk attributes of the cloned PV, rewrite `hypervisorAttachedDiskUUIDs` from Prism Central v4, and abort at preflight (before stopping anything) if the cloned VG disk cannot be read. |
+| `backup_before_restore` | `true` | Safety backup of the manifests (`kind: pre_restore`, never pruned) before any live restore. |
+| `inplace_refresh_pv_disk` | `true` | After an in-place restore, recreate the PV with the fresh disk if HYCU replaced it. |
+| `retain_source_pv` | `true` | Kept for compatibility: switching the source, current and new PVs to **Retain** during a restore is now **systematic**. |
 | `hycu_verify_tls` | `false` | Verify the HYCU TLS certificate (often self-signed → `false`). |
 | `nutanix_url` | `""` | Prism **Element** URL, e.g. `https://prism.example.com:9440`. Empty = disabled. |
 | `nutanix_api_base` | `/PrismGateway/services/rest/v2.0` | Prism Element v2 API base. |
