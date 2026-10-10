@@ -2058,7 +2058,7 @@ def _scan_backup_dir(base):
                     out.append({"timestamp": ts, "path": os.path.join(base, ts),
                                 "index": json.load(f)})
             except Exception as e:
-                print("Sauvegarde %s/%s : index.json illisible (%s) — ignorée." % (ns, ts, e))
+                print("Sauvegarde %s : index.json illisible (%s) — ignorée." % (os.path.join(base, ts), e))
     # Ordre chronologique réel (champ created), pas lexicographique : robuste au
     # changement d'heure et aux horodatages de fuseaux différents.
     out.sort(key=lambda b: (_backup_epoch(b) or 0.0, b["timestamp"]), reverse=True)
