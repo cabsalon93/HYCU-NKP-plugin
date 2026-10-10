@@ -955,13 +955,14 @@ async function hyBatchRun(opts){
      "Les VG sources ne sont <b>pas</b> modifiés — de <b>nouveaux</b> VG sont créés."]}))) return false;
   const b=$("#hyBatchGo"); b.disabled=true; b.innerHTML='<span class="spin"></span>Clones HYCU en cours…';
   hideNextBar();
-  let failed=0;
-  for(const row of rows){
+  // Clones HYCU en PARALLÈLE (au plus 4 à la fois) : chaque volume garde sa ligne de
+  // suivi ; HYCU exécute ses jobs indépendamment et l'endpoint serveur est sans verrou.
+  async function cloneRow(row){
     row.stat.innerHTML='<div class="hint" style="margin-top:6px"><span class="spin"></span> Clone HYCU…</div>';
     const body={namespace:rsHyMatch.ns, source_uuid:row.vg, restore_point_id:row.rp,
                 mode:"clone", new_name:row.newName, dry:dry()};
     const r=await post("/api/hycu/restore",body);
-    if(!r.ok){ row.stat.innerHTML=errBox(r.error); failed++; continue; }
+    if(!r.ok){ row.stat.innerHTML=errBox(r.error); return false; }
     if(r.dry){
       row.stat.innerHTML=`<div class="warnbox" style="margin-top:6px">Simulation — appel HYCU qui serait envoyé :</div><pre class="box">${esc(JSON.stringify(r.planned,null,2))}</pre>`;
       // En simulation aucun VG n'est créé : on inscrit une référence PROVISOIRE (le VG
@@ -970,15 +971,19 @@ async function hyBatchRun(opts){
       const m=((rsHyMatch&&rsHyMatch.matches)||[]).find(x=>x.pvc===row.pvc);
       if(m && m.nutanix_uuid){ setRef(row.pvc, m.nutanix_uuid);
         row.stat.innerHTML+='<div class="hint">Référence provisoire (VG source) inscrite pour la simulation — remplacée par le VG cloné en réel.</div>'; }
-      continue; }
-    if(!r.job_id){ row.stat.innerHTML='<div class="warnbox" style="margin-top:6px">Job HYCU non identifié — récupérez la référence via le volet Avancé une fois le clone terminé.</div>'; failed++; continue; }
+      return true; }
+    if(!r.job_id){ row.stat.innerHTML='<div class="warnbox" style="margin-top:6px">Job HYCU non identifié — récupérez la référence via le volet Avancé une fois le clone terminé.</div>'; return false; }
     const ok=await pollJobBar(r.job_id, row.stat);
-    if(!ok){ failed++; continue; }
+    if(!ok){ return false; }
     const lu=await lookupVgUuid(row.newName);
-    if(!lu.ok){ row.stat.innerHTML+=`<div class="warnbox">${esc(lu.err)}</div>`; failed++; continue; }
+    if(!lu.ok){ row.stat.innerHTML+=`<div class="warnbox">${esc(lu.err)}</div>`; return false; }
     setRef(row.pvc, lu.uuid);
     row.stat.innerHTML=`<div class="note" style="margin-top:6px">✓ VG cloné — référence <code>${esc(lu.uuid)}</code> remplie.</div>`;
+    return true;
   }
+  let failed=0, next=0;
+  const worker=async()=>{ while(next<rows.length){ const row=rows[next++]; try{ if(!(await cloneRow(row))) failed++; }catch(e){ row.stat.innerHTML=errBox(String(e&&e.message||e)); failed++; } } };
+  await Promise.all(Array.from({length:Math.min(4, rows.length)}, worker));
   b.disabled=false; b.textContent="Restaurer les VG depuis HYCU ("+rows.length+" volume(s))";
   if(dry()) return false;                    // simulation : rien à préparer
   const items=collectItems();
