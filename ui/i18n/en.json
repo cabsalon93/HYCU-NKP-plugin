@@ -5504,10 +5504,6 @@
 "UUID of the Volume Group restored on the target site (8-4-4-4-12)"
 ],
 [
-"Restauration DR terminée. Vérifiez l'application, puis re-protégez ses Volume Groups dans HYCU.",
-"DR restore finished. Verify the application, then re-protect its Volume Groups in HYCU."
-],
-[
 "Aucun export de l'outil dans ce bucket.",
 "No export from this tool in that bucket."
 ],
@@ -6234,5 +6230,465 @@
 [
 "\"Vérifier l'application →\"",
 "\"Verify the application →\""
+],
+[
+"<span>Nouvelle politique</span>",
+"<span>New policy</span>"
+],
+[
+"<th>Politique HYCU</th>",
+"<th>HYCU policy</th>"
+],
+[
+"<th>Dernière exécution</th>",
+"<th>Last run</th>"
+],
+[
+"id=\"polEditTitle\">Nouvelle politique<",
+"id=\"polEditTitle\">New policy<"
+],
+[
+">Namespaces (séparés par des virgules)<",
+">Namespaces (comma-separated)<"
+],
+[
+">et/ou sélecteur d'étiquettes<",
+">and/or label selector<"
+],
+[
+">Politique HYCU (optionnel)<",
+">HYCU policy (optional)<"
+],
+[
+"> Activée</label>",
+"> Enabled</label>"
+],
+[
+"La première politique de la liste qui correspond à un namespace l'emporte ; un namespace sans politique suit la politique par défaut. La politique HYCU est assignée aux volumes qui n'en ont pas encore.",
+"The first policy in the list that matches a namespace wins; a namespace without a policy follows the default policy. The HYCU policy is assigned to volumes that do not have one yet."
+],
+[
+">Supprimer la politique<",
+">Delete the policy<"
+],
+[
+"Politique par défaut — sauvegarde automatique de la configuration",
+"Default policy — automatic configuration backup"
+],
+[
+">Sauvegarde de l'outil<",
+">Tool backup<"
+],
+[
+"Configuration, politiques et coffre chiffré. Exportée chaque jour avec l'export automatique ; restaurable sur une nouvelle instance.",
+"Configuration, policies and encrypted vault. Exported daily with the automatic export; restorable on a new instance."
+],
+[
+">Exporter maintenant<",
+">Export now<"
+],
+[
+">Restaurer l'outil depuis le bucket…<",
+">Restore the tool from the bucket…<"
+],
+[
+"\"étiquette \"",
+"\"label \""
+],
+[
+" namespace(s) : \"",
+" namespace(s): \""
+],
+[
+"\"aucun namespace actuellement\"",
+"\"no namespace currently\""
+],
+[
+">Par défaut<",
+">Default<"
+],
+[
+"Namespaces sans autre politique",
+"Namespaces without another policy"
+],
+[
+"stIc(\"na\",\"En pause\")",
+"stIc(\"na\",\"Paused\")"
+],
+[
+"\"illimitée\"",
+"\"unlimited\""
+],
+[
+"\"(connectez HYCU pour choisir)\"",
+"\"(connect HYCU to choose)\""
+],
+[
+"'<option value=\"\">(aucune)</option>'",
+"'<option value=\"\">(none)</option>'"
+],
+[
+"\"Politique « \"",
+"\"Policy « \""
+],
+[
+"\"Enregistrement impossible.\"",
+"\"Could not save.\""
+],
+[
+"\"Donnez un nom à la politique.\"",
+"\"Give the policy a name.\""
+],
+[
+"\"Indiquez des namespaces ou un sélecteur d'étiquettes.\"",
+"\"Enter namespaces or a label selector.\""
+],
+[
+"title:\"Supprimer la politique\"",
+"title:\"Delete the policy\""
+],
+[
+"\"La politique <b>\"",
+"\"Policy <b>\""
+],
+[
+"</b> sera supprimée. Ses namespaces suivront la politique par défaut ; les sauvegardes existantes sont conservées.",
+"</b> will be deleted. Its namespaces will follow the default policy; existing backups are kept."
+],
+[
+"\"en pause\"",
+"\"paused\""
+],
+[
+"Dernière sauvegarde plus ancienne que l'intervalle de sa politique",
+"Last backup older than its policy interval"
+],
+[
+"<span class=\"k\">Autres politiques</span>",
+"<span class=\"k\">Other policies</span>"
+],
+[
+"Kit exporté : <code>",
+"Kit exported: <code>"
+],
+[
+"\"Téléchargement impossible : \"",
+"\"Download failed: \""
+],
+[
+"Aucun kit de l\\'outil dans ce bucket.",
+"No tool kit in this bucket."
+],
+[
+"<th>Taille</th>",
+"<th>Size</th>"
+],
+[
+">Phrase de chiffrement (kits .enc uniquement)<",
+">Encryption passphrase (.enc kits only)<"
+],
+[
+">Restaurer l'outil<",
+">Restore the tool<"
+],
+[
+"title:\"Restaurer l'outil\"",
+"title:\"Restore the tool\""
+],
+[
+"\"La configuration actuelle (politiques, filtres, sources) et le coffre seront remplacés par ceux du kit <b>\"",
+"\"The current configuration (policies, filters, sources) and the vault will be replaced by those of kit <b>\""
+],
+[
+"\"Une copie de l'existant est gardée dans <code>hycu-backups/_tool_restore_backup/</code>.\"",
+"\"A copy of the current state is kept in <code>hycu-backups/_tool_restore_backup/</code>.\""
+],
+[
+"Outil restauré",
+"Tool restored"
+],
+[
+" — déverrouillez ensuite le coffre avec votre phrase secrète",
+" — then unlock the vault with your passphrase"
+],
+[
+". Rechargement…",
+". Reloading…"
+],
+[
+"Vous réinstallez une instance existante ? ",
+"Reinstalling an existing instance? "
+],
+[
+">Restaurer l'outil depuis un bucket S3<",
+">Restore the tool from an S3 bucket<"
+],
+[
+"Politique « ",
+"Policy « "
+],
+[
+" volume(s) rattaché(s) à la politique HYCU « ",
+" volume(s) attached to HYCU policy « "
+],
+[
+" volume(s) déjà dans une autre politique HYCU (non modifiés)",
+" volume(s) already in another HYCU policy (left unchanged)"
+],
+[
+"politique HYCU non appliquée (HYCU non connecté)",
+"HYCU policy not applied (HYCU not connected)"
+],
+[
+"politique HYCU non appliquée (",
+"HYCU policy not applied ("
+],
+[
+"assignation HYCU refusée : ",
+"HYCU assignment refused: "
+],
+[
+" (politique ",
+" (policy "
+],
+[
+"sélecteur « ",
+"selector « "
+],
+[
+" ; kit de l'outil exporté",
+"; tool kit exported"
+],
+[
+" ; export du kit de l'outil en échec : ",
+"; tool kit export failed: "
+],
+[
+"chiffrement activé mais phrase de chiffrement absente",
+"encryption enabled but encryption passphrase missing"
+],
+[
+"Connectez d'abord le stockage objet S3.",
+"Connect the S3 object storage first."
+],
+[
+"Export du kit de l'outil impossible : ",
+"Tool kit export failed: "
+],
+[
+"Une opération est en cours : réessayez quand elle sera terminée.",
+"An operation is running: try again when it has finished."
+],
+[
+"Kit invalide.",
+"Invalid kit."
+],
+[
+"Téléchargement du kit impossible : ",
+"Kit download failed: "
+],
+[
+"Kit chiffré : renseignez la phrase de chiffrement des exports.",
+"Encrypted kit: enter the export encryption passphrase."
+],
+[
+"Déchiffrement impossible (phrase incorrecte ou kit altéré).",
+"Decryption failed (wrong passphrase or altered kit)."
+],
+[
+"Kit illisible : ",
+"Unreadable kit: "
+],
+[
+"Ce fichier n'est pas un kit de l'outil.",
+"This file is not a tool kit."
+],
+[
+") : rien n'a été modifié.",
+"): nothing was changed."
+],
+[
+"Copie de sécurité impossible (",
+"Safety copy failed ("
+],
+[
+"title=\"Supprimer des versions de sauvegarde de configuration\"",
+"title=\"Delete configuration backup versions\""
+],
+[
+"<span>Purger</span>",
+"<span>Purge</span>"
+],
+[
+"> Masquer les supprimées<",
+"> Hide deleted<"
+],
+[
+"id=\"mPurgeTitle\">Versions sauvegardées<",
+"id=\"mPurgeTitle\">Saved versions<"
+],
+[
+"esc(\"Versions sauvegardées\")",
+"esc(\"Saved versions\")"
+],
+[
+">Toutes sauf la plus récente<",
+">All but the most recent<"
+],
+[
+">Supprimer la sélection<",
+">Delete the selection<"
+],
+[
+"auto:\"Automatique\", manual:\"Manuelle\", pre_restore:\"Avant restauration\"",
+"auto:\"Automatic\", manual:\"Manual\", pre_restore:\"Before restore\""
+],
+[
+"Aucune version sauvegardée.",
+"No saved version."
+],
+[
+"(la plus récente)",
+"(most recent)"
+],
+[
+"' <span class=\"hint\">partielle</span>'",
+"' <span class=\"hint\">partial</span>'"
+],
+[
+"title:\"Supprimer des versions\"",
+"title:\"Delete versions\""
+],
+[
+"\"</b> version(s) de la configuration de <b>\"",
+"\"</b> configuration version(s) of <b>\""
+],
+[
+"\"</b> seront supprimées définitivement.\"",
+"\"</b> will be permanently deleted.\""
+],
+[
+"\"<b>Toutes</b> les versions sont sélectionnées : cette application ne pourra plus être restaurée depuis l'outil.\"",
+"\"<b>All</b> versions are selected: this application can no longer be restored from the tool.\""
+],
+[
+"\"Les données des volumes (HYCU) ne sont pas touchées.\"",
+"\"The volume data (HYCU) is not touched.\""
+],
+[
+"\" version(s) supprimée(s).\"",
+"\" version(s) deleted.\""
+],
+[
+"Namespace ou versions manquants.",
+"Namespace or versions missing."
+],
+[
+" : pas une sauvegarde de « ",
+": not a backup of « "
+],
+[
+" : utilisée par une restauration en cours (conservée)",
+": used by a running restore (kept)"
+],
+[
+"Restauration DR terminée. Vérifiez l’application, puis re-protégez ses Volume Groups dans HYCU.",
+"DR restore finished. Verify the application, then re-protect its Volume Groups in HYCU."
+],
+[
+"Application restaurée. Vérifiez-la, puis re-protégez ses Volume Groups dans HYCU si besoin.",
+"Application restored. Verify it, then re-protect its Volume Groups in HYCU if needed."
+],
+[
+"Restauration de l’application…",
+"Restoring the application…"
+],
+[
+"\"Restaurer (simulation)\" : \"Restaurer\"",
+"\"Restore (simulation)\" : \"Restore\""
+],
+[
+"\"Appliquer (simulation)\" : \"Appliquer\"",
+"\"Apply (simulation)\" : \"Apply\""
+],
+[
+"Copie de l’application terminée. L’application d’origine est intacte.",
+"Application copy finished. The original application is intact."
+],
+[
+"Restauration vers les nouveaux volumes terminée.",
+"Restore to the new volumes finished."
+],
+[
+"\"Restauration des objets terminée : \"",
+"\"Object restore finished: \""
+],
+[
+"Restauration de l’application terminée.",
+"Application restore finished."
+],
+[
+"\" Pensez à re-protéger ses Volume Groups dans HYCU.\"",
+"\" Remember to re-protect its Volume Groups in HYCU.\""
+],
+[
+"\"Cloner dans HYCU <b>\"",
+"\"Clone in HYCU <b>\""
+],
+[
+"\"</b> Volume Group(s) (de nouveaux VG sont créés) ?\"",
+"\"</b> Volume Group(s) (new VGs are created)?\""
+],
+[
+"Si un volume d'origine a disparu du cluster, HYCU le restaurera automatiquement avant la recréation.",
+"If an original volume has disappeared from the cluster, HYCU will restore it automatically before recreating."
+],
+[
+"inplace:\"Restaurer sur place\", clone:\"Restaurer vers les nouveaux volumes\", cloneapp:\"Lancer le clone de l'application\"",
+"inplace:\"Restore in place\", clone:\"Restore to the new volumes\", cloneapp:\"Launch the application clone\""
+],
+[
+"inplace:\"Simuler la restauration sur place\", clone:\"Simuler la restauration\", cloneapp:\"Simuler le clone de l'application\"",
+"inplace:\"Simulate the in-place restore\", clone:\"Simulate the restore\", cloneapp:\"Simulate the application clone\""
+],
+[
+"\"Cloner les VG dans HYCU →\"",
+"\"Clone the VGs in HYCU →\""
+],
+[
+"lbl=\"Restaurer sur place\"",
+"lbl=\"Restore in place\""
+],
+[
+"\"dans le <b>même namespace</b> (avec un suffixe)\"",
+"\"in the <b>same namespace</b> (with a suffix)\""
+],
+[
+"' et leurs dépendances seront recréés depuis l’instantané.</div>'",
+"' and their dependencies will be recreated from the snapshot.</div>'"
+],
+[
+"Aucune sauvegarde pour ce namespace — lancez d’abord une sauvegarde (Applications → Sauvegarder).",
+"No backup for this namespace — run a backup first (Applications → Back up)."
+],
+[
+"Comparaison avec l’état live…",
+"Comparing with the live state…"
+],
+[
+"\" objet(s) dans l’instantané\"",
+"\" object(s) in the snapshot\""
+],
+[
+"\" de l’application « \"",
+"\" of the application « \""
+],
+[
+"id=\"drOpenCfg\" type=\"button\">Ouvrir les réglages<",
+"id=\"drOpenCfg\" type=\"button\">Open the settings<"
+],
+[
+" : choisissez une sauvegarde source.",
+": choose a source backup."
 ]
 ]

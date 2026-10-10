@@ -395,8 +395,10 @@ function buildWizSteps(){
       <label class="fld">Langue de l'interface</label>
       <div id="wLang">${[["fr","Français"],["en","English"]].map(([code,lbl])=>
         `<span class="chip ${PAGE_LANG===code?'sel':''}" data-lang="${code}">${lbl}</span>`).join("")}</div>
-      <div class="note" style="margin-top:14px">Contexte kubectl détecté : <b>${esc(ctx||"indisponible")}</b></div>`,
-     enter:()=>{ document.querySelectorAll("#wLang .chip").forEach(c=>c.onclick=()=>{
+      <div class="note" style="margin-top:14px">Contexte kubectl détecté : <b>${esc(ctx||"indisponible")}</b></div>
+      <div class="hint" style="margin-top:14px">Vous réinstallez une instance existante ? <a href="#" id="wRestoreKit">Restaurer l'outil depuis un bucket S3</a></div>`,
+     enter:()=>{ const rk=$("#wRestoreKit"); if(rk) rk.onclick=(e)=>{ e.preventDefault(); $("#wizard").style.display="none"; openSources("s3"); };
+       document.querySelectorAll("#wLang .chip").forEach(c=>c.onclick=()=>{
         const l=c.dataset.lang; if(l===PAGE_LANG) return;              // déjà dans cette langue
         // Change la langue et recharge : le coffre de config n'existe pas encore,
         // l'assistant se rouvre entièrement dans la langue choisie.
@@ -1031,19 +1033,18 @@ $("#rsInplaceRun").onclick=async()=>{
   $("#rsInplaceLog").innerHTML='<div class="hint"><span class="spin"></span> Démarrage…</div>';
   const ipBody={namespace:(rsHyMatch?rsHyMatch.ns:$("#rsNs").value), items, dry:dry()};
   if(live && ctxInfo.require_confirm) ipBody.confirm_context=confirmedCtx;
+  const sess=rsSession, mine=()=>sess===rsSession;
   const r=await runOp("/api/orchestrate/inplace", ipBody,
-    log=>{ $("#rsInplaceLog").innerHTML='<div class="hint"><span class="spin"></span> Orchestration en cours…</div>'+renderLog(log); });
+    log=>{ if(mine()) $("#rsInplaceLog").innerHTML='<div class="hint"><span class="spin"></span> Orchestration en cours…</div>'+renderLog(log); });
+  if(!mine()) return;
   b.disabled=false; b.textContent="Lancer la restauration sur place";
   if(r.error && !(r.log&&r.log.length)){ $("#rsInplaceLog").innerHTML=errBox(r.error); return; }
   const lines=renderLog(r.log);
   const head=r.dry?'<div class="warnbox">Simulation — séquence et appels HYCU qui seraient exécutés.</div>'
     :(r.aborted?'<div class="err"><b>Séquence interrompue</b> — l\'application est restée arrêtée. Voir le détail.</div>'
-      :(r.ok?'<div class="note">Restauration sur place terminée.</div>':'<div class="err">Des étapes ont échoué.</div>'));
+      :(r.ok?'<div class="note">Restauration sur place terminée.</div>':'<div class="err">Des étapes ont échoué — voir le détail.</div>'));
   $("#rsInplaceLog").innerHTML=head+lines;
-  if(!r.dry && r.ok && !r.aborted){
-    $("#rsInplaceLog").insertAdjacentHTML("afterbegin",'<div class="note">Ouverture de la vérification…</div>');
-    setTimeout(()=>gotoVerify(ipBody.namespace,true),1200);
-  }
+  if(!r.dry && r.ok && !r.aborted) rsFinish(ipBody.namespace, false, sess);
 };
 document.querySelectorAll("#rsMode button").forEach(b=>b.onclick=()=>{
   document.querySelectorAll("#rsMode button").forEach(x=>x.classList.remove("on"));
@@ -1143,7 +1144,7 @@ $("#rsPreview").onclick=async()=>{
 };
 // Toute modification des références/noms rend le plan périmé : il faut re-prévisualiser.
 function invalidatePlan(){
-  rsDone=false;
+  if(rsDone) return;                       // parcours terminé : rien à relancer
   if(!state.preview) return;
   state.preview=null; $("#rsPlan").style.display="none"; $("#rsLog").innerHTML="";
   if(typeof rsWizPage!=="undefined" && rsWizPage==="plan") rsShowPage("form");
@@ -1165,11 +1166,10 @@ function updateGoButton(ready){
   $("#rsCtxConfirm").style.display = "none";          // la confirmation se fait dans la boîte de dialogue
   $("#rsGoHint").textContent = live? "" : "Mode simulation : rien ne sera modifié.";
   $("#rsGo").className = live? "btn danger" : "btn";
-  let act;
-  if(state.mode!=="clone") act = "la restauration sur place (flux manuel)";
-  else if(isCloneApp()) act = "le clone de l'application";
-  else act = "le clone";
-  $("#rsGo").textContent = (live? "Lancer " : "Simuler ") + act;
+  const kind = state.mode!=="clone" ? "inplace" : (isCloneApp() ? "cloneapp" : "clone");
+  $("#rsGo").textContent = live
+    ? {inplace:"Restaurer sur place", clone:"Restaurer vers les nouveaux volumes", cloneapp:"Lancer le clone de l'application"}[kind]
+    : {inplace:"Simuler la restauration sur place", clone:"Simuler la restauration", cloneapp:"Simuler le clone de l'application"}[kind];
   $("#rsGo").disabled = !ready;
   updateNextBar();
 }
@@ -1178,9 +1178,30 @@ $("#dry").addEventListener("change",()=>{ if($("#rsPlan").style.display!=="none"
 
 // ----- Clone d'application : confirmation unique, exécution, état « terminé » -----
 let rsDone=false, rsDoneTarget="", cloneBusy=false;
+// Chaque ouverture de la fenêtre de restauration est une « session » : une opération
+// lancée dans une session précédente (fenêtre fermée en cours de route) n'écrit plus
+// dans les journaux et ne termine plus l'assistant de la nouvelle ouverture.
+let rsSession=0;
+function rsNewSession(){
+  rsSession++; rsDone=false; cloneBusy=false; state.preview=null;
+  $("#rsProgress").style.display="none"; $("#rsCloneTargetNs").value="";
+  document.querySelectorAll("#drForm input, #drForm select").forEach(e=>e.disabled=false);
+}
+// Fin RÉUSSIE d'une opération réelle, quel que soit le parcours : seul « Vérifier » reste.
+// `stay` : quelque chose est à lire (avertissements, re-protection) -> pas de bascule auto.
+function rsFinish(ns, stay, sess, slow){
+  if(sess!==undefined && sess!==rsSession) return;        // opération d'une ouverture précédente
+  rsDone=true; rsDoneTarget=ns||state.ns||"";
+  setRsStep(4);
+  // Plus rien de relançable une fois terminé (bouton HYCU de la page DR, champs).
+  $("#drAutoWrap").style.display="none";
+  document.querySelectorAll("#drForm input, #drForm select").forEach(e=>e.disabled=true);
+  rsWizSync();
+  if(!stay) setTimeout(()=>{ if(rsDone && sess===rsSession && $("#mRestore").style.display!=="none") gotoVerify(rsDoneTarget, true); }, slow ? 4000 : 1500);
+}
 function confirmCloneApp(withHycu){
   const needCtx = ctxInfo.require_confirm ? (ctxInfo.context||"") : null;
-  const tgt = state.cloneNsMode==="same" ? "dans le <b>même namespace</b> (avec suffixe)"
+  const tgt = state.cloneNsMode==="same" ? "dans le <b>même namespace</b> (avec un suffixe)"
             : "dans le namespace <b>"+esc($("#rsCloneTargetNs").value.trim()||"?")+"</b>";
   const lines=[];
   if(withHycu) lines.push("Cloner dans HYCU les Volume Groups aux points choisis (les volumes d'origine ne sont pas modifiés).");
@@ -1189,24 +1210,25 @@ function confirmCloneApp(withHycu){
   return confirmDanger({title:"Confirmer le clone d'application", requireText:needCtx, lines});
 }
 async function runCloneApp(confirmedCtxCA){
-  const live=!dry();
+  const live=!dry(), sess=rsSession, mine=()=>sess===rsSession;
   rsDone=false;
   const bb=$("#rsGo"); bb.disabled=true; bb.innerHTML='<span class="spin"></span>…';
   $("#rsLog").innerHTML='<div class="hint"><span class="spin"></span> Démarrage…</div>';
   const caBody={...cloneAppBody(), dry:dry()};
   if(live && ctxInfo.require_confirm) caBody.confirm_context=confirmedCtxCA;
   const r=await runOp("/api/clone_app", caBody,
-    log=>{ $("#rsLog").innerHTML='<div class="hint"><span class="spin"></span> Clonage en cours…</div>'+renderLog(log); });
+    log=>{ if(mine()) $("#rsLog").innerHTML='<div class="hint"><span class="spin"></span> Clonage en cours…</div>'+renderLog(log); });
+  if(!mine()) return;
   bb.disabled=false; updateGoButton(true);
   if(r.error && !(r.log&&r.log.length)){ $("#rsLog").innerHTML=errBox(r.error); return; }
   const lns=renderLog(r.log);
   const hd=r.dry?'<div class="note">Simulation — ressources qui seraient créées (l\'app d\'origine reste intacte).</div>'
-    :(r.ok?'<div class="note">Clone terminé. L\'application d\'origine est intacte.</div>':'<div class="err">Des étapes ont échoué — voir le détail.</div>');
+    :(r.ok?'<div class="note">Copie de l’application terminée. L’application d’origine est intacte.</div>':'<div class="err">Des étapes ont échoué — voir le détail.</div>');
   $("#rsLog").innerHTML=hd+lns+cloneWarnings(r.warnings);
   if(!r.dry && r.ok){
     // Terminé : plus de bouton de lancement, seule la vérification reste (pied de la fenêtre).
-    rsDone=true; rsDoneTarget = state.cloneNsMode==="other" ? $("#rsCloneTargetNs").value.trim() : $("#rsNs").value;
-    setRsStep(4); rsWizSync();
+    rsFinish(state.cloneNsMode==="other" ? $("#rsCloneTargetNs").value.trim() : $("#rsNs").value,
+             false, sess, !!cloneWarnings(r.warnings));
   }
 }
 // Étape 2 -> lancement direct : une seule confirmation, clones HYCU si nécessaire, puis la copie.
@@ -1217,7 +1239,7 @@ async function cloneAppDirect(){
   if(state.cloneNsMode==="other" && !$("#rsCloneTargetNs").value.trim()){ $("#rsErr").innerHTML='<div class="err">Indiquez le namespace cible.</div>'; return; }
   if(dry()){ $("#rsPreview").click(); return; }          // simulation : aperçu, rien n'est créé
   const batch=$("#hyBatchGo");
-  const pending = !!batch && !(items.length && items.every(i=>(i.new_ref||"").trim()));
+  const pending = !rsStatelessClone() && !!batch && !(items.length && items.every(i=>(i.new_ref||"").trim()));
   const res=await confirmCloneApp(pending);
   if(!res) return;
   const confirmedCtx = (typeof res==="string") ? res : "";
@@ -1228,6 +1250,7 @@ async function cloneAppDirect(){
       if(!ok) return;                                      // erreurs affichées volume par volume
     }
     $("#rsRepl").innerHTML=""; $("#rsSteps").innerHTML=""; $("#rsLog").innerHTML="";
+    state.preview={_cloneapp:true};          // « Relancer » depuis cette page = la copie, jamais la restauration destructive
     $("#rsPlan").style.display="block"; rsShowPage("plan");
     await runCloneApp(confirmedCtx);
   } finally { cloneBusy=false; rsWizSync(); }
@@ -1256,6 +1279,7 @@ $("#rsGo").onclick=async()=>{
     if(typeof res==="string") confirmedCtx=res;
   }
   const b=$("#rsGo"); b.disabled=true; b.innerHTML='<span class="spin"></span>Exécution…';
+  const sess=rsSession, mine=()=>sess===rsSession;
   const body={...state.preview,dry:dry()};
   if(live && ctxInfo.require_confirm) body.confirm_context=confirmedCtx || $("#rsCtxInput").value.trim();
   setRsStep(4); rsRunning=true;
@@ -1267,8 +1291,9 @@ $("#rsGo").onclick=async()=>{
     const done=log.length, last=log[log.length-1];
     $("#rsProgressBar").style.width=Math.min(96, Math.round(100*done/total))+"%";
     $("#rsProgressTxt").textContent="Étape "+done+" · "+((last&&last.label)||"…");
-    $("#rsLog").innerHTML='<div class="hint"><span class="spin"></span> Exécution en cours…</div>'+renderLog(log); });
-  rsRunning=false; $("#rsCancel").style.display="none";
+    if(mine()) $("#rsLog").innerHTML='<div class="hint"><span class="spin"></span> Exécution en cours…</div>'+renderLog(log); });
+  rsRunning=false; if(!mine()) return;
+  $("#rsCancel").style.display="none";
   $("#rsProgressBar").style.width="100%"; $("#rsProgressTxt").textContent = r.aborted ? "Interrompue" : (r.ok ? "Terminée" : "Terminée avec erreurs");
   b.disabled=false; updateGoButton(true);
   if(r.error && !(r.log&&r.log.length)){$("#rsLog").innerHTML=errBox(r.error)+renderPreflight(r.preflight);return;}
@@ -1276,7 +1301,7 @@ $("#rsGo").onclick=async()=>{
   let head;
   if(r.dry) head='<div class="note">Simulation terminée — voici ce qui serait exécuté.</div>';
   else if(r.aborted) head='<div class="err"><b>Séquence interrompue</b> — l\'application est restée arrêtée pour éviter un redémarrage incohérent. Voir le détail.</div>';
-  else if(r.ok) head='<div class="note">Restauration terminée.</div>';
+  else if(r.ok) head='<div class="note">Restauration vers les nouveaux volumes terminée.</div>';
   else head='<div class="err">Des étapes ont échoué — voir ci-dessous.</div>';
   let reprot="";
   if(r.reprotect && r.reprotect.length){
@@ -1288,15 +1313,8 @@ $("#rsGo").onclick=async()=>{
   }
   $("#rsLog").innerHTML = head + renderPreflight(r.preflight) + lines + reprot;
   const rb=$("#rsReprotectBtn"); if(rb) rb.onclick=()=>goReprotect($("#rsNs").value);
-  if(!r.dry && r.ok && !r.aborted){
-    if(reprot){   // ne pas quitter la page tant que la re-protection HYCU n'est pas traitée
-      $("#rsLog").insertAdjacentHTML("beforeend",'<div style="margin-top:8px"><button class="btn" id="rsGoVerify">Vérifier l\'application maintenant →</button></div>');
-      $("#rsGoVerify").onclick=()=>gotoVerify($("#rsNs").value,true);
-    } else {
-      $("#rsLog").insertAdjacentHTML("afterbegin",'<div class="note">Ouverture de la vérification…</div>');
-      setTimeout(()=>gotoVerify($("#rsNs").value,true),1200);
-    }
-  }
+  // Re-protection HYCU à traiter : pas de bascule automatique (le bouton reste dans le journal).
+  if(!r.dry && r.ok && !r.aborted) rsFinish($("#rsNs").value, !!reprot, sess);
 };
 
 // --------- Vérification ---------
@@ -1563,6 +1581,46 @@ $("#s3ListBtn").onclick=async()=>{
   const all=$("#s3ImpAll"); if(all) all.onchange=()=>{ document.querySelectorAll(".s3ImpChk").forEach(c=>c.checked=all.checked); s3ImpSync(); };
   s3ImpSync();
 };
+// ----- Sauvegarde de l'outil (kit : configuration, politiques, coffre chiffré) -----
+$("#tkUpload").onclick=async()=>{
+  const b=$("#tkUpload"); b.disabled=true;
+  const r=await post("/api/tool_kit/upload",{});
+  b.disabled=false;
+  $("#tkOut").innerHTML = r.ok ? `<div class="note" style="margin-top:8px">Kit exporté : <code>${esc(r.key)}</code></div>` : errBox(r.error);
+};
+$("#tkDownload").onclick=async()=>{
+  try{
+    const resp=await fetch("/api/tool_kit/download",{method:"POST",headers:{"Content-Type":"application/json","X-CSRF-Token":CSRF,"X-HYCU-Cluster":ACTIVE_CID},body:"{}"});
+    if(!resp.ok) throw new Error("HTTP "+resp.status);
+    const blob=await resp.blob(), a=document.createElement("a");
+    a.href=URL.createObjectURL(blob); a.download="hycu-tool-"+new Date().toISOString().slice(0,10)+".zip";
+    document.body.appendChild(a); a.click(); setTimeout(()=>{ URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+  }catch(e){ $("#tkOut").innerHTML=errBox("Téléchargement impossible : "+(e&&e.message||e)); }
+};
+$("#tkList").onclick=async()=>{
+  $("#tkOut").innerHTML='<div class="hint" style="margin-top:8px"><span class="spin"></span></div>';
+  const r=await get("/api/tool_kit/list");
+  if(!r.ok){ $("#tkOut").innerHTML=errBox(r.error); return; }
+  const k=r.kits||[];
+  if(!k.length){ $("#tkOut").innerHTML='<div class="hint" style="margin-top:8px">Aucun kit de l\'outil dans ce bucket.</div>'; return; }
+  $("#tkOut").innerHTML=`<div class="tcard" style="box-shadow:none;border:1px solid var(--rule);margin-top:8px"><table class="ht"><thead><tr><th class="cb"></th><th>Kit</th><th>Taille</th></tr></thead><tbody>`+
+    k.map((x,i)=>`<tr><td class="cb"><input type="radio" name="tkPick" value="${esc(x.key)}" data-enc="${x.encrypted?1:0}" ${i===0?"checked":""}></td><td>${esc(x.name)}</td><td>${esc(fmtBytes(x.size))}</td></tr>`).join("")+
+    `</tbody></table></div>
+    <div class="row" style="margin-top:8px"><div><label class="fld">Phrase de chiffrement (kits .enc uniquement)</label><input type="password" id="tkPass" autocomplete="off"></div>
+    <div style="flex:none;align-self:flex-end"><button class="btn danger" id="tkRestore" type="button">Restaurer l'outil</button></div></div><div id="tkRes"></div>`;
+  $("#tkRestore").onclick=async()=>{
+    const pick=document.querySelector('input[name="tkPick"]:checked'); if(!pick) return;
+    if(!(await confirmDanger({title:"Restaurer l'outil", lines:[
+      "La configuration actuelle (politiques, filtres, sources) et le coffre seront remplacés par ceux du kit <b>"+esc(pick.value.split("/").pop())+"</b>.",
+      "Une copie de l'existant est gardée dans <code>hycu-backups/_tool_restore_backup/</code>."]}))) return;
+    const b=$("#tkRestore"); b.disabled=true;
+    const res=await post("/api/tool_kit/restore",{key:pick.value, passphrase:$("#tkPass").value});
+    $("#tkPass").value=""; b.disabled=false;
+    if(!res.ok){ $("#tkRes").innerHTML=errBox(res.error); return; }
+    $("#tkRes").innerHTML=`<div class="note" style="margin-top:8px">Outil restauré${res.vault?" — déverrouillez ensuite le coffre avec votre phrase secrète":""}. Rechargement…</div>`;
+    setTimeout(()=>location.reload(), 1800);
+  };
+};
 $("#s3ImportBtn").onclick=async()=>{
   const items=[...document.querySelectorAll(".s3ImpChk:checked")].map(c=>({key:(window.s3Objs||[])[+c.dataset.i].key}));
   if(!items.length) return;
@@ -1718,7 +1776,7 @@ refreshDry();
 // ============================================================================
 var rsAutoCheck=false;            // assistant ouvert : volumes présélectionnés (cf. renderRsPvcs)
 var pageTimer=null;
-const MODALS=["mBackup","mPolicy","mRestore","mSources","mBulk"];
+const MODALS=["mBackup","mPolicy","mRestore","mSources","mBulk","mPurge"];
 const FOCUSABLE='a[href],button:not([disabled]),input:not([disabled]):not([type=hidden]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])';
 let modalReturnFocus={};
 function openModal(id){
@@ -1880,13 +1938,17 @@ async function loadApps(fresh){
   }
   renderApps(); return r;
 }
-function appPolicyLabel(){
-  return appsPolicy.enabled ? ("Configuration auto · "+Math.round(appsPolicy.interval_hours||24)+" h") : "Aucune";
+function appPolicyLabel(a){
+  const p=(a && a.policy) || null;
+  if(p && p.name) return p.name+" · "+(p.enabled ? (+p.interval_hours)+" h" : "en pause");
+  const d = p || appsPolicy;
+  return d.enabled ? ("Configuration auto · "+Math.round(d.interval_hours||24)+" h") : "Aucune";
 }
 function appsVisible(){
   const q=($("#appsSearch").value||"").trim().toLowerCase();
-  return apps.filter(a=>!q || a.name.toLowerCase().includes(q) || appNs(a).toLowerCase().includes(q)
-                           || (a.cluster||"").toLowerCase().includes(q) || (a.workspace||"").toLowerCase().includes(q));
+  const hideDel=$("#appsHideDel").checked;
+  return apps.filter(a=>!(hideDel && a.missing) && (!q || a.name.toLowerCase().includes(q) || appNs(a).toLowerCase().includes(q)
+                           || (a.cluster||"").toLowerCase().includes(q) || (a.workspace||"").toLowerCase().includes(q)));
 }
 // Pagination : au-delà de APPS_PAGE_SIZE lignes (grands clusters), le tableau est
 // découpé en pages ; la recherche s'applique à toutes les lignes, la sélection persiste.
@@ -1928,7 +1990,7 @@ function renderApps(){
       const k=appKey(a), sel=appsSel.has(k);
       const comp = a.missing ? stIc("na","Namespace supprimé du cluster")
                  : a.compliant ? stIc("ok","Sauvegarde de configuration récente")
-                 : (a.protected ? stIc("ko","Dernière sauvegarde plus ancienne que "+appsFresh+" h")
+                 : (a.protected ? stIc("ko","Dernière sauvegarde plus ancienne que l'intervalle de sa politique")
                                 : stIc("na","Jamais sauvegardée"));
       // Protection = sauvegardes du NAMESPACE ; un volume de l'application absent de la
       // dernière sauvegarde (PVC créé depuis) rend sa protection incomplète.
@@ -1943,7 +2005,7 @@ function renderApps(){
         <td class="cb"><input type="checkbox" tabindex="-1" ${sel?"checked":""}></td>
         <td style="color:var(--strong);font-weight:500">${nameCell}</td><td>${esc(appNs(a))}</td>
         <td class="mc">${esc(a.workspace||"—")}</td><td class="mc">${esc(a.cluster||"")}</td>
-        <td>${appTypeCell(a)}</td><td>${esc(appPolicyLabel())}</td>
+        <td>${appTypeCell(a)}</td><td>${esc(appPolicyLabel(a))}</td>
         <td class="ctr">${comp}</td><td class="ctr">${prot}</td><td>${last}</td>
         <td class="ctr">${a.backups||0}</td></tr>`;
     }).join("");
@@ -1974,6 +2036,8 @@ function updateAppActs(){
   const objs=selAppObjs(), n=objs.length, anyMissing=objs.some(a=>a.missing), anyEmpty=objs.some(a=>a.type==="empty");
   $("#actBackup").disabled = !n || anyMissing || anyEmpty;
   $("#actVerify").disabled = n!==1 || anyMissing;
+  // Purger : les versions d'UN namespace (une ou plusieurs applications de ce namespace).
+  $("#actPurge").disabled = !(n>=1 && new Set(objs.map(a=>(a.cluster_id||ACTIVE_CID)+"|"+appNs(a))).size===1 && objs.some(a=>a.backups));
   // Définir la politique : une ou PLUSIEURS applications (du même cluster) en une fois.
   const oneCluster = n>=1 && new Set(objs.map(a=>a.cluster_id||ACTIVE_CID)).size===1;
   $("#actPolicy").disabled = !oneCluster || anyMissing || anyEmpty;
@@ -1990,6 +2054,8 @@ function updateAppActs(){
 // bascule d'abord le cluster actif, pour que confirmations et garde-fous le désignent.
 async function ensureCluster(a){ if(a && a.cluster_id && a.cluster_id!==ACTIVE_CID) await setActiveCluster(a.cluster_id); }
 $("#appsSearch").oninput=()=>{ appsPage=0; renderApps(); };
+$("#appsHideDel").checked=!!prefs().hideDeleted;
+$("#appsHideDel").onchange=()=>{ savePref("hideDeleted", $("#appsHideDel").checked); appsPage=0; renderApps(); };
 // « Tout sélectionner » porte sur la PAGE affichée (jamais 1 000 lignes d'un coup à l'insu de l'opérateur).
 $("#appsAll").onchange=()=>{ const on=$("#appsAll").checked;
   appsVisible().slice(appsPage*APPS_PAGE_SIZE, (appsPage+1)*APPS_PAGE_SIZE).forEach(a=>on ? appsSel.add(appKey(a)) : appsSel.delete(appKey(a))); renderApps(); };
@@ -2005,6 +2071,40 @@ $("#actRestore").onclick=async()=>{ const objs=selAppObjs(), a=objs[0]; await en
   // Plusieurs applications du même namespace sélectionnées -> tout le namespace.
   openRestoreModal(appNs(a), objs.length>1 ? null : a); };
 $("#actPolicy").onclick=async()=>{ const objs=selNsObjs(); await ensureCluster(objs[0]); openPolicyModal(objs.length>1 ? objs.map(a=>a.name) : appNs(selAppObjs()[0])); };
+// ----- Purge des versions de configuration d'un namespace -----
+let purgeNs="", purgeRows=[];
+const KIND_LBL={auto:"Automatique", manual:"Manuelle", pre_restore:"Avant restauration"};
+function purgeSync(){ $("#purgeGo").disabled = !document.querySelectorAll(".purgeChk:checked").length; }
+async function openPurgeModal(ns){
+  purgeNs=ns; purgeRows=[];
+  $("#mPurgeTitle").innerHTML=esc("Versions sauvegardées")+'<span class="sep">›</span>'+esc(ns);
+  $("#purgeMsg").innerHTML=""; $("#purgeList").innerHTML='<div class="hint"><span class="spin"></span></div>';
+  openModal("mPurge");
+  const r=await get("/api/backups?ns="+encodeURIComponent(ns));
+  purgeRows=r.backups||[];
+  if(!purgeRows.length){ $("#purgeList").innerHTML='<div class="hint">Aucune version sauvegardée.</div>'; purgeSync(); return; }
+  $("#purgeList").innerHTML=`<div class="tcard" style="box-shadow:none;border:1px solid var(--rule)"><table class="ht"><thead><tr><th class="cb"></th><th>Date</th><th>Type</th><th class="ctr">Volumes</th></tr></thead><tbody>`+
+    purgeRows.map((b,i)=>{ const ix=b.index||{};
+      return `<tr><td class="cb"><input type="checkbox" class="purgeChk" data-i="${i}"></td><td>${esc(ix.created ? new Date(ix.created).toLocaleString() : b.timestamp)}${i===0?' <span class="hint">(la plus récente)</span>':''}</td>
+        <td>${esc(KIND_LBL[ix.kind]||"—")}${ix.partial?' <span class="hint">partielle</span>':''}</td><td class="ctr">${(ix.volumes||[]).length}</td></tr>`; }).join("")+`</tbody></table></div>`;
+  document.querySelectorAll(".purgeChk").forEach(c=>c.onchange=purgeSync);
+  purgeSync();
+}
+$("#purgeOld").onclick=()=>{ document.querySelectorAll(".purgeChk").forEach(c=>c.checked = +c.dataset.i>0); purgeSync(); };
+$("#purgeGo").onclick=async()=>{
+  const sel=[...document.querySelectorAll(".purgeChk:checked")].map(c=>purgeRows[+c.dataset.i]);
+  if(!sel.length) return;
+  const all = sel.length===purgeRows.length;
+  if(!(await confirmDanger({title:"Supprimer des versions", lines:[
+     "<b>"+sel.length+"</b> version(s) de la configuration de <b>"+esc(purgeNs)+"</b> seront supprimées définitivement.",
+     all ? "<b>Toutes</b> les versions sont sélectionnées : cette application ne pourra plus être restaurée depuis l'outil." : "Les données des volumes (HYCU) ne sont pas touchées."]}))) return;
+  const b=$("#purgeGo"); b.disabled=true;
+  const r=await post("/api/backups/delete",{ns:purgeNs, paths:sel.map(x=>x.path)});
+  $("#purgeMsg").innerHTML = r.ok ? `<div class="note" style="margin-top:8px">${esc(r.removed+" version(s) supprimée(s).")}</div>` : errBox(r.error);
+  await openPurgeModal(purgeNs);
+  if(r.removed) loadApps(true);
+};
+$("#actPurge").onclick=async()=>{ const a=selAppObjs()[0]; await ensureCluster(a); openPurgeModal(appNs(a)); };
 $("#actVerify").onclick=async()=>{ const a=selAppObjs()[0]; await ensureCluster(a); gotoVerify(appNs(a), false); };
 
 // ============================ Modale Sauvegarde ============================
@@ -2423,18 +2523,46 @@ $("#nkpImport").onclick=async()=>{
 };
 
 // ============================ Politiques ============================
+let polAll=[], polEditIdx=-1, polMembers={};
+function polTarget(p){
+  const parts=[];
+  if((p.namespaces||[]).length) parts.push(p.namespaces.join(", "));
+  if(p.label_selector) parts.push("étiquette "+p.label_selector);
+  return parts.join(" · ");
+}
+function polLast(x){ return x.last_run ? esc(fmtAgo(x.last_run))+" "+stIc(x.last_ok?"ok":"ko", x.last_summary||"") : "—"; }
+function polMemberHint(name){
+  const m=polMembers[name];
+  return m ? '<div class="hint" style="margin:2px 0 0">'+(m.length ? esc(m.length+" namespace(s) : "+m.slice(0,8).join(", ")+(m.length>8?"…":"")) : "aucun namespace actuellement")+'</div>' : "";
+}
 async function loadPolicies(){
   await loadAutoBackup();
   const s=await get("/api/auto_backup")||{};
   const on=!!s.enabled;
-  $("#polBody").innerHTML=`<tr class="clk" id="polRow">
-    <td style="color:var(--strong);font-weight:500">Configuration Kubernetes</td>
-    <td>Manifestes PV/PVC et ressources des namespaces du filtre</td>
+  polAll=s.policies||[];
+  const mem=await get("/api/policy_members"); polMembers=(mem&&mem.ok)?(mem.members||{}):{};
+  let h=`<tr class="clk" data-i="-1">
+    <td style="color:var(--strong);font-weight:500">Par défaut</td>
+    <td>Namespaces sans autre politique${polMemberHint("")}</td>
     <td>${on ? "Toutes les "+Math.round(s.interval_hours||24)+" h" : "—"}</td>
-    <td>${abRetLabel(s)}</td>
-    <td><code>${esc(s.dest||"hycu-backups/")}</code></td>
+    <td>${abRetLabel(s)}</td><td>—</td>
+    <td>${s.last_run ? esc(fmtAgo(s.last_run))+" "+stIc(s.last_ok?"ok":"ko", s.last_summary||"") : "—"}</td>
     <td class="ctr">${on ? stIc("ok","Activée") : stIc("na","Désactivée")}</td></tr>`;
-  $("#polRow").onclick=()=>$("#abEnabled").scrollIntoView({behavior:"smooth", block:"center"});
+  h+=polAll.map((p,i)=>`<tr class="clk" data-i="${i}">
+    <td style="color:var(--strong);font-weight:500">${esc(p.name)}</td>
+    <td>${esc(polTarget(p))}${polMemberHint(p.name)}</td>
+    <td>${"Toutes les "+esc(String(+p.interval_hours))+" h"}</td>
+    <td>${p.keep===0 ? "illimitée" : esc(p.keep+" versions")}</td>
+    <td>${esc(p.hycu_policy_name||"—")}</td>
+    <td>${polLast(p)}</td>
+    <td class="ctr">${p.enabled ? stIc("ok","Activée") : stIc("na","En pause")}</td></tr>`).join("");
+  $("#polBody").innerHTML=h;
+  document.querySelectorAll("#polBody tr.clk").forEach(tr=>tr.onclick=()=>{
+    const i=+tr.dataset.i;
+    if(i<0){ $("#polEdit").style.display="none"; $("#abEnabled").scrollIntoView({behavior:"smooth", block:"center"}); }
+    else polOpen(i);
+  });
+  if(mem && mem.selector_error) $("#polBody").insertAdjacentHTML("beforeend", `<tr><td colspan="7">${errBox(mem.selector_error)}</td></tr>`);
   if(conn.hycu && conn.hycu.connected){
     $("#polHycu").innerHTML='<div class="hint"><span class="spin"></span></div>';
     const p=await get("/api/hycu/policies");
@@ -2443,9 +2571,60 @@ async function loadPolicies(){
         p.policies.map(x=>`<tr><td>${esc(x.name||"—")}</td><td><code>${esc(x.uuid||"")}</code></td></tr>`).join("")+`</tbody></table></div>`
       : '<div class="hint">Aucune politique HYCU.</div>');
   } else {
-    $("#polHycu").innerHTML='<div class="warnbox">Enregistrez la source HYCU (⚙ en haut à droite) pour afficher ses politiques.</div>';
+    $("#polHycu").innerHTML='<div class="hint">Enregistrez la source HYCU (⚙ en haut à droite) pour afficher ses politiques.</div>';
   }
 }
+async function polHycuOptions(sel){
+  const box=$("#peHycu");
+  box.innerHTML='<option value="">(aucune)</option>';
+  if(!(conn.hycu && conn.hycu.connected)){ box.innerHTML='<option value="">(connectez HYCU pour choisir)</option>'; box.disabled=true; return; }
+  box.disabled=false;
+  const r=await get("/api/hycu/policies");
+  (r.ok ? (r.policies||[]) : []).forEach(x=>box.insertAdjacentHTML("beforeend", `<option value="${esc(x.uuid)}">${esc(x.name||x.uuid)}</option>`));
+  box.value=sel||"";
+}
+function polOpen(i){
+  polEditIdx=i;
+  const p = i>=0 ? polAll[i] : {name:"", namespaces:[], label_selector:"", interval_hours:24, keep:15, enabled:true, hycu_policy:""};
+  $("#polEditTitle").textContent = i>=0 ? "Politique « "+p.name+" »" : "Nouvelle politique";
+  $("#peName").value=p.name; $("#peNs").value=(p.namespaces||[]).join(", "); $("#peSel").value=p.label_selector||"";
+  $("#peInterval").value=p.interval_hours; $("#peKeep").value=p.keep; $("#peEnabled").checked=p.enabled!==false;
+  $("#peDelete").style.display = i>=0 ? "" : "none"; $("#peMsg").innerHTML="";
+  $("#polEdit").style.display="block";
+  polHycuOptions(p.hycu_policy);
+  $("#polEdit").scrollIntoView({behavior:"smooth", block:"start"});
+}
+function polClean(p){ return {name:p.name, namespaces:p.namespaces||[], label_selector:p.label_selector||"",
+  interval_hours:+p.interval_hours, keep:+p.keep, enabled:p.enabled!==false,
+  hycu_policy:p.hycu_policy||"", hycu_policy_name:p.hycu_policy_name||""}; }
+async function polSaveList(list){
+  const r=await post("/api/config",{config:{backup_policies:list.map(polClean)}});
+  if(!r.ok){ $("#peMsg").innerHTML=errBox(r.error||"Enregistrement impossible."); return false; }
+  $("#polEdit").style.display="none";
+  await loadPolicies();
+  return true;
+}
+$("#polNew").onclick=()=>polOpen(-1);
+$("#peCancel").onclick=()=>{ $("#polEdit").style.display="none"; };
+$("#peSave").onclick=async()=>{
+  const hy=$("#peHycu");
+  const p={name:$("#peName").value.trim(), namespaces:csv($("#peNs").value).map(x=>x.toLowerCase()),
+    label_selector:$("#peSel").value.trim(),
+    interval_hours:Math.max(0.25, parseFloat(String($("#peInterval").value).replace(",","."))||24),
+    keep:Math.max(0, parseInt($("#peKeep").value)||0), enabled:$("#peEnabled").checked,
+    hycu_policy:hy.value||"", hycu_policy_name:hy.value ? (hy.options[hy.selectedIndex].textContent||"") : ""};
+  if(!p.name){ $("#peMsg").innerHTML=errBox("Donnez un nom à la politique."); return; }
+  if(!p.namespaces.length && !p.label_selector){ $("#peMsg").innerHTML=errBox("Indiquez des namespaces ou un sélecteur d'étiquettes."); return; }
+  const list=polAll.map(polClean);
+  if(polEditIdx>=0) list[polEditIdx]=p; else list.push(p);
+  await polSaveList(list);
+};
+$("#peDelete").onclick=async()=>{
+  if(polEditIdx<0) return;
+  const p=polAll[polEditIdx];
+  if(!(await confirmDanger({title:"Supprimer la politique", lines:["La politique <b>"+esc(p.name)+"</b> sera supprimée. Ses namespaces suivront la politique par défaut ; les sauvegardes existantes sont conservées."]}))) return;
+  await polSaveList(polAll.filter((_,i)=>i!==polEditIdx).map(polClean));
+};
 $("#abSave").addEventListener("click", ()=>setTimeout(()=>{ if(curPage==="policies") loadPolicies(); }, 900));
 
 // ============================ Tâches ============================
@@ -2539,6 +2718,7 @@ async function loadDashboard(){
       <li><span class="k">Rétention</span><span class="v">${esc(abRetLabel(ab))}</span></li>
       <li><span class="k">Dernière exécution</span><span class="v">${ab.last_run ? esc(fmtAgo(ab.last_run))+" "+stIc(ab.last_ok?"ok":"ko") : "—"}</span></li>
       <li><span class="k">Prochaine exécution</span><span class="v">${ab.next_due ? esc(new Date(ab.next_due*1000).toLocaleString()) : "—"}</span></li>
+      ${(ab.policies||[]).length ? `<li><span class="k">Autres politiques</span><span class="v">${esc((ab.policies||[]).map(p=>p.name).join(", "))}</span></li>` : ""}
     </ul>`;
 
   const keys=["hycu","nutanix","prismcentral"];
@@ -2667,7 +2847,7 @@ function rsAppLabel(){
 document.addEventListener("click", e=>{ const a=e.target.closest && e.target.closest(".rsWholeNs, #rsWholeNs");
   if(a){ e.preventDefault(); rsTargetWholeNs(); } });
 function openRestoreModal(ns, app){
-  rsDone=false; cloneBusy=false;
+  rsNewSession();
   ns = ns || state.ns || $("#rsNs").value; if(!ns) return;
   state.ns=ns; applyGlobalNs();
   // Application ciblée (page Applications) : {name, type, pvcs, whole_ns}. Sans
@@ -2683,8 +2863,12 @@ function openRestoreModal(ns, app){
   // Application STATELESS : les parcours de stockage n'ont pas de sens -> seules les cartes
   // « copie » (clone des workloads + dépendances) et « objets de configuration » restent,
   // la seconde présélectionnée (restauration = ré-appliquer ses objets).
-  const sl = !!(state.app && state.app.type==="stateless");
-  document.querySelectorAll('#rsPgType .opt').forEach(o=>{ o.style.display = (sl && (o.dataset.kind==="inplace"||o.dataset.kind==="reattach"||o.dataset.kind==="dr")) ? "none" : ""; });
+  // Namespace entier sans aucun volume (que des applications stateless) : même règle.
+  const nsApps = apps.filter(a=>appNs(a)===ns && (a.cluster_id||ACTIVE_CID)===ACTIVE_CID);
+  const nsNoVol = !state.app && nsApps.length>0 && nsApps.every(a=>!(a.pvcs||[]).length && !a.volumes);
+  const sl = !!(state.app && state.app.type==="stateless") || nsNoVol;
+  // La DR reste proposée : une sauvegarde stateless se restaure aussi sur un autre cluster.
+  document.querySelectorAll('#rsPgType .opt').forEach(o=>{ o.style.display = (sl && (o.dataset.kind==="inplace"||o.dataset.kind==="reattach")) ? "none" : ""; });
   if(sl){ rsWizKind="objects"; rsSyncOpts(); }
   rsShowPage("type");
 }
@@ -2706,7 +2890,7 @@ function rsTargetWholeNs(){
   state.app=null; rsRenderAppNote();
   document.querySelectorAll('#rsPgType .opt').forEach(o=>o.style.display="");   // tous les parcours de nouveau
   $("#rsWizApp").innerHTML=rsAppLabel(); const oa=$("#objApp"); if(oa) oa.innerHTML=rsAppLabel();
-  if(rsWizPage==="form"){ rsAutoCheck=true; document.querySelectorAll(".rsChk").forEach(c=>c.checked=true); rebuildVolCfgs(); }
+  if(rsWizPage==="form"){ rsToForm().then(()=>{ rsAutoCheck=true; document.querySelectorAll(".rsChk").forEach(c=>c.checked=true); rebuildVolCfgs(); }); }
   else if(rsWizPage==="objects"){ objLoadList(); }
   rsWizSync();
 }
@@ -2719,8 +2903,12 @@ async function rsToForm(){
   rsShowPage("form");
   rsAutoCheck=true;
   $("#rsPlan").style.display="none";
+  $("#rsAdvWrap").style.display="";
   if(rsStatelessClone()){
     state.ns=$("#rsNs").value||state.ns; state.backup_path=null; state.selected={};
+    // Copie depuis le cluster vivant : ni volumes, ni panneau HYCU, ni choix de sauvegarde.
+    hyPanelSeq++; $("#rsVolCfgs").innerHTML=""; const ha=$("#rsHyActions"); if(ha) ha.innerHTML="";
+    $("#rsBackupSelWrap").style.display="none"; $("#rsAdvWrap").style.display="none";
     $("#rsPvcs").innerHTML=`<div class="note">Application <b>${esc(state.app.name)}</b> : <b>stateless</b>, aucun volume à restaurer. La copie recrée ses workloads (${esc((state.app.workloads||[]).map(w=>w.kind+"/"+w.name).join(", ")||"—")}) et leurs dépendances depuis le cluster.</div>`;
     $("#rsConfig").style.display="none"; setRsStep(2); rsWizSync(); return;
   }
@@ -2732,7 +2920,9 @@ async function rsToForm(){
 // à l'étape (clone HYCU groupé, restauration sur place, construction du plan, lancement).
 function rsWizSync(){
   const go=$("#rsWizGo"); let lbl="Suivant", dis=false, act=null, src=null;
-  if(rsWizPage==="type"){ dis=!rsWizKind; act=rsNextFromType; }
+  $("#rsWizBack").style.display = (rsDone || rsWizPage==="type" || rsWizKind==="recover") ? "none" : "";
+  if(rsDone){ lbl="Vérifier l'application →"; act=()=>gotoVerify(rsDoneTarget, true); }
+  else if(rsWizPage==="type"){ dis=!rsWizKind; act=rsNextFromType; }
   else if(rsWizPage==="dr"){
     const n=document.querySelectorAll(".drRef").length;
     const filled=[...document.querySelectorAll(".drRef")].filter(t=>t.value.trim()).length;
@@ -2741,14 +2931,14 @@ function rsWizSync(){
     // sauvegarde STATELESS (aucun volume, workloads dans l'instantané) se restaure sans volume.
     const needRefs = !drRecoverReuse();
     const b=drSel(), noVol = !n && !!(b && b.stateless);
-    lbl=dry()? "Restaurer (simulation)" : "Restaurer (réel)";
+    lbl=dry()? "Restaurer (simulation)" : "Restaurer";
     dis=!drAllowed || (!n && !noVol) || (needRefs && filled<n) || drBusy || !$("#drTargetNs").value.trim();
     act=drRun;
   }
   else if(rsWizPage==="objects"){
     const n=document.querySelectorAll(".objChk:checked").length;
     if(objPhase==="pick"){ lbl="Prévisualiser les différences"; dis=!n || objBusy; act=objToDiff; }
-    else { lbl=dry()? "Appliquer (simulation)" : "Appliquer (réel)"; dis=!n || objBusy; act=objApply; }
+    else { lbl=dry()? "Appliquer (simulation)" : "Appliquer"; dis=!n || objBusy; act=objApply; }
   }
   else if(rsWizPage==="target"){ dis=!rsTgtMode; act=rsTargetToForm; }
   else if(rsWizPage==="form"){
@@ -2763,16 +2953,15 @@ function rsWizSync(){
       dis = cloneBusy || (!rsStatelessClone() && (!n || (pending && batch.disabled)));
       act = cloneAppDirect;
     }
-    else if(state.mode==="inplace" && hyOn){ src=$("#rsInplaceRun"); lbl="Restaurer"; }
+    else if(state.mode==="inplace" && hyOn){ src=$("#rsInplaceRun"); lbl="Restaurer sur place"; }
     else {
       const items=collectItems(), filled=items.length>0 && items.every(i=>(i.new_ref||"").trim());
       const batch=$("#hyBatchGo");
-      if(batch && !filled){ src=batch; lbl="Restaurer"; }
+      if(batch && !filled){ src=batch; lbl="Cloner les VG dans HYCU →"; }
       else { dis=!n; act=()=>$("#rsPreview").click(); }
     }
     if(src){ dis=!n || src.disabled; act=()=>src.click(); }
-  } else if(rsDone){ lbl="Vérifier l'application →"; dis=false; act=()=>gotoVerify(rsDoneTarget, true); }
-  else { src=$("#rsGo"); lbl=(src.textContent||"").trim() || "Lancer"; dis=src.disabled || cloneBusy; act=()=>src.click(); }
+  } else { src=$("#rsGo"); lbl=(src.textContent||"").trim() || "Lancer"; dis=src.disabled || cloneBusy; act=()=>src.click(); }
   const busy = src && src.querySelector(".spin");
   const html = busy ? '<span class="spin"></span>'+esc((src.textContent||"").trim()) : esc(lbl);
   if(html!==rsWizHtml){ go.innerHTML=html; rsWizHtml=html; }
@@ -2798,7 +2987,7 @@ var drAllowed=false, drBusy=false, drBackups=[], drMode="dr", drRecoverNs=null;
 // mêmes mécanismes que la page DR (sources depuis la sauvegarde seule), mais SANS
 // la dérogation allow_dr_restore (le serveur vérifie que la sauvegarde est d'ici).
 function openRecoverModal(ns){
-  rsDone=false; cloneBusy=false;
+  rsNewSession();
   state.ns=ns; state.app=null;         // la récupération recrée tout le namespace
   document.querySelectorAll('#rsPgType .opt').forEach(o=>{ o.style.display=""; });   // (masquées pour une app stateless)
   const note=$("#rsAppNote"); if(note){ note.style.display="none"; note.innerHTML=""; }
@@ -2867,20 +3056,23 @@ function drRenderVols(){
      <input type="text" class="drRef" data-pvc="${esc(v)}" spellcheck="false" autocomplete="off"
        value="${drMode==="recover"&&refs[v]?esc(refs[v]):""}"
        placeholder="${esc(drMode==="recover"?"UUID du Volume Group (8-4-4-4-12)":"UUID du VG restauré/cloné sur le site cible (8-4-4-4-12)")}"></div>`).join("")
-    : (b && b.stateless ? '<div class="note">Sauvegarde <b>stateless</b> (aucun volume) : les workloads'+((b.apps||[]).length?' ('+esc((b.apps||[]).join(", "))+')':'')+' et leurs dépendances seront recréés depuis l\'instantané.</div>'
+    : (b && b.stateless ? '<div class="note">Sauvegarde <b>stateless</b> (aucun volume) : les workloads'+((b.apps||[]).length?' ('+esc((b.apps||[]).join(", "))+')':'')+' et leurs dépendances seront recréés depuis l’instantané.</div>'
                         : '<div class="hint">Aucun volume dans cette sauvegarde.</div>');
   document.querySelectorAll(".drRef").forEach(t=>t.oninput=rsWizSync);
   drSyncReuse();
 }
 // Bascule d'affichage de la grille selon « réutiliser les volumes d'origine ».
 function drSyncReuse(){
-  const reuse=drRecoverReuse();
-  $("#drVols").style.display = reuse? "none":"block";
-  $("#drVolsLabel").style.display = (drMode==="recover")? (reuse?"none":"block") : "block";
+  const reuse=drRecoverReuse(), bsel=drSel(), stateless=!!(bsel && bsel.stateless);
+  // Sauvegarde STATELESS : aucun champ de volume (StorageClass, réutilisation, UUID, HYCU).
+  $("#drScRow").style.display = stateless ? "none" : "";
+  $("#drReuseWrap").style.display = (drMode==="recover" && !stateless) ? "block" : "none";
+  $("#drVols").style.display = (reuse && !stateless)? "none":"block";
+  $("#drVolsLabel").style.display = stateless ? "none" : ((drMode==="recover")? (reuse?"none":"block") : "block");
   if(drMode==="recover") $("#drVolsLabel").textContent="Nouveaux volumes — collez l'identifiant (UUID) fourni par HYCU";
   else $("#drVolsLabel").textContent="Volumes — collez l'UUID du VG restauré/cloné sur le site cible";
   // Bouton « auto HYCU » : seulement quand la grille est visible ET HYCU + Prism connectés.
-  const autoOk = !reuse && (conn.hycu&&conn.hycu.connected)
+  const autoOk = !reuse && !stateless && !rsDone && (conn.hycu&&conn.hycu.connected)
                  && ((conn.prismcentral&&conn.prismcentral.connected)||(conn.nutanix&&conn.nutanix.connected));
   $("#drAutoWrap").style.display = autoOk? "block":"none";
   rsWizSync();
@@ -2898,7 +3090,7 @@ $("#drAuto").onclick=async()=>{
   if(!volumes.length || volumes.some(v=>!v.source_vg_uuid)){
     $("#drErr").innerHTML=errBox("UUID du VG source absent de la sauvegarde : automatisation impossible, saisissez les UUID manuellement."); return; }
   if(!dry() && !(await confirmDanger({title:"Confirmer les clones HYCU", lines:[
-      "Déclencher dans HYCU le <b>clone</b> de <b>"+volumes.length+"</b> Volume Group(s) (nouveaux VG créés) ?",
+      "Cloner dans HYCU <b>"+volumes.length+"</b> Volume Group(s) (de nouveaux VG sont créés) ?",
       "Les nouveaux identifiants seront inscrits automatiquement dans la grille."]}))) return;
   const btn=$("#drAuto"); btn.disabled=true; drBusy=true; rsWizSync();
   $("#drErr").innerHTML=""; $("#drLog").innerHTML='<div class="hint"><span class="spin"></span>HYCU : création des volumes…</div>';
@@ -2926,24 +3118,29 @@ async function drRun(){
       drMode==="recover"
         ? "L'application sera RECRÉÉE sur ce cluster depuis la sauvegarde (namespace, PV/PVC, workloads, dépendances non masquées)."
         : "La garde inter-cluster est LEVÉE pour cette opération : l'application sera recréée sur ce cluster depuis la sauvegarde (PV/PVC, workloads, dépendances non masquées).",
-      ...((drMode==="recover" && drRecoverReuse() && conn.hycu && conn.hycu.connected)
-        ? ["Si un volume d'origine a disparu du cluster, HYCU le RESTAURERA automatiquement (opération HYCU réelle) avant la recréation."] : [])]});
+      ...((drMode==="recover" && !b.stateless && drRecoverReuse() && conn.hycu && conn.hycu.connected)
+        ? ["Si un volume d'origine a disparu du cluster, HYCU le restaurera automatiquement avant la recréation."] : [])]});
     if(!res) return;
     if(typeof res==="string") confirmedCtx=res;
   }
   drBusy=true; rsWizSync();
-  $("#drLog").innerHTML='<div class="hint"><span class="spin"></span>Restauration DR…</div>';
+  $("#drLog").innerHTML='<div class="hint"><span class="spin"></span>'+(drMode==="recover"?"Restauration de l’application…":"Restauration DR…")+'</div>';
   const body={namespace:b.namespace, target_namespace:$("#drTargetNs").value.trim(),
               backup_path:b.path, items, dry:dry(),
               dr_storageclass:$("#drSc").value.trim(), clone_refs:$("#drRefs").checked};
   if(drMode==="recover") body.from_backup_only=true; else body.dr_restore=true;
   if(live && ctxInfo.require_confirm) body.confirm_context=confirmedCtx;
-  const r=await runOp("/api/clone_app", body, log=>{ $("#drLog").innerHTML=renderLog(log); });
+  const sess=rsSession;
+  const r=await runOp("/api/clone_app", body, log=>{ if(sess===rsSession) $("#drLog").innerHTML=renderLog(log); });
+  if(sess!==rsSession) return;
   drBusy=false; rsWizSync();
-  const head = r.ok? (r.dry? '<div class="warnbox">Simulation — séquence qui serait exécutée.</div>'
-                           : '<div class="note">Restauration DR terminée. Vérifiez l\'application, puis re-protégez ses Volume Groups dans HYCU.</div>')
-                   : errBox(r.error);
-  $("#drLog").innerHTML=head+((r.warnings||[]).length?`<div class="warnbox" style="margin-top:8px">${r.warnings.map(esc).join("<br>")}</div>`:"")+renderLog(r.log);
+  const reprot = b.stateless ? "" : " Pensez à re-protéger ses Volume Groups dans HYCU.";
+  const done = (drMode==="recover" ? "Restauration de l’application terminée." : "Restauration DR terminée.") + reprot;
+  const head = r.ok? (r.dry? '<div class="note">Simulation — séquence qui serait exécutée.</div>'
+                           : '<div class="note">'+done+'</div>')
+                   : errBox(r.error || "Des étapes ont échoué — voir le détail.");
+  $("#drLog").innerHTML=head+cloneWarnings(r.warnings)+renderLog(r.log);
+  if(r.ok && !r.dry) rsFinish(body.target_namespace || b.namespace, false, sess, true);
 }
 
 // ----- Restauration guidée des OBJETS de configuration (resources.json) -----
@@ -2967,10 +3164,14 @@ async function objOpen(){
 }
 $("#objBackupSel").onchange=()=>objLoadList();
 async function objLoadList(){
-  objBusy=true; rsWizSync();
+  objBusy=true;
+  // Nouvelle liste = retour à la sélection : jamais appliquer des objets d'une autre
+  // sauvegarde que celle dont les différences sont affichées.
+  objPhase="pick"; $("#objDiffWrap").style.display="none"; $("#objPick").style.display="block"; setRsStep(2);
+  rsWizSync();
   $("#objErr").innerHTML=""; $("#objLog").innerHTML="";
   if(!$("#objBackupSel").value){
-    $("#objBody").innerHTML='<tr><td colspan="4" class="tempty">Aucune sauvegarde pour ce namespace — lancez d\'abord une sauvegarde (Applications → Sauvegarder).</td></tr>';
+    $("#objBody").innerHTML='<tr><td colspan="4" class="tempty">Aucune sauvegarde pour ce namespace — lancez d’abord une sauvegarde (Applications → Sauvegarder).</td></tr>';
     objItems=[]; objBusy=false; rsWizSync(); return;
   }
   const r=await post("/api/objects/list", objBody_());
@@ -2981,7 +3182,7 @@ async function objLoadList(){
   // autres applications du namespace sont masqués par défaut (case « seulement… »).
   const appOn = !!(r.app);
   $("#objOnlyAppWrap").style.display = appOn ? "" : "none";
-  $("#objInfo").textContent="("+objItems.length+" objet(s) dans l'instantané"+(appOn?(" · "+(r.app_count||0)+" de l'application « "+r.app+" »"):"")+")";
+  $("#objInfo").textContent="("+objItems.length+" objet(s) dans l’instantané"+(appOn?(" · "+(r.app_count||0)+" de l’application « "+r.app+" »"):"")+")";
   $("#objBody").innerHTML=objItems.length? objItems.map(o=>`<tr class="clk${o.redacted?'':' '}${appOn&&!o.in_app?' objOther':''}" data-i="${o.i}">
      <td class="cb"><input type="checkbox" class="objChk" data-i="${o.i}" ${o.redacted?"disabled":""} ${appOn&&o.in_app&&!o.redacted?"checked":""}></td>
      <td>${esc(o.kind)}</td><td style="color:var(--strong);font-weight:500">${esc(o.name)}</td>
@@ -3006,8 +3207,8 @@ function objSelIdx(){ return [...document.querySelectorAll(".objChk:checked")].m
 async function objToDiff(){
   objBusy=true; rsWizSync();
   $("#objErr").innerHTML="";
-  $("#objDiff").innerHTML='<div class="hint"><span class="spin"></span>Comparaison avec l\'état live…</div>';
-  $("#objDiffWrap").style.display="block";
+  $("#objDiff").innerHTML='<div class="hint"><span class="spin"></span>Comparaison avec l’état live…</div>';
+  $("#objDiffWrap").style.display="block"; setRsStep(3);
   const r=await post("/api/objects/diff", Object.assign(objBody_(), {indexes:objSelIdx()}));
   objBusy=false;
   if(!r.ok){ $("#objDiffWrap").style.display="none"; $("#objErr").innerHTML=errBox(r.error); rsWizSync(); return; }
@@ -3038,12 +3239,15 @@ async function objApply(){
   $("#objLog").innerHTML='<div class="hint"><span class="spin"></span>Application…</div>';
   const body=Object.assign(objBody_(), {indexes:objSelIdx(), dry:dry()});
   if(live && ctxInfo.require_confirm) body.confirm_context=confirmedCtx;
+  const sess=rsSession;
   const r=await post("/api/objects/restore", body);
+  if(sess!==rsSession) return;
   objBusy=false; rsWizSync();
   const head = r.ok? (r.dry? '<div class="warnbox">Simulation — commandes qui seraient exécutées.</div>'
-                           : `<div class="note">${r.applied} objet(s) appliqué(s)${r.skipped?(" · "+r.skipped+" ignoré(s)"):""}.</div>`)
+                           : `<div class="note">${"Restauration des objets terminée : "+r.applied+" objet(s) appliqué(s)"}${r.skipped?(" · "+r.skipped+" ignoré(s)"):""}.</div>`)
                    : errBox(r.error);
   $("#objLog").innerHTML=head+renderLog(r.log);
+  if(r.ok && !r.dry) rsFinish(body.namespace, !!r.skipped, sess);
 }
 setInterval(()=>{ if($("#mRestore").style.display!=="none") rsWizSync(); }, 300);
 

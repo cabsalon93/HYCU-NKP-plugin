@@ -9,8 +9,11 @@ library only), also shipped as a container image.
 ## What it does
 
 - **Backs up** namespace configuration: PV/PVC manifests, Deployments, Services,
-  ConfigMaps, Secrets (encrypted). On demand or **automatically** (schedule, retention,
-  quota), with optional export to **S3** object storage.
+  ConfigMaps, Secrets (encrypted). On demand or **automatically** through **policies**
+  (target by namespaces or labels, frequency, retention, HYCU policy), with optional export
+  to **S3** object storage and manual purge of old versions.
+- **Backs itself up**: configuration, policies and vault exported daily to the bucket,
+  restorable on a new instance (⚙ Sources → S3 object storage).
 - **Protects** volumes in HYCU: PVC ↔ Volume Group matching, HYCU policy.
 - **Restores**: to **new volumes** (HYCU clone), **in place** (HYCU in-place restore), a
   **deleted application**, **in bulk**, or onto **another cluster** (DR). The tool runs
@@ -99,7 +102,8 @@ Everything is set from the UI (⚙ **Settings**, ⚙ **Sources**) or in `hycu_co
 | `namespace_filter` | `[]` | Visible namespaces (empty = all). `namespace_label_selector` for a label-based filter. |
 | `allowed_contexts` | `[]` | Clusters/contexts allowed in live mode (empty = all, with confirmation). |
 | `allowed_hosts` | `[]` | DNS names accepted besides `127.0.0.1` (Ingress / reverse proxy; put authentication in front). |
-| `auto_backup_enabled` | `false` | Automatic backup of all visible namespaces. |
+| `auto_backup_enabled` | `false` | Default policy: automatic backup of namespaces without another policy. |
+| `backup_policies` | `[]` | Named policies (Policies page): namespaces and/or label selector, interval, versions to keep, optional HYCU policy. The first match wins. |
 | `auto_backup_interval_hours` | `24` | Automatic backup interval. |
 | `auto_backup_keep` | `15` | Versions kept per namespace (`0` = unlimited). `auto_backup_retention: "gfs"` for daily/weekly/monthly retention. |
 | `storage_quota_gb` / `storage_min_free_mb` | `0` / `500` | Backup folder quota and free-space floor. |

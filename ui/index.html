@@ -190,10 +190,12 @@
         <button class="pact" id="actRestore" type="button" disabled><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4.4 12.5a7.6 7.6 0 1 0 2.1-5.8"/><path d="M4.2 4.3v3.9h3.9"/><path d="M12 8.3v4l2.6 1.9"/></svg><span>Restaurer</span></button>
         <button class="pact" id="actPolicy" type="button" disabled><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l7.5 3v5.4c0 4.6-3.2 8.3-7.5 9.6-4.3-1.3-7.5-5-7.5-9.6V6z"/><path d="M12 8.8v6.4M8.8 12h6.4"/></svg><span>Définir la politique</span></button>
         <button class="pact" id="actVerify" type="button" disabled><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="8.6"/><path d="M8.3 12.2l2.5 2.5 5-5.3"/></svg><span>Vérifier</span></button>
+        <button class="pact" id="actPurge" type="button" disabled title="Supprimer des versions de sauvegarde de configuration"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4.5 7h15M9.5 7V4.8h5V7M6.8 7l.8 12.2h8.8l.8-12.2M10.2 10.6v5.6M13.8 10.6v5.6"/></svg><span>Purger</span></button>
         <button class="pact" id="actBulk" type="button" title="Recréer tous les namespaces supprimés du cluster actif depuis leurs sauvegardes"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3.5" y="4" width="17" height="5" rx="1.2"/><rect x="3.5" y="11" width="17" height="5" rx="1.2"/><path d="M6 18.5h12M4.4 21a7 7 0 0 0 1.9-5.3"/><path d="M4.2 13.2v3.6h3.6"/></svg><span>Restaurer en masse</span></button>
       </div></div>
     <div class="tcard">
       <div class="tbar"><div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap"><input type="text" id="appsSearch" placeholder="Rechercher" autocomplete="off">
+        <label class="fld" style="margin:0;display:flex;align-items:center;gap:6px;font-size:13px;white-space:nowrap"><input type="checkbox" id="appsHideDel" style="width:auto;margin:0"> Masquer les supprimées</label>
         <div class="seg" id="appsScope" style="display:none"><button class="on" type="button" data-scope="one">Cluster actif</button><button type="button" data-scope="all">Tous les clusters</button></div></div>
         <div style="display:flex;align-items:center;gap:14px"><span class="tinfo" id="appsInfo"></span><span class="tinfo" id="appsPager" style="display:none"></span>
           <button class="pact nsEdit" type="button" title="Filtrer la liste des namespaces"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5h16l-6.2 7.4V19l-3.6-1.8v-4.8z"/></svg></button></div></div>
@@ -205,13 +207,35 @@
   </section>
   <!-- ===================== POLITIQUES ===================== -->
   <section id="tab-policies" style="display:none">
-    <div class="pagehead"><h1 class="ptitle">Politiques</h1></div>
+    <div class="pagehead"><h1 class="ptitle">Politiques</h1>
+      <div class="pacts"><button class="pact" id="polNew" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg><span>Nouvelle politique</span></button></div></div>
     <div class="tcard" style="margin-bottom:16px">
-      <table class="ht"><thead><tr><th>Nom</th><th>Objet protégé</th><th>Fréquence</th><th>Rétention</th><th>Cible</th><th class="ctr">État</th></tr></thead>
+      <table class="ht"><thead><tr><th>Nom</th><th>Namespaces</th><th>Fréquence</th><th>Rétention</th><th>Politique HYCU</th><th>Dernière exécution</th><th class="ctr">État</th></tr></thead>
         <tbody id="polBody"></tbody></table>
     </div>
+    <div class="card" id="polEdit" style="display:none">
+      <h3 id="polEditTitle">Nouvelle politique</h3>
+      <div class="row">
+        <div style="flex:none;width:200px"><label class="fld">Nom</label><input type="text" id="peName" maxlength="40" placeholder="or"></div>
+        <div><label class="fld">Namespaces (séparés par des virgules)</label><input type="text" id="peNs" placeholder="shop, billing"></div>
+        <div><label class="fld">et/ou sélecteur d'étiquettes</label><input type="text" id="peSel" placeholder="hycu.io/policy=or"></div>
+      </div>
+      <div class="row">
+        <div style="flex:none;width:150px"><label class="fld">Intervalle (heures)</label><input type="number" id="peInterval" min="0.25" step="0.25" value="24"></div>
+        <div style="flex:none;width:170px"><label class="fld">Versions à conserver</label><input type="number" id="peKeep" min="0" step="1" value="15"></div>
+        <div><label class="fld">Politique HYCU (optionnel)</label><select id="peHycu"></select></div>
+        <div style="flex:none;align-self:flex-end"><label class="fld"><input type="checkbox" id="peEnabled" style="width:auto" checked> Activée</label></div>
+      </div>
+      <div class="hint" style="margin-top:6px">La première politique de la liste qui correspond à un namespace l'emporte ; un namespace sans politique suit la politique par défaut. La politique HYCU est assignée aux volumes qui n'en ont pas encore.</div>
+      <div style="margin-top:12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <button class="btn" id="peSave" type="button">Enregistrer</button>
+        <button class="btn ghost" id="peCancel" type="button">Annuler</button>
+        <button class="lnk" id="peDelete" type="button" style="margin-left:auto;color:var(--red-t)">Supprimer la politique</button>
+      </div>
+      <div id="peMsg"></div>
+    </div>
     <div class="card">
-      <h3><span class="step-no">⏱</span>Sauvegarde automatique de la configuration (PV/PVC)</h3>
+      <h3><span class="step-no">⏱</span>Politique par défaut — sauvegarde automatique de la configuration</h3>
       <p class="sub">Sauvegarde régulièrement les <b>manifestes PV/PVC</b> (la « recette » du restore) de tous les
         namespaces autorisés par le filtre — tant que l'outil est lancé. <b>Pas les données</b> des volumes :
         elles sont protégées par HYCU (<b>Applications → Définir la politique</b>).</p>
@@ -366,6 +390,15 @@
     <div class="hm-foot" id="mBackupFoot"><button class="lnk" type="button" data-close="mBackup">Fermer</button><button class="btn" id="bkRunSel" type="button" style="display:none">Sauvegarder la sélection</button></div>
   </div>
 </div>
+<div id="mPurge" class="hmodal-bg" style="display:none">
+  <div class="hmodal" style="max-width:640px">
+    <div class="hm-head"><h2 id="mPurgeTitle">Versions sauvegardées</h2><div class="hm-ico"><button type="button" data-close="mPurge" title="Fermer">✕</button></div></div>
+    <div class="hm-body"><div id="purgeList"></div><div id="purgeMsg"></div></div>
+    <div class="hm-foot"><button class="lnk" type="button" id="purgeOld" style="margin-right:auto">Toutes sauf la plus récente</button>
+      <button class="lnk" type="button" data-close="mPurge">Fermer</button>
+      <button class="btn danger" id="purgeGo" type="button" disabled>Supprimer la sélection</button></div>
+  </div>
+</div>
 <div id="mBulk" class="hmodal-bg" style="display:none">
   <div class="hmodal" style="max-width:860px">
     <div class="hm-head"><h2>Restauration en masse</h2><div class="hm-ico"><button type="button" data-close="mBulk" title="Fermer">✕</button></div></div>
@@ -446,7 +479,7 @@
           <div><label class="fld">Sauvegarde source (tous clusters / imports S3)</label><select id="drBackupSel"></select></div>
           <div style="flex:none;width:220px"><label class="fld">Namespace cible</label><input type="text" id="drTargetNs" autocomplete="off"></div>
         </div>
-        <div class="row">
+        <div class="row" id="drScRow">
           <div style="flex:none;width:260px"><label class="fld">StorageClass cible (vide = inchangée)</label><input type="text" id="drSc" placeholder="nutanix-volume" autocomplete="off"></div>
           <div style="align-self:flex-end"><label class="fld"><input type="checkbox" id="drRefs" checked style="width:auto"> Recréer les dépendances depuis la sauvegarde (Secrets non masqués, ConfigMaps, ServiceAccounts, Services)</label></div>
         </div>
@@ -719,6 +752,16 @@
           <div class="hint" style="margin-top:4px">Les exports rapatriés vont dans <code>hycu-backups/_imports/…</code> ; ils se restaurent via la <b>Restauration DR</b> de l'assistant (ou sur leur cluster d'origine).</div>
           <div id="s3ImpRes"></div>
         </div>
+      </div>
+      <div style="margin-top:14px;border-top:1px solid var(--line);padding-top:12px" id="tkCard">
+        <b style="font-size:13px">Sauvegarde de l'outil</b>
+        <div class="hint" style="margin:2px 0 8px">Configuration, politiques et coffre chiffré. Exportée chaque jour avec l'export automatique ; restaurable sur une nouvelle instance.</div>
+        <div style="display:flex;gap:10px;flex-wrap:wrap">
+          <button class="btn ghost" id="tkUpload" type="button">Exporter maintenant</button>
+          <button class="btn ghost" id="tkDownload" type="button">Télécharger</button>
+          <button class="btn ghost" id="tkList" type="button">Restaurer l'outil depuis le bucket…</button>
+        </div>
+        <div id="tkOut"></div>
       </div>
     </div>
 

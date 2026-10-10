@@ -219,7 +219,7 @@ try:
             return {"items": [{"metadata": {"name": "pv-a"}}, {"metadata": {"name": "pv-b"}}]}, None
         return {"items": []}, None
     H.kubectl_json = kj_pass
-    def fake_backup(ns, dest=None, protect=None, pv_cache=None, defer_quota=False, kind="manual", internal=False):
+    def fake_backup(ns, dest=None, protect=None, pv_cache=None, defer_quota=False, kind="manual", internal=False, **kw):
         got["threads"].add(threading.get_ident())
         got["cache"].append((ns, sorted(pv_cache or {}), defer_quota))
         time.sleep(0.05)

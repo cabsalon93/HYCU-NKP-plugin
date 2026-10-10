@@ -217,6 +217,14 @@ DEFAULT_CONFIG = {
     "auto_backup_keep_daily": 7,
     "auto_backup_keep_weekly": 4,
     "auto_backup_keep_monthly": 12,
+    # POLITIQUES NOMMÉES (en plus de la sauvegarde automatique ci-dessus, qui devient la
+    # « politique par défaut ») : chacune cible des namespaces par NOM et/ou par
+    # SÉLECTEUR D'ÉTIQUETTES et a sa propre fréquence, sa rétention (N versions) et,
+    # optionnellement, une politique HYCU assignée aux volumes encore sans politique.
+    # La PREMIÈRE politique qui correspond l'emporte ; un namespace sans politique suit
+    # la politique par défaut. Ex. :
+    # [{"name": "or", "label_selector": "hycu.io/policy=or", "interval_hours": 4, "keep": 30}]
+    "backup_policies": [],
     # Restore in-place HYCU : HYCU remplace le DISQUE du VG (nouvel extId) -> le
     # hypervisorAttachedDiskUUIDs du PV devient périmé et le montage échoue
     # ("failed to get symlink for disk ..."). True = après le restore, recréer le PV
@@ -282,6 +290,45 @@ def _is_str_list(v):
     return all(isinstance(x, str) for x in v)
 
 
+_POLICY_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.-]{0,39}$")
+_LABEL_SEL_RE = re.compile(r"^[A-Za-z0-9_./=!,() -]{0,200}$")
+
+
+def _valid_backup_policies(v):
+    """Politiques nommées : nom unique, au moins une cible (namespaces et/ou sélecteur),
+    intervalle 0,25–8760 h, rétention 0–10000 versions (0 = illimité)."""
+    seen = set()
+    for p in v:
+        if not isinstance(p, dict):
+            return False
+        name = str(p.get("name") or "").strip()
+        if not _POLICY_NAME_RE.match(name) or name.lower() in seen or name.lower() in ("default", "par défaut"):
+            return False
+        seen.add(name.lower())
+        nss = p.get("namespaces") or []
+        if not isinstance(nss, list) or not all(isinstance(x, str) and re.match(r"^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$", x)
+                                                 for x in nss):
+            return False
+        sel = p.get("label_selector") or ""
+        if not isinstance(sel, str) or not _LABEL_SEL_RE.match(sel):
+            return False
+        if not nss and not sel.strip():
+            return False
+        try:
+            iv = float(p.get("interval_hours", 24))
+            kp = int(p.get("keep", 15))
+        except (TypeError, ValueError):
+            return False
+        if isinstance(p.get("keep"), bool) or not (0.25 <= iv <= 8760 and 0 <= kp <= 10000):
+            return False
+        if not isinstance(p.get("enabled", True), bool):
+            return False
+        for k in ("hycu_policy", "hycu_policy_name"):
+            if not isinstance(p.get(k) or "", str) or len(p.get(k) or "") > 120:
+                return False
+    return True
+
+
 CONFIG_SCHEMA = {
     "host": (str, None),
     "port": (int, lambda v: 1 <= v <= 65535),
@@ -313,6 +360,7 @@ CONFIG_SCHEMA = {
     "auto_backup_keep_daily": (int, lambda v: 0 <= v <= 3660),
     "auto_backup_keep_weekly": (int, lambda v: 0 <= v <= 520),
     "auto_backup_keep_monthly": (int, lambda v: 0 <= v <= 1200),
+    "backup_policies": (list, _valid_backup_policies),
     "cluster_health_minutes": (int, lambda v: 0 <= v <= 1440),
     "audit_retention_days": (int, lambda v: 0 <= v <= 36500),
     "storage_min_free_mb": (int, lambda v: 0 <= v <= 10_000_000),
@@ -567,7 +615,7 @@ def save_config(updates, source="internal"):
 
 # Version horodatée de la build (format AAAAMMJJ-HHMM). À incrémenter à chaque
 # changement notable du programme ; affichée dans l'en-tête de l'interface.
-VERSION = "20261010-1600"
+VERSION = "20261010-2200"
 
 # Jeton anti-CSRF généré au démarrage, injecté dans la page et exigé sur les POST.
 CSRF_TOKEN = secrets.token_urlsafe(32)
@@ -2481,10 +2529,11 @@ def action_pvcs(ns):
 
 BACKUP_SCHEMA = 2
 BACKUP_KINDS = ("manual", "auto", "pre_restore")
+_ALL_POLICIES = object()      # action_backup_all : périmètre « tous les namespaces » (sauvegarde manuelle)
 
 
 def action_backup(ns, dest=None, protect=None, pv_cache=None, defer_quota=False,
-                  kind="manual", internal=False):
+                  kind="manual", internal=False, keep=None, retention_mode=None):
     """Exporte + nettoie tous les PV/PVC du namespace (étapes 1-3 du document).
     `dest` (optionnel) = dossier de destination choisi par l'utilisateur (vide = défaut).
     `protect` = chemins de sauvegarde à ne jamais purger par la rétention (ex. la
@@ -2505,12 +2554,14 @@ def action_backup(ns, dest=None, protect=None, pv_cache=None, defer_quota=False,
     root, derr = _resolve_backup_dest(dest)
     if derr:
         return {"ok": False, "error": derr}
+    if keep is None:                          # rétention de la politique du namespace
+        keep, retention_mode = _retention_for(ns)
     ferr = _storage_floor_error(root)
     if ferr:
         # Donner d'abord sa chance à la rétention/au quota de libérer de la place :
         # sinon le plancher bloque la seule purge capable de le lever (verrou).
         try:
-            _prune_backups(root, ns, CONFIG.get("auto_backup_keep", 15), protect=protect)
+            _prune_backups(root, ns, keep, protect=protect, mode=retention_mode)
             enforce_storage_quota(root)
         except Exception as e:
             print("Rétention avant sauvegarde : %s" % e)
@@ -2656,7 +2707,7 @@ def action_backup(ns, dest=None, protect=None, pv_cache=None, defer_quota=False,
     # pré-restauration, cf. _prune_backups) puis quota global éventuel.
     pruned = 0
     try:
-        pruned = _prune_backups(root, ns, CONFIG.get("auto_backup_keep", 15), protect=protect)
+        pruned = _prune_backups(root, ns, keep, protect=protect, mode=retention_mode)
         if not defer_quota:
             enforce_storage_quota(root)
     except Exception as e:
@@ -2668,17 +2719,33 @@ def action_backup(ns, dest=None, protect=None, pv_cache=None, defer_quota=False,
          "secrets": secrets_mode, "secrets_warning": secrets_warning})
 
 
-def action_backup_all(dest=None, kind="manual", internal=False):
+def action_backup_all(dest=None, kind="manual", internal=False, policy_scope=_ALL_POLICIES):
     """Sauvegarde la config (PV/PVC) de TOUS les namespaces autorisés par le filtre
     courant (tous les namespaces du cluster si aucun filtre). Un namespace sans PVC est
     « ignoré » (pas une erreur). Renvoie un récapitulatif par namespace + des totaux.
-    `dest` (optionnel) = dossier de destination commun (vide = défaut)."""
+    `dest` (optionnel) = dossier de destination commun (vide = défaut).
+    `policy_scope` : par défaut TOUS les namespaces (sauvegarde manuelle) ; None = ceux
+    de la politique PAR DÉFAUT (sans politique nommée) ; une politique = ses namespaces."""
     info = action_namespaces()
     if not info.get("ok"):
         return {"ok": False, "error": info.get("error") or "Liste des namespaces indisponible.",
                 "results": []}
     namespaces = info.get("namespaces") or []
-    if not namespaces:
+    pmap, perr = {}, None
+    if policy_scope is not _ALL_POLICIES:
+        pmap, perr = _policy_map(namespaces)
+        want = (policy_scope or {}).get("name")
+        if perr and want:
+            # Membres par étiquette invérifiables : seuls les namespaces nommés explicitement
+            # sont sûrs ; le passage est signalé en échec (cf. _policy_run).
+            namespaces = [n for n in namespaces if n in (policy_scope.get("namespaces") or [])]
+        else:
+            namespaces = [n for n in namespaces if ((pmap.get(n) or {}).get("name")) == want]
+        if not namespaces:
+            return {"ok": True, "error": None, "results": [], "root": None, "namespaces": 0,
+                    "backed_up": 0, "volumes": 0, "partial": [], "filtered": bool(_ns_filter()),
+                    "selector_error": perr}
+    elif not namespaces:
         return {"ok": False, "error": "Aucun namespace à sauvegarder.", "results": []}
     root, derr = _resolve_backup_dest(dest)        # valide la destination une seule fois
     if derr:
@@ -2713,7 +2780,12 @@ def action_backup_all(dest=None, kind="manual", internal=False):
                 return {"ns": ns, "ok": False, "skipped": True, "count": 0,
                         "error": "Restauration en cours (transaction) : sauvegarde différée."}
             try:
-                b = action_backup(ns, root, pv_cache=pv_cache, defer_quota=True, kind=kind, internal=True)
+                kp, km = (None, None)
+                pol = pmap.get(ns) if policy_scope is not _ALL_POLICIES else None
+                if pol:
+                    kp, km = int(pol.get("keep", 15)), "count"
+                b = action_backup(ns, root, pv_cache=pv_cache, defer_quota=True, kind=kind, internal=True,
+                                  keep=kp, retention_mode=km)
             except Exception as e:                      # un namespace en erreur n'arrête pas le passage
                 b = {"ok": False, "error": "Erreur interne : %s" % e}
             if b.get("ok"):
@@ -2740,7 +2812,7 @@ def action_backup_all(dest=None, kind="manual", internal=False):
           partial=partial_ns)
     return {"ok": True, "error": None, "results": results, "root": root,
             "namespaces": len(namespaces), "backed_up": backed_up, "volumes": vol_total,
-            "partial": partial_ns, "filtered": bool(_ns_filter())}
+            "partial": partial_ns, "filtered": bool(_ns_filter()), "selector_error": perr}
 
 
 # ------------------------------------------------------------------------------
@@ -2749,7 +2821,7 @@ def action_backup_all(dest=None, kind="manual", internal=False):
 # (= action_backup_all, en lecture seule côté cluster). Le dernier passage est
 # persisté sur disque : l'intervalle est respecté même après un redémarrage.
 # ------------------------------------------------------------------------------
-AUTO_BACKUP = {"last_run": 0.0, "last_ok": None, "last_summary": "", "running": False}
+AUTO_BACKUP = {"last_run": 0.0, "last_ok": None, "last_summary": "", "running": False, "policies": {}}
 
 
 def _auto_backup_state_path():
@@ -2763,14 +2835,17 @@ def _load_auto_backup_state():
         for k in ("last_run", "last_ok", "last_summary"):
             if k in st:
                 AUTO_BACKUP[k] = st[k]
+        if isinstance(st.get("policies"), dict):
+            AUTO_BACKUP["policies"] = {k: v for k, v in st["policies"].items() if isinstance(v, dict)}
     except Exception:
         pass                        # pas d'état = jamais exécutée
 
 
 def _save_auto_backup_state():
     try:
-        _write_json_atomic(_auto_backup_state_path(),
-                           {k: AUTO_BACKUP[k] for k in ("last_run", "last_ok", "last_summary")}, mode=0o644)
+        st = {k: AUTO_BACKUP[k] for k in ("last_run", "last_ok", "last_summary")}
+        st["policies"] = dict(AUTO_BACKUP.get("policies") or {})
+        _write_json_atomic(_auto_backup_state_path(), st, mode=0o644)
     except OSError:
         pass                        # best-effort : l'état vit en mémoire de toute façon
 
@@ -2790,6 +2865,203 @@ def _auto_backup_due(now):
     if not last:
         return True                 # jamais exécutée -> première sauvegarde immédiate
     return (now - last) >= _auto_backup_interval_s()
+
+
+# ---- Politiques nommées ------------------------------------------------------
+# Une politique = cible (namespaces par nom et/ou sélecteur d'étiquettes) + fréquence +
+# rétention + politique HYCU optionnelle. Résolution : la PREMIÈRE politique (ordre de
+# la liste) qui contient le namespace l'emporte ; sinon, politique PAR DÉFAUT (réglages
+# auto_backup_* historiques). Les politiques s'appliquent à tous les clusters.
+_POLICY_SEL_CACHE = {}
+_POLICY_SEL_LOCK = threading.Lock()
+_POLICY_SEL_TTL = 60.0
+
+
+def _named_policies():
+    """Politiques nommées normalisées (copies) ; liste vide si aucune."""
+    out = []
+    for p in (CONFIG.get("backup_policies") or []):
+        if not isinstance(p, dict) or not str(p.get("name") or "").strip():
+            continue
+        try:
+            iv = max(0.25, float(p.get("interval_hours", 24)))
+            kp = max(0, int(p.get("keep", 15)))
+        except (TypeError, ValueError):
+            continue
+        out.append({"name": str(p["name"]).strip(), "namespaces": list(p.get("namespaces") or []),
+                    "label_selector": (p.get("label_selector") or "").strip(),
+                    "interval_hours": iv, "keep": kp, "enabled": p.get("enabled", True) is not False,
+                    "hycu_policy": (p.get("hycu_policy") or "").strip(),
+                    "hycu_policy_name": (p.get("hycu_policy_name") or "").strip()})
+    return out
+
+
+def _policy_selector_sets(policies):
+    """{nom de politique: namespaces correspondant à son sélecteur} sur le cluster ACTIF
+    (un `kubectl get ns -l` par politique à sélecteur, mis en cache 60 s). Renvoie
+    (ensembles, erreur) — une erreur n'est jamais assimilée à « aucun namespace »."""
+    sels = tuple((p["name"], p["label_selector"]) for p in policies if p.get("label_selector"))
+    if not sels:
+        return {}, None
+    key = (_current_cid(), sels)
+    now = time.time()
+    with _POLICY_SEL_LOCK:
+        c = _POLICY_SEL_CACHE.get(key)
+        if c and now - c["at"] <= _POLICY_SEL_TTL:
+            return c["sets"], c["err"]
+    sets, err = {}, None
+    for name, sel in sels:
+        data, e = kubectl_json(["get", "ns", "-l", sel])
+        if e:
+            err = "sélecteur « %s » (politique %s) : %s" % (sel, name, e)
+            sets[name] = set()
+            continue
+        sets[name] = {(i.get("metadata") or {}).get("name") for i in (data or {}).get("items", [])}
+    with _POLICY_SEL_LOCK:
+        _POLICY_SEL_CACHE.clear()
+        _POLICY_SEL_CACHE[key] = {"at": now, "sets": sets, "err": err}
+    return sets, err
+
+
+def _policy_of(ns, policies=None, sets=None):
+    """Politique nommée du namespace (première qui correspond), ou None = par défaut."""
+    pols = _named_policies() if policies is None else policies
+    if not pols:
+        return None
+    if sets is None:
+        sets, _e = _policy_selector_sets(pols)
+    for p in pols:
+        if ns in p["namespaces"] or ns in sets.get(p["name"], ()):
+            return p
+    return None
+
+
+def _policy_map(namespaces):
+    """({namespace: politique nommée ou None}, erreur de sélecteur éventuelle)."""
+    pols = _named_policies()
+    if not pols:
+        return {n: None for n in namespaces}, None
+    sets, err = _policy_selector_sets(pols)
+    return {n: _policy_of(n, pols, sets) for n in namespaces}, err
+
+
+def _retention_for(ns):
+    """(versions à conserver, mode) pour une sauvegarde de `ns` : celle de sa politique
+    nommée, sinon les réglages par défaut. Appartenance invérifiable (sélecteur en
+    erreur) -> AUCUNE purge (dans le doute, ne rien supprimer)."""
+    pols = _named_policies()
+    if not pols:
+        return CONFIG.get("auto_backup_keep", 15), None
+    sets, err = _policy_selector_sets(pols)
+    p = _policy_of(ns, pols, sets)
+    if p:
+        return p["keep"], "count"
+    if err:
+        return 0, "count"
+    return CONFIG.get("auto_backup_keep", 15), None
+
+
+def _policy_interval_s(p):
+    return max(0.25, float(p.get("interval_hours") or 24)) * 3600.0
+
+
+def _policy_state(name):
+    return AUTO_BACKUP.setdefault("policies", {}).setdefault(
+        name, {"last_run": 0.0, "last_ok": None, "last_summary": ""})
+
+
+def _policy_due(p, now):
+    if not p.get("enabled", True):
+        return False
+    last = float(_policy_state(p["name"]).get("last_run") or 0)
+    return (not last) or (now - last) >= _policy_interval_s(p)
+
+
+def _hycu_assign_policy(policy_uuid, vg_uuids):
+    path = "/policies/%s/assign" % urllib.parse.quote(policy_uuid)
+    return _rest("hycu", "POST", path, body={"volumeGroupUuidList": sorted(set(vg_uuids)),
+                                              "includeDependencies": False})
+
+
+def _policy_hycu_assign(p, namespaces):
+    """Politique HYCU de la politique nommée : assignée aux Volume Groups (correspondance
+    EXACTE uniquement) qui n'ont ENCORE aucune politique HYCU. Un volume déjà dans une
+    autre politique HYCU n'est jamais modifié (signalé). Renvoie (ok, message)."""
+    pol_uuid = p.get("hycu_policy") or ""
+    if not pol_uuid or not namespaces:
+        return True, ""
+    if not SESSION_CREDS.get("hycu"):
+        return True, "politique HYCU non appliquée (HYCU non connecté)"
+    items, herr = _hycu_list_vgs()
+    if herr is not None:
+        return False, "politique HYCU non appliquée (%s)" % herr
+    todo, other = [], 0
+    for ns in namespaces:
+        m = action_hycu_match(ns, vg_items=items)
+        if not m.get("ok"):
+            continue
+        for x in m.get("matches") or []:
+            if not (x.get("matched") and x.get("trusted") and x.get("hycu_vg_uuid")):
+                continue
+            cur = (x.get("policy") or "").strip()
+            if not cur:
+                todo.append(x["hycu_vg_uuid"])
+            elif cur != p.get("hycu_policy_name"):
+                other += 1
+    msgs, ok = [], True
+    if todo:
+        r = _hycu_assign_policy(pol_uuid, todo)
+        ok = bool(r.get("ok"))
+        audit("hycu_protect", ok=ok, auto=True, policy=pol_uuid, policy_name=p["name"],
+              namespaces=namespaces, vgs=sorted(set(todo)))
+        msgs.append(("%d volume(s) rattaché(s) à la politique HYCU « %s »"
+                     % (len(set(todo)), p.get("hycu_policy_name") or pol_uuid)) if ok
+                    else "assignation HYCU refusée : %s" % r.get("error"))
+    if other:
+        msgs.append("%d volume(s) déjà dans une autre politique HYCU (non modifiés)" % other)
+    return ok, " ; ".join(msgs)
+
+
+def _policy_run(p, now=None):
+    """Un passage d'une politique nommée sur tous les clusters : sauvegarde de ses
+    namespaces (rétention de la politique) puis politique HYCU éventuelle."""
+    now = time.time() if now is None else now
+    if BULK["running"] or not ACTION_LOCK.acquire(blocking=False):
+        return None
+    AUTO_BACKUP["running"] = True
+    dest = CONFIG.get("auto_backup_dest") or None
+    try:
+        parts = []
+        cids = _cluster_ids()
+        for cid in cids:
+            try:
+                with use_cluster(cid, req_timeout=60):
+                    if cid == LOCAL_CID and len(cids) > 1 and not action_context().get("kubectl_ok"):
+                        continue
+                    r = action_backup_all(dest, kind="auto", internal=True, policy_scope=p)
+                    ok, summary = _auto_backup_one(lambda d: r, dest)
+                    if r.get("selector_error"):
+                        ok, summary = False, summary + " ; " + r["selector_error"]
+                    done = [x["ns"] for x in (r.get("results") or []) if x.get("ok")]
+                    hok, hmsg = _policy_hycu_assign(p, done)
+                    if hmsg:
+                        summary += " ; " + hmsg
+                    parts.append((_cluster_label(cid), ok and hok, summary))
+            except Exception as e:
+                parts.append((_cluster_label(cid), False, "erreur : %s" % e))
+        ok = bool(parts) and all(x[1] for x in parts)
+        summary = (parts[0][2] if len(parts) == 1 else
+                   " | ".join("%s : %s" % (x[0], x[2]) for x in parts)) if parts else "aucun cluster disponible"
+        summary = "Politique « %s » : %s" % (p["name"], summary)
+        _policy_state(p["name"]).update({"last_run": now, "last_ok": ok, "last_summary": summary})
+        _save_auto_backup_state()
+        _apps_cache_clear()
+        audit("auto_backup", ok=ok, summary=summary, policy=p["name"],
+              **({"cluster": "*"} if len(parts) > 1 else {}))
+        return ok
+    finally:
+        AUTO_BACKUP["running"] = False
+        ACTION_LOCK.release()
 
 
 def _gfs_keep_paths(backups, daily, weekly, monthly):
@@ -2817,7 +3089,7 @@ def _gfs_keep_paths(backups, daily, weekly, monthly):
     return keep
 
 
-def _prune_backups(root, ns, keep, protect=None):
+def _prune_backups(root, ns, keep, protect=None, mode=None):
     """Rétention : mode « count » (garder les `keep` plus récentes ; 0 = pas de
     rétention compteur, comme les autres réglages où 0 = illimité) ou « gfs »
     (quotidiennes/hebdomadaires/mensuelles — auto_backup_retention). Ne supprime QUE
@@ -2828,7 +3100,7 @@ def _prune_backups(root, ns, keep, protect=None):
         keep = int(keep)
     except (TypeError, ValueError):
         keep = 15
-    mode = (CONFIG.get("auto_backup_retention") or "count")
+    mode = mode or (CONFIG.get("auto_backup_retention") or "count")   # politique nommée : « count » imposé
     if mode != "gfs" and keep <= 0:
         return 0
     # Ne JAMAIS supprimer la sauvegarde de sécurité d'une transaction de restauration
@@ -2906,7 +3178,7 @@ def _auto_backup_run(now=None, runner=None):
                         if cid == LOCAL_CID and len(cids) > 1 and not action_context().get("kubectl_ok"):
                             continue
                         parts.append((_cluster_label(cid),) + _auto_backup_one(
-                            lambda d: action_backup_all(d, kind="auto", internal=True), dest))
+                            lambda d: action_backup_all(d, kind="auto", internal=True, policy_scope=None), dest))
                 except Exception as e:          # un cluster en erreur n'arrête pas les autres
                     parts.append((_cluster_label(cid), False, "erreur : %s" % e))
         ok = bool(parts) and all(p[1] for p in parts)
@@ -2914,6 +3186,14 @@ def _auto_backup_run(now=None, runner=None):
             summary = parts[0][2] if parts else "aucun cluster disponible"
         else:
             summary = " | ".join("%s : %s" % (p[0], p[2]) for p in parts)
+        if runner is None and CONFIG.get("s3_auto_upload") and SESSION_CREDS.get("s3"):
+            # Filet de l'outil lui-même : configuration, politiques et coffre chiffré,
+            # exportés (un objet par jour) à côté des sauvegardes. Jamais bloquant.
+            try:
+                tok, tinfo = s3_upload_tool_kit()
+                summary += " ; kit de l'outil exporté" if tok else " ; export du kit de l'outil en échec : %s" % tinfo
+            except Exception as e:
+                summary += " ; export du kit de l'outil en échec : %s" % e
         AUTO_BACKUP.update({"last_run": now, "last_ok": ok, "last_summary": summary})
         _save_auto_backup_state()
         _apps_cache_clear()
@@ -2963,6 +3243,15 @@ def _auto_backup_loop():
     _load_auto_backup_state()
     while True:
         time.sleep(30)
+        for p in _named_policies():
+            try:
+                if _policy_due(p, time.time()) and not ACTION_LOCK.locked():
+                    _policy_run(p)
+            except Exception as e:
+                print("Politique %s : erreur inattendue : %s" % (p.get("name"), e), flush=True)
+                _policy_state(p["name"]).update({"last_run": time.time(), "last_ok": False,
+                                                 "last_summary": "Politique « %s » : erreur : %s" % (p["name"], e)})
+                _save_auto_backup_state()
         try:
             if _auto_backup_due(time.time()) and not ACTION_LOCK.locked():
                 _auto_backup_run()
@@ -3011,7 +3300,71 @@ def action_auto_backup_status():
             "running": bool(AUTO_BACKUP.get("running")),
             "last_run": last or None, "last_ok": AUTO_BACKUP.get("last_ok"),
             "last_summary": AUTO_BACKUP.get("last_summary") or "",
-            "next_due": (last + itv) if (enabled and last) else None}
+            "next_due": (last + itv) if (enabled and last) else None,
+            "policies": [dict(p, last_run=(_policy_state(p["name"]).get("last_run") or None),
+                              last_ok=_policy_state(p["name"]).get("last_ok"),
+                              last_summary=_policy_state(p["name"]).get("last_summary") or "",
+                              next_due=((_policy_state(p["name"]).get("last_run") or 0) + _policy_interval_s(p))
+                              if (p["enabled"] and _policy_state(p["name"]).get("last_run")) else None)
+                         for p in _named_policies()]}
+
+
+def action_backups_delete(payload):
+    """Supprime des VERSIONS de sauvegarde de configuration d'un namespace (purge
+    manuelle). Garde-fous : chemins sous les dossiers de sauvegarde de l'outil, dossier
+    réellement une sauvegarde de CE namespace (index.json), jamais la sauvegarde de
+    sécurité d'une restauration en cours, aucune purge pendant une opération."""
+    ns = (payload.get("ns") or "").strip()
+    paths = [p for p in (payload.get("paths") or []) if isinstance(p, str) and p.strip()]
+    if not K8S_NAME_RE.match(ns) or not paths:
+        return _err("Namespace ou versions manquants.")
+    flt = _ns_filter()
+    if flt and ns not in flt:
+        return _err("Namespace '%s' non autorisé." % ns)
+    if ACTION_LOCK.locked() or AUTO_BACKUP.get("running"):
+        return _err("Une opération est en cours : réessayez quand elle sera terminée.")
+    txn = _load_txn(ns) or {}
+    protected = os.path.realpath(txn["backup_dir"]) if txn.get("backup_dir") else None
+    removed, errors = 0, []
+    for p in paths:
+        full = _safe_backup_path(p)
+        idx_path = os.path.join(full, "index.json") if full else ""
+        try:
+            idx = json.load(open(idx_path, encoding="utf-8")) if full and os.path.isfile(idx_path) else None
+        except (OSError, ValueError):
+            idx = None
+        if not full or not idx or os.path.basename(os.path.dirname(full)) != ns \
+                or (idx.get("namespace") not in (None, ns)):
+            errors.append("%s : pas une sauvegarde de « %s »" % (os.path.basename(p.rstrip("/\\")), ns))
+            continue
+        if protected and os.path.realpath(full) == protected:
+            errors.append("%s : utilisée par une restauration en cours (conservée)" % os.path.basename(full))
+            continue
+        try:
+            shutil.rmtree(full)
+            removed += 1
+            _catalog_forget_path(full)
+        except OSError as e:
+            errors.append("%s : %s" % (os.path.basename(full), e))
+    if removed:
+        _apps_cache_clear()
+    audit("backup_delete", namespace=ns, removed=removed, errors=len(errors))
+    return {"ok": not errors, "removed": removed, "errors": errors,
+            "error": ("; ".join(errors) if errors else None)}
+
+
+def action_policy_members():
+    """Namespaces du cluster ACTIF par politique (aperçu « qui est protégé par quoi »)."""
+    info = action_namespaces()
+    if not info.get("ok"):
+        return _err(info.get("error") or "Liste des namespaces indisponible.")
+    pmap, err = _policy_map(info.get("namespaces") or [])
+    members = {"": []}
+    for p in _named_policies():
+        members[p["name"]] = []
+    for ns, p in sorted(pmap.items()):
+        members.setdefault((p or {}).get("name", ""), []).append(ns)
+    return _ok(members=members, selector_error=err)
 
 
 def action_metrics_text():
@@ -3067,11 +3420,23 @@ def action_metrics_text():
 # Vues « à la HYCU » (lecture seule) : Applications (namespaces + protection /
 # conformité) et Tâches (historique des opérations, tiré du journal d'audit).
 # ------------------------------------------------------------------------------
-def _backup_freshness_s():
-    """Âge maximal d'une sauvegarde de config pour être « conforme » : l'intervalle
-    de la sauvegarde automatique si elle est activée, sinon 24 h (+10 % de marge)."""
-    base = _auto_backup_interval_s() if CONFIG.get("auto_backup_enabled") else 24 * 3600.0
+def _backup_freshness_s(policy=None):
+    """Âge maximal d'une sauvegarde de config pour être « conforme » : l'intervalle de
+    la politique (nommée si `policy`, sinon par défaut) si elle est active, sinon 24 h
+    (+10 % de marge)."""
+    if policy:
+        base = _policy_interval_s(policy) if policy.get("enabled", True) else 24 * 3600.0
+    else:
+        base = _auto_backup_interval_s() if CONFIG.get("auto_backup_enabled") else 24 * 3600.0
     return base * 1.1
+
+
+def _policy_view(p):
+    """Politique d'une ligne Applications (nom vide = politique par défaut)."""
+    if p:
+        return {"name": p["name"], "enabled": p["enabled"], "interval_hours": p["interval_hours"]}
+    return {"name": "", "enabled": bool(CONFIG.get("auto_backup_enabled")),
+            "interval_hours": _auto_backup_interval_s() / 3600.0}
 
 
 def _backup_epoch(b):
@@ -3441,8 +3806,11 @@ def action_applications():
     live_names = [n for n in names if n in live]
     if live_names and info.get("ok"):
         wl_by_ns, pvc_by_ns, wl_err = _list_namespace_workloads(live_names)
+    pmap, _perr = _policy_map(names)
     apps = []
     for ns in names:
+        pol = pmap.get(ns)
+        fresh_ns = _backup_freshness_s(pol) if pol else fresh
         bks = [v for c in cats for v in c.get(ns, [])]
         stamps = [v.get("epoch") for v in bks if v.get("epoch")]
         last = max(stamps) if stamps else None
@@ -3462,8 +3830,8 @@ def action_applications():
         else:
             ns_apps = [{"name": ns, "namespace": ns, "workloads": [], "pvcs": [], "type": "unknown", "whole_ns": True}]
         base = {"namespace": ns, "backups": len(bks), "last_backup": last, "protected": bool(bks),
-                "missing": missing, "compliant": bool(last and (now - last) <= fresh),
-                "ns_apps": len(ns_apps)}
+                "missing": missing, "compliant": bool(last and (now - last) <= fresh_ns),
+                "ns_apps": len(ns_apps), "policy": _policy_view(pol)}
         for a in ns_apps:
             row = dict(base, name=a["name"], type=a["type"], workloads=a.get("workloads") or [],
                        pvcs=a.get("pvcs") or [], unassigned=bool(a.get("unassigned")),
@@ -5749,6 +6117,180 @@ def action_s3_list():
     return _ok(objects=out, prefix=prefix, bucket=CONFIG.get("s3_bucket"))
 
 
+# ---- Kit de l'outil : sa propre sauvegarde (reprise après la perte de son PVC) ------
+# Contenu : configuration (politiques, filtres, sources), coffre d'identifiants (déjà
+# chiffré par la phrase maîtresse) et état de la sauvegarde automatique. Exporté dans
+# le bucket à chaque passage automatique (un objet par jour), téléchargeable, et
+# restaurable depuis le bucket sur une nouvelle instance.
+TOOL_KIT_DIR = "_tool"
+_TOOL_KIT_RE = re.compile(r"^hycu-tool-\d{4}-\d{2}-\d{2}\.zip(\.enc)?$")
+_TOOL_KIT_FILES = ("hycu_config.json", "hycu_secrets.enc", ".auto_backup_state.json", "manifest.json")
+
+
+def tool_kit_bytes():
+    """Archive .zip du kit de l'outil (en mémoire)."""
+    import io
+    import zipfile
+    buf, files = io.BytesIO(), []
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        with CONFIG_LOCK:
+            z.writestr("hycu_config.json", json.dumps(USER_CONFIG, indent=2, ensure_ascii=False))
+        files.append("hycu_config.json")
+        for arc, path in (("hycu_secrets.enc", SECRETS_PATH), (".auto_backup_state.json", _auto_backup_state_path())):
+            if os.path.isfile(path):
+                z.write(path, arc)
+                files.append(arc)
+        z.writestr("manifest.json", json.dumps({"tool": "hycu-k8s-nutanix", "version": VERSION,
+                                                 "created": datetime.datetime.now().astimezone().isoformat(),
+                                                 "files": files}, indent=2))
+    return buf.getvalue(), files
+
+
+def s3_upload_tool_kit():
+    """Envoie le kit de l'outil : <préfixe>/_tool/hycu-tool-<AAAA-MM-JJ>.zip[.enc]
+    (un objet par jour, remplacé dans la journée). Renvoie (ok, clé|erreur)."""
+    data, _files = tool_kit_bytes()
+    ext = ".zip"
+    if CONFIG.get("s3_encrypt"):
+        enc_pw = ((SESSION_CREDS.get("s3") or {}).get("enc") or "")
+        if not enc_pw:
+            return False, "chiffrement activé mais phrase de chiffrement absente"
+        data = encrypt_bytes(data, enc_pw)
+        ext = ".zip.enc"
+    prefix = (CONFIG.get("s3_prefix") or "hycu-backups").strip().strip("/")
+    key = "/".join(x for x in (prefix, TOOL_KIT_DIR, "hycu-tool-%s%s" % (datetime.date.today().isoformat(), ext)) if x)
+    r = _s3_request("PUT", key, data)
+    if not r["ok"]:
+        return False, r.get("error") or "envoi refusé"
+    audit("tool_kit_upload", key=key, size=len(data), encrypted=ext.endswith(".enc"))
+    return True, key
+
+
+def action_tool_kit_upload():
+    if not SESSION_CREDS.get("s3"):
+        return _err("Connectez d'abord le stockage objet S3.")
+    ok, info = s3_upload_tool_kit()
+    return _ok(key=info) if ok else _err("Export du kit de l'outil impossible : %s" % info)
+
+
+def action_tool_kit_list():
+    """Kits de l'outil présents dans le bucket (plus récents d'abord)."""
+    import xml.etree.ElementTree as ET
+    if not SESSION_CREDS.get("s3"):
+        return _err("Connectez d'abord le stockage objet S3.")
+    prefix = (CONFIG.get("s3_prefix") or "hycu-backups").strip().strip("/")
+    pfx = "/".join(x for x in (prefix, TOOL_KIT_DIR) if x) + "/"
+    r = _s3_request("GET", "", b"", "list-type=2&max-keys=1000&prefix=" + urllib.parse.quote(pfx, safe=""),
+                    want_body=True)
+    if not r["ok"]:
+        return _err("Liste du bucket impossible : %s" % r.get("error"))
+    try:
+        root = ET.fromstring(r["data"])
+    except ET.ParseError as e:
+        return _err("Réponse du bucket illisible (XML) : %s" % e)
+    nsm = {"s3": root.tag.split("}")[0].strip("{")} if root.tag.startswith("{") else None
+
+    def find(el, name):
+        return el.find("s3:" + name, nsm) if nsm else el.find(name)
+    out = []
+    for c in (root.findall("s3:Contents", nsm) if nsm else root.findall("Contents")):
+        key = find(c, "Key").text or ""
+        fname = key[len(pfx):] if key.startswith(pfx) else ""
+        if not _TOOL_KIT_RE.match(fname):
+            continue
+        out.append({"key": key, "name": fname, "size": int(find(c, "Size").text or 0),
+                    "modified": (find(c, "LastModified").text or "")[:19], "encrypted": fname.endswith(".enc")})
+    out.sort(key=lambda x: x["name"], reverse=True)
+    return _ok(kits=out)
+
+
+def action_tool_kit_restore(payload):
+    """Restaure le kit de l'outil depuis le bucket : configuration (sauf les réglages
+    propres à la machine : chemins, binaire kubectl, hôte/port), coffre chiffré et état
+    de la sauvegarde auto. Une copie de l'existant est gardée avant remplacement."""
+    import io
+    import zipfile
+    if not SESSION_CREDS.get("s3"):
+        return _err("Connectez d'abord le stockage objet S3.")
+    if ACTION_LOCK.locked() or AUTO_BACKUP.get("running") or BULK["running"]:
+        return _err("Une opération est en cours : réessayez quand elle sera terminée.")
+    key = (payload.get("key") or "").strip()
+    prefix = (CONFIG.get("s3_prefix") or "hycu-backups").strip().strip("/")
+    pfx = "/".join(x for x in (prefix, TOOL_KIT_DIR) if x) + "/"
+    if not key.startswith(pfx) or not _TOOL_KIT_RE.match(key[len(pfx):]):
+        return _err("Kit invalide.")
+    r = _s3_request("GET", key, b"", "", want_body=True)
+    if not r["ok"]:
+        return _err("Téléchargement du kit impossible : %s" % r.get("error"))
+    data = r["data"]
+    if key.endswith(".enc"):
+        pw = (payload.get("passphrase") or "") or ((SESSION_CREDS.get("s3") or {}).get("enc") or "")
+        if not pw:
+            return _err("Kit chiffré : renseignez la phrase de chiffrement des exports.")
+        data = decrypt_bytes(data, pw)
+        if data is None:
+            return _err("Déchiffrement impossible (phrase incorrecte ou kit altéré).")
+    try:
+        z = zipfile.ZipFile(io.BytesIO(data))
+        content = {}
+        for info in z.infolist():
+            if info.filename in _TOOL_KIT_FILES and info.file_size <= 20 * 1024 * 1024:
+                content[info.filename] = z.read(info.filename)
+        manifest = json.loads(content.get("manifest.json") or b"{}")
+        kit_cfg = json.loads(content.get("hycu_config.json") or b"{}")
+    except Exception as e:
+        return _err("Kit illisible : %s" % e)
+    if manifest.get("tool") != "hycu-k8s-nutanix" or not isinstance(kit_cfg, dict):
+        return _err("Ce fichier n'est pas un kit de l'outil.")
+    machine = set(_CONTAINER_LOCKED_KEYS)
+    new_cfg, ignored = {}, []
+    for k, v in kit_cfg.items():
+        if k not in CONFIG_SCHEMA or k in machine:
+            continue
+        try:
+            new_cfg[k] = _coerce_config_value(k, v)
+        except ValueError:
+            ignored.append(k)
+    # Copie de sécurité de l'existant (configuration + coffre) avant remplacement.
+    safe = os.path.join(CONFIG["backup_root"], "_tool_restore_backup",
+                        datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
+    try:
+        os.makedirs(safe, exist_ok=True)
+        for path in (CONFIG_PATH, SECRETS_PATH, _auto_backup_state_path()):
+            if os.path.isfile(path):
+                shutil.copy2(path, os.path.join(safe, os.path.basename(path)))
+    except OSError as e:
+        return _err("Copie de sécurité impossible (%s) : rien n'a été modifié." % e)
+    with CONFIG_LOCK:
+        keep_local = {k: v for k, v in USER_CONFIG.items() if k in machine}
+        dropped = [k for k in USER_CONFIG if k not in new_cfg and k not in machine]
+        USER_CONFIG.clear()
+        USER_CONFIG.update(new_cfg)
+        USER_CONFIG.update(keep_local)
+        _write_json_atomic(CONFIG_PATH, USER_CONFIG, mode=0o644)
+        # Effet immédiat sans toucher aux réglages propres à la machine (chemins, kubectl…) :
+        # valeurs du kit, défauts pour les clés absentes du kit, l'environnement prime.
+        for k in dropped:
+            CONFIG[k] = DEFAULT_CONFIG[k]
+        CONFIG.update(new_cfg)
+        CONFIG.update(_env_overrides())
+    restored = ["hycu_config.json"]
+    if content.get("hycu_secrets.enc"):
+        _write_text_private(SECRETS_PATH, content["hycu_secrets.enc"].decode("ascii", "replace"))
+        restored.append("hycu_secrets.enc")
+    if content.get(".auto_backup_state.json"):
+        try:
+            _write_json_atomic(_auto_backup_state_path(), json.loads(content[".auto_backup_state.json"]), mode=0o644)
+            _load_auto_backup_state()
+            restored.append(".auto_backup_state.json")
+        except (ValueError, OSError):
+            pass
+    _apps_cache_clear()
+    audit("tool_restore", key=key, files=restored, version=manifest.get("version"), ignored=ignored)
+    return _ok(restored=restored, vault=("hycu_secrets.enc" in restored), safety_copy=safe,
+               version=manifest.get("version"), ignored=ignored)
+
+
 IMPORT_MAX_BYTES = 2 * 1024 ** 3     # taille DÉCOMPRESSÉE maximale d'un export importé
 
 
@@ -7234,7 +7776,7 @@ def _namespace_nutanix_vgs(ns):
     return out, None
 
 
-def action_hycu_match(ns):
+def action_hycu_match(ns, vg_items=None):
     """Associe chaque PVC du namespace à son Volume Group HYCU.
     Pivot FIABLE = égalité EXACTE de l'UUID : l'externalId d'un VG Nutanix est
     l'UUID du Volume Group, identique à celui du volumeHandle du PV. Le match par
@@ -7246,7 +7788,8 @@ def action_hycu_match(ns):
     vols, err = _namespace_nutanix_vgs(ns)
     if err:
         return {"ok": False, "error": err, "matches": []}
-    items, herr = _hycu_list_vgs()
+    # `vg_items` : liste des VG HYCU déjà lue (une seule lecture pour plusieurs namespaces).
+    items, herr = (vg_items, None) if vg_items is not None else _hycu_list_vgs()
     if herr is not None:
         return {"ok": False, "error": herr, "matches": []}
     # Index sensibles aux collisions (listes), UUID normalisé via UUID_RE.
@@ -8272,7 +8815,8 @@ def action_clone_app(payload, log=None):
                     "Impossible de vérifier l'existence du namespace « %s » (%s) : récupération refusée "
                     "par prudence." % (ns, st_err or "kubectl")}
     if from_backup and not backup_path:
-        return {"ok": False, "error": "Restauration DR : choisissez une sauvegarde source.", "log": []}
+        return {"ok": False, "error": ("Restauration DR" if dr else "Restauration de l'application")
+                + " : choisissez une sauvegarde source.", "log": []}
     if not from_backup and not _namespace_allowed(ns):
         return {"ok": False, "error": "Namespace '%s' non autorisé." % ns, "log": []}
     if from_backup and not dr and _ns_filter() and ns not in _ns_filter():
@@ -8304,7 +8848,8 @@ def action_clone_app(payload, log=None):
         # avertit que workloads/dépendances ne seront pas recréés (sauvegarde ancienne).
         bitems, berr = _load_backup_resources(backup_path, backup_root, allow_dr=dr, missing_ok=True)
         if berr:
-            return {"ok": False, "error": "Restauration DR : %s" % berr, "log": []}
+            return {"ok": False, "error": "%s : %s" % ("Restauration DR" if dr else "Restauration de l'application", berr),
+                    "log": []}
         if not items:
             stateless = any((o.get("kind") or "") in APP_WORKLOAD_KINDS for o in (bitems or []))
             if not stateless:
@@ -8962,6 +9507,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._json(action_bulk_status())
             if path == "/api/auto_backup":
                 return self._json(action_auto_backup_status())
+            if path == "/api/policy_members":
+                return self._json(action_policy_members())
+            if path == "/api/tool_kit/list":
+                return self._json(action_tool_kit_list())
             if path == "/api/applications":
                 fresh = qs.get("fresh") == "1"
                 if qs.get("scope") == "all":
@@ -9073,6 +9622,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._json(action_objects_diff(payload))
             if path == "/api/objects/restore":
                 return self._json(action_objects_restore(payload))
+            if path == "/api/backups/delete":
+                return self._json(action_backups_delete(payload))
+            if path == "/api/tool_kit/upload":
+                return self._json(action_tool_kit_upload())
+            if path == "/api/tool_kit/restore":
+                return self._json(action_tool_kit_restore(payload))
+            if path == "/api/tool_kit/download":
+                data, _f = tool_kit_bytes()
+                audit("tool_kit_download", size=len(data))
+                return self._send(200, data, "application/zip",
+                                  {"Content-Disposition": 'attachment; filename="hycu-tool-%s.zip"'
+                                   % datetime.date.today().isoformat()})
             if path == "/api/hycu/protect":
                 return self._json(action_hycu_protect(payload))
             if path == "/api/orchestrate/inplace":
@@ -9353,6 +9914,8 @@ HTML = r"""<!DOCTYPE html>
   table.ht th:last-child{border-right:none}
   table.ht td{padding:11px 12px;color:var(--text);border-bottom:1px solid #F0F2F6;vertical-align:middle}
   table.ht tr:last-child td{border-bottom:none}
+  #appsTable td{padding-top:6px;padding-bottom:6px}       /* liste dense : plus de lignes à l'écran */
+  #mPurge table.ht, #tkOut table.ht{min-width:0}          /* tableaux étroits (fenêtre / carte) */
   table.ht tbody tr:hover td{background:#FAF8FF}
   table.ht tbody tr.sel td{background:var(--purple-t)}
   table.ht tbody tr.clk{cursor:pointer}
@@ -9773,10 +10336,12 @@ HTML = r"""<!DOCTYPE html>
         <button class="pact" id="actRestore" type="button" disabled><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4.4 12.5a7.6 7.6 0 1 0 2.1-5.8"/><path d="M4.2 4.3v3.9h3.9"/><path d="M12 8.3v4l2.6 1.9"/></svg><span>Restaurer</span></button>
         <button class="pact" id="actPolicy" type="button" disabled><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l7.5 3v5.4c0 4.6-3.2 8.3-7.5 9.6-4.3-1.3-7.5-5-7.5-9.6V6z"/><path d="M12 8.8v6.4M8.8 12h6.4"/></svg><span>Définir la politique</span></button>
         <button class="pact" id="actVerify" type="button" disabled><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="8.6"/><path d="M8.3 12.2l2.5 2.5 5-5.3"/></svg><span>Vérifier</span></button>
+        <button class="pact" id="actPurge" type="button" disabled title="Supprimer des versions de sauvegarde de configuration"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4.5 7h15M9.5 7V4.8h5V7M6.8 7l.8 12.2h8.8l.8-12.2M10.2 10.6v5.6M13.8 10.6v5.6"/></svg><span>Purger</span></button>
         <button class="pact" id="actBulk" type="button" title="Recréer tous les namespaces supprimés du cluster actif depuis leurs sauvegardes"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3.5" y="4" width="17" height="5" rx="1.2"/><rect x="3.5" y="11" width="17" height="5" rx="1.2"/><path d="M6 18.5h12M4.4 21a7 7 0 0 0 1.9-5.3"/><path d="M4.2 13.2v3.6h3.6"/></svg><span>Restaurer en masse</span></button>
       </div></div>
     <div class="tcard">
       <div class="tbar"><div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap"><input type="text" id="appsSearch" placeholder="Rechercher" autocomplete="off">
+        <label class="fld" style="margin:0;display:flex;align-items:center;gap:6px;font-size:13px;white-space:nowrap"><input type="checkbox" id="appsHideDel" style="width:auto;margin:0"> Masquer les supprimées</label>
         <div class="seg" id="appsScope" style="display:none"><button class="on" type="button" data-scope="one">Cluster actif</button><button type="button" data-scope="all">Tous les clusters</button></div></div>
         <div style="display:flex;align-items:center;gap:14px"><span class="tinfo" id="appsInfo"></span><span class="tinfo" id="appsPager" style="display:none"></span>
           <button class="pact nsEdit" type="button" title="Filtrer la liste des namespaces"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5h16l-6.2 7.4V19l-3.6-1.8v-4.8z"/></svg></button></div></div>
@@ -9788,13 +10353,35 @@ HTML = r"""<!DOCTYPE html>
   </section>
   <!-- ===================== POLITIQUES ===================== -->
   <section id="tab-policies" style="display:none">
-    <div class="pagehead"><h1 class="ptitle">Politiques</h1></div>
+    <div class="pagehead"><h1 class="ptitle">Politiques</h1>
+      <div class="pacts"><button class="pact" id="polNew" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg><span>Nouvelle politique</span></button></div></div>
     <div class="tcard" style="margin-bottom:16px">
-      <table class="ht"><thead><tr><th>Nom</th><th>Objet protégé</th><th>Fréquence</th><th>Rétention</th><th>Cible</th><th class="ctr">État</th></tr></thead>
+      <table class="ht"><thead><tr><th>Nom</th><th>Namespaces</th><th>Fréquence</th><th>Rétention</th><th>Politique HYCU</th><th>Dernière exécution</th><th class="ctr">État</th></tr></thead>
         <tbody id="polBody"></tbody></table>
     </div>
+    <div class="card" id="polEdit" style="display:none">
+      <h3 id="polEditTitle">Nouvelle politique</h3>
+      <div class="row">
+        <div style="flex:none;width:200px"><label class="fld">Nom</label><input type="text" id="peName" maxlength="40" placeholder="or"></div>
+        <div><label class="fld">Namespaces (séparés par des virgules)</label><input type="text" id="peNs" placeholder="shop, billing"></div>
+        <div><label class="fld">et/ou sélecteur d'étiquettes</label><input type="text" id="peSel" placeholder="hycu.io/policy=or"></div>
+      </div>
+      <div class="row">
+        <div style="flex:none;width:150px"><label class="fld">Intervalle (heures)</label><input type="number" id="peInterval" min="0.25" step="0.25" value="24"></div>
+        <div style="flex:none;width:170px"><label class="fld">Versions à conserver</label><input type="number" id="peKeep" min="0" step="1" value="15"></div>
+        <div><label class="fld">Politique HYCU (optionnel)</label><select id="peHycu"></select></div>
+        <div style="flex:none;align-self:flex-end"><label class="fld"><input type="checkbox" id="peEnabled" style="width:auto" checked> Activée</label></div>
+      </div>
+      <div class="hint" style="margin-top:6px">La première politique de la liste qui correspond à un namespace l'emporte ; un namespace sans politique suit la politique par défaut. La politique HYCU est assignée aux volumes qui n'en ont pas encore.</div>
+      <div style="margin-top:12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <button class="btn" id="peSave" type="button">Enregistrer</button>
+        <button class="btn ghost" id="peCancel" type="button">Annuler</button>
+        <button class="lnk" id="peDelete" type="button" style="margin-left:auto;color:var(--red-t)">Supprimer la politique</button>
+      </div>
+      <div id="peMsg"></div>
+    </div>
     <div class="card">
-      <h3><span class="step-no">⏱</span>Sauvegarde automatique de la configuration (PV/PVC)</h3>
+      <h3><span class="step-no">⏱</span>Politique par défaut — sauvegarde automatique de la configuration</h3>
       <p class="sub">Sauvegarde régulièrement les <b>manifestes PV/PVC</b> (la « recette » du restore) de tous les
         namespaces autorisés par le filtre — tant que l'outil est lancé. <b>Pas les données</b> des volumes :
         elles sont protégées par HYCU (<b>Applications → Définir la politique</b>).</p>
@@ -9949,6 +10536,15 @@ HTML = r"""<!DOCTYPE html>
     <div class="hm-foot" id="mBackupFoot"><button class="lnk" type="button" data-close="mBackup">Fermer</button><button class="btn" id="bkRunSel" type="button" style="display:none">Sauvegarder la sélection</button></div>
   </div>
 </div>
+<div id="mPurge" class="hmodal-bg" style="display:none">
+  <div class="hmodal" style="max-width:640px">
+    <div class="hm-head"><h2 id="mPurgeTitle">Versions sauvegardées</h2><div class="hm-ico"><button type="button" data-close="mPurge" title="Fermer">✕</button></div></div>
+    <div class="hm-body"><div id="purgeList"></div><div id="purgeMsg"></div></div>
+    <div class="hm-foot"><button class="lnk" type="button" id="purgeOld" style="margin-right:auto">Toutes sauf la plus récente</button>
+      <button class="lnk" type="button" data-close="mPurge">Fermer</button>
+      <button class="btn danger" id="purgeGo" type="button" disabled>Supprimer la sélection</button></div>
+  </div>
+</div>
 <div id="mBulk" class="hmodal-bg" style="display:none">
   <div class="hmodal" style="max-width:860px">
     <div class="hm-head"><h2>Restauration en masse</h2><div class="hm-ico"><button type="button" data-close="mBulk" title="Fermer">✕</button></div></div>
@@ -10029,7 +10625,7 @@ HTML = r"""<!DOCTYPE html>
           <div><label class="fld">Sauvegarde source (tous clusters / imports S3)</label><select id="drBackupSel"></select></div>
           <div style="flex:none;width:220px"><label class="fld">Namespace cible</label><input type="text" id="drTargetNs" autocomplete="off"></div>
         </div>
-        <div class="row">
+        <div class="row" id="drScRow">
           <div style="flex:none;width:260px"><label class="fld">StorageClass cible (vide = inchangée)</label><input type="text" id="drSc" placeholder="nutanix-volume" autocomplete="off"></div>
           <div style="align-self:flex-end"><label class="fld"><input type="checkbox" id="drRefs" checked style="width:auto"> Recréer les dépendances depuis la sauvegarde (Secrets non masqués, ConfigMaps, ServiceAccounts, Services)</label></div>
         </div>
@@ -10302,6 +10898,16 @@ HTML = r"""<!DOCTYPE html>
           <div class="hint" style="margin-top:4px">Les exports rapatriés vont dans <code>hycu-backups/_imports/…</code> ; ils se restaurent via la <b>Restauration DR</b> de l'assistant (ou sur leur cluster d'origine).</div>
           <div id="s3ImpRes"></div>
         </div>
+      </div>
+      <div style="margin-top:14px;border-top:1px solid var(--line);padding-top:12px" id="tkCard">
+        <b style="font-size:13px">Sauvegarde de l'outil</b>
+        <div class="hint" style="margin:2px 0 8px">Configuration, politiques et coffre chiffré. Exportée chaque jour avec l'export automatique ; restaurable sur une nouvelle instance.</div>
+        <div style="display:flex;gap:10px;flex-wrap:wrap">
+          <button class="btn ghost" id="tkUpload" type="button">Exporter maintenant</button>
+          <button class="btn ghost" id="tkDownload" type="button">Télécharger</button>
+          <button class="btn ghost" id="tkList" type="button">Restaurer l'outil depuis le bucket…</button>
+        </div>
+        <div id="tkOut"></div>
       </div>
     </div>
 
@@ -10774,8 +11380,10 @@ function buildWizSteps(){
       <label class="fld">Langue de l'interface</label>
       <div id="wLang">${[["fr","Français"],["en","English"]].map(([code,lbl])=>
         `<span class="chip ${PAGE_LANG===code?'sel':''}" data-lang="${code}">${lbl}</span>`).join("")}</div>
-      <div class="note" style="margin-top:14px">Contexte kubectl détecté : <b>${esc(ctx||"indisponible")}</b></div>`,
-     enter:()=>{ document.querySelectorAll("#wLang .chip").forEach(c=>c.onclick=()=>{
+      <div class="note" style="margin-top:14px">Contexte kubectl détecté : <b>${esc(ctx||"indisponible")}</b></div>
+      <div class="hint" style="margin-top:14px">Vous réinstallez une instance existante ? <a href="#" id="wRestoreKit">Restaurer l'outil depuis un bucket S3</a></div>`,
+     enter:()=>{ const rk=$("#wRestoreKit"); if(rk) rk.onclick=(e)=>{ e.preventDefault(); $("#wizard").style.display="none"; openSources("s3"); };
+       document.querySelectorAll("#wLang .chip").forEach(c=>c.onclick=()=>{
         const l=c.dataset.lang; if(l===PAGE_LANG) return;              // déjà dans cette langue
         // Change la langue et recharge : le coffre de config n'existe pas encore,
         // l'assistant se rouvre entièrement dans la langue choisie.
@@ -11410,19 +12018,18 @@ $("#rsInplaceRun").onclick=async()=>{
   $("#rsInplaceLog").innerHTML='<div class="hint"><span class="spin"></span> Démarrage…</div>';
   const ipBody={namespace:(rsHyMatch?rsHyMatch.ns:$("#rsNs").value), items, dry:dry()};
   if(live && ctxInfo.require_confirm) ipBody.confirm_context=confirmedCtx;
+  const sess=rsSession, mine=()=>sess===rsSession;
   const r=await runOp("/api/orchestrate/inplace", ipBody,
-    log=>{ $("#rsInplaceLog").innerHTML='<div class="hint"><span class="spin"></span> Orchestration en cours…</div>'+renderLog(log); });
+    log=>{ if(mine()) $("#rsInplaceLog").innerHTML='<div class="hint"><span class="spin"></span> Orchestration en cours…</div>'+renderLog(log); });
+  if(!mine()) return;
   b.disabled=false; b.textContent="Lancer la restauration sur place";
   if(r.error && !(r.log&&r.log.length)){ $("#rsInplaceLog").innerHTML=errBox(r.error); return; }
   const lines=renderLog(r.log);
   const head=r.dry?'<div class="warnbox">Simulation — séquence et appels HYCU qui seraient exécutés.</div>'
     :(r.aborted?'<div class="err"><b>Séquence interrompue</b> — l\'application est restée arrêtée. Voir le détail.</div>'
-      :(r.ok?'<div class="note">Restauration sur place terminée.</div>':'<div class="err">Des étapes ont échoué.</div>'));
+      :(r.ok?'<div class="note">Restauration sur place terminée.</div>':'<div class="err">Des étapes ont échoué — voir le détail.</div>'));
   $("#rsInplaceLog").innerHTML=head+lines;
-  if(!r.dry && r.ok && !r.aborted){
-    $("#rsInplaceLog").insertAdjacentHTML("afterbegin",'<div class="note">Ouverture de la vérification…</div>');
-    setTimeout(()=>gotoVerify(ipBody.namespace,true),1200);
-  }
+  if(!r.dry && r.ok && !r.aborted) rsFinish(ipBody.namespace, false, sess);
 };
 document.querySelectorAll("#rsMode button").forEach(b=>b.onclick=()=>{
   document.querySelectorAll("#rsMode button").forEach(x=>x.classList.remove("on"));
@@ -11522,7 +12129,7 @@ $("#rsPreview").onclick=async()=>{
 };
 // Toute modification des références/noms rend le plan périmé : il faut re-prévisualiser.
 function invalidatePlan(){
-  rsDone=false;
+  if(rsDone) return;                       // parcours terminé : rien à relancer
   if(!state.preview) return;
   state.preview=null; $("#rsPlan").style.display="none"; $("#rsLog").innerHTML="";
   if(typeof rsWizPage!=="undefined" && rsWizPage==="plan") rsShowPage("form");
@@ -11544,11 +12151,10 @@ function updateGoButton(ready){
   $("#rsCtxConfirm").style.display = "none";          // la confirmation se fait dans la boîte de dialogue
   $("#rsGoHint").textContent = live? "" : "Mode simulation : rien ne sera modifié.";
   $("#rsGo").className = live? "btn danger" : "btn";
-  let act;
-  if(state.mode!=="clone") act = "la restauration sur place (flux manuel)";
-  else if(isCloneApp()) act = "le clone de l'application";
-  else act = "le clone";
-  $("#rsGo").textContent = (live? "Lancer " : "Simuler ") + act;
+  const kind = state.mode!=="clone" ? "inplace" : (isCloneApp() ? "cloneapp" : "clone");
+  $("#rsGo").textContent = live
+    ? {inplace:"Restaurer sur place", clone:"Restaurer vers les nouveaux volumes", cloneapp:"Lancer le clone de l'application"}[kind]
+    : {inplace:"Simuler la restauration sur place", clone:"Simuler la restauration", cloneapp:"Simuler le clone de l'application"}[kind];
   $("#rsGo").disabled = !ready;
   updateNextBar();
 }
@@ -11557,9 +12163,30 @@ $("#dry").addEventListener("change",()=>{ if($("#rsPlan").style.display!=="none"
 
 // ----- Clone d'application : confirmation unique, exécution, état « terminé » -----
 let rsDone=false, rsDoneTarget="", cloneBusy=false;
+// Chaque ouverture de la fenêtre de restauration est une « session » : une opération
+// lancée dans une session précédente (fenêtre fermée en cours de route) n'écrit plus
+// dans les journaux et ne termine plus l'assistant de la nouvelle ouverture.
+let rsSession=0;
+function rsNewSession(){
+  rsSession++; rsDone=false; cloneBusy=false; state.preview=null;
+  $("#rsProgress").style.display="none"; $("#rsCloneTargetNs").value="";
+  document.querySelectorAll("#drForm input, #drForm select").forEach(e=>e.disabled=false);
+}
+// Fin RÉUSSIE d'une opération réelle, quel que soit le parcours : seul « Vérifier » reste.
+// `stay` : quelque chose est à lire (avertissements, re-protection) -> pas de bascule auto.
+function rsFinish(ns, stay, sess, slow){
+  if(sess!==undefined && sess!==rsSession) return;        // opération d'une ouverture précédente
+  rsDone=true; rsDoneTarget=ns||state.ns||"";
+  setRsStep(4);
+  // Plus rien de relançable une fois terminé (bouton HYCU de la page DR, champs).
+  $("#drAutoWrap").style.display="none";
+  document.querySelectorAll("#drForm input, #drForm select").forEach(e=>e.disabled=true);
+  rsWizSync();
+  if(!stay) setTimeout(()=>{ if(rsDone && sess===rsSession && $("#mRestore").style.display!=="none") gotoVerify(rsDoneTarget, true); }, slow ? 4000 : 1500);
+}
 function confirmCloneApp(withHycu){
   const needCtx = ctxInfo.require_confirm ? (ctxInfo.context||"") : null;
-  const tgt = state.cloneNsMode==="same" ? "dans le <b>même namespace</b> (avec suffixe)"
+  const tgt = state.cloneNsMode==="same" ? "dans le <b>même namespace</b> (avec un suffixe)"
             : "dans le namespace <b>"+esc($("#rsCloneTargetNs").value.trim()||"?")+"</b>";
   const lines=[];
   if(withHycu) lines.push("Cloner dans HYCU les Volume Groups aux points choisis (les volumes d'origine ne sont pas modifiés).");
@@ -11568,24 +12195,25 @@ function confirmCloneApp(withHycu){
   return confirmDanger({title:"Confirmer le clone d'application", requireText:needCtx, lines});
 }
 async function runCloneApp(confirmedCtxCA){
-  const live=!dry();
+  const live=!dry(), sess=rsSession, mine=()=>sess===rsSession;
   rsDone=false;
   const bb=$("#rsGo"); bb.disabled=true; bb.innerHTML='<span class="spin"></span>…';
   $("#rsLog").innerHTML='<div class="hint"><span class="spin"></span> Démarrage…</div>';
   const caBody={...cloneAppBody(), dry:dry()};
   if(live && ctxInfo.require_confirm) caBody.confirm_context=confirmedCtxCA;
   const r=await runOp("/api/clone_app", caBody,
-    log=>{ $("#rsLog").innerHTML='<div class="hint"><span class="spin"></span> Clonage en cours…</div>'+renderLog(log); });
+    log=>{ if(mine()) $("#rsLog").innerHTML='<div class="hint"><span class="spin"></span> Clonage en cours…</div>'+renderLog(log); });
+  if(!mine()) return;
   bb.disabled=false; updateGoButton(true);
   if(r.error && !(r.log&&r.log.length)){ $("#rsLog").innerHTML=errBox(r.error); return; }
   const lns=renderLog(r.log);
   const hd=r.dry?'<div class="note">Simulation — ressources qui seraient créées (l\'app d\'origine reste intacte).</div>'
-    :(r.ok?'<div class="note">Clone terminé. L\'application d\'origine est intacte.</div>':'<div class="err">Des étapes ont échoué — voir le détail.</div>');
+    :(r.ok?'<div class="note">Copie de l’application terminée. L’application d’origine est intacte.</div>':'<div class="err">Des étapes ont échoué — voir le détail.</div>');
   $("#rsLog").innerHTML=hd+lns+cloneWarnings(r.warnings);
   if(!r.dry && r.ok){
     // Terminé : plus de bouton de lancement, seule la vérification reste (pied de la fenêtre).
-    rsDone=true; rsDoneTarget = state.cloneNsMode==="other" ? $("#rsCloneTargetNs").value.trim() : $("#rsNs").value;
-    setRsStep(4); rsWizSync();
+    rsFinish(state.cloneNsMode==="other" ? $("#rsCloneTargetNs").value.trim() : $("#rsNs").value,
+             false, sess, !!cloneWarnings(r.warnings));
   }
 }
 // Étape 2 -> lancement direct : une seule confirmation, clones HYCU si nécessaire, puis la copie.
@@ -11596,7 +12224,7 @@ async function cloneAppDirect(){
   if(state.cloneNsMode==="other" && !$("#rsCloneTargetNs").value.trim()){ $("#rsErr").innerHTML='<div class="err">Indiquez le namespace cible.</div>'; return; }
   if(dry()){ $("#rsPreview").click(); return; }          // simulation : aperçu, rien n'est créé
   const batch=$("#hyBatchGo");
-  const pending = !!batch && !(items.length && items.every(i=>(i.new_ref||"").trim()));
+  const pending = !rsStatelessClone() && !!batch && !(items.length && items.every(i=>(i.new_ref||"").trim()));
   const res=await confirmCloneApp(pending);
   if(!res) return;
   const confirmedCtx = (typeof res==="string") ? res : "";
@@ -11607,6 +12235,7 @@ async function cloneAppDirect(){
       if(!ok) return;                                      // erreurs affichées volume par volume
     }
     $("#rsRepl").innerHTML=""; $("#rsSteps").innerHTML=""; $("#rsLog").innerHTML="";
+    state.preview={_cloneapp:true};          // « Relancer » depuis cette page = la copie, jamais la restauration destructive
     $("#rsPlan").style.display="block"; rsShowPage("plan");
     await runCloneApp(confirmedCtx);
   } finally { cloneBusy=false; rsWizSync(); }
@@ -11635,6 +12264,7 @@ $("#rsGo").onclick=async()=>{
     if(typeof res==="string") confirmedCtx=res;
   }
   const b=$("#rsGo"); b.disabled=true; b.innerHTML='<span class="spin"></span>Exécution…';
+  const sess=rsSession, mine=()=>sess===rsSession;
   const body={...state.preview,dry:dry()};
   if(live && ctxInfo.require_confirm) body.confirm_context=confirmedCtx || $("#rsCtxInput").value.trim();
   setRsStep(4); rsRunning=true;
@@ -11646,8 +12276,9 @@ $("#rsGo").onclick=async()=>{
     const done=log.length, last=log[log.length-1];
     $("#rsProgressBar").style.width=Math.min(96, Math.round(100*done/total))+"%";
     $("#rsProgressTxt").textContent="Étape "+done+" · "+((last&&last.label)||"…");
-    $("#rsLog").innerHTML='<div class="hint"><span class="spin"></span> Exécution en cours…</div>'+renderLog(log); });
-  rsRunning=false; $("#rsCancel").style.display="none";
+    if(mine()) $("#rsLog").innerHTML='<div class="hint"><span class="spin"></span> Exécution en cours…</div>'+renderLog(log); });
+  rsRunning=false; if(!mine()) return;
+  $("#rsCancel").style.display="none";
   $("#rsProgressBar").style.width="100%"; $("#rsProgressTxt").textContent = r.aborted ? "Interrompue" : (r.ok ? "Terminée" : "Terminée avec erreurs");
   b.disabled=false; updateGoButton(true);
   if(r.error && !(r.log&&r.log.length)){$("#rsLog").innerHTML=errBox(r.error)+renderPreflight(r.preflight);return;}
@@ -11655,7 +12286,7 @@ $("#rsGo").onclick=async()=>{
   let head;
   if(r.dry) head='<div class="note">Simulation terminée — voici ce qui serait exécuté.</div>';
   else if(r.aborted) head='<div class="err"><b>Séquence interrompue</b> — l\'application est restée arrêtée pour éviter un redémarrage incohérent. Voir le détail.</div>';
-  else if(r.ok) head='<div class="note">Restauration terminée.</div>';
+  else if(r.ok) head='<div class="note">Restauration vers les nouveaux volumes terminée.</div>';
   else head='<div class="err">Des étapes ont échoué — voir ci-dessous.</div>';
   let reprot="";
   if(r.reprotect && r.reprotect.length){
@@ -11667,15 +12298,8 @@ $("#rsGo").onclick=async()=>{
   }
   $("#rsLog").innerHTML = head + renderPreflight(r.preflight) + lines + reprot;
   const rb=$("#rsReprotectBtn"); if(rb) rb.onclick=()=>goReprotect($("#rsNs").value);
-  if(!r.dry && r.ok && !r.aborted){
-    if(reprot){   // ne pas quitter la page tant que la re-protection HYCU n'est pas traitée
-      $("#rsLog").insertAdjacentHTML("beforeend",'<div style="margin-top:8px"><button class="btn" id="rsGoVerify">Vérifier l\'application maintenant →</button></div>');
-      $("#rsGoVerify").onclick=()=>gotoVerify($("#rsNs").value,true);
-    } else {
-      $("#rsLog").insertAdjacentHTML("afterbegin",'<div class="note">Ouverture de la vérification…</div>');
-      setTimeout(()=>gotoVerify($("#rsNs").value,true),1200);
-    }
-  }
+  // Re-protection HYCU à traiter : pas de bascule automatique (le bouton reste dans le journal).
+  if(!r.dry && r.ok && !r.aborted) rsFinish($("#rsNs").value, !!reprot, sess);
 };
 
 // --------- Vérification ---------
@@ -11942,6 +12566,46 @@ $("#s3ListBtn").onclick=async()=>{
   const all=$("#s3ImpAll"); if(all) all.onchange=()=>{ document.querySelectorAll(".s3ImpChk").forEach(c=>c.checked=all.checked); s3ImpSync(); };
   s3ImpSync();
 };
+// ----- Sauvegarde de l'outil (kit : configuration, politiques, coffre chiffré) -----
+$("#tkUpload").onclick=async()=>{
+  const b=$("#tkUpload"); b.disabled=true;
+  const r=await post("/api/tool_kit/upload",{});
+  b.disabled=false;
+  $("#tkOut").innerHTML = r.ok ? `<div class="note" style="margin-top:8px">Kit exporté : <code>${esc(r.key)}</code></div>` : errBox(r.error);
+};
+$("#tkDownload").onclick=async()=>{
+  try{
+    const resp=await fetch("/api/tool_kit/download",{method:"POST",headers:{"Content-Type":"application/json","X-CSRF-Token":CSRF,"X-HYCU-Cluster":ACTIVE_CID},body:"{}"});
+    if(!resp.ok) throw new Error("HTTP "+resp.status);
+    const blob=await resp.blob(), a=document.createElement("a");
+    a.href=URL.createObjectURL(blob); a.download="hycu-tool-"+new Date().toISOString().slice(0,10)+".zip";
+    document.body.appendChild(a); a.click(); setTimeout(()=>{ URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+  }catch(e){ $("#tkOut").innerHTML=errBox("Téléchargement impossible : "+(e&&e.message||e)); }
+};
+$("#tkList").onclick=async()=>{
+  $("#tkOut").innerHTML='<div class="hint" style="margin-top:8px"><span class="spin"></span></div>';
+  const r=await get("/api/tool_kit/list");
+  if(!r.ok){ $("#tkOut").innerHTML=errBox(r.error); return; }
+  const k=r.kits||[];
+  if(!k.length){ $("#tkOut").innerHTML='<div class="hint" style="margin-top:8px">Aucun kit de l\'outil dans ce bucket.</div>'; return; }
+  $("#tkOut").innerHTML=`<div class="tcard" style="box-shadow:none;border:1px solid var(--rule);margin-top:8px"><table class="ht"><thead><tr><th class="cb"></th><th>Kit</th><th>Taille</th></tr></thead><tbody>`+
+    k.map((x,i)=>`<tr><td class="cb"><input type="radio" name="tkPick" value="${esc(x.key)}" data-enc="${x.encrypted?1:0}" ${i===0?"checked":""}></td><td>${esc(x.name)}</td><td>${esc(fmtBytes(x.size))}</td></tr>`).join("")+
+    `</tbody></table></div>
+    <div class="row" style="margin-top:8px"><div><label class="fld">Phrase de chiffrement (kits .enc uniquement)</label><input type="password" id="tkPass" autocomplete="off"></div>
+    <div style="flex:none;align-self:flex-end"><button class="btn danger" id="tkRestore" type="button">Restaurer l'outil</button></div></div><div id="tkRes"></div>`;
+  $("#tkRestore").onclick=async()=>{
+    const pick=document.querySelector('input[name="tkPick"]:checked'); if(!pick) return;
+    if(!(await confirmDanger({title:"Restaurer l'outil", lines:[
+      "La configuration actuelle (politiques, filtres, sources) et le coffre seront remplacés par ceux du kit <b>"+esc(pick.value.split("/").pop())+"</b>.",
+      "Une copie de l'existant est gardée dans <code>hycu-backups/_tool_restore_backup/</code>."]}))) return;
+    const b=$("#tkRestore"); b.disabled=true;
+    const res=await post("/api/tool_kit/restore",{key:pick.value, passphrase:$("#tkPass").value});
+    $("#tkPass").value=""; b.disabled=false;
+    if(!res.ok){ $("#tkRes").innerHTML=errBox(res.error); return; }
+    $("#tkRes").innerHTML=`<div class="note" style="margin-top:8px">Outil restauré${res.vault?" — déverrouillez ensuite le coffre avec votre phrase secrète":""}. Rechargement…</div>`;
+    setTimeout(()=>location.reload(), 1800);
+  };
+};
 $("#s3ImportBtn").onclick=async()=>{
   const items=[...document.querySelectorAll(".s3ImpChk:checked")].map(c=>({key:(window.s3Objs||[])[+c.dataset.i].key}));
   if(!items.length) return;
@@ -12097,7 +12761,7 @@ refreshDry();
 // ============================================================================
 var rsAutoCheck=false;            // assistant ouvert : volumes présélectionnés (cf. renderRsPvcs)
 var pageTimer=null;
-const MODALS=["mBackup","mPolicy","mRestore","mSources","mBulk"];
+const MODALS=["mBackup","mPolicy","mRestore","mSources","mBulk","mPurge"];
 const FOCUSABLE='a[href],button:not([disabled]),input:not([disabled]):not([type=hidden]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])';
 let modalReturnFocus={};
 function openModal(id){
@@ -12259,13 +12923,17 @@ async function loadApps(fresh){
   }
   renderApps(); return r;
 }
-function appPolicyLabel(){
-  return appsPolicy.enabled ? ("Configuration auto · "+Math.round(appsPolicy.interval_hours||24)+" h") : "Aucune";
+function appPolicyLabel(a){
+  const p=(a && a.policy) || null;
+  if(p && p.name) return p.name+" · "+(p.enabled ? (+p.interval_hours)+" h" : "en pause");
+  const d = p || appsPolicy;
+  return d.enabled ? ("Configuration auto · "+Math.round(d.interval_hours||24)+" h") : "Aucune";
 }
 function appsVisible(){
   const q=($("#appsSearch").value||"").trim().toLowerCase();
-  return apps.filter(a=>!q || a.name.toLowerCase().includes(q) || appNs(a).toLowerCase().includes(q)
-                           || (a.cluster||"").toLowerCase().includes(q) || (a.workspace||"").toLowerCase().includes(q));
+  const hideDel=$("#appsHideDel").checked;
+  return apps.filter(a=>!(hideDel && a.missing) && (!q || a.name.toLowerCase().includes(q) || appNs(a).toLowerCase().includes(q)
+                           || (a.cluster||"").toLowerCase().includes(q) || (a.workspace||"").toLowerCase().includes(q)));
 }
 // Pagination : au-delà de APPS_PAGE_SIZE lignes (grands clusters), le tableau est
 // découpé en pages ; la recherche s'applique à toutes les lignes, la sélection persiste.
@@ -12307,7 +12975,7 @@ function renderApps(){
       const k=appKey(a), sel=appsSel.has(k);
       const comp = a.missing ? stIc("na","Namespace supprimé du cluster")
                  : a.compliant ? stIc("ok","Sauvegarde de configuration récente")
-                 : (a.protected ? stIc("ko","Dernière sauvegarde plus ancienne que "+appsFresh+" h")
+                 : (a.protected ? stIc("ko","Dernière sauvegarde plus ancienne que l'intervalle de sa politique")
                                 : stIc("na","Jamais sauvegardée"));
       // Protection = sauvegardes du NAMESPACE ; un volume de l'application absent de la
       // dernière sauvegarde (PVC créé depuis) rend sa protection incomplète.
@@ -12322,7 +12990,7 @@ function renderApps(){
         <td class="cb"><input type="checkbox" tabindex="-1" ${sel?"checked":""}></td>
         <td style="color:var(--strong);font-weight:500">${nameCell}</td><td>${esc(appNs(a))}</td>
         <td class="mc">${esc(a.workspace||"—")}</td><td class="mc">${esc(a.cluster||"")}</td>
-        <td>${appTypeCell(a)}</td><td>${esc(appPolicyLabel())}</td>
+        <td>${appTypeCell(a)}</td><td>${esc(appPolicyLabel(a))}</td>
         <td class="ctr">${comp}</td><td class="ctr">${prot}</td><td>${last}</td>
         <td class="ctr">${a.backups||0}</td></tr>`;
     }).join("");
@@ -12353,6 +13021,8 @@ function updateAppActs(){
   const objs=selAppObjs(), n=objs.length, anyMissing=objs.some(a=>a.missing), anyEmpty=objs.some(a=>a.type==="empty");
   $("#actBackup").disabled = !n || anyMissing || anyEmpty;
   $("#actVerify").disabled = n!==1 || anyMissing;
+  // Purger : les versions d'UN namespace (une ou plusieurs applications de ce namespace).
+  $("#actPurge").disabled = !(n>=1 && new Set(objs.map(a=>(a.cluster_id||ACTIVE_CID)+"|"+appNs(a))).size===1 && objs.some(a=>a.backups));
   // Définir la politique : une ou PLUSIEURS applications (du même cluster) en une fois.
   const oneCluster = n>=1 && new Set(objs.map(a=>a.cluster_id||ACTIVE_CID)).size===1;
   $("#actPolicy").disabled = !oneCluster || anyMissing || anyEmpty;
@@ -12369,6 +13039,8 @@ function updateAppActs(){
 // bascule d'abord le cluster actif, pour que confirmations et garde-fous le désignent.
 async function ensureCluster(a){ if(a && a.cluster_id && a.cluster_id!==ACTIVE_CID) await setActiveCluster(a.cluster_id); }
 $("#appsSearch").oninput=()=>{ appsPage=0; renderApps(); };
+$("#appsHideDel").checked=!!prefs().hideDeleted;
+$("#appsHideDel").onchange=()=>{ savePref("hideDeleted", $("#appsHideDel").checked); appsPage=0; renderApps(); };
 // « Tout sélectionner » porte sur la PAGE affichée (jamais 1 000 lignes d'un coup à l'insu de l'opérateur).
 $("#appsAll").onchange=()=>{ const on=$("#appsAll").checked;
   appsVisible().slice(appsPage*APPS_PAGE_SIZE, (appsPage+1)*APPS_PAGE_SIZE).forEach(a=>on ? appsSel.add(appKey(a)) : appsSel.delete(appKey(a))); renderApps(); };
@@ -12384,6 +13056,40 @@ $("#actRestore").onclick=async()=>{ const objs=selAppObjs(), a=objs[0]; await en
   // Plusieurs applications du même namespace sélectionnées -> tout le namespace.
   openRestoreModal(appNs(a), objs.length>1 ? null : a); };
 $("#actPolicy").onclick=async()=>{ const objs=selNsObjs(); await ensureCluster(objs[0]); openPolicyModal(objs.length>1 ? objs.map(a=>a.name) : appNs(selAppObjs()[0])); };
+// ----- Purge des versions de configuration d'un namespace -----
+let purgeNs="", purgeRows=[];
+const KIND_LBL={auto:"Automatique", manual:"Manuelle", pre_restore:"Avant restauration"};
+function purgeSync(){ $("#purgeGo").disabled = !document.querySelectorAll(".purgeChk:checked").length; }
+async function openPurgeModal(ns){
+  purgeNs=ns; purgeRows=[];
+  $("#mPurgeTitle").innerHTML=esc("Versions sauvegardées")+'<span class="sep">›</span>'+esc(ns);
+  $("#purgeMsg").innerHTML=""; $("#purgeList").innerHTML='<div class="hint"><span class="spin"></span></div>';
+  openModal("mPurge");
+  const r=await get("/api/backups?ns="+encodeURIComponent(ns));
+  purgeRows=r.backups||[];
+  if(!purgeRows.length){ $("#purgeList").innerHTML='<div class="hint">Aucune version sauvegardée.</div>'; purgeSync(); return; }
+  $("#purgeList").innerHTML=`<div class="tcard" style="box-shadow:none;border:1px solid var(--rule)"><table class="ht"><thead><tr><th class="cb"></th><th>Date</th><th>Type</th><th class="ctr">Volumes</th></tr></thead><tbody>`+
+    purgeRows.map((b,i)=>{ const ix=b.index||{};
+      return `<tr><td class="cb"><input type="checkbox" class="purgeChk" data-i="${i}"></td><td>${esc(ix.created ? new Date(ix.created).toLocaleString() : b.timestamp)}${i===0?' <span class="hint">(la plus récente)</span>':''}</td>
+        <td>${esc(KIND_LBL[ix.kind]||"—")}${ix.partial?' <span class="hint">partielle</span>':''}</td><td class="ctr">${(ix.volumes||[]).length}</td></tr>`; }).join("")+`</tbody></table></div>`;
+  document.querySelectorAll(".purgeChk").forEach(c=>c.onchange=purgeSync);
+  purgeSync();
+}
+$("#purgeOld").onclick=()=>{ document.querySelectorAll(".purgeChk").forEach(c=>c.checked = +c.dataset.i>0); purgeSync(); };
+$("#purgeGo").onclick=async()=>{
+  const sel=[...document.querySelectorAll(".purgeChk:checked")].map(c=>purgeRows[+c.dataset.i]);
+  if(!sel.length) return;
+  const all = sel.length===purgeRows.length;
+  if(!(await confirmDanger({title:"Supprimer des versions", lines:[
+     "<b>"+sel.length+"</b> version(s) de la configuration de <b>"+esc(purgeNs)+"</b> seront supprimées définitivement.",
+     all ? "<b>Toutes</b> les versions sont sélectionnées : cette application ne pourra plus être restaurée depuis l'outil." : "Les données des volumes (HYCU) ne sont pas touchées."]}))) return;
+  const b=$("#purgeGo"); b.disabled=true;
+  const r=await post("/api/backups/delete",{ns:purgeNs, paths:sel.map(x=>x.path)});
+  $("#purgeMsg").innerHTML = r.ok ? `<div class="note" style="margin-top:8px">${esc(r.removed+" version(s) supprimée(s).")}</div>` : errBox(r.error);
+  await openPurgeModal(purgeNs);
+  if(r.removed) loadApps(true);
+};
+$("#actPurge").onclick=async()=>{ const a=selAppObjs()[0]; await ensureCluster(a); openPurgeModal(appNs(a)); };
 $("#actVerify").onclick=async()=>{ const a=selAppObjs()[0]; await ensureCluster(a); gotoVerify(appNs(a), false); };
 
 // ============================ Modale Sauvegarde ============================
@@ -12802,18 +13508,46 @@ $("#nkpImport").onclick=async()=>{
 };
 
 // ============================ Politiques ============================
+let polAll=[], polEditIdx=-1, polMembers={};
+function polTarget(p){
+  const parts=[];
+  if((p.namespaces||[]).length) parts.push(p.namespaces.join(", "));
+  if(p.label_selector) parts.push("étiquette "+p.label_selector);
+  return parts.join(" · ");
+}
+function polLast(x){ return x.last_run ? esc(fmtAgo(x.last_run))+" "+stIc(x.last_ok?"ok":"ko", x.last_summary||"") : "—"; }
+function polMemberHint(name){
+  const m=polMembers[name];
+  return m ? '<div class="hint" style="margin:2px 0 0">'+(m.length ? esc(m.length+" namespace(s) : "+m.slice(0,8).join(", ")+(m.length>8?"…":"")) : "aucun namespace actuellement")+'</div>' : "";
+}
 async function loadPolicies(){
   await loadAutoBackup();
   const s=await get("/api/auto_backup")||{};
   const on=!!s.enabled;
-  $("#polBody").innerHTML=`<tr class="clk" id="polRow">
-    <td style="color:var(--strong);font-weight:500">Configuration Kubernetes</td>
-    <td>Manifestes PV/PVC et ressources des namespaces du filtre</td>
+  polAll=s.policies||[];
+  const mem=await get("/api/policy_members"); polMembers=(mem&&mem.ok)?(mem.members||{}):{};
+  let h=`<tr class="clk" data-i="-1">
+    <td style="color:var(--strong);font-weight:500">Par défaut</td>
+    <td>Namespaces sans autre politique${polMemberHint("")}</td>
     <td>${on ? "Toutes les "+Math.round(s.interval_hours||24)+" h" : "—"}</td>
-    <td>${abRetLabel(s)}</td>
-    <td><code>${esc(s.dest||"hycu-backups/")}</code></td>
+    <td>${abRetLabel(s)}</td><td>—</td>
+    <td>${s.last_run ? esc(fmtAgo(s.last_run))+" "+stIc(s.last_ok?"ok":"ko", s.last_summary||"") : "—"}</td>
     <td class="ctr">${on ? stIc("ok","Activée") : stIc("na","Désactivée")}</td></tr>`;
-  $("#polRow").onclick=()=>$("#abEnabled").scrollIntoView({behavior:"smooth", block:"center"});
+  h+=polAll.map((p,i)=>`<tr class="clk" data-i="${i}">
+    <td style="color:var(--strong);font-weight:500">${esc(p.name)}</td>
+    <td>${esc(polTarget(p))}${polMemberHint(p.name)}</td>
+    <td>${"Toutes les "+esc(String(+p.interval_hours))+" h"}</td>
+    <td>${p.keep===0 ? "illimitée" : esc(p.keep+" versions")}</td>
+    <td>${esc(p.hycu_policy_name||"—")}</td>
+    <td>${polLast(p)}</td>
+    <td class="ctr">${p.enabled ? stIc("ok","Activée") : stIc("na","En pause")}</td></tr>`).join("");
+  $("#polBody").innerHTML=h;
+  document.querySelectorAll("#polBody tr.clk").forEach(tr=>tr.onclick=()=>{
+    const i=+tr.dataset.i;
+    if(i<0){ $("#polEdit").style.display="none"; $("#abEnabled").scrollIntoView({behavior:"smooth", block:"center"}); }
+    else polOpen(i);
+  });
+  if(mem && mem.selector_error) $("#polBody").insertAdjacentHTML("beforeend", `<tr><td colspan="7">${errBox(mem.selector_error)}</td></tr>`);
   if(conn.hycu && conn.hycu.connected){
     $("#polHycu").innerHTML='<div class="hint"><span class="spin"></span></div>';
     const p=await get("/api/hycu/policies");
@@ -12822,9 +13556,60 @@ async function loadPolicies(){
         p.policies.map(x=>`<tr><td>${esc(x.name||"—")}</td><td><code>${esc(x.uuid||"")}</code></td></tr>`).join("")+`</tbody></table></div>`
       : '<div class="hint">Aucune politique HYCU.</div>');
   } else {
-    $("#polHycu").innerHTML='<div class="warnbox">Enregistrez la source HYCU (⚙ en haut à droite) pour afficher ses politiques.</div>';
+    $("#polHycu").innerHTML='<div class="hint">Enregistrez la source HYCU (⚙ en haut à droite) pour afficher ses politiques.</div>';
   }
 }
+async function polHycuOptions(sel){
+  const box=$("#peHycu");
+  box.innerHTML='<option value="">(aucune)</option>';
+  if(!(conn.hycu && conn.hycu.connected)){ box.innerHTML='<option value="">(connectez HYCU pour choisir)</option>'; box.disabled=true; return; }
+  box.disabled=false;
+  const r=await get("/api/hycu/policies");
+  (r.ok ? (r.policies||[]) : []).forEach(x=>box.insertAdjacentHTML("beforeend", `<option value="${esc(x.uuid)}">${esc(x.name||x.uuid)}</option>`));
+  box.value=sel||"";
+}
+function polOpen(i){
+  polEditIdx=i;
+  const p = i>=0 ? polAll[i] : {name:"", namespaces:[], label_selector:"", interval_hours:24, keep:15, enabled:true, hycu_policy:""};
+  $("#polEditTitle").textContent = i>=0 ? "Politique « "+p.name+" »" : "Nouvelle politique";
+  $("#peName").value=p.name; $("#peNs").value=(p.namespaces||[]).join(", "); $("#peSel").value=p.label_selector||"";
+  $("#peInterval").value=p.interval_hours; $("#peKeep").value=p.keep; $("#peEnabled").checked=p.enabled!==false;
+  $("#peDelete").style.display = i>=0 ? "" : "none"; $("#peMsg").innerHTML="";
+  $("#polEdit").style.display="block";
+  polHycuOptions(p.hycu_policy);
+  $("#polEdit").scrollIntoView({behavior:"smooth", block:"start"});
+}
+function polClean(p){ return {name:p.name, namespaces:p.namespaces||[], label_selector:p.label_selector||"",
+  interval_hours:+p.interval_hours, keep:+p.keep, enabled:p.enabled!==false,
+  hycu_policy:p.hycu_policy||"", hycu_policy_name:p.hycu_policy_name||""}; }
+async function polSaveList(list){
+  const r=await post("/api/config",{config:{backup_policies:list.map(polClean)}});
+  if(!r.ok){ $("#peMsg").innerHTML=errBox(r.error||"Enregistrement impossible."); return false; }
+  $("#polEdit").style.display="none";
+  await loadPolicies();
+  return true;
+}
+$("#polNew").onclick=()=>polOpen(-1);
+$("#peCancel").onclick=()=>{ $("#polEdit").style.display="none"; };
+$("#peSave").onclick=async()=>{
+  const hy=$("#peHycu");
+  const p={name:$("#peName").value.trim(), namespaces:csv($("#peNs").value).map(x=>x.toLowerCase()),
+    label_selector:$("#peSel").value.trim(),
+    interval_hours:Math.max(0.25, parseFloat(String($("#peInterval").value).replace(",","."))||24),
+    keep:Math.max(0, parseInt($("#peKeep").value)||0), enabled:$("#peEnabled").checked,
+    hycu_policy:hy.value||"", hycu_policy_name:hy.value ? (hy.options[hy.selectedIndex].textContent||"") : ""};
+  if(!p.name){ $("#peMsg").innerHTML=errBox("Donnez un nom à la politique."); return; }
+  if(!p.namespaces.length && !p.label_selector){ $("#peMsg").innerHTML=errBox("Indiquez des namespaces ou un sélecteur d'étiquettes."); return; }
+  const list=polAll.map(polClean);
+  if(polEditIdx>=0) list[polEditIdx]=p; else list.push(p);
+  await polSaveList(list);
+};
+$("#peDelete").onclick=async()=>{
+  if(polEditIdx<0) return;
+  const p=polAll[polEditIdx];
+  if(!(await confirmDanger({title:"Supprimer la politique", lines:["La politique <b>"+esc(p.name)+"</b> sera supprimée. Ses namespaces suivront la politique par défaut ; les sauvegardes existantes sont conservées."]}))) return;
+  await polSaveList(polAll.filter((_,i)=>i!==polEditIdx).map(polClean));
+};
 $("#abSave").addEventListener("click", ()=>setTimeout(()=>{ if(curPage==="policies") loadPolicies(); }, 900));
 
 // ============================ Tâches ============================
@@ -12918,6 +13703,7 @@ async function loadDashboard(){
       <li><span class="k">Rétention</span><span class="v">${esc(abRetLabel(ab))}</span></li>
       <li><span class="k">Dernière exécution</span><span class="v">${ab.last_run ? esc(fmtAgo(ab.last_run))+" "+stIc(ab.last_ok?"ok":"ko") : "—"}</span></li>
       <li><span class="k">Prochaine exécution</span><span class="v">${ab.next_due ? esc(new Date(ab.next_due*1000).toLocaleString()) : "—"}</span></li>
+      ${(ab.policies||[]).length ? `<li><span class="k">Autres politiques</span><span class="v">${esc((ab.policies||[]).map(p=>p.name).join(", "))}</span></li>` : ""}
     </ul>`;
 
   const keys=["hycu","nutanix","prismcentral"];
@@ -13046,7 +13832,7 @@ function rsAppLabel(){
 document.addEventListener("click", e=>{ const a=e.target.closest && e.target.closest(".rsWholeNs, #rsWholeNs");
   if(a){ e.preventDefault(); rsTargetWholeNs(); } });
 function openRestoreModal(ns, app){
-  rsDone=false; cloneBusy=false;
+  rsNewSession();
   ns = ns || state.ns || $("#rsNs").value; if(!ns) return;
   state.ns=ns; applyGlobalNs();
   // Application ciblée (page Applications) : {name, type, pvcs, whole_ns}. Sans
@@ -13062,8 +13848,12 @@ function openRestoreModal(ns, app){
   // Application STATELESS : les parcours de stockage n'ont pas de sens -> seules les cartes
   // « copie » (clone des workloads + dépendances) et « objets de configuration » restent,
   // la seconde présélectionnée (restauration = ré-appliquer ses objets).
-  const sl = !!(state.app && state.app.type==="stateless");
-  document.querySelectorAll('#rsPgType .opt').forEach(o=>{ o.style.display = (sl && (o.dataset.kind==="inplace"||o.dataset.kind==="reattach"||o.dataset.kind==="dr")) ? "none" : ""; });
+  // Namespace entier sans aucun volume (que des applications stateless) : même règle.
+  const nsApps = apps.filter(a=>appNs(a)===ns && (a.cluster_id||ACTIVE_CID)===ACTIVE_CID);
+  const nsNoVol = !state.app && nsApps.length>0 && nsApps.every(a=>!(a.pvcs||[]).length && !a.volumes);
+  const sl = !!(state.app && state.app.type==="stateless") || nsNoVol;
+  // La DR reste proposée : une sauvegarde stateless se restaure aussi sur un autre cluster.
+  document.querySelectorAll('#rsPgType .opt').forEach(o=>{ o.style.display = (sl && (o.dataset.kind==="inplace"||o.dataset.kind==="reattach")) ? "none" : ""; });
   if(sl){ rsWizKind="objects"; rsSyncOpts(); }
   rsShowPage("type");
 }
@@ -13085,7 +13875,7 @@ function rsTargetWholeNs(){
   state.app=null; rsRenderAppNote();
   document.querySelectorAll('#rsPgType .opt').forEach(o=>o.style.display="");   // tous les parcours de nouveau
   $("#rsWizApp").innerHTML=rsAppLabel(); const oa=$("#objApp"); if(oa) oa.innerHTML=rsAppLabel();
-  if(rsWizPage==="form"){ rsAutoCheck=true; document.querySelectorAll(".rsChk").forEach(c=>c.checked=true); rebuildVolCfgs(); }
+  if(rsWizPage==="form"){ rsToForm().then(()=>{ rsAutoCheck=true; document.querySelectorAll(".rsChk").forEach(c=>c.checked=true); rebuildVolCfgs(); }); }
   else if(rsWizPage==="objects"){ objLoadList(); }
   rsWizSync();
 }
@@ -13098,8 +13888,12 @@ async function rsToForm(){
   rsShowPage("form");
   rsAutoCheck=true;
   $("#rsPlan").style.display="none";
+  $("#rsAdvWrap").style.display="";
   if(rsStatelessClone()){
     state.ns=$("#rsNs").value||state.ns; state.backup_path=null; state.selected={};
+    // Copie depuis le cluster vivant : ni volumes, ni panneau HYCU, ni choix de sauvegarde.
+    hyPanelSeq++; $("#rsVolCfgs").innerHTML=""; const ha=$("#rsHyActions"); if(ha) ha.innerHTML="";
+    $("#rsBackupSelWrap").style.display="none"; $("#rsAdvWrap").style.display="none";
     $("#rsPvcs").innerHTML=`<div class="note">Application <b>${esc(state.app.name)}</b> : <b>stateless</b>, aucun volume à restaurer. La copie recrée ses workloads (${esc((state.app.workloads||[]).map(w=>w.kind+"/"+w.name).join(", ")||"—")}) et leurs dépendances depuis le cluster.</div>`;
     $("#rsConfig").style.display="none"; setRsStep(2); rsWizSync(); return;
   }
@@ -13111,7 +13905,9 @@ async function rsToForm(){
 // à l'étape (clone HYCU groupé, restauration sur place, construction du plan, lancement).
 function rsWizSync(){
   const go=$("#rsWizGo"); let lbl="Suivant", dis=false, act=null, src=null;
-  if(rsWizPage==="type"){ dis=!rsWizKind; act=rsNextFromType; }
+  $("#rsWizBack").style.display = (rsDone || rsWizPage==="type" || rsWizKind==="recover") ? "none" : "";
+  if(rsDone){ lbl="Vérifier l'application →"; act=()=>gotoVerify(rsDoneTarget, true); }
+  else if(rsWizPage==="type"){ dis=!rsWizKind; act=rsNextFromType; }
   else if(rsWizPage==="dr"){
     const n=document.querySelectorAll(".drRef").length;
     const filled=[...document.querySelectorAll(".drRef")].filter(t=>t.value.trim()).length;
@@ -13120,14 +13916,14 @@ function rsWizSync(){
     // sauvegarde STATELESS (aucun volume, workloads dans l'instantané) se restaure sans volume.
     const needRefs = !drRecoverReuse();
     const b=drSel(), noVol = !n && !!(b && b.stateless);
-    lbl=dry()? "Restaurer (simulation)" : "Restaurer (réel)";
+    lbl=dry()? "Restaurer (simulation)" : "Restaurer";
     dis=!drAllowed || (!n && !noVol) || (needRefs && filled<n) || drBusy || !$("#drTargetNs").value.trim();
     act=drRun;
   }
   else if(rsWizPage==="objects"){
     const n=document.querySelectorAll(".objChk:checked").length;
     if(objPhase==="pick"){ lbl="Prévisualiser les différences"; dis=!n || objBusy; act=objToDiff; }
-    else { lbl=dry()? "Appliquer (simulation)" : "Appliquer (réel)"; dis=!n || objBusy; act=objApply; }
+    else { lbl=dry()? "Appliquer (simulation)" : "Appliquer"; dis=!n || objBusy; act=objApply; }
   }
   else if(rsWizPage==="target"){ dis=!rsTgtMode; act=rsTargetToForm; }
   else if(rsWizPage==="form"){
@@ -13142,16 +13938,15 @@ function rsWizSync(){
       dis = cloneBusy || (!rsStatelessClone() && (!n || (pending && batch.disabled)));
       act = cloneAppDirect;
     }
-    else if(state.mode==="inplace" && hyOn){ src=$("#rsInplaceRun"); lbl="Restaurer"; }
+    else if(state.mode==="inplace" && hyOn){ src=$("#rsInplaceRun"); lbl="Restaurer sur place"; }
     else {
       const items=collectItems(), filled=items.length>0 && items.every(i=>(i.new_ref||"").trim());
       const batch=$("#hyBatchGo");
-      if(batch && !filled){ src=batch; lbl="Restaurer"; }
+      if(batch && !filled){ src=batch; lbl="Cloner les VG dans HYCU →"; }
       else { dis=!n; act=()=>$("#rsPreview").click(); }
     }
     if(src){ dis=!n || src.disabled; act=()=>src.click(); }
-  } else if(rsDone){ lbl="Vérifier l'application →"; dis=false; act=()=>gotoVerify(rsDoneTarget, true); }
-  else { src=$("#rsGo"); lbl=(src.textContent||"").trim() || "Lancer"; dis=src.disabled || cloneBusy; act=()=>src.click(); }
+  } else { src=$("#rsGo"); lbl=(src.textContent||"").trim() || "Lancer"; dis=src.disabled || cloneBusy; act=()=>src.click(); }
   const busy = src && src.querySelector(".spin");
   const html = busy ? '<span class="spin"></span>'+esc((src.textContent||"").trim()) : esc(lbl);
   if(html!==rsWizHtml){ go.innerHTML=html; rsWizHtml=html; }
@@ -13177,7 +13972,7 @@ var drAllowed=false, drBusy=false, drBackups=[], drMode="dr", drRecoverNs=null;
 // mêmes mécanismes que la page DR (sources depuis la sauvegarde seule), mais SANS
 // la dérogation allow_dr_restore (le serveur vérifie que la sauvegarde est d'ici).
 function openRecoverModal(ns){
-  rsDone=false; cloneBusy=false;
+  rsNewSession();
   state.ns=ns; state.app=null;         // la récupération recrée tout le namespace
   document.querySelectorAll('#rsPgType .opt').forEach(o=>{ o.style.display=""; });   // (masquées pour une app stateless)
   const note=$("#rsAppNote"); if(note){ note.style.display="none"; note.innerHTML=""; }
@@ -13246,20 +14041,23 @@ function drRenderVols(){
      <input type="text" class="drRef" data-pvc="${esc(v)}" spellcheck="false" autocomplete="off"
        value="${drMode==="recover"&&refs[v]?esc(refs[v]):""}"
        placeholder="${esc(drMode==="recover"?"UUID du Volume Group (8-4-4-4-12)":"UUID du VG restauré/cloné sur le site cible (8-4-4-4-12)")}"></div>`).join("")
-    : (b && b.stateless ? '<div class="note">Sauvegarde <b>stateless</b> (aucun volume) : les workloads'+((b.apps||[]).length?' ('+esc((b.apps||[]).join(", "))+')':'')+' et leurs dépendances seront recréés depuis l\'instantané.</div>'
+    : (b && b.stateless ? '<div class="note">Sauvegarde <b>stateless</b> (aucun volume) : les workloads'+((b.apps||[]).length?' ('+esc((b.apps||[]).join(", "))+')':'')+' et leurs dépendances seront recréés depuis l’instantané.</div>'
                         : '<div class="hint">Aucun volume dans cette sauvegarde.</div>');
   document.querySelectorAll(".drRef").forEach(t=>t.oninput=rsWizSync);
   drSyncReuse();
 }
 // Bascule d'affichage de la grille selon « réutiliser les volumes d'origine ».
 function drSyncReuse(){
-  const reuse=drRecoverReuse();
-  $("#drVols").style.display = reuse? "none":"block";
-  $("#drVolsLabel").style.display = (drMode==="recover")? (reuse?"none":"block") : "block";
+  const reuse=drRecoverReuse(), bsel=drSel(), stateless=!!(bsel && bsel.stateless);
+  // Sauvegarde STATELESS : aucun champ de volume (StorageClass, réutilisation, UUID, HYCU).
+  $("#drScRow").style.display = stateless ? "none" : "";
+  $("#drReuseWrap").style.display = (drMode==="recover" && !stateless) ? "block" : "none";
+  $("#drVols").style.display = (reuse && !stateless)? "none":"block";
+  $("#drVolsLabel").style.display = stateless ? "none" : ((drMode==="recover")? (reuse?"none":"block") : "block");
   if(drMode==="recover") $("#drVolsLabel").textContent="Nouveaux volumes — collez l'identifiant (UUID) fourni par HYCU";
   else $("#drVolsLabel").textContent="Volumes — collez l'UUID du VG restauré/cloné sur le site cible";
   // Bouton « auto HYCU » : seulement quand la grille est visible ET HYCU + Prism connectés.
-  const autoOk = !reuse && (conn.hycu&&conn.hycu.connected)
+  const autoOk = !reuse && !stateless && !rsDone && (conn.hycu&&conn.hycu.connected)
                  && ((conn.prismcentral&&conn.prismcentral.connected)||(conn.nutanix&&conn.nutanix.connected));
   $("#drAutoWrap").style.display = autoOk? "block":"none";
   rsWizSync();
@@ -13277,7 +14075,7 @@ $("#drAuto").onclick=async()=>{
   if(!volumes.length || volumes.some(v=>!v.source_vg_uuid)){
     $("#drErr").innerHTML=errBox("UUID du VG source absent de la sauvegarde : automatisation impossible, saisissez les UUID manuellement."); return; }
   if(!dry() && !(await confirmDanger({title:"Confirmer les clones HYCU", lines:[
-      "Déclencher dans HYCU le <b>clone</b> de <b>"+volumes.length+"</b> Volume Group(s) (nouveaux VG créés) ?",
+      "Cloner dans HYCU <b>"+volumes.length+"</b> Volume Group(s) (de nouveaux VG sont créés) ?",
       "Les nouveaux identifiants seront inscrits automatiquement dans la grille."]}))) return;
   const btn=$("#drAuto"); btn.disabled=true; drBusy=true; rsWizSync();
   $("#drErr").innerHTML=""; $("#drLog").innerHTML='<div class="hint"><span class="spin"></span>HYCU : création des volumes…</div>';
@@ -13305,24 +14103,29 @@ async function drRun(){
       drMode==="recover"
         ? "L'application sera RECRÉÉE sur ce cluster depuis la sauvegarde (namespace, PV/PVC, workloads, dépendances non masquées)."
         : "La garde inter-cluster est LEVÉE pour cette opération : l'application sera recréée sur ce cluster depuis la sauvegarde (PV/PVC, workloads, dépendances non masquées).",
-      ...((drMode==="recover" && drRecoverReuse() && conn.hycu && conn.hycu.connected)
-        ? ["Si un volume d'origine a disparu du cluster, HYCU le RESTAURERA automatiquement (opération HYCU réelle) avant la recréation."] : [])]});
+      ...((drMode==="recover" && !b.stateless && drRecoverReuse() && conn.hycu && conn.hycu.connected)
+        ? ["Si un volume d'origine a disparu du cluster, HYCU le restaurera automatiquement avant la recréation."] : [])]});
     if(!res) return;
     if(typeof res==="string") confirmedCtx=res;
   }
   drBusy=true; rsWizSync();
-  $("#drLog").innerHTML='<div class="hint"><span class="spin"></span>Restauration DR…</div>';
+  $("#drLog").innerHTML='<div class="hint"><span class="spin"></span>'+(drMode==="recover"?"Restauration de l’application…":"Restauration DR…")+'</div>';
   const body={namespace:b.namespace, target_namespace:$("#drTargetNs").value.trim(),
               backup_path:b.path, items, dry:dry(),
               dr_storageclass:$("#drSc").value.trim(), clone_refs:$("#drRefs").checked};
   if(drMode==="recover") body.from_backup_only=true; else body.dr_restore=true;
   if(live && ctxInfo.require_confirm) body.confirm_context=confirmedCtx;
-  const r=await runOp("/api/clone_app", body, log=>{ $("#drLog").innerHTML=renderLog(log); });
+  const sess=rsSession;
+  const r=await runOp("/api/clone_app", body, log=>{ if(sess===rsSession) $("#drLog").innerHTML=renderLog(log); });
+  if(sess!==rsSession) return;
   drBusy=false; rsWizSync();
-  const head = r.ok? (r.dry? '<div class="warnbox">Simulation — séquence qui serait exécutée.</div>'
-                           : '<div class="note">Restauration DR terminée. Vérifiez l\'application, puis re-protégez ses Volume Groups dans HYCU.</div>')
-                   : errBox(r.error);
-  $("#drLog").innerHTML=head+((r.warnings||[]).length?`<div class="warnbox" style="margin-top:8px">${r.warnings.map(esc).join("<br>")}</div>`:"")+renderLog(r.log);
+  const reprot = b.stateless ? "" : " Pensez à re-protéger ses Volume Groups dans HYCU.";
+  const done = (drMode==="recover" ? "Restauration de l’application terminée." : "Restauration DR terminée.") + reprot;
+  const head = r.ok? (r.dry? '<div class="note">Simulation — séquence qui serait exécutée.</div>'
+                           : '<div class="note">'+done+'</div>')
+                   : errBox(r.error || "Des étapes ont échoué — voir le détail.");
+  $("#drLog").innerHTML=head+cloneWarnings(r.warnings)+renderLog(r.log);
+  if(r.ok && !r.dry) rsFinish(body.target_namespace || b.namespace, false, sess, true);
 }
 
 // ----- Restauration guidée des OBJETS de configuration (resources.json) -----
@@ -13346,10 +14149,14 @@ async function objOpen(){
 }
 $("#objBackupSel").onchange=()=>objLoadList();
 async function objLoadList(){
-  objBusy=true; rsWizSync();
+  objBusy=true;
+  // Nouvelle liste = retour à la sélection : jamais appliquer des objets d'une autre
+  // sauvegarde que celle dont les différences sont affichées.
+  objPhase="pick"; $("#objDiffWrap").style.display="none"; $("#objPick").style.display="block"; setRsStep(2);
+  rsWizSync();
   $("#objErr").innerHTML=""; $("#objLog").innerHTML="";
   if(!$("#objBackupSel").value){
-    $("#objBody").innerHTML='<tr><td colspan="4" class="tempty">Aucune sauvegarde pour ce namespace — lancez d\'abord une sauvegarde (Applications → Sauvegarder).</td></tr>';
+    $("#objBody").innerHTML='<tr><td colspan="4" class="tempty">Aucune sauvegarde pour ce namespace — lancez d’abord une sauvegarde (Applications → Sauvegarder).</td></tr>';
     objItems=[]; objBusy=false; rsWizSync(); return;
   }
   const r=await post("/api/objects/list", objBody_());
@@ -13360,7 +14167,7 @@ async function objLoadList(){
   // autres applications du namespace sont masqués par défaut (case « seulement… »).
   const appOn = !!(r.app);
   $("#objOnlyAppWrap").style.display = appOn ? "" : "none";
-  $("#objInfo").textContent="("+objItems.length+" objet(s) dans l'instantané"+(appOn?(" · "+(r.app_count||0)+" de l'application « "+r.app+" »"):"")+")";
+  $("#objInfo").textContent="("+objItems.length+" objet(s) dans l’instantané"+(appOn?(" · "+(r.app_count||0)+" de l’application « "+r.app+" »"):"")+")";
   $("#objBody").innerHTML=objItems.length? objItems.map(o=>`<tr class="clk${o.redacted?'':' '}${appOn&&!o.in_app?' objOther':''}" data-i="${o.i}">
      <td class="cb"><input type="checkbox" class="objChk" data-i="${o.i}" ${o.redacted?"disabled":""} ${appOn&&o.in_app&&!o.redacted?"checked":""}></td>
      <td>${esc(o.kind)}</td><td style="color:var(--strong);font-weight:500">${esc(o.name)}</td>
@@ -13385,8 +14192,8 @@ function objSelIdx(){ return [...document.querySelectorAll(".objChk:checked")].m
 async function objToDiff(){
   objBusy=true; rsWizSync();
   $("#objErr").innerHTML="";
-  $("#objDiff").innerHTML='<div class="hint"><span class="spin"></span>Comparaison avec l\'état live…</div>';
-  $("#objDiffWrap").style.display="block";
+  $("#objDiff").innerHTML='<div class="hint"><span class="spin"></span>Comparaison avec l’état live…</div>';
+  $("#objDiffWrap").style.display="block"; setRsStep(3);
   const r=await post("/api/objects/diff", Object.assign(objBody_(), {indexes:objSelIdx()}));
   objBusy=false;
   if(!r.ok){ $("#objDiffWrap").style.display="none"; $("#objErr").innerHTML=errBox(r.error); rsWizSync(); return; }
@@ -13417,12 +14224,15 @@ async function objApply(){
   $("#objLog").innerHTML='<div class="hint"><span class="spin"></span>Application…</div>';
   const body=Object.assign(objBody_(), {indexes:objSelIdx(), dry:dry()});
   if(live && ctxInfo.require_confirm) body.confirm_context=confirmedCtx;
+  const sess=rsSession;
   const r=await post("/api/objects/restore", body);
+  if(sess!==rsSession) return;
   objBusy=false; rsWizSync();
   const head = r.ok? (r.dry? '<div class="warnbox">Simulation — commandes qui seraient exécutées.</div>'
-                           : `<div class="note">${r.applied} objet(s) appliqué(s)${r.skipped?(" · "+r.skipped+" ignoré(s)"):""}.</div>`)
+                           : `<div class="note">${"Restauration des objets terminée : "+r.applied+" objet(s) appliqué(s)"}${r.skipped?(" · "+r.skipped+" ignoré(s)"):""}.</div>`)
                    : errBox(r.error);
   $("#objLog").innerHTML=head+renderLog(r.log);
+  if(r.ok && !r.dry) rsFinish(body.namespace, !!r.skipped, sess);
 }
 setInterval(()=>{ if($("#mRestore").style.display!=="none") rsWizSync(); }, 300);
 
@@ -13610,6 +14420,8 @@ HTML_EN = r"""<!DOCTYPE html>
   table.ht th:last-child{border-right:none}
   table.ht td{padding:11px 12px;color:var(--text);border-bottom:1px solid #F0F2F6;vertical-align:middle}
   table.ht tr:last-child td{border-bottom:none}
+  #appsTable td{padding-top:6px;padding-bottom:6px}       /* liste dense : plus de lignes à l'écran */
+  #mPurge table.ht, #tkOut table.ht{min-width:0}          /* tableaux étroits (fenêtre / carte) */
   table.ht tbody tr:hover td{background:#FAF8FF}
   table.ht tbody tr.sel td{background:var(--purple-t)}
   table.ht tbody tr.clk{cursor:pointer}
@@ -14030,10 +14842,12 @@ HTML_EN = r"""<!DOCTYPE html>
         <button class="pact" id="actRestore" type="button" disabled><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4.4 12.5a7.6 7.6 0 1 0 2.1-5.8"/><path d="M4.2 4.3v3.9h3.9"/><path d="M12 8.3v4l2.6 1.9"/></svg><span>Restore</span></button>
         <button class="pact" id="actPolicy" type="button" disabled><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l7.5 3v5.4c0 4.6-3.2 8.3-7.5 9.6-4.3-1.3-7.5-5-7.5-9.6V6z"/><path d="M12 8.8v6.4M8.8 12h6.4"/></svg><span>Set Policy</span></button>
         <button class="pact" id="actVerify" type="button" disabled><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="8.6"/><path d="M8.3 12.2l2.5 2.5 5-5.3"/></svg><span>Verify</span></button>
+        <button class="pact" id="actPurge" type="button" disabled title="Delete configuration backup versions"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4.5 7h15M9.5 7V4.8h5V7M6.8 7l.8 12.2h8.8l.8-12.2M10.2 10.6v5.6M13.8 10.6v5.6"/></svg><span>Purge</span></button>
         <button class="pact" id="actBulk" type="button" title="Recreate every deleted namespace of the active cluster from its backups"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3.5" y="4" width="17" height="5" rx="1.2"/><rect x="3.5" y="11" width="17" height="5" rx="1.2"/><path d="M6 18.5h12M4.4 21a7 7 0 0 0 1.9-5.3"/><path d="M4.2 13.2v3.6h3.6"/></svg><span>Bulk restore</span></button>
       </div></div>
     <div class="tcard">
       <div class="tbar"><div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap"><input type="text" id="appsSearch" placeholder="Search" autocomplete="off">
+        <label class="fld" style="margin:0;display:flex;align-items:center;gap:6px;font-size:13px;white-space:nowrap"><input type="checkbox" id="appsHideDel" style="width:auto;margin:0"> Hide deleted</label>
         <div class="seg" id="appsScope" style="display:none"><button class="on" type="button" data-scope="one">Active cluster</button><button type="button" data-scope="all">All clusters</button></div></div>
         <div style="display:flex;align-items:center;gap:14px"><span class="tinfo" id="appsInfo"></span><span class="tinfo" id="appsPager" style="display:none"></span>
           <button class="pact nsEdit" type="button" title="Filter the namespace list"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5h16l-6.2 7.4V19l-3.6-1.8v-4.8z"/></svg></button></div></div>
@@ -14045,13 +14859,35 @@ HTML_EN = r"""<!DOCTYPE html>
   </section>
   <!-- ===================== POLITIQUES ===================== -->
   <section id="tab-policies" style="display:none">
-    <div class="pagehead"><h1 class="ptitle">Policies</h1></div>
+    <div class="pagehead"><h1 class="ptitle">Policies</h1>
+      <div class="pacts"><button class="pact" id="polNew" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg><span>New policy</span></button></div></div>
     <div class="tcard" style="margin-bottom:16px">
-      <table class="ht"><thead><tr><th>Name</th><th>Protected object</th><th>Frequency</th><th>Retention</th><th>Target</th><th class="ctr">Status</th></tr></thead>
+      <table class="ht"><thead><tr><th>Name</th><th>Namespaces</th><th>Frequency</th><th>Retention</th><th>HYCU policy</th><th>Last run</th><th class="ctr">Status</th></tr></thead>
         <tbody id="polBody"></tbody></table>
     </div>
+    <div class="card" id="polEdit" style="display:none">
+      <h3 id="polEditTitle">New policy</h3>
+      <div class="row">
+        <div style="flex:none;width:200px"><label class="fld">Nom</label><input type="text" id="peName" maxlength="40" placeholder="or"></div>
+        <div><label class="fld">Namespaces (comma-separated)</label><input type="text" id="peNs" placeholder="shop, billing"></div>
+        <div><label class="fld">and/or label selector</label><input type="text" id="peSel" placeholder="hycu.io/policy=or"></div>
+      </div>
+      <div class="row">
+        <div style="flex:none;width:150px"><label class="fld">Interval (hours)</label><input type="number" id="peInterval" min="0.25" step="0.25" value="24"></div>
+        <div style="flex:none;width:170px"><label class="fld">Versions to keep</label><input type="number" id="peKeep" min="0" step="1" value="15"></div>
+        <div><label class="fld">HYCU policy (optional)</label><select id="peHycu"></select></div>
+        <div style="flex:none;align-self:flex-end"><label class="fld"><input type="checkbox" id="peEnabled" style="width:auto" checked> Enabled</label></div>
+      </div>
+      <div class="hint" style="margin-top:6px">The first policy in the list that matches a namespace wins; a namespace without a policy follows the default policy. The HYCU policy is assigned to volumes that do not have one yet.</div>
+      <div style="margin-top:12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <button class="btn" id="peSave" type="button">Enregistrer</button>
+        <button class="btn ghost" id="peCancel" type="button">Cancel</button>
+        <button class="lnk" id="peDelete" type="button" style="margin-left:auto;color:var(--red-t)">Delete the policy</button>
+      </div>
+      <div id="peMsg"></div>
+    </div>
     <div class="card">
-      <h3><span class="step-no">⏱</span>Automatic configuration backup (PV/PVC manifests)</h3>
+      <h3><span class="step-no">⏱</span>Default policy — automatic configuration backup</h3>
       <p class="sub">Regularly backs up the <b>PV/PVC manifests</b> (the restore “recipe”) of all
         namespaces allowed by the filter — while the tool is running. <b>Not the data</b> of the volumes:
         they are protected by HYCU (<b>Applications → Set Policy</b>).</p>
@@ -14206,6 +15042,15 @@ HTML_EN = r"""<!DOCTYPE html>
     <div class="hm-foot" id="mBackupFoot"><button class="lnk" type="button" data-close="mBackup">Close</button><button class="btn" id="bkRunSel" type="button" style="display:none">Back up the selection</button></div>
   </div>
 </div>
+<div id="mPurge" class="hmodal-bg" style="display:none">
+  <div class="hmodal" style="max-width:640px">
+    <div class="hm-head"><h2 id="mPurgeTitle">Saved versions</h2><div class="hm-ico"><button type="button" data-close="mPurge" title="Close">✕</button></div></div>
+    <div class="hm-body"><div id="purgeList"></div><div id="purgeMsg"></div></div>
+    <div class="hm-foot"><button class="lnk" type="button" id="purgeOld" style="margin-right:auto">All but the most recent</button>
+      <button class="lnk" type="button" data-close="mPurge">Close</button>
+      <button class="btn danger" id="purgeGo" type="button" disabled>Delete the selection</button></div>
+  </div>
+</div>
 <div id="mBulk" class="hmodal-bg" style="display:none">
   <div class="hmodal" style="max-width:860px">
     <div class="hm-head"><h2>Bulk restore</h2><div class="hm-ico"><button type="button" data-close="mBulk" title="Close">✕</button></div></div>
@@ -14278,7 +15123,7 @@ HTML_EN = r"""<!DOCTYPE html>
     </div>
     <div id="rsPgDr" style="display:none">
       <div id="drGate" style="display:none"><div class="warnbox"><b>DR restore</b> is disabled. Enable “<b>Allow DR restore</b>” in ⚙ → Settings (for the duration of the drill or disaster), then come back here.</div>
-        <div style="margin-top:10px"><button class="btn ghost" id="drOpenCfg" type="button">Ouvrir les réglages</button></div></div>
+        <div style="margin-top:10px"><button class="btn ghost" id="drOpenCfg" type="button">Open the settings</button></div></div>
       <div id="drForm" style="display:none">
         <div class="warnbox" id="drWarnDr"><b>Disaster recovery</b> mode: the cross-cluster guard is lifted for THIS operation. Every source comes from the selected backup; the target is the <b>active cluster</b> (<b id="drCluster"></b>). First restore the Volume Groups in HYCU to the target site, then paste their UUIDs.</div>
         <div class="note" id="drWarnRec" style="display:none">This namespace no longer exists on cluster <b id="drClusterRec"></b>: the application will be <b>recreated from its backup</b> (namespace, PV/PVC, workloads, non-redacted dependencies), reusing its original volumes — or, if they were deleted with the namespace, restoring them automatically from HYCU (“Protected deleted”). In the common case, nothing to enter: check the backup and start the restore.</div>
@@ -14286,7 +15131,7 @@ HTML_EN = r"""<!DOCTYPE html>
           <div><label class="fld">Source backup (all clusters / S3 imports)</label><select id="drBackupSel"></select></div>
           <div style="flex:none;width:220px"><label class="fld">Target namespace</label><input type="text" id="drTargetNs" autocomplete="off"></div>
         </div>
-        <div class="row">
+        <div class="row" id="drScRow">
           <div style="flex:none;width:260px"><label class="fld">Target StorageClass (empty = unchanged)</label><input type="text" id="drSc" placeholder="nutanix-volume" autocomplete="off"></div>
           <div style="align-self:flex-end"><label class="fld"><input type="checkbox" id="drRefs" checked style="width:auto"> Recreate dependencies from the backup (non-redacted Secrets, ConfigMaps, ServiceAccounts, Services)</label></div>
         </div>
@@ -14559,6 +15404,16 @@ HTML_EN = r"""<!DOCTYPE html>
           <div class="hint" style="margin-top:4px">Repatriated exports go to <code>hycu-backups/_imports/…</code>; they are restored through the wizard's <b>DR restore</b> (or on their source cluster).</div>
           <div id="s3ImpRes"></div>
         </div>
+      </div>
+      <div style="margin-top:14px;border-top:1px solid var(--line);padding-top:12px" id="tkCard">
+        <b style="font-size:13px">Tool backup</b>
+        <div class="hint" style="margin:2px 0 8px">Configuration, policies and encrypted vault. Exported daily with the automatic export; restorable on a new instance.</div>
+        <div style="display:flex;gap:10px;flex-wrap:wrap">
+          <button class="btn ghost" id="tkUpload" type="button">Export now</button>
+          <button class="btn ghost" id="tkDownload" type="button">Télécharger</button>
+          <button class="btn ghost" id="tkList" type="button">Restore the tool from the bucket…</button>
+        </div>
+        <div id="tkOut"></div>
       </div>
     </div>
 
@@ -15031,8 +15886,10 @@ function buildWizSteps(){
       <label class="fld">Interface language</label>
       <div id="wLang">${[["fr","Français"],["en","English"]].map(([code,lbl])=>
         `<span class="chip ${PAGE_LANG===code?'sel':''}" data-lang="${code}">${lbl}</span>`).join("")}</div>
-      <div class="note" style="margin-top:14px">Detected kubectl context: <b>${esc(ctx||"unavailable")}</b></div>`,
-     enter:()=>{ document.querySelectorAll("#wLang .chip").forEach(c=>c.onclick=()=>{
+      <div class="note" style="margin-top:14px">Detected kubectl context: <b>${esc(ctx||"unavailable")}</b></div>
+      <div class="hint" style="margin-top:14px">Reinstalling an existing instance? <a href="#" id="wRestoreKit">Restore the tool from an S3 bucket</a></div>`,
+     enter:()=>{ const rk=$("#wRestoreKit"); if(rk) rk.onclick=(e)=>{ e.preventDefault(); $("#wizard").style.display="none"; openSources("s3"); };
+       document.querySelectorAll("#wLang .chip").forEach(c=>c.onclick=()=>{
         const l=c.dataset.lang; if(l===PAGE_LANG) return;              // déjà dans cette langue
         // Change la langue et recharge : le coffre de config n'existe pas encore,
         // l'assistant se rouvre entièrement dans la langue choisie.
@@ -15667,19 +16524,18 @@ $("#rsInplaceRun").onclick=async()=>{
   $("#rsInplaceLog").innerHTML='<div class="hint"><span class="spin"></span> Starting…</div>';
   const ipBody={namespace:(rsHyMatch?rsHyMatch.ns:$("#rsNs").value), items, dry:dry()};
   if(live && ctxInfo.require_confirm) ipBody.confirm_context=confirmedCtx;
+  const sess=rsSession, mine=()=>sess===rsSession;
   const r=await runOp("/api/orchestrate/inplace", ipBody,
-    log=>{ $("#rsInplaceLog").innerHTML='<div class="hint"><span class="spin"></span> Orchestration in progress…</div>'+renderLog(log); });
+    log=>{ if(mine()) $("#rsInplaceLog").innerHTML='<div class="hint"><span class="spin"></span> Orchestration in progress…</div>'+renderLog(log); });
+  if(!mine()) return;
   b.disabled=false; b.textContent="Launch the in-place restore";
   if(r.error && !(r.log&&r.log.length)){ $("#rsInplaceLog").innerHTML=errBox(r.error); return; }
   const lines=renderLog(r.log);
   const head=r.dry?'<div class="warnbox">Simulation — sequence and HYCU calls that would be executed.</div>'
     :(r.aborted?'<div class="err"><b>Sequence aborted</b> — the application was left stopped. See details.</div>'
-      :(r.ok?'<div class="note">In-place restore complete.</div>':'<div class="err">Some steps failed.</div>'));
+      :(r.ok?'<div class="note">In-place restore complete.</div>':'<div class="err">Some steps failed — see details.</div>'));
   $("#rsInplaceLog").innerHTML=head+lines;
-  if(!r.dry && r.ok && !r.aborted){
-    $("#rsInplaceLog").insertAdjacentHTML("afterbegin",'<div class="note">Opening the verification…</div>');
-    setTimeout(()=>gotoVerify(ipBody.namespace,true),1200);
-  }
+  if(!r.dry && r.ok && !r.aborted) rsFinish(ipBody.namespace, false, sess);
 };
 document.querySelectorAll("#rsMode button").forEach(b=>b.onclick=()=>{
   document.querySelectorAll("#rsMode button").forEach(x=>x.classList.remove("on"));
@@ -15779,7 +16635,7 @@ $("#rsPreview").onclick=async()=>{
 };
 // Toute modification des références/noms rend le plan périmé : il faut re-prévisualiser.
 function invalidatePlan(){
-  rsDone=false;
+  if(rsDone) return;                       // parcours finished : rien à relancer
   if(!state.preview) return;
   state.preview=null; $("#rsPlan").style.display="none"; $("#rsLog").innerHTML="";
   if(typeof rsWizPage!=="undefined" && rsWizPage==="plan") rsShowPage("form");
@@ -15801,11 +16657,10 @@ function updateGoButton(ready){
   $("#rsCtxConfirm").style.display = "none";          // la confirmation se fait dans la boîte de dialogue
   $("#rsGoHint").textContent = live? "" : "Simulation mode: nothing will be changed.";
   $("#rsGo").className = live? "btn danger" : "btn";
-  let act;
-  if(state.mode!=="clone") act = "the in-place restore (manual flow)";
-  else if(isCloneApp()) act = "the application clone";
-  else act = "the clone";
-  $("#rsGo").textContent = (live? "Launch " : "Simulate ") + act;
+  const kind = state.mode!=="clone" ? "inplace" : (isCloneApp() ? "cloneapp" : "clone");
+  $("#rsGo").textContent = live
+    ? {inplace:"Restore in place", clone:"Restore to the new volumes", cloneapp:"Launch the application clone"}[kind]
+    : {inplace:"Simulate the in-place restore", clone:"Simulate the restore", cloneapp:"Simulate the application clone"}[kind];
   $("#rsGo").disabled = !ready;
   updateNextBar();
 }
@@ -15814,9 +16669,30 @@ $("#dry").addEventListener("change",()=>{ if($("#rsPlan").style.display!=="none"
 
 // ----- Clone d'application : confirmation unique, exécution, état « finished » -----
 let rsDone=false, rsDoneTarget="", cloneBusy=false;
+// Chaque ouverture de la fenêtre de restauration est une « session » : une opération
+// lancée dans une session précédente (fenêtre fermée en cours de route) n'écrit plus
+// dans les journaux et ne termine plus l'assistant de la nouvelle ouverture.
+let rsSession=0;
+function rsNewSession(){
+  rsSession++; rsDone=false; cloneBusy=false; state.preview=null;
+  $("#rsProgress").style.display="none"; $("#rsCloneTargetNs").value="";
+  document.querySelectorAll("#drForm input, #drForm select").forEach(e=>e.disabled=false);
+}
+// Fin RÉUSSIE d'une opération réelle, quel que soit le parcours : seul « Vérifier » reste.
+// `stay` : quelque chose est à lire (avertissements, re-protection) -> pas de bascule auto.
+function rsFinish(ns, stay, sess, slow){
+  if(sess!==undefined && sess!==rsSession) return;        // opération d'une ouverture précédente
+  rsDone=true; rsDoneTarget=ns||state.ns||"";
+  setRsStep(4);
+  // Plus rien de relançable une fois finished (bouton HYCU de la page DR, champs).
+  $("#drAutoWrap").style.display="none";
+  document.querySelectorAll("#drForm input, #drForm select").forEach(e=>e.disabled=true);
+  rsWizSync();
+  if(!stay) setTimeout(()=>{ if(rsDone && sess===rsSession && $("#mRestore").style.display!=="none") gotoVerify(rsDoneTarget, true); }, slow ? 4000 : 1500);
+}
 function confirmCloneApp(withHycu){
   const needCtx = ctxInfo.require_confirm ? (ctxInfo.context||"") : null;
-  const tgt = state.cloneNsMode==="same" ? "dans le <b>même namespace</b> (avec suffixe)"
+  const tgt = state.cloneNsMode==="same" ? "in the <b>same namespace</b> (with a suffix)"
             : "in namespace <b>"+esc($("#rsCloneTargetNs").value.trim()||"?")+"</b>";
   const lines=[];
   if(withHycu) lines.push("Clone the Volume Groups in HYCU at the chosen points (the original volumes are not modified).");
@@ -15825,24 +16701,25 @@ function confirmCloneApp(withHycu){
   return confirmDanger({title:"Confirm the application clone", requireText:needCtx, lines});
 }
 async function runCloneApp(confirmedCtxCA){
-  const live=!dry();
+  const live=!dry(), sess=rsSession, mine=()=>sess===rsSession;
   rsDone=false;
   const bb=$("#rsGo"); bb.disabled=true; bb.innerHTML='<span class="spin"></span>…';
   $("#rsLog").innerHTML='<div class="hint"><span class="spin"></span> Starting…</div>';
   const caBody={...cloneAppBody(), dry:dry()};
   if(live && ctxInfo.require_confirm) caBody.confirm_context=confirmedCtxCA;
   const r=await runOp("/api/clone_app", caBody,
-    log=>{ $("#rsLog").innerHTML='<div class="hint"><span class="spin"></span> Cloning in progress…</div>'+renderLog(log); });
+    log=>{ if(mine()) $("#rsLog").innerHTML='<div class="hint"><span class="spin"></span> Cloning in progress…</div>'+renderLog(log); });
+  if(!mine()) return;
   bb.disabled=false; updateGoButton(true);
   if(r.error && !(r.log&&r.log.length)){ $("#rsLog").innerHTML=errBox(r.error); return; }
   const lns=renderLog(r.log);
   const hd=r.dry?'<div class="note">Simulation — resources that would be created (the original app stays intact).</div>'
-    :(r.ok?'<div class="note">Clone finished. The original application is intact.</div>':'<div class="err">Some steps failed — see details.</div>');
+    :(r.ok?'<div class="note">Application copy finished. The original application is intact.</div>':'<div class="err">Some steps failed — see details.</div>');
   $("#rsLog").innerHTML=hd+lns+cloneWarnings(r.warnings);
   if(!r.dry && r.ok){
     // Terminé : plus de bouton de lancement, seule la vérification reste (pied de la fenêtre).
-    rsDone=true; rsDoneTarget = state.cloneNsMode==="other" ? $("#rsCloneTargetNs").value.trim() : $("#rsNs").value;
-    setRsStep(4); rsWizSync();
+    rsFinish(state.cloneNsMode==="other" ? $("#rsCloneTargetNs").value.trim() : $("#rsNs").value,
+             false, sess, !!cloneWarnings(r.warnings));
   }
 }
 // Étape 2 -> lancement direct : une seule confirmation, clones HYCU si nécessaire, puis la copie.
@@ -15853,7 +16730,7 @@ async function cloneAppDirect(){
   if(state.cloneNsMode==="other" && !$("#rsCloneTargetNs").value.trim()){ $("#rsErr").innerHTML='<div class="err">Provide the target namespace.</div>'; return; }
   if(dry()){ $("#rsPreview").click(); return; }          // simulation : aperçu, rien n'est créé
   const batch=$("#hyBatchGo");
-  const pending = !!batch && !(items.length && items.every(i=>(i.new_ref||"").trim()));
+  const pending = !rsStatelessClone() && !!batch && !(items.length && items.every(i=>(i.new_ref||"").trim()));
   const res=await confirmCloneApp(pending);
   if(!res) return;
   const confirmedCtx = (typeof res==="string") ? res : "";
@@ -15864,6 +16741,7 @@ async function cloneAppDirect(){
       if(!ok) return;                                      // erreurs affichées volume par volume
     }
     $("#rsRepl").innerHTML=""; $("#rsSteps").innerHTML=""; $("#rsLog").innerHTML="";
+    state.preview={_cloneapp:true};          // « Relancer » depuis cette page = la copie, jamais la restauration destructive
     $("#rsPlan").style.display="block"; rsShowPage("plan");
     await runCloneApp(confirmedCtx);
   } finally { cloneBusy=false; rsWizSync(); }
@@ -15892,6 +16770,7 @@ $("#rsGo").onclick=async()=>{
     if(typeof res==="string") confirmedCtx=res;
   }
   const b=$("#rsGo"); b.disabled=true; b.innerHTML='<span class="spin"></span>Executing…';
+  const sess=rsSession, mine=()=>sess===rsSession;
   const body={...state.preview,dry:dry()};
   if(live && ctxInfo.require_confirm) body.confirm_context=confirmedCtx || $("#rsCtxInput").value.trim();
   setRsStep(4); rsRunning=true;
@@ -15903,8 +16782,9 @@ $("#rsGo").onclick=async()=>{
     const done=log.length, last=log[log.length-1];
     $("#rsProgressBar").style.width=Math.min(96, Math.round(100*done/total))+"%";
     $("#rsProgressTxt").textContent="Step "+done+" · "+((last&&last.label)||"…");
-    $("#rsLog").innerHTML='<div class="hint"><span class="spin"></span> Execution in progress…</div>'+renderLog(log); });
-  rsRunning=false; $("#rsCancel").style.display="none";
+    if(mine()) $("#rsLog").innerHTML='<div class="hint"><span class="spin"></span> Execution in progress…</div>'+renderLog(log); });
+  rsRunning=false; if(!mine()) return;
+  $("#rsCancel").style.display="none";
   $("#rsProgressBar").style.width="100%"; $("#rsProgressTxt").textContent = r.aborted ? "Interrupted" : (r.ok ? "Completed" : "Completed with errors");
   b.disabled=false; updateGoButton(true);
   if(r.error && !(r.log&&r.log.length)){$("#rsLog").innerHTML=errBox(r.error)+renderPreflight(r.preflight);return;}
@@ -15912,7 +16792,7 @@ $("#rsGo").onclick=async()=>{
   let head;
   if(r.dry) head='<div class="note">Simulation finished — here is what would be executed.</div>';
   else if(r.aborted) head='<div class="err"><b>Sequence aborted</b> — the application was left stopped to avoid an inconsistent restart. See details.</div>';
-  else if(r.ok) head='<div class="note">Restore complete.</div>';
+  else if(r.ok) head='<div class="note">Restore to the new volumes finished.</div>';
   else head='<div class="err">Some steps failed — see below.</div>';
   let reprot="";
   if(r.reprotect && r.reprotect.length){
@@ -15924,15 +16804,8 @@ $("#rsGo").onclick=async()=>{
   }
   $("#rsLog").innerHTML = head + renderPreflight(r.preflight) + lines + reprot;
   const rb=$("#rsReprotectBtn"); if(rb) rb.onclick=()=>goReprotect($("#rsNs").value);
-  if(!r.dry && r.ok && !r.aborted){
-    if(reprot){   // ne pas quitter la page tant que la re-protection HYCU n'est pas traitée
-      $("#rsLog").insertAdjacentHTML("beforeend",'<div style="margin-top:8px"><button class="btn" id="rsGoVerify">Verify the application now →</button></div>');
-      $("#rsGoVerify").onclick=()=>gotoVerify($("#rsNs").value,true);
-    } else {
-      $("#rsLog").insertAdjacentHTML("afterbegin",'<div class="note">Opening the verification…</div>');
-      setTimeout(()=>gotoVerify($("#rsNs").value,true),1200);
-    }
-  }
+  // Re-protection HYCU à traiter : pas de bascule automatique (le bouton reste dans le journal).
+  if(!r.dry && r.ok && !r.aborted) rsFinish($("#rsNs").value, !!reprot, sess);
 };
 
 // --------- Vérification ---------
@@ -16191,13 +17064,53 @@ $("#s3ListBtn").onclick=async()=>{
   const r=await get("/api/s3/list");
   if(!r.ok){ $("#s3ListOut").innerHTML=errBox(r.error); return; }
   const o=r.objects||[];
-  $("#s3ListOut").innerHTML = o.length? `<div class="tcard" style="box-shadow:none;border:1px solid var(--rule)"><table class="ht"><thead><tr><th class="cb"><input type="checkbox" id="s3ImpAll"></th><th>Cluster</th><th>Application</th><th>Timestamp</th><th>Taille</th><th>Encrypted</th></tr></thead><tbody>`+
+  $("#s3ListOut").innerHTML = o.length? `<div class="tcard" style="box-shadow:none;border:1px solid var(--rule)"><table class="ht"><thead><tr><th class="cb"><input type="checkbox" id="s3ImpAll"></th><th>Cluster</th><th>Application</th><th>Timestamp</th><th>Size</th><th>Encrypted</th></tr></thead><tbody>`+
     o.map((x,i)=>`<tr><td class="cb"><input type="checkbox" class="s3ImpChk" data-i="${i}"></td><td>${esc(x.cluster)}</td><td style="color:var(--strong)">${esc(x.namespace)}</td><td>${esc(x.timestamp)}</td><td>${esc(fmtBytes(x.size))}</td><td>${x.encrypted?"oui":"—"}</td></tr>`).join("")+
     `</tbody></table></div>` : '<div class="hint">Aucun export de l\'outil dans ce bucket.</div>';
   window.s3Objs=o;
   document.querySelectorAll(".s3ImpChk").forEach(c=>c.onchange=s3ImpSync);
   const all=$("#s3ImpAll"); if(all) all.onchange=()=>{ document.querySelectorAll(".s3ImpChk").forEach(c=>c.checked=all.checked); s3ImpSync(); };
   s3ImpSync();
+};
+// ----- Sauvegarde de l'outil (kit : configuration, politiques, coffre chiffré) -----
+$("#tkUpload").onclick=async()=>{
+  const b=$("#tkUpload"); b.disabled=true;
+  const r=await post("/api/tool_kit/upload",{});
+  b.disabled=false;
+  $("#tkOut").innerHTML = r.ok ? `<div class="note" style="margin-top:8px">Kit exported: <code>${esc(r.key)}</code></div>` : errBox(r.error);
+};
+$("#tkDownload").onclick=async()=>{
+  try{
+    const resp=await fetch("/api/tool_kit/download",{method:"POST",headers:{"Content-Type":"application/json","X-CSRF-Token":CSRF,"X-HYCU-Cluster":ACTIVE_CID},body:"{}"});
+    if(!resp.ok) throw new Error("HTTP "+resp.status);
+    const blob=await resp.blob(), a=document.createElement("a");
+    a.href=URL.createObjectURL(blob); a.download="hycu-tool-"+new Date().toISOString().slice(0,10)+".zip";
+    document.body.appendChild(a); a.click(); setTimeout(()=>{ URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+  }catch(e){ $("#tkOut").innerHTML=errBox("Download failed: "+(e&&e.message||e)); }
+};
+$("#tkList").onclick=async()=>{
+  $("#tkOut").innerHTML='<div class="hint" style="margin-top:8px"><span class="spin"></span></div>';
+  const r=await get("/api/tool_kit/list");
+  if(!r.ok){ $("#tkOut").innerHTML=errBox(r.error); return; }
+  const k=r.kits||[];
+  if(!k.length){ $("#tkOut").innerHTML='<div class="hint" style="margin-top:8px">No tool kit in this bucket.</div>'; return; }
+  $("#tkOut").innerHTML=`<div class="tcard" style="box-shadow:none;border:1px solid var(--rule);margin-top:8px"><table class="ht"><thead><tr><th class="cb"></th><th>Kit</th><th>Size</th></tr></thead><tbody>`+
+    k.map((x,i)=>`<tr><td class="cb"><input type="radio" name="tkPick" value="${esc(x.key)}" data-enc="${x.encrypted?1:0}" ${i===0?"checked":""}></td><td>${esc(x.name)}</td><td>${esc(fmtBytes(x.size))}</td></tr>`).join("")+
+    `</tbody></table></div>
+    <div class="row" style="margin-top:8px"><div><label class="fld">Encryption passphrase (.enc kits only)</label><input type="password" id="tkPass" autocomplete="off"></div>
+    <div style="flex:none;align-self:flex-end"><button class="btn danger" id="tkRestore" type="button">Restore the tool</button></div></div><div id="tkRes"></div>`;
+  $("#tkRestore").onclick=async()=>{
+    const pick=document.querySelector('input[name="tkPick"]:checked'); if(!pick) return;
+    if(!(await confirmDanger({title:"Restore the tool", lines:[
+      "The current configuration (policies, filters, sources) and the vault will be replaced by those of kit <b>"+esc(pick.value.split("/").pop())+"</b>.",
+      "A copy of the current state is kept in <code>hycu-backups/_tool_restore_backup/</code>."]}))) return;
+    const b=$("#tkRestore"); b.disabled=true;
+    const res=await post("/api/tool_kit/restore",{key:pick.value, passphrase:$("#tkPass").value});
+    $("#tkPass").value=""; b.disabled=false;
+    if(!res.ok){ $("#tkRes").innerHTML=errBox(res.error); return; }
+    $("#tkRes").innerHTML=`<div class="note" style="margin-top:8px">Tool restored${res.vault?" — then unlock the vault with your passphrase":""}. Reloading…</div>`;
+    setTimeout(()=>location.reload(), 1800);
+  };
 };
 $("#s3ImportBtn").onclick=async()=>{
   const items=[...document.querySelectorAll(".s3ImpChk:checked")].map(c=>({key:(window.s3Objs||[])[+c.dataset.i].key}));
@@ -16354,7 +17267,7 @@ refreshDry();
 // ============================================================================
 var rsAutoCheck=false;            // assistant ouvert : volumes présélectionnés (cf. renderRsPvcs)
 var pageTimer=null;
-const MODALS=["mBackup","mPolicy","mRestore","mSources","mBulk"];
+const MODALS=["mBackup","mPolicy","mRestore","mSources","mBulk","mPurge"];
 const FOCUSABLE='a[href],button:not([disabled]),input:not([disabled]):not([type=hidden]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])';
 let modalReturnFocus={};
 function openModal(id){
@@ -16516,13 +17429,17 @@ async function loadApps(fresh){
   }
   renderApps(); return r;
 }
-function appPolicyLabel(){
-  return appsPolicy.enabled ? ("Automatic configuration · "+Math.round(appsPolicy.interval_hours||24)+" h") : "None";
+function appPolicyLabel(a){
+  const p=(a && a.policy) || null;
+  if(p && p.name) return p.name+" · "+(p.enabled ? (+p.interval_hours)+" h" : "paused");
+  const d = p || appsPolicy;
+  return d.enabled ? ("Automatic configuration · "+Math.round(d.interval_hours||24)+" h") : "None";
 }
 function appsVisible(){
   const q=($("#appsSearch").value||"").trim().toLowerCase();
-  return apps.filter(a=>!q || a.name.toLowerCase().includes(q) || appNs(a).toLowerCase().includes(q)
-                           || (a.cluster||"").toLowerCase().includes(q) || (a.workspace||"").toLowerCase().includes(q));
+  const hideDel=$("#appsHideDel").checked;
+  return apps.filter(a=>!(hideDel && a.missing) && (!q || a.name.toLowerCase().includes(q) || appNs(a).toLowerCase().includes(q)
+                           || (a.cluster||"").toLowerCase().includes(q) || (a.workspace||"").toLowerCase().includes(q)));
 }
 // Pagination : au-delà de APPS_PAGE_SIZE lignes (grands clusters), le tableau est
 // découpé en pages ; la recherche s'applique à toutes les lignes, la sélection persiste.
@@ -16564,7 +17481,7 @@ function renderApps(){
       const k=appKey(a), sel=appsSel.has(k);
       const comp = a.missing ? stIc("na","Namespace deleted from the cluster")
                  : a.compliant ? stIc("ok","Recent configuration backup")
-                 : (a.protected ? stIc("ko","Last backup older than "+appsFresh+" h")
+                 : (a.protected ? stIc("ko","Last backup older than its policy interval")
                                 : stIc("na","Never backed up"));
       // Protection = sauvegardes du NAMESPACE ; un volume de l'application absent de la
       // dernière sauvegarde (PVC créé depuis) rend sa protection incomplète.
@@ -16579,7 +17496,7 @@ function renderApps(){
         <td class="cb"><input type="checkbox" tabindex="-1" ${sel?"checked":""}></td>
         <td style="color:var(--strong);font-weight:500">${nameCell}</td><td>${esc(appNs(a))}</td>
         <td class="mc">${esc(a.workspace||"—")}</td><td class="mc">${esc(a.cluster||"")}</td>
-        <td>${appTypeCell(a)}</td><td>${esc(appPolicyLabel())}</td>
+        <td>${appTypeCell(a)}</td><td>${esc(appPolicyLabel(a))}</td>
         <td class="ctr">${comp}</td><td class="ctr">${prot}</td><td>${last}</td>
         <td class="ctr">${a.backups||0}</td></tr>`;
     }).join("");
@@ -16610,6 +17527,8 @@ function updateAppActs(){
   const objs=selAppObjs(), n=objs.length, anyMissing=objs.some(a=>a.missing), anyEmpty=objs.some(a=>a.type==="empty");
   $("#actBackup").disabled = !n || anyMissing || anyEmpty;
   $("#actVerify").disabled = n!==1 || anyMissing;
+  // Purger : les versions d'UN namespace (une ou plusieurs applications de ce namespace).
+  $("#actPurge").disabled = !(n>=1 && new Set(objs.map(a=>(a.cluster_id||ACTIVE_CID)+"|"+appNs(a))).size===1 && objs.some(a=>a.backups));
   // Set Policy : une ou PLUSIEURS applications (du même cluster) en une fois.
   const oneCluster = n>=1 && new Set(objs.map(a=>a.cluster_id||ACTIVE_CID)).size===1;
   $("#actPolicy").disabled = !oneCluster || anyMissing || anyEmpty;
@@ -16626,6 +17545,8 @@ function updateAppActs(){
 // bascule d'abord le cluster actif, pour que confirmations et garde-fous le désignent.
 async function ensureCluster(a){ if(a && a.cluster_id && a.cluster_id!==ACTIVE_CID) await setActiveCluster(a.cluster_id); }
 $("#appsSearch").oninput=()=>{ appsPage=0; renderApps(); };
+$("#appsHideDel").checked=!!prefs().hideDeleted;
+$("#appsHideDel").onchange=()=>{ savePref("hideDeleted", $("#appsHideDel").checked); appsPage=0; renderApps(); };
 // « Tout sélectionner » porte sur la PAGE affichée (jamais 1 000 lignes d'un coup à l'insu de l'opérateur).
 $("#appsAll").onchange=()=>{ const on=$("#appsAll").checked;
   appsVisible().slice(appsPage*APPS_PAGE_SIZE, (appsPage+1)*APPS_PAGE_SIZE).forEach(a=>on ? appsSel.add(appKey(a)) : appsSel.delete(appKey(a))); renderApps(); };
@@ -16641,6 +17562,40 @@ $("#actRestore").onclick=async()=>{ const objs=selAppObjs(), a=objs[0]; await en
   // Plusieurs applications du même namespace sélectionnées -> tout le namespace.
   openRestoreModal(appNs(a), objs.length>1 ? null : a); };
 $("#actPolicy").onclick=async()=>{ const objs=selNsObjs(); await ensureCluster(objs[0]); openPolicyModal(objs.length>1 ? objs.map(a=>a.name) : appNs(selAppObjs()[0])); };
+// ----- Purge des versions de configuration d'un namespace -----
+let purgeNs="", purgeRows=[];
+const KIND_LBL={auto:"Automatic", manual:"Manual", pre_restore:"Before restore"};
+function purgeSync(){ $("#purgeGo").disabled = !document.querySelectorAll(".purgeChk:checked").length; }
+async function openPurgeModal(ns){
+  purgeNs=ns; purgeRows=[];
+  $("#mPurgeTitle").innerHTML=esc("Saved versions")+'<span class="sep">›</span>'+esc(ns);
+  $("#purgeMsg").innerHTML=""; $("#purgeList").innerHTML='<div class="hint"><span class="spin"></span></div>';
+  openModal("mPurge");
+  const r=await get("/api/backups?ns="+encodeURIComponent(ns));
+  purgeRows=r.backups||[];
+  if(!purgeRows.length){ $("#purgeList").innerHTML='<div class="hint">No saved version.</div>'; purgeSync(); return; }
+  $("#purgeList").innerHTML=`<div class="tcard" style="box-shadow:none;border:1px solid var(--rule)"><table class="ht"><thead><tr><th class="cb"></th><th>Date</th><th>Type</th><th class="ctr">Volumes</th></tr></thead><tbody>`+
+    purgeRows.map((b,i)=>{ const ix=b.index||{};
+      return `<tr><td class="cb"><input type="checkbox" class="purgeChk" data-i="${i}"></td><td>${esc(ix.created ? new Date(ix.created).toLocaleString() : b.timestamp)}${i===0?' <span class="hint">(most recent)</span>':''}</td>
+        <td>${esc(KIND_LBL[ix.kind]||"—")}${ix.partial?' <span class="hint">partial</span>':''}</td><td class="ctr">${(ix.volumes||[]).length}</td></tr>`; }).join("")+`</tbody></table></div>`;
+  document.querySelectorAll(".purgeChk").forEach(c=>c.onchange=purgeSync);
+  purgeSync();
+}
+$("#purgeOld").onclick=()=>{ document.querySelectorAll(".purgeChk").forEach(c=>c.checked = +c.dataset.i>0); purgeSync(); };
+$("#purgeGo").onclick=async()=>{
+  const sel=[...document.querySelectorAll(".purgeChk:checked")].map(c=>purgeRows[+c.dataset.i]);
+  if(!sel.length) return;
+  const all = sel.length===purgeRows.length;
+  if(!(await confirmDanger({title:"Delete versions", lines:[
+     "<b>"+sel.length+"</b> configuration version(s) of <b>"+esc(purgeNs)+"</b> will be permanently deleted.",
+     all ? "<b>All</b> versions are selected: this application can no longer be restored from the tool." : "The volume data (HYCU) is not touched."]}))) return;
+  const b=$("#purgeGo"); b.disabled=true;
+  const r=await post("/api/backups/delete",{ns:purgeNs, paths:sel.map(x=>x.path)});
+  $("#purgeMsg").innerHTML = r.ok ? `<div class="note" style="margin-top:8px">${esc(r.removed+" version(s) deleted.")}</div>` : errBox(r.error);
+  await openPurgeModal(purgeNs);
+  if(r.removed) loadApps(true);
+};
+$("#actPurge").onclick=async()=>{ const a=selAppObjs()[0]; await ensureCluster(a); openPurgeModal(appNs(a)); };
 $("#actVerify").onclick=async()=>{ const a=selAppObjs()[0]; await ensureCluster(a); gotoVerify(appNs(a), false); };
 
 // ============================ Modale Sauvegarde ============================
@@ -17059,18 +18014,46 @@ $("#nkpImport").onclick=async()=>{
 };
 
 // ============================ Politiques ============================
+let polAll=[], polEditIdx=-1, polMembers={};
+function polTarget(p){
+  const parts=[];
+  if((p.namespaces||[]).length) parts.push(p.namespaces.join(", "));
+  if(p.label_selector) parts.push("label "+p.label_selector);
+  return parts.join(" · ");
+}
+function polLast(x){ return x.last_run ? esc(fmtAgo(x.last_run))+" "+stIc(x.last_ok?"ok":"ko", x.last_summary||"") : "—"; }
+function polMemberHint(name){
+  const m=polMembers[name];
+  return m ? '<div class="hint" style="margin:2px 0 0">'+(m.length ? esc(m.length+" namespace(s): "+m.slice(0,8).join(", ")+(m.length>8?"…":"")) : "no namespace currently")+'</div>' : "";
+}
 async function loadPolicies(){
   await loadAutoBackup();
   const s=await get("/api/auto_backup")||{};
   const on=!!s.enabled;
-  $("#polBody").innerHTML=`<tr class="clk" id="polRow">
-    <td style="color:var(--strong);font-weight:500">Kubernetes configuration</td>
-    <td>PV/PVC manifests and resources of the filtered namespaces</td>
+  polAll=s.policies||[];
+  const mem=await get("/api/policy_members"); polMembers=(mem&&mem.ok)?(mem.members||{}):{};
+  let h=`<tr class="clk" data-i="-1">
+    <td style="color:var(--strong);font-weight:500">Default</td>
+    <td>Namespaces without another policy${polMemberHint("")}</td>
     <td>${on ? "Every "+Math.round(s.interval_hours||24)+" h" : "—"}</td>
-    <td>${abRetLabel(s)}</td>
-    <td><code>${esc(s.dest||"hycu-backups/")}</code></td>
+    <td>${abRetLabel(s)}</td><td>—</td>
+    <td>${s.last_run ? esc(fmtAgo(s.last_run))+" "+stIc(s.last_ok?"ok":"ko", s.last_summary||"") : "—"}</td>
     <td class="ctr">${on ? stIc("ok","Enabled") : stIc("na","Disabled")}</td></tr>`;
-  $("#polRow").onclick=()=>$("#abEnabled").scrollIntoView({behavior:"smooth", block:"center"});
+  h+=polAll.map((p,i)=>`<tr class="clk" data-i="${i}">
+    <td style="color:var(--strong);font-weight:500">${esc(p.name)}</td>
+    <td>${esc(polTarget(p))}${polMemberHint(p.name)}</td>
+    <td>${"Every "+esc(String(+p.interval_hours))+" h"}</td>
+    <td>${p.keep===0 ? "unlimited" : esc(p.keep+" versions")}</td>
+    <td>${esc(p.hycu_policy_name||"—")}</td>
+    <td>${polLast(p)}</td>
+    <td class="ctr">${p.enabled ? stIc("ok","Enabled") : stIc("na","Paused")}</td></tr>`).join("");
+  $("#polBody").innerHTML=h;
+  document.querySelectorAll("#polBody tr.clk").forEach(tr=>tr.onclick=()=>{
+    const i=+tr.dataset.i;
+    if(i<0){ $("#polEdit").style.display="none"; $("#abEnabled").scrollIntoView({behavior:"smooth", block:"center"}); }
+    else polOpen(i);
+  });
+  if(mem && mem.selector_error) $("#polBody").insertAdjacentHTML("beforeend", `<tr><td colspan="7">${errBox(mem.selector_error)}</td></tr>`);
   if(conn.hycu && conn.hycu.connected){
     $("#polHycu").innerHTML='<div class="hint"><span class="spin"></span></div>';
     const p=await get("/api/hycu/policies");
@@ -17079,9 +18062,60 @@ async function loadPolicies(){
         p.policies.map(x=>`<tr><td>${esc(x.name||"—")}</td><td><code>${esc(x.uuid||"")}</code></td></tr>`).join("")+`</tbody></table></div>`
       : '<div class="hint">No HYCU policy.</div>');
   } else {
-    $("#polHycu").innerHTML='<div class="warnbox">Register the HYCU source (⚙ at the top right) to display its policies.</div>';
+    $("#polHycu").innerHTML='<div class="hint">Register the HYCU source (⚙ at the top right) to display its policies.</div>';
   }
 }
+async function polHycuOptions(sel){
+  const box=$("#peHycu");
+  box.innerHTML='<option value="">(none)</option>';
+  if(!(conn.hycu && conn.hycu.connected)){ box.innerHTML='<option value="">(connectez HYCU pour choisir)</option>'; box.disabled=true; return; }
+  box.disabled=false;
+  const r=await get("/api/hycu/policies");
+  (r.ok ? (r.policies||[]) : []).forEach(x=>box.insertAdjacentHTML("beforeend", `<option value="${esc(x.uuid)}">${esc(x.name||x.uuid)}</option>`));
+  box.value=sel||"";
+}
+function polOpen(i){
+  polEditIdx=i;
+  const p = i>=0 ? polAll[i] : {name:"", namespaces:[], label_selector:"", interval_hours:24, keep:15, enabled:true, hycu_policy:""};
+  $("#polEditTitle").textContent = i>=0 ? "Policy « "+p.name+" »" : "Nouvelle politique";
+  $("#peName").value=p.name; $("#peNs").value=(p.namespaces||[]).join(", "); $("#peSel").value=p.label_selector||"";
+  $("#peInterval").value=p.interval_hours; $("#peKeep").value=p.keep; $("#peEnabled").checked=p.enabled!==false;
+  $("#peDelete").style.display = i>=0 ? "" : "none"; $("#peMsg").innerHTML="";
+  $("#polEdit").style.display="block";
+  polHycuOptions(p.hycu_policy);
+  $("#polEdit").scrollIntoView({behavior:"smooth", block:"start"});
+}
+function polClean(p){ return {name:p.name, namespaces:p.namespaces||[], label_selector:p.label_selector||"",
+  interval_hours:+p.interval_hours, keep:+p.keep, enabled:p.enabled!==false,
+  hycu_policy:p.hycu_policy||"", hycu_policy_name:p.hycu_policy_name||""}; }
+async function polSaveList(list){
+  const r=await post("/api/config",{config:{backup_policies:list.map(polClean)}});
+  if(!r.ok){ $("#peMsg").innerHTML=errBox(r.error||"Could not save."); return false; }
+  $("#polEdit").style.display="none";
+  await loadPolicies();
+  return true;
+}
+$("#polNew").onclick=()=>polOpen(-1);
+$("#peCancel").onclick=()=>{ $("#polEdit").style.display="none"; };
+$("#peSave").onclick=async()=>{
+  const hy=$("#peHycu");
+  const p={name:$("#peName").value.trim(), namespaces:csv($("#peNs").value).map(x=>x.toLowerCase()),
+    label_selector:$("#peSel").value.trim(),
+    interval_hours:Math.max(0.25, parseFloat(String($("#peInterval").value).replace(",","."))||24),
+    keep:Math.max(0, parseInt($("#peKeep").value)||0), enabled:$("#peEnabled").checked,
+    hycu_policy:hy.value||"", hycu_policy_name:hy.value ? (hy.options[hy.selectedIndex].textContent||"") : ""};
+  if(!p.name){ $("#peMsg").innerHTML=errBox("Give the policy a name."); return; }
+  if(!p.namespaces.length && !p.label_selector){ $("#peMsg").innerHTML=errBox("Enter namespaces or a label selector."); return; }
+  const list=polAll.map(polClean);
+  if(polEditIdx>=0) list[polEditIdx]=p; else list.push(p);
+  await polSaveList(list);
+};
+$("#peDelete").onclick=async()=>{
+  if(polEditIdx<0) return;
+  const p=polAll[polEditIdx];
+  if(!(await confirmDanger({title:"Delete the policy", lines:["Policy <b>"+esc(p.name)+"</b> will be deleted. Its namespaces will follow the default policy; existing backups are kept."]}))) return;
+  await polSaveList(polAll.filter((_,i)=>i!==polEditIdx).map(polClean));
+};
 $("#abSave").addEventListener("click", ()=>setTimeout(()=>{ if(curPage==="policies") loadPolicies(); }, 900));
 
 // ============================ Tâches ============================
@@ -17175,6 +18209,7 @@ async function loadDashboard(){
       <li><span class="k">Retention</span><span class="v">${esc(abRetLabel(ab))}</span></li>
       <li><span class="k">Last run</span><span class="v">${ab.last_run ? esc(fmtAgo(ab.last_run))+" "+stIc(ab.last_ok?"ok":"ko") : "—"}</span></li>
       <li><span class="k">Next run</span><span class="v">${ab.next_due ? esc(new Date(ab.next_due*1000).toLocaleString()) : "—"}</span></li>
+      ${(ab.policies||[]).length ? `<li><span class="k">Other policies</span><span class="v">${esc((ab.policies||[]).map(p=>p.name).join(", "))}</span></li>` : ""}
     </ul>`;
 
   const keys=["hycu","nutanix","prismcentral"];
@@ -17303,7 +18338,7 @@ function rsAppLabel(){
 document.addEventListener("click", e=>{ const a=e.target.closest && e.target.closest(".rsWholeNs, #rsWholeNs");
   if(a){ e.preventDefault(); rsTargetWholeNs(); } });
 function openRestoreModal(ns, app){
-  rsDone=false; cloneBusy=false;
+  rsNewSession();
   ns = ns || state.ns || $("#rsNs").value; if(!ns) return;
   state.ns=ns; applyGlobalNs();
   // Application ciblée (page Applications) : {name, type, pvcs, whole_ns}. Sans
@@ -17319,8 +18354,12 @@ function openRestoreModal(ns, app){
   // Application STATELESS : les parcours de stockage n'ont pas de sens -> seules les cartes
   // « copie » (clone des workloads + dépendances) et « objets de configuration » restent,
   // la seconde présélectionnée (restauration = ré-appliquer ses objets).
-  const sl = !!(state.app && state.app.type==="stateless");
-  document.querySelectorAll('#rsPgType .opt').forEach(o=>{ o.style.display = (sl && (o.dataset.kind==="inplace"||o.dataset.kind==="reattach"||o.dataset.kind==="dr")) ? "none" : ""; });
+  // Namespace entier sans aucun volume (que des applications stateless) : même règle.
+  const nsApps = apps.filter(a=>appNs(a)===ns && (a.cluster_id||ACTIVE_CID)===ACTIVE_CID);
+  const nsNoVol = !state.app && nsApps.length>0 && nsApps.every(a=>!(a.pvcs||[]).length && !a.volumes);
+  const sl = !!(state.app && state.app.type==="stateless") || nsNoVol;
+  // La DR reste proposée : une sauvegarde stateless se restaure aussi sur un autre cluster.
+  document.querySelectorAll('#rsPgType .opt').forEach(o=>{ o.style.display = (sl && (o.dataset.kind==="inplace"||o.dataset.kind==="reattach")) ? "none" : ""; });
   if(sl){ rsWizKind="objects"; rsSyncOpts(); }
   rsShowPage("type");
 }
@@ -17342,7 +18381,7 @@ function rsTargetWholeNs(){
   state.app=null; rsRenderAppNote();
   document.querySelectorAll('#rsPgType .opt').forEach(o=>o.style.display="");   // tous les parcours de nouveau
   $("#rsWizApp").innerHTML=rsAppLabel(); const oa=$("#objApp"); if(oa) oa.innerHTML=rsAppLabel();
-  if(rsWizPage==="form"){ rsAutoCheck=true; document.querySelectorAll(".rsChk").forEach(c=>c.checked=true); rebuildVolCfgs(); }
+  if(rsWizPage==="form"){ rsToForm().then(()=>{ rsAutoCheck=true; document.querySelectorAll(".rsChk").forEach(c=>c.checked=true); rebuildVolCfgs(); }); }
   else if(rsWizPage==="objects"){ objLoadList(); }
   rsWizSync();
 }
@@ -17355,8 +18394,12 @@ async function rsToForm(){
   rsShowPage("form");
   rsAutoCheck=true;
   $("#rsPlan").style.display="none";
+  $("#rsAdvWrap").style.display="";
   if(rsStatelessClone()){
     state.ns=$("#rsNs").value||state.ns; state.backup_path=null; state.selected={};
+    // Copie depuis le cluster vivant : ni volumes, ni panneau HYCU, ni choix de sauvegarde.
+    hyPanelSeq++; $("#rsVolCfgs").innerHTML=""; const ha=$("#rsHyActions"); if(ha) ha.innerHTML="";
+    $("#rsBackupSelWrap").style.display="none"; $("#rsAdvWrap").style.display="none";
     $("#rsPvcs").innerHTML=`<div class="note">Application <b>${esc(state.app.name)}</b>: <b>stateless</b>, no volume to restore. The copy recreates its workloads (${esc((state.app.workloads||[]).map(w=>w.kind+"/"+w.name).join(", ")||"—")}) and their dependencies from the cluster.</div>`;
     $("#rsConfig").style.display="none"; setRsStep(2); rsWizSync(); return;
   }
@@ -17368,7 +18411,9 @@ async function rsToForm(){
 // à l'étape (clone HYCU groupé, restauration sur place, construction du plan, lancement).
 function rsWizSync(){
   const go=$("#rsWizGo"); let lbl="Next", dis=false, act=null, src=null;
-  if(rsWizPage==="type"){ dis=!rsWizKind; act=rsNextFromType; }
+  $("#rsWizBack").style.display = (rsDone || rsWizPage==="type" || rsWizKind==="recover") ? "none" : "";
+  if(rsDone){ lbl="Verify the application →"; act=()=>gotoVerify(rsDoneTarget, true); }
+  else if(rsWizPage==="type"){ dis=!rsWizKind; act=rsNextFromType; }
   else if(rsWizPage==="dr"){
     const n=document.querySelectorAll(".drRef").length;
     const filled=[...document.querySelectorAll(".drRef")].filter(t=>t.value.trim()).length;
@@ -17377,14 +18422,14 @@ function rsWizSync(){
     // sauvegarde STATELESS (aucun volume, workloads dans l'instantané) se restaure sans volume.
     const needRefs = !drRecoverReuse();
     const b=drSel(), noVol = !n && !!(b && b.stateless);
-    lbl=dry()? "Restore (simulation)" : "Restore (real)";
+    lbl=dry()? "Restore (simulation)" : "Restore";
     dis=!drAllowed || (!n && !noVol) || (needRefs && filled<n) || drBusy || !$("#drTargetNs").value.trim();
     act=drRun;
   }
   else if(rsWizPage==="objects"){
     const n=document.querySelectorAll(".objChk:checked").length;
     if(objPhase==="pick"){ lbl="Preview differences"; dis=!n || objBusy; act=objToDiff; }
-    else { lbl=dry()? "Apply (simulation)" : "Apply (real)"; dis=!n || objBusy; act=objApply; }
+    else { lbl=dry()? "Apply (simulation)" : "Apply"; dis=!n || objBusy; act=objApply; }
   }
   else if(rsWizPage==="target"){ dis=!rsTgtMode; act=rsTargetToForm; }
   else if(rsWizPage==="form"){
@@ -17399,16 +18444,15 @@ function rsWizSync(){
       dis = cloneBusy || (!rsStatelessClone() && (!n || (pending && batch.disabled)));
       act = cloneAppDirect;
     }
-    else if(state.mode==="inplace" && hyOn){ src=$("#rsInplaceRun"); lbl="Restore"; }
+    else if(state.mode==="inplace" && hyOn){ src=$("#rsInplaceRun"); lbl="Restore in place"; }
     else {
       const items=collectItems(), filled=items.length>0 && items.every(i=>(i.new_ref||"").trim());
       const batch=$("#hyBatchGo");
-      if(batch && !filled){ src=batch; lbl="Restore"; }
+      if(batch && !filled){ src=batch; lbl="Clone the VGs in HYCU →"; }
       else { dis=!n; act=()=>$("#rsPreview").click(); }
     }
     if(src){ dis=!n || src.disabled; act=()=>src.click(); }
-  } else if(rsDone){ lbl="Verify the application →"; dis=false; act=()=>gotoVerify(rsDoneTarget, true); }
-  else { src=$("#rsGo"); lbl=(src.textContent||"").trim() || "Launch"; dis=src.disabled || cloneBusy; act=()=>src.click(); }
+  } else { src=$("#rsGo"); lbl=(src.textContent||"").trim() || "Launch"; dis=src.disabled || cloneBusy; act=()=>src.click(); }
   const busy = src && src.querySelector(".spin");
   const html = busy ? '<span class="spin"></span>'+esc((src.textContent||"").trim()) : esc(lbl);
   if(html!==rsWizHtml){ go.innerHTML=html; rsWizHtml=html; }
@@ -17434,7 +18478,7 @@ var drAllowed=false, drBusy=false, drBackups=[], drMode="dr", drRecoverNs=null;
 // mêmes mécanismes que la page DR (sources depuis la sauvegarde seule), mais SANS
 // la dérogation allow_dr_restore (le serveur vérifie que la sauvegarde est d'ici).
 function openRecoverModal(ns){
-  rsDone=false; cloneBusy=false;
+  rsNewSession();
   state.ns=ns; state.app=null;         // la récupération recrée tout le namespace
   document.querySelectorAll('#rsPgType .opt').forEach(o=>{ o.style.display=""; });   // (masquées pour une app stateless)
   const note=$("#rsAppNote"); if(note){ note.style.display="none"; note.innerHTML=""; }
@@ -17503,20 +18547,23 @@ function drRenderVols(){
      <input type="text" class="drRef" data-pvc="${esc(v)}" spellcheck="false" autocomplete="off"
        value="${drMode==="recover"&&refs[v]?esc(refs[v]):""}"
        placeholder="${esc(drMode==="recover"?"Volume Group UUID (8-4-4-4-12)":"UUID of the VG restored/cloned on the target site (8-4-4-4-12)")}"></div>`).join("")
-    : (b && b.stateless ? '<div class="note"><b>Stateless</b> backup (no volume): the workloads'+((b.apps||[]).length?' ('+esc((b.apps||[]).join(", "))+')':'')+' et leurs dépendances seront recréés depuis l\'instantané.</div>'
+    : (b && b.stateless ? '<div class="note"><b>Stateless</b> backup (no volume): the workloads'+((b.apps||[]).length?' ('+esc((b.apps||[]).join(", "))+')':'')+' and their dependencies will be recreated from the snapshot.</div>'
                         : '<div class="hint">No volume in this backup.</div>');
   document.querySelectorAll(".drRef").forEach(t=>t.oninput=rsWizSync);
   drSyncReuse();
 }
 // Bascule d'affichage de la grille selon « réutiliser les volumes d'origine ».
 function drSyncReuse(){
-  const reuse=drRecoverReuse();
-  $("#drVols").style.display = reuse? "none":"block";
-  $("#drVolsLabel").style.display = (drMode==="recover")? (reuse?"none":"block") : "block";
+  const reuse=drRecoverReuse(), bsel=drSel(), stateless=!!(bsel && bsel.stateless);
+  // Sauvegarde STATELESS : aucun champ de volume (StorageClass, réutilisation, UUID, HYCU).
+  $("#drScRow").style.display = stateless ? "none" : "";
+  $("#drReuseWrap").style.display = (drMode==="recover" && !stateless) ? "block" : "none";
+  $("#drVols").style.display = (reuse && !stateless)? "none":"block";
+  $("#drVolsLabel").style.display = stateless ? "none" : ((drMode==="recover")? (reuse?"none":"block") : "block");
   if(drMode==="recover") $("#drVolsLabel").textContent="New volumes — paste the ID (UUID) provided by HYCU";
   else $("#drVolsLabel").textContent="Volumes — paste the UUID of the VG restored/cloned on the target site";
   // Bouton « auto HYCU » : seulement quand la grille est visible ET HYCU + Prism connectés.
-  const autoOk = !reuse && (conn.hycu&&conn.hycu.connected)
+  const autoOk = !reuse && !stateless && !rsDone && (conn.hycu&&conn.hycu.connected)
                  && ((conn.prismcentral&&conn.prismcentral.connected)||(conn.nutanix&&conn.nutanix.connected));
   $("#drAutoWrap").style.display = autoOk? "block":"none";
   rsWizSync();
@@ -17534,7 +18581,7 @@ $("#drAuto").onclick=async()=>{
   if(!volumes.length || volumes.some(v=>!v.source_vg_uuid)){
     $("#drErr").innerHTML=errBox("Source VG UUID missing from the backup: automation not possible, enter the UUIDs manually."); return; }
   if(!dry() && !(await confirmDanger({title:"Confirm the HYCU clones", lines:[
-      "Trigger in HYCU the <b>clone</b> of <b>"+volumes.length+"</b> Volume Group(s) (nouveaux VG créés) ?",
+      "Clone in HYCU <b>"+volumes.length+"</b> Volume Group(s) (new VGs are created)?",
       "The new IDs will be filled into the grid automatically."]}))) return;
   const btn=$("#drAuto"); btn.disabled=true; drBusy=true; rsWizSync();
   $("#drErr").innerHTML=""; $("#drLog").innerHTML='<div class="hint"><span class="spin"></span>HYCU: creating the volumes…</div>';
@@ -17562,24 +18609,29 @@ async function drRun(){
       drMode==="recover"
         ? "The application will be RECREATED on this cluster from the backup (namespace, PV/PVC, workloads, non-redacted dependencies)."
         : "The cross-cluster guard is LIFTED for this operation: the application will be recreated on this cluster from the backup (PV/PVC, workloads, non-redacted dependencies).",
-      ...((drMode==="recover" && drRecoverReuse() && conn.hycu && conn.hycu.connected)
-        ? ["If an original volume has disappeared from the cluster, HYCU will RESTORE it automatically (real HYCU operation) before the recreation."] : [])]});
+      ...((drMode==="recover" && !b.stateless && drRecoverReuse() && conn.hycu && conn.hycu.connected)
+        ? ["If an original volume has disappeared from the cluster, HYCU will restore it automatically before recreating."] : [])]});
     if(!res) return;
     if(typeof res==="string") confirmedCtx=res;
   }
   drBusy=true; rsWizSync();
-  $("#drLog").innerHTML='<div class="hint"><span class="spin"></span>DR restore…</div>';
+  $("#drLog").innerHTML='<div class="hint"><span class="spin"></span>'+(drMode==="recover"?"Restoring the application…":"DR restore…")+'</div>';
   const body={namespace:b.namespace, target_namespace:$("#drTargetNs").value.trim(),
               backup_path:b.path, items, dry:dry(),
               dr_storageclass:$("#drSc").value.trim(), clone_refs:$("#drRefs").checked};
   if(drMode==="recover") body.from_backup_only=true; else body.dr_restore=true;
   if(live && ctxInfo.require_confirm) body.confirm_context=confirmedCtx;
-  const r=await runOp("/api/clone_app", body, log=>{ $("#drLog").innerHTML=renderLog(log); });
+  const sess=rsSession;
+  const r=await runOp("/api/clone_app", body, log=>{ if(sess===rsSession) $("#drLog").innerHTML=renderLog(log); });
+  if(sess!==rsSession) return;
   drBusy=false; rsWizSync();
-  const head = r.ok? (r.dry? '<div class="warnbox">Simulation — séquence qui serait exécutée.</div>'
-                           : '<div class="note">Restauration DR finishede. Vérifiez l\'application, puis re-protégez ses Volume Groups dans HYCU.</div>')
-                   : errBox(r.error);
-  $("#drLog").innerHTML=head+((r.warnings||[]).length?`<div class="warnbox" style="margin-top:8px">${r.warnings.map(esc).join("<br>")}</div>`:"")+renderLog(r.log);
+  const reprot = b.stateless ? "" : " Remember to re-protect its Volume Groups in HYCU.";
+  const done = (drMode==="recover" ? "Application restore finished." : "Restauration DR finishede.") + reprot;
+  const head = r.ok? (r.dry? '<div class="note">Simulation — séquence qui serait exécutée.</div>'
+                           : '<div class="note">'+done+'</div>')
+                   : errBox(r.error || "Some steps failed — see details.");
+  $("#drLog").innerHTML=head+cloneWarnings(r.warnings)+renderLog(r.log);
+  if(r.ok && !r.dry) rsFinish(body.target_namespace || b.namespace, false, sess, true);
 }
 
 // ----- Restauration guidée des OBJETS de configuration (resources.json) -----
@@ -17603,10 +18655,14 @@ async function objOpen(){
 }
 $("#objBackupSel").onchange=()=>objLoadList();
 async function objLoadList(){
-  objBusy=true; rsWizSync();
+  objBusy=true;
+  // Nouvelle liste = retour à la sélection : jamais appliquer des objets d'une autre
+  // sauvegarde que celle dont les différences sont affichées.
+  objPhase="pick"; $("#objDiffWrap").style.display="none"; $("#objPick").style.display="block"; setRsStep(2);
+  rsWizSync();
   $("#objErr").innerHTML=""; $("#objLog").innerHTML="";
   if(!$("#objBackupSel").value){
-    $("#objBody").innerHTML='<tr><td colspan="4" class="tempty">Aucune sauvegarde pour ce namespace — lancez d\'abord une sauvegarde (Applications → Back up).</td></tr>';
+    $("#objBody").innerHTML='<tr><td colspan="4" class="tempty">No backup for this namespace — run a backup first (Applications → Back up).</td></tr>';
     objItems=[]; objBusy=false; rsWizSync(); return;
   }
   const r=await post("/api/objects/list", objBody_());
@@ -17617,7 +18673,7 @@ async function objLoadList(){
   // autres applications du namespace sont masqués par défaut (case « seulement… »).
   const appOn = !!(r.app);
   $("#objOnlyAppWrap").style.display = appOn ? "" : "none";
-  $("#objInfo").textContent="("+objItems.length+" objet(s) dans l'instantané"+(appOn?(" · "+(r.app_count||0)+" of the application « "+r.app+" »"):"")+")";
+  $("#objInfo").textContent="("+objItems.length+" object(s) in the snapshot"+(appOn?(" · "+(r.app_count||0)+" of the application « "+r.app+" »"):"")+")";
   $("#objBody").innerHTML=objItems.length? objItems.map(o=>`<tr class="clk${o.redacted?'':' '}${appOn&&!o.in_app?' objOther':''}" data-i="${o.i}">
      <td class="cb"><input type="checkbox" class="objChk" data-i="${o.i}" ${o.redacted?"disabled":""} ${appOn&&o.in_app&&!o.redacted?"checked":""}></td>
      <td>${esc(o.kind)}</td><td style="color:var(--strong);font-weight:500">${esc(o.name)}</td>
@@ -17642,8 +18698,8 @@ function objSelIdx(){ return [...document.querySelectorAll(".objChk:checked")].m
 async function objToDiff(){
   objBusy=true; rsWizSync();
   $("#objErr").innerHTML="";
-  $("#objDiff").innerHTML='<div class="hint"><span class="spin"></span>Comparaison avec l\'état live…</div>';
-  $("#objDiffWrap").style.display="block";
+  $("#objDiff").innerHTML='<div class="hint"><span class="spin"></span>Comparing with the live state…</div>';
+  $("#objDiffWrap").style.display="block"; setRsStep(3);
   const r=await post("/api/objects/diff", Object.assign(objBody_(), {indexes:objSelIdx()}));
   objBusy=false;
   if(!r.ok){ $("#objDiffWrap").style.display="none"; $("#objErr").innerHTML=errBox(r.error); rsWizSync(); return; }
@@ -17674,12 +18730,15 @@ async function objApply(){
   $("#objLog").innerHTML='<div class="hint"><span class="spin"></span>Applying…</div>';
   const body=Object.assign(objBody_(), {indexes:objSelIdx(), dry:dry()});
   if(live && ctxInfo.require_confirm) body.confirm_context=confirmedCtx;
+  const sess=rsSession;
   const r=await post("/api/objects/restore", body);
+  if(sess!==rsSession) return;
   objBusy=false; rsWizSync();
   const head = r.ok? (r.dry? '<div class="warnbox">Simulation — commandes qui seraient exécutées.</div>'
-                           : `<div class="note">${r.applied} object(s) applied${r.skipped?(" · "+r.skipped+" skipped"):""}.</div>`)
+                           : `<div class="note">${"Object restore finished: "+r.applied+" object(s) applied"}${r.skipped?(" · "+r.skipped+" skipped"):""}.</div>`)
                    : errBox(r.error);
   $("#objLog").innerHTML=head+renderLog(r.log);
+  if(r.ok && !r.dry) rsFinish(body.namespace, !!r.skipped, sess);
 }
 setInterval(()=>{ if($("#mRestore").style.display!=="none") rsWizSync(); }, 300);
 
@@ -19085,7 +20144,6 @@ I18N_EN = [
     ('">Stockage <', '">Storage <'),
     ('">Santé des clusters <', '">Cluster health <'),
     ('UUID du Volume Group restauré sur le site cible (8-4-4-4-12)', 'UUID of the Volume Group restored on the target site (8-4-4-4-12)'),
-    ("Restauration DR terminée. Vérifiez l'application, puis re-protégez ses Volume Groups dans HYCU.", 'DR restore finished. Verify the application, then re-protect its Volume Groups in HYCU.'),
     ("Aucun export de l'outil dans ce bucket.", 'No export from this tool in that bucket.'),
     ("<b>Application supprimée du cluster ?</b> Tant que ses sauvegardes existent, elle reste listée dans <b>Applications</b> avec le badge « Supprimée — restaurable ». Cliquez <b>Restaurer</b> : le parcours de récupération recrée tout (namespace, PV/PVC, workloads, dépendances non masquées) depuis la sauvegarde choisie — restaurez d'abord ses Volume Groups dans HYCU et collez leurs UUID. Aucune dérogation DR n'est requise : la récupération reste sur le même cluster/contexte.", '<b>Application deleted from the cluster?</b> As long as its backups exist, it stays listed under <b>Applications</b> with the “Deleted — restorable” badge. Click <b>Restore</b>: the recovery flow recreates everything (namespace, PV/PVC, workloads, non-redacted dependencies) from the selected backup — first restore its Volume Groups in HYCU and paste their UUIDs. No DR override is required: the recovery stays on the same cluster/context.'),
     (" inconnu (retiré, ou session verrouillée) : sélectionnez un cluster dans la barre du haut. Aucune commande n'a été exécutée.", ' unknown (removed, or session locked): select a cluster in the top bar. No command was executed.'),
@@ -19268,6 +20326,121 @@ I18N_EN = [
     ("Clone terminé. L\\'application d\\'origine est intacte.", 'Clone finished. The original application is intact.'),
     ('"Lancer le clone de l\'application"', '"Launch the application clone"'),
     ('"Vérifier l\'application →"', '"Verify the application →"'),
+    ('<span>Nouvelle politique</span>', '<span>New policy</span>'),
+    ('<th>Politique HYCU</th>', '<th>HYCU policy</th>'),
+    ('<th>Dernière exécution</th>', '<th>Last run</th>'),
+    ('id="polEditTitle">Nouvelle politique<', 'id="polEditTitle">New policy<'),
+    ('>Namespaces (séparés par des virgules)<', '>Namespaces (comma-separated)<'),
+    (">et/ou sélecteur d'étiquettes<", '>and/or label selector<'),
+    ('>Politique HYCU (optionnel)<', '>HYCU policy (optional)<'),
+    ('> Activée</label>', '> Enabled</label>'),
+    ("La première politique de la liste qui correspond à un namespace l'emporte ; un namespace sans politique suit la politique par défaut. La politique HYCU est assignée aux volumes qui n'en ont pas encore.", 'The first policy in the list that matches a namespace wins; a namespace without a policy follows the default policy. The HYCU policy is assigned to volumes that do not have one yet.'),
+    ('>Supprimer la politique<', '>Delete the policy<'),
+    ('Politique par défaut — sauvegarde automatique de la configuration', 'Default policy — automatic configuration backup'),
+    (">Sauvegarde de l'outil<", '>Tool backup<'),
+    ("Configuration, politiques et coffre chiffré. Exportée chaque jour avec l'export automatique ; restaurable sur une nouvelle instance.", 'Configuration, policies and encrypted vault. Exported daily with the automatic export; restorable on a new instance.'),
+    ('>Exporter maintenant<', '>Export now<'),
+    (">Restaurer l'outil depuis le bucket…<", '>Restore the tool from the bucket…<'),
+    ('"étiquette "', '"label "'),
+    (' namespace(s) : "', ' namespace(s): "'),
+    ('"aucun namespace actuellement"', '"no namespace currently"'),
+    ('>Par défaut<', '>Default<'),
+    ('Namespaces sans autre politique', 'Namespaces without another policy'),
+    ('stIc("na","En pause")', 'stIc("na","Paused")'),
+    ('"illimitée"', '"unlimited"'),
+    ('"(connectez HYCU pour choisir)"', '"(connect HYCU to choose)"'),
+    ('\'<option value="">(aucune)</option>\'', '\'<option value="">(none)</option>\''),
+    ('"Politique « "', '"Policy « "'),
+    ('"Enregistrement impossible."', '"Could not save."'),
+    ('"Donnez un nom à la politique."', '"Give the policy a name."'),
+    ('"Indiquez des namespaces ou un sélecteur d\'étiquettes."', '"Enter namespaces or a label selector."'),
+    ('title:"Supprimer la politique"', 'title:"Delete the policy"'),
+    ('"La politique <b>"', '"Policy <b>"'),
+    ('</b> sera supprimée. Ses namespaces suivront la politique par défaut ; les sauvegardes existantes sont conservées.', '</b> will be deleted. Its namespaces will follow the default policy; existing backups are kept.'),
+    ('"en pause"', '"paused"'),
+    ("Dernière sauvegarde plus ancienne que l'intervalle de sa politique", 'Last backup older than its policy interval'),
+    ('<span class="k">Autres politiques</span>', '<span class="k">Other policies</span>'),
+    ('Kit exporté : <code>', 'Kit exported: <code>'),
+    ('"Téléchargement impossible : "', '"Download failed: "'),
+    ("Aucun kit de l\\'outil dans ce bucket.", 'No tool kit in this bucket.'),
+    ('<th>Taille</th>', '<th>Size</th>'),
+    ('>Phrase de chiffrement (kits .enc uniquement)<', '>Encryption passphrase (.enc kits only)<'),
+    (">Restaurer l'outil<", '>Restore the tool<'),
+    ('title:"Restaurer l\'outil"', 'title:"Restore the tool"'),
+    ('"La configuration actuelle (politiques, filtres, sources) et le coffre seront remplacés par ceux du kit <b>"', '"The current configuration (policies, filters, sources) and the vault will be replaced by those of kit <b>"'),
+    ('"Une copie de l\'existant est gardée dans <code>hycu-backups/_tool_restore_backup/</code>."', '"A copy of the current state is kept in <code>hycu-backups/_tool_restore_backup/</code>."'),
+    ('Outil restauré', 'Tool restored'),
+    (' — déverrouillez ensuite le coffre avec votre phrase secrète', ' — then unlock the vault with your passphrase'),
+    ('. Rechargement…', '. Reloading…'),
+    ('Vous réinstallez une instance existante ? ', 'Reinstalling an existing instance? '),
+    (">Restaurer l'outil depuis un bucket S3<", '>Restore the tool from an S3 bucket<'),
+    ('Politique « ', 'Policy « '),
+    (' volume(s) rattaché(s) à la politique HYCU « ', ' volume(s) attached to HYCU policy « '),
+    (' volume(s) déjà dans une autre politique HYCU (non modifiés)', ' volume(s) already in another HYCU policy (left unchanged)'),
+    ('politique HYCU non appliquée (HYCU non connecté)', 'HYCU policy not applied (HYCU not connected)'),
+    ('politique HYCU non appliquée (', 'HYCU policy not applied ('),
+    ('assignation HYCU refusée : ', 'HYCU assignment refused: '),
+    (' (politique ', ' (policy '),
+    ('sélecteur « ', 'selector « '),
+    (" ; kit de l'outil exporté", '; tool kit exported'),
+    (" ; export du kit de l'outil en échec : ", '; tool kit export failed: '),
+    ('chiffrement activé mais phrase de chiffrement absente', 'encryption enabled but encryption passphrase missing'),
+    ("Connectez d'abord le stockage objet S3.", 'Connect the S3 object storage first.'),
+    ("Export du kit de l'outil impossible : ", 'Tool kit export failed: '),
+    ('Une opération est en cours : réessayez quand elle sera terminée.', 'An operation is running: try again when it has finished.'),
+    ('Kit invalide.', 'Invalid kit.'),
+    ('Téléchargement du kit impossible : ', 'Kit download failed: '),
+    ('Kit chiffré : renseignez la phrase de chiffrement des exports.', 'Encrypted kit: enter the export encryption passphrase.'),
+    ('Déchiffrement impossible (phrase incorrecte ou kit altéré).', 'Decryption failed (wrong passphrase or altered kit).'),
+    ('Kit illisible : ', 'Unreadable kit: '),
+    ("Ce fichier n'est pas un kit de l'outil.", 'This file is not a tool kit.'),
+    (") : rien n'a été modifié.", '): nothing was changed.'),
+    ('Copie de sécurité impossible (', 'Safety copy failed ('),
+    ('title="Supprimer des versions de sauvegarde de configuration"', 'title="Delete configuration backup versions"'),
+    ('<span>Purger</span>', '<span>Purge</span>'),
+    ('> Masquer les supprimées<', '> Hide deleted<'),
+    ('id="mPurgeTitle">Versions sauvegardées<', 'id="mPurgeTitle">Saved versions<'),
+    ('esc("Versions sauvegardées")', 'esc("Saved versions")'),
+    ('>Toutes sauf la plus récente<', '>All but the most recent<'),
+    ('>Supprimer la sélection<', '>Delete the selection<'),
+    ('auto:"Automatique", manual:"Manuelle", pre_restore:"Avant restauration"', 'auto:"Automatic", manual:"Manual", pre_restore:"Before restore"'),
+    ('Aucune version sauvegardée.', 'No saved version.'),
+    ('(la plus récente)', '(most recent)'),
+    ('\' <span class="hint">partielle</span>\'', '\' <span class="hint">partial</span>\''),
+    ('title:"Supprimer des versions"', 'title:"Delete versions"'),
+    ('"</b> version(s) de la configuration de <b>"', '"</b> configuration version(s) of <b>"'),
+    ('"</b> seront supprimées définitivement."', '"</b> will be permanently deleted."'),
+    ('"<b>Toutes</b> les versions sont sélectionnées : cette application ne pourra plus être restaurée depuis l\'outil."', '"<b>All</b> versions are selected: this application can no longer be restored from the tool."'),
+    ('"Les données des volumes (HYCU) ne sont pas touchées."', '"The volume data (HYCU) is not touched."'),
+    ('" version(s) supprimée(s)."', '" version(s) deleted."'),
+    ('Namespace ou versions manquants.', 'Namespace or versions missing.'),
+    (' : pas une sauvegarde de « ', ': not a backup of « '),
+    (' : utilisée par une restauration en cours (conservée)', ': used by a running restore (kept)'),
+    ('Restauration DR terminée. Vérifiez l’application, puis re-protégez ses Volume Groups dans HYCU.', 'DR restore finished. Verify the application, then re-protect its Volume Groups in HYCU.'),
+    ('Application restaurée. Vérifiez-la, puis re-protégez ses Volume Groups dans HYCU si besoin.', 'Application restored. Verify it, then re-protect its Volume Groups in HYCU if needed.'),
+    ('Restauration de l’application…', 'Restoring the application…'),
+    ('"Restaurer (simulation)" : "Restaurer"', '"Restore (simulation)" : "Restore"'),
+    ('"Appliquer (simulation)" : "Appliquer"', '"Apply (simulation)" : "Apply"'),
+    ('Copie de l’application terminée. L’application d’origine est intacte.', 'Application copy finished. The original application is intact.'),
+    ('Restauration vers les nouveaux volumes terminée.', 'Restore to the new volumes finished.'),
+    ('"Restauration des objets terminée : "', '"Object restore finished: "'),
+    ('Restauration de l’application terminée.', 'Application restore finished.'),
+    ('" Pensez à re-protéger ses Volume Groups dans HYCU."', '" Remember to re-protect its Volume Groups in HYCU."'),
+    ('"Cloner dans HYCU <b>"', '"Clone in HYCU <b>"'),
+    ('"</b> Volume Group(s) (de nouveaux VG sont créés) ?"', '"</b> Volume Group(s) (new VGs are created)?"'),
+    ("Si un volume d'origine a disparu du cluster, HYCU le restaurera automatiquement avant la recréation.", 'If an original volume has disappeared from the cluster, HYCU will restore it automatically before recreating.'),
+    ('inplace:"Restaurer sur place", clone:"Restaurer vers les nouveaux volumes", cloneapp:"Lancer le clone de l\'application"', 'inplace:"Restore in place", clone:"Restore to the new volumes", cloneapp:"Launch the application clone"'),
+    ('inplace:"Simuler la restauration sur place", clone:"Simuler la restauration", cloneapp:"Simuler le clone de l\'application"', 'inplace:"Simulate the in-place restore", clone:"Simulate the restore", cloneapp:"Simulate the application clone"'),
+    ('"Cloner les VG dans HYCU →"', '"Clone the VGs in HYCU →"'),
+    ('lbl="Restaurer sur place"', 'lbl="Restore in place"'),
+    ('"dans le <b>même namespace</b> (avec un suffixe)"', '"in the <b>same namespace</b> (with a suffix)"'),
+    ("' et leurs dépendances seront recréés depuis l’instantané.</div>'", "' and their dependencies will be recreated from the snapshot.</div>'"),
+    ('Aucune sauvegarde pour ce namespace — lancez d’abord une sauvegarde (Applications → Sauvegarder).', 'No backup for this namespace — run a backup first (Applications → Back up).'),
+    ('Comparaison avec l’état live…', 'Comparing with the live state…'),
+    ('" objet(s) dans l’instantané"', '" object(s) in the snapshot"'),
+    ('" de l’application « "', '" of the application « "'),
+    ('id="drOpenCfg" type="button">Ouvrir les réglages<', 'id="drOpenCfg" type="button">Open the settings<'),
+    (' : choisissez une sauvegarde source.', ': choose a source backup.'),
 ]
 # <<< I18N-END
 _I18N_SORTED = None          # (fr, en) triés du plus long au plus court

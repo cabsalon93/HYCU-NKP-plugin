@@ -60,6 +60,7 @@
   "auto_backup_keep_daily": 7,
   "auto_backup_keep_weekly": 4,
   "auto_backup_keep_monthly": 12,
+  "backup_policies": [],
   "auto_backup_dest": "",
 
   "_section_coffre": "— Coffre d'identifiants chiffré (optionnel) —",

@@ -9,8 +9,11 @@ Python (bibliothèque standard uniquement), livré aussi en image conteneur.
 ## Ce que ça fait
 
 - **Sauvegarde** la configuration des namespaces : manifestes PV/PVC, Deployments, Services,
-  ConfigMaps, Secrets (chiffrés). À la demande ou **automatiquement** (planification,
-  rétention, quota), avec export optionnel vers un stockage **S3**.
+  ConfigMaps, Secrets (chiffrés). À la demande ou **automatiquement** via des **politiques**
+  (cible par namespaces ou étiquettes, fréquence, rétention, politique HYCU), avec export
+  optionnel vers un stockage **S3** et purge manuelle des anciennes versions.
+- **Se sauvegarde lui-même** : configuration, politiques et coffre exportés chaque jour dans le
+  bucket, restaurables sur une nouvelle instance (⚙ Sources → Stockage objet S3).
 - **Protège** les volumes dans HYCU : correspondance PVC ↔ Volume Group, politique HYCU.
 - **Restaure** : vers de **nouveaux volumes** (clone HYCU), **sur place** (restore HYCU
   in-place), une **application supprimée**, **en masse**, ou sur un **autre cluster** (DR).
@@ -99,7 +102,8 @@ Tout se règle dans l'interface (⚙ **Réglages**, ⚙ **Sources**) ou dans `hy
 | `namespace_filter` | `[]` | Namespaces visibles (vide = tous). `namespace_label_selector` pour un filtre par étiquettes. |
 | `allowed_contexts` | `[]` | Clusters/contextes autorisés en mode réel (vide = tous, avec confirmation). |
 | `allowed_hosts` | `[]` | Noms DNS acceptés en plus de `127.0.0.1` (Ingress / reverse-proxy, à protéger par une authentification). |
-| `auto_backup_enabled` | `false` | Sauvegarde automatique de tous les namespaces visibles. |
+| `auto_backup_enabled` | `false` | Politique par défaut : sauvegarde automatique des namespaces sans autre politique. |
+| `backup_policies` | `[]` | Politiques nommées (page Politiques) : namespaces et/ou sélecteur d'étiquettes, intervalle, versions à conserver, politique HYCU optionnelle. La première qui correspond l'emporte. |
 | `auto_backup_interval_hours` | `24` | Intervalle de la sauvegarde automatique. |
 | `auto_backup_keep` | `15` | Versions conservées par namespace (`0` = illimité). `auto_backup_retention: "gfs"` pour une rétention jour/semaine/mois. |
 | `storage_quota_gb` / `storage_min_free_mb` | `0` / `500` | Quota du dossier de sauvegardes et plancher d'espace libre. |
