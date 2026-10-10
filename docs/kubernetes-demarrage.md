@@ -110,20 +110,21 @@ afficher **ton cluster** (et non « indisponible »). ✅ L'outil pilote bien Ku
 
 ## 3. Mettre à jour vers une nouvelle version de l'image
 
-Le manifeste épingle désormais une **image versionnée** : chaque build publie, en plus
-de `:latest`, un tag `:vAAAAMMJJ-HHMM` égal à la version du programme (affichée en bas
-à gauche de l'interface). Tu choisis quand monter de version, et le **retour arrière**
-est une seule commande. Pour passer à une nouvelle version :
+Le manifeste utilise l'image `:latest` (republiée à chaque version, `imagePullPolicy:
+Always`) : pas de numéro de version à connaître. Pour passer à la dernière version :
 
 ```bash
-kubectl -n hycu set image deployment/hycu hycu=ghcr.io/cabsalon93/hycu-nkp-plugin:vNOUVELLE-VERSION
-kubectl -n hycu rollout status deployment hycu      # attendre "successfully rolled out"
+kubectl -n hycu rollout restart deployment/hycu
+kubectl -n hycu rollout status deployment/hycu      # attendre "successfully rolled out"
 # retour arrière si besoin :
-kubectl -n hycu rollout undo deployment hycu
+kubectl -n hycu rollout undo deployment/hycu
 ```
 
-(Si tu utilises encore `:latest` : `kubectl -n hycu rollout restart deployment hycu`
-suffit à retélécharger l'image.) Le Pod se recrée en ~30 s (tes données restent sur le
+Si tu préfères figer une version précise, chaque build existe aussi sous un tag
+`:vAAAAMMJJ-HHMM` (la version affichée en bas à gauche de l'interface) :
+`kubectl -n hycu set image deployment/hycu hycu=ghcr.io/cabsalon93/hycu-nkp-plugin:vAAAAMMJJ-HHMM`.
+
+Le Pod se recrée en ~30 s (tes données restent sur le
 PVC). ⚠️ Le `port-forward` se coupe quand le Pod redémarre : **relance-le** (`Ctrl + C`
 puis la commande de l'étape 5).
 

@@ -83,10 +83,12 @@ spec:
         seccompProfile: { type: RuntimeDefault }
       containers:
         - name: hycu
-          # Image VERSIONNÉE (un tag git v<version> publie ghcr.io/...:v<version>).
-          # Montée de version : kubectl -n hycu set image deployment/hycu hycu=...:vNOUVELLE
-          # Retour arrière   : kubectl -n hycu rollout undo deployment hycu
-          image: ghcr.io/cabsalon93/hycu-nkp-plugin:v20261009-2300
+          # Image publiée à chaque version sous :latest (et aussi :vAAAAMMJJ-HHMM pour
+          # figer une version précise si vous le souhaitez).
+          # Mise à jour   : kubectl -n hycu rollout restart deployment/hycu
+          # Retour arrière : kubectl -n hycu rollout undo deployment/hycu
+          image: ghcr.io/cabsalon93/hycu-nkp-plugin:latest
+          imagePullPolicy: Always       # :latest est un tag mobile : toujours re-télécharger
           ports:
             - containerPort: 8765
           env:
