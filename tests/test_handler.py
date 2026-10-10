@@ -197,3 +197,28 @@ def test_protect_many_namespaces_single_hycu_calls(H, monkeypatch):
     r2 = H.action_hycu_protect({"dry": False, "items": [{"namespace": "app1", "vg_uuids": ["vg-a"]},
                                                         {"namespace": "app2", "vg_uuids": ["vg-c"]}]})
     assert not r2["ok"] and "hors correspondance" in r2["error"] and not calls
+
+
+def test_parallel_hycu_clones_are_serialized_not_refused(H, monkeypatch):
+    """Plusieurs clones HYCU lancés en même temps (interface parallèle) : la section
+    critique attend le verrou au lieu de répondre « une autre opération est en cours »."""
+    import threading, time
+    calls = []
+
+    def fake_rest(system, method, path, body=None, **kw):
+        time.sleep(0.2)
+        calls.append(body.get("vgName"))
+        return {"ok": True, "json": {"uuid": "job-" + body.get("vgName"), "status": "QUEUED"}, "raw": ""}
+    monkeypatch.setattr(H, "_rest", fake_rest)
+    monkeypatch.setattr(H, "_reject_stale_vgs", lambda ns, uuids, confirmed_by_name=None: None)
+    monkeypatch.setattr(H, "_hycu_job_id", lambda j: (j or {}).get("uuid"))
+    out = {}
+
+    def run(name):
+        out[name] = H.action_hycu_restore({"dry": False, "restore_point_id": "rp", "mode": "clone",
+                                           "new_name": name, "source_uuid": "vg-src", "namespace": "app"})
+    ths = [threading.Thread(target=run, args=("c%d" % i,)) for i in range(4)]
+    [t.start() for t in ths]
+    [t.join() for t in ths]
+    assert all(r["ok"] and r["job_id"] == "job-" + n for n, r in out.items()), out
+    assert sorted(calls) == ["c0", "c1", "c2", "c3"]

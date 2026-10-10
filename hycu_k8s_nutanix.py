@@ -567,7 +567,7 @@ def save_config(updates, source="internal"):
 
 # Version horodatée de la build (format AAAAMMJJ-HHMM). À incrémenter à chaque
 # changement notable du programme ; affichée dans l'en-tête de l'interface.
-VERSION = "20261010-1530"
+VERSION = "20261010-1600"
 
 # Jeton anti-CSRF généré au démarrage, injecté dans la page et exigé sur les POST.
 CSRF_TOKEN = secrets.token_urlsafe(32)
@@ -733,10 +733,17 @@ class _Busy(Exception):
 
 
 @contextlib.contextmanager
-def action_lock(skip=False):
+def action_lock(skip=False, wait=0.0):
     """Sérialise les actions destructives. `skip=True` (ex. dry-run) n'acquiert rien.
-    Lève _Busy si le verrou est déjà pris. Libère toujours en sortie."""
-    got = bool(skip) or ACTION_LOCK.acquire(blocking=False)
+    `wait` > 0 : patiente jusqu'à `wait` secondes (sections critiques COURTES appelées en
+    parallèle, ex. plusieurs clones HYCU lancés ensemble) au lieu de refuser aussitôt.
+    Lève _Busy si le verrou n'est pas obtenu. Libère toujours en sortie."""
+    if skip:
+        got = True
+    elif wait and wait > 0:
+        got = ACTION_LOCK.acquire(timeout=float(wait))
+    else:
+        got = ACTION_LOCK.acquire(blocking=False)
     if not got:
         raise _Busy("Une autre opération est déjà en cours. Réessayez.")
     try:
@@ -6874,7 +6881,10 @@ def action_hycu_restore(payload):
                 "message": "Simulation : aucun appel HYCU envoyé. Vérifiez l'appel ci-dessus, "
                            "puis désactivez la simulation pour lancer réellement."}
     try:
-        with action_lock():
+        # Section critique courte (un POST) : les clones lancés en parallèle par l'interface
+        # attendent leur tour au lieu d'être refusés ; une restauration longue en cours
+        # finit tout de même par faire refuser la demande (délai).
+        with action_lock(wait=60):
             r = _rest("hycu", "POST", path, body=body)
             if not r["ok"]:
                 return {"ok": False, "error": r.get("error"), "raw": (r.get("raw") or "")[:500]}
