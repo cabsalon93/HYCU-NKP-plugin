@@ -567,7 +567,7 @@ def save_config(updates, source="internal"):
 
 # Version horodatée de la build (format AAAAMMJJ-HHMM). À incrémenter à chaque
 # changement notable du programme ; affichée dans l'en-tête de l'interface.
-VERSION = "20261010-1200"
+VERSION = "20261010-1500"
 
 # Jeton anti-CSRF généré au démarrage, injecté dans la page et exigé sur les POST.
 CSRF_TOKEN = secrets.token_urlsafe(32)
@@ -9188,8 +9188,8 @@ HTML = r"""<!DOCTYPE html>
     --bg:#F3F4F9; --card:#FFFFFF; --title:#4B5274; --text:#3D4464; --strong:#2A2E44;
     --muted:#6B7089; --grey:#8A8FA3; --rule:#8A9BB0; --line:#E3E7EE;
   /* variantes « texte » conformes aux contrastes (≥ 4.5:1 sur blanc) */
-  --green-t:#047857; --red-t:#C53030; --orange-t:#9A6B1E;
-    --green:#05A274; --green-l:#9BDAC7; --red:#E9605A; --orange:#CA923E; --blue:#6688FF;
+  --green-t:#047857; --red-t:#C53030; --orange-t:#4B5274;
+    --green:#05A274; --green-l:#9BDAC7; --red:#E9605A; --orange:#8A94B8; --blue:#6688FF;
     /* alias historiques (utilisés par du HTML/JS existant) */
     --ink:var(--strong); --paper:var(--bg); --teal:var(--purple); --teal-d:var(--top);
     --accent:var(--purple); --amber:var(--orange); --good:var(--green); --warn:var(--orange);
@@ -9491,7 +9491,7 @@ HTML = r"""<!DOCTYPE html>
            font-size:13px;color:var(--text)}
   .badge{font-size:11px;padding:2px 8px;border-radius:10px;font-weight:500}
   .b-bound{background:#E1F4EE;color:var(--green)} .b-lost{background:#FCE9E8;color:var(--red)}
-  .b-pending{background:#F8EFE0;color:var(--orange)} .b-na{background:#EEF0F5;color:var(--muted)}
+  .b-pending{background:#EEF0F5;color:var(--muted)} .b-na{background:#EEF0F5;color:var(--muted)}
   pre.box{background:var(--strong);color:#E6E8F0;border-radius:4px;padding:12px 14px;font-size:12px;
           overflow:auto;max-height:340px;white-space:pre-wrap;word-break:break-word}
   .drVol{display:flex;align-items:center;gap:12px;margin:7px 0}
@@ -9504,11 +9504,11 @@ HTML = r"""<!DOCTYPE html>
   ol.plan li{margin:3px 0}
   .logline{display:flex;gap:8px;align-items:flex-start;font-size:13px;padding:7px 0;border-bottom:1px solid #F0F2F6}
   .logline .ic{margin-top:1px}
-  .ok{color:var(--green)} .ko{color:var(--red)} .sim{color:var(--orange)}
+  .ok{color:var(--green)} .ko{color:var(--red)} .sim{color:var(--muted)}
   .hint{font-size:12.5px;color:var(--muted);margin-top:8px}
   .note{background:#F7F5FD;border-left:3px solid var(--purple);padding:10px 14px;border-radius:0 4px 4px 0;
         font-size:13px;margin-top:12px;color:var(--text)}
-  .warnbox{background:#FBF5EB;border-left:3px solid var(--orange);padding:10px 14px;border-radius:0 4px 4px 0;
+  .warnbox{background:#F3F4F9;border-left:3px solid var(--grey);padding:10px 14px;border-radius:0 4px 4px 0;
         font-size:13px;margin-top:10px;color:#6E4E17}
   .err{background:#FDF0EF;border-left:3px solid var(--red);padding:10px 14px;border-radius:0 4px 4px 0;
        font-size:13px;color:#8E2F2A;margin-top:10px}
@@ -9525,6 +9525,7 @@ HTML = r"""<!DOCTYPE html>
   .nextbar{display:none;align-items:center;justify-content:space-between;gap:12px;margin-top:14px;padding:10px 12px;
            background:#fff;border:1px solid var(--line);border-radius:6px}
   .nextbar.show{display:flex}
+  #rsStepsWrap:has(ol:empty){display:none}
   .step-no{display:none}
   /* ---------- Assistant de restauration : étapes visibles ---------- */
   .stepper{display:flex;gap:0;margin:0 0 16px;border:1px solid var(--line);border-radius:6px;overflow:hidden;background:#fff}
@@ -10141,7 +10142,7 @@ HTML = r"""<!DOCTYPE html>
       <h3><span class="step-no">3</span>Vérifier puis lancer</h3>
       <p class="sub">Vérifiez les remplacements dérivés et la séquence, puis lancez.</p>
       <div id="rsRepl"></div>
-      <div><b style="font-size:13px">Séquence prévue</b><ol class="plan" id="rsSteps"></ol></div>
+      <div id="rsStepsWrap"><b style="font-size:13px">Séquence prévue</b><ol class="plan" id="rsSteps"></ol></div>
       <div id="rsCtxConfirm" style="display:none;margin-top:14px">
         <label class="fld">Confirmation du contexte cible avant toute action</label>
         <input type="text" id="rsCtxInput" placeholder="retapez le nom du contexte kubectl">
@@ -10422,7 +10423,7 @@ function errHint(raw){
   if(/\b404\b|api-docs|endpoint.*not found/.test(e)) return "Endpoint introuvable — vérifiez l'URL de base et la version d'API (⚙ Réglages).";
   if(/certificat|certificate|ssl|tls|self.?signed/.test(e)) return "Certificat TLS — cochez/décochez « Vérifier le certificat TLS » dans Connexions selon votre PKI.";
   if(/stockage objet|object storage/.test(e)) return "Endpoint S3 injoignable — vérifiez le PORT (MinIO : 9000 = API S3, pas la console 9001 ; Nutanix Objects : 443), le protocole http/https, et que la machine qui exécute l'outil (le Pod, pas votre poste) atteint cet hôte.";
-  if(/timeout|timed out|délai|connexion impossible|connection failed|refused|unreachable|injoignable|getaddrinfo|name or service|errno|10061|10060/.test(e)) return "Hôte injoignable — vérifiez l'URL:port (HYCU 8443, Prism 9440), le réseau et le pare-feu.";
+  if(/^(hôte|serveur|host|server) (injoignable|unreachable)|timed out|connexion impossible|connection (failed|refused)|getaddrinfo|name or service|errno \d+|10061|10060/.test(e)) return "Hôte injoignable — vérifiez l'URL:port (HYCU 8443, Prism 9440), le réseau et le pare-feu.";
   if(/non connecté|connectez-vous|not connected|connect to at least|connect to hycu/.test(e)) return "Enregistrez d'abord la source (⚙ en haut à droite).";
   if(/namespace.*(non autorisé|autorisé|not allowed)|(non autorisé).*namespace/.test(e)) return "Namespace hors liste autorisée — voir ⚙ Réglages → namespaces autorisés.";
   if(/contexte.*non autorisé|context.*not allowed|allowed_contexts/.test(e)) return "Contexte kubectl hors liste autorisée — voir ⚙ Réglages.";
@@ -11307,7 +11308,8 @@ async function lookupVgUuid(vgName){
 }
 // Clone TOUS les volumes prêts dans HYCU (séquentiel : suivi lisible ligne par ligne),
 // remplit les références, puis construit le plan automatiquement.
-async function hyBatchRun(){
+async function hyBatchRun(opts){
+  opts = (opts && !(opts instanceof Event)) ? opts : {};
   const rows=[...document.querySelectorAll("#rsVolCfgs .vol-cfg")].map(div=>{
     const sel=div.querySelector(".hyRp"); if(!sel || !sel.value) return null;
     const nameEl=div.querySelector(".hyVgName");
@@ -11315,11 +11317,11 @@ async function hyBatchRun(){
     return {pvc:div.dataset.pvc, vg:sel.dataset.vg, rp:sel.value,
             newName, stat:div.querySelector(".hyStat")};
   }).filter(Boolean);
-  if(!rows.length) return;
+  if(!rows.length) return false;
   const live=!dry();
-  if(live && !(await confirmDanger({title:"Confirmer les clones HYCU", lines:[
+  if(live && !opts.skipConfirm && !(await confirmDanger({title:"Confirmer les clones HYCU", lines:[
      "Déclencher dans HYCU le <b>clone</b> de <b>"+rows.length+"</b> Volume Group(s) au point choisi ?",
-     "Les VG sources ne sont <b>pas</b> modifiés — de <b>nouveaux</b> VG sont créés."]}))) return;
+     "Les VG sources ne sont <b>pas</b> modifiés — de <b>nouveaux</b> VG sont créés."]}))) return false;
   const b=$("#hyBatchGo"); b.disabled=true; b.innerHTML='<span class="spin"></span>Clones HYCU en cours…';
   hideNextBar();
   let failed=0;
@@ -11347,15 +11349,18 @@ async function hyBatchRun(){
     row.stat.innerHTML=`<div class="note" style="margin-top:6px">✓ VG cloné — référence <code>${esc(lu.uuid)}</code> remplie.</div>`;
   }
   b.disabled=false; b.textContent="Restaurer les VG depuis HYCU ("+rows.length+" volume(s))";
-  if(dry()) return;                          // simulation : rien à préparer
+  if(dry()) return false;                    // simulation : rien à préparer
   const items=collectItems();
-  const allFilled=items.length && items.every(i=>(i.new_ref||"").trim());
-  if(!failed && allFilled){
+  const allFilled=!!(items.length && items.every(i=>(i.new_ref||"").trim()));
+  const ok=!failed && allFilled;
+  if(opts.noChain) return ok;
+  if(ok){
     // Enchaîner directement : construire le plan et amener l'opérateur au lancement.
     $("#rsPreview").click();
   } else {
     updateNextBar();
   }
+  return ok;
 }
 // --------- Orchestration RESTAURATION SUR PLACE (arrêt -> restore in-place -> redémarrage) ---------
 let rsInplaceSel={};   // {pvc: {source_vg_uuid, restore_point_id, vg_name}}
@@ -11431,19 +11436,21 @@ function cloneAppBody(){
           suffix: same? ($("#rsCloneSuffix").value.trim()||"-clone") : "",
           clone_refs: same? false : !!($("#rsCloneRefs")&&$("#rsCloneRefs").checked)};
 }
+function cloneWarnings(ws){
+  // Le résumé liste déjà les dépendances clonées : seules les limites restent, en une ligne.
+  return (ws||[]).filter(w=>!/^Dépendances clonées automatiquement/.test(w)).map(w=>`<div class="hint" style="margin-top:6px">${esc(w)}</div>`).join("");
+}
 function renderCloneAppPlan(r){
   if(!r.ok && !r.preview){ $("#rsErr").innerHTML=errBox(r.error); return; }
   const p=r.preview||{};
-  let html=`<div class="note">Aperçu prêt. Vérifiez ci-dessous, puis cliquez « <b>Lancer le clone de l'application (réel)</b> » en bas pour créer la copie. <span class="hint">L'application d'origine n'est pas touchée.</span></div>
-     <div class="repl"><div class="nm">Clone d'application → namespace <b>${esc(p.target_namespace)}</b> ${p.same_namespace?'(même namespace, suffixe)':'(autre namespace)'}</div>
-     <div><span class="k">PV créés</span> : ${esc((p.pvs||[]).join(', ')||'—')}</div>
-     <div><span class="k">PVC créés</span> : ${esc((p.pvcs||[]).join(', ')||'—')}</div>
-     <div><span class="k">Applications clonées</span> : ${esc((p.workloads||[]).join(', ')||'aucune')}</div>
-     ${(p.dependencies&&p.dependencies.length)?`<div><span class="k">Dépendances clonées</span> : ${esc(p.dependencies.join(', '))}</div>`:''}</div>`;
-  (r.warnings||[]).forEach(w=>html+=`<div class="warnbox">⚠ ${esc(w)}</div>`);
-  if(r.manifests_preview){ html+=`<details style="margin-top:6px"><summary class="hint">Voir les manifestes des applications clonées</summary><pre class="box">${esc(r.manifests_preview)}</pre></details>`; }
+  let html=`<div class="repl"><div class="nm">Copie → namespace <b>${esc(p.target_namespace)}</b>${p.same_namespace?' (suffixe)':''}</div>
+     ${(p.pvcs||[]).length?`<div><span class="k">Volumes</span> : ${esc(p.pvcs.join(', '))}</div>`:''}
+     <div><span class="k">Applications</span> : ${esc((p.workloads||[]).join(', ')||'aucune')}</div>
+     ${(p.dependencies&&p.dependencies.length)?`<div><span class="k">Dépendances</span> : ${esc(p.dependencies.join(', '))}</div>`:''}</div>`;
+  html+=cloneWarnings(r.warnings);
+  if(r.manifests_preview){ html+=`<details style="margin-top:6px"><summary class="hint">Voir les manifestes</summary><pre class="box">${esc(r.manifests_preview)}</pre></details>`; }
   $("#rsRepl").innerHTML=html;
-  $("#rsSteps").innerHTML='<li>Créer le namespace cible (si « autre »)</li>'+(rsStatelessClone()?'':'<li>Créer les PV/PVC clonés (sur le VG cloné)</li>')+'<li>Créer les applications clonées (elles démarrent automatiquement)</li><li>L\'application d\'origine n\'est PAS modifiée ni arrêtée</li>';
+  $("#rsSteps").innerHTML="";
   $("#rsPlan").style.display="block"; setRsStep(3);
   updateGoButton(r.ok);
   if($("#mRestore").style.display!=="none") rsShowPage("plan");
@@ -11500,6 +11507,7 @@ $("#rsPreview").onclick=async()=>{
 };
 // Toute modification des références/noms rend le plan périmé : il faut re-prévisualiser.
 function invalidatePlan(){
+  rsDone=false;
   if(!state.preview) return;
   state.preview=null; $("#rsPlan").style.display="none"; $("#rsLog").innerHTML="";
   if(typeof rsWizPage!=="undefined" && rsWizPage==="plan") rsShowPage("form");
@@ -11518,55 +11526,87 @@ function updateGoButton(ready){
   refreshDry();
   const live=!dry();
   const needConfirm = live && ctxInfo.require_confirm;
-  $("#rsCtxConfirm").style.display = needConfirm? "block":"none";
+  $("#rsCtxConfirm").style.display = "none";          // la confirmation se fait dans la boîte de dialogue
   $("#rsGoHint").textContent = live? "" : "Mode simulation : rien ne sera modifié.";
   $("#rsGo").className = live? "btn danger" : "btn";
   let act;
   if(state.mode!=="clone") act = "la restauration sur place (flux manuel)";
   else if(isCloneApp()) act = "le clone de l'application";
   else act = "le clone";
-  $("#rsGo").textContent = (live? "Lancer " : "Simuler ") + act + (live? " (réel)" : "");
+  $("#rsGo").textContent = (live? "Lancer " : "Simuler ") + act;
   $("#rsGo").disabled = !ready;
   updateNextBar();
 }
 $("#dry").addEventListener("change",()=>{ if($("#rsPlan").style.display!=="none") updateGoButton(!$("#rsGo").disabled); });
 
+
+// ----- Clone d'application : confirmation unique, exécution, état « terminé » -----
+let rsDone=false, rsDoneTarget="", cloneBusy=false;
+function confirmCloneApp(withHycu){
+  const needCtx = ctxInfo.require_confirm ? (ctxInfo.context||"") : null;
+  const tgt = state.cloneNsMode==="same" ? "dans le <b>même namespace</b> (avec suffixe)"
+            : "dans le namespace <b>"+esc($("#rsCloneTargetNs").value.trim()||"?")+"</b>";
+  const lines=[];
+  if(withHycu) lines.push("Cloner dans HYCU les Volume Groups aux points choisis (les volumes d'origine ne sont pas modifiés).");
+  lines.push("Créer une copie de l'application "+tgt+" — l'application d'origine n'est ni modifiée ni arrêtée.");
+  lines.push("Cluster : <b>"+esc(ctxInfo.context||"?")+"</b>");
+  return confirmDanger({title:"Confirmer le clone d'application", requireText:needCtx, lines});
+}
+async function runCloneApp(confirmedCtxCA){
+  const live=!dry();
+  rsDone=false;
+  const bb=$("#rsGo"); bb.disabled=true; bb.innerHTML='<span class="spin"></span>…';
+  $("#rsLog").innerHTML='<div class="hint"><span class="spin"></span> Démarrage…</div>';
+  const caBody={...cloneAppBody(), dry:dry()};
+  if(live && ctxInfo.require_confirm) caBody.confirm_context=confirmedCtxCA;
+  const r=await runOp("/api/clone_app", caBody,
+    log=>{ $("#rsLog").innerHTML='<div class="hint"><span class="spin"></span> Clonage en cours…</div>'+renderLog(log); });
+  bb.disabled=false; updateGoButton(true);
+  if(r.error && !(r.log&&r.log.length)){ $("#rsLog").innerHTML=errBox(r.error); return; }
+  const lns=renderLog(r.log);
+  const hd=r.dry?'<div class="note">Simulation — ressources qui seraient créées (l\'app d\'origine reste intacte).</div>'
+    :(r.ok?'<div class="note">Clone terminé. L\'application d\'origine est intacte.</div>':'<div class="err">Des étapes ont échoué — voir le détail.</div>');
+  $("#rsLog").innerHTML=hd+lns+cloneWarnings(r.warnings);
+  if(!r.dry && r.ok){
+    // Terminé : plus de bouton de lancement, seule la vérification reste (pied de la fenêtre).
+    rsDone=true; rsDoneTarget = state.cloneNsMode==="other" ? $("#rsCloneTargetNs").value.trim() : $("#rsNs").value;
+    setRsStep(4); rsWizSync();
+  }
+}
+// Étape 2 -> lancement direct : une seule confirmation, clones HYCU si nécessaire, puis la copie.
+async function cloneAppDirect(){
+  $("#rsErr").innerHTML="";
+  const items=collectItems();
+  if(!items.length && !rsStatelessClone()){ $("#rsErr").innerHTML='<div class="err">Cochez au moins un PVC.</div>'; return; }
+  if(state.cloneNsMode==="other" && !$("#rsCloneTargetNs").value.trim()){ $("#rsErr").innerHTML='<div class="err">Indiquez le namespace cible.</div>'; return; }
+  if(dry()){ $("#rsPreview").click(); return; }          // simulation : aperçu, rien n'est créé
+  const batch=$("#hyBatchGo");
+  const pending = !!batch && !(items.length && items.every(i=>(i.new_ref||"").trim()));
+  const res=await confirmCloneApp(pending);
+  if(!res) return;
+  const confirmedCtx = (typeof res==="string") ? res : "";
+  cloneBusy=true; rsWizSync();
+  try{
+    if(pending){
+      const ok=await hyBatchRun({skipConfirm:true, noChain:true});
+      if(!ok) return;                                      // erreurs affichées volume par volume
+    }
+    $("#rsRepl").innerHTML=""; $("#rsSteps").innerHTML=""; $("#rsLog").innerHTML="";
+    $("#rsPlan").style.display="block"; rsShowPage("plan");
+    await runCloneApp(confirmedCtx);
+  } finally { cloneBusy=false; rsWizSync(); }
+}
 $("#rsGo").onclick=async()=>{
   hideNextBar();   // pas de « prochaine action » pendant l'exécution
   const live=!dry();
   if(state.preview && state.preview._cloneapp){
     let confirmedCtxCA="";
     if(live){
-      const needCtx = ctxInfo.require_confirm ? (ctxInfo.context||"") : null;
-      const res = await confirmDanger({title:"Confirmer le clone d'application", requireText:needCtx, lines:[
-         "Une <b>COPIE</b> de l'application sera créée"+(state.cloneNsMode==="same"?" dans le <b>même namespace</b> (avec suffixe)":" dans le namespace cible <b>"+esc($("#rsCloneTargetNs").value||"?")+"</b>")+".",
-         "Cluster ciblé : <b>"+esc(ctxInfo.context||"?")+"</b>",
-         "L'application d'origine n'est <b>PAS</b> modifiée ni arrêtée."]});
+      const res = await confirmCloneApp(false);
       if(!res) return;
       if(typeof res==="string") confirmedCtxCA=res;
     }
-    const bb=$("#rsGo"); bb.disabled=true; bb.innerHTML='<span class="spin"></span>…';
-    $("#rsLog").innerHTML='<div class="hint"><span class="spin"></span> Démarrage…</div>';
-    const caBody={...cloneAppBody(), dry:dry()};
-    if(live && ctxInfo.require_confirm) caBody.confirm_context=confirmedCtxCA;
-    const r=await runOp("/api/clone_app", caBody,
-      log=>{ $("#rsLog").innerHTML='<div class="hint"><span class="spin"></span> Clonage en cours…</div>'+renderLog(log); });
-    bb.disabled=false; updateGoButton(true);
-    if(r.error && !(r.log&&r.log.length)){ $("#rsLog").innerHTML=errBox(r.error); return; }
-    const lns=renderLog(r.log);
-    const hd=r.dry?'<div class="warnbox">Simulation — ressources qui seraient créées (l\'app d\'origine reste intacte).</div>'
-      :(r.ok?'<div class="note">Clone d\'application créé. L\'application d\'origine est intacte.</div>':'<div class="err">Des étapes ont échoué — voir le détail.</div>');
-    $("#rsLog").innerHTML=hd+lns+((r.warnings||[]).map(w=>`<div class="warnbox">⚠ ${esc(w)}</div>`).join(""));
-    if(!r.dry && r.ok){
-      const tgt = state.cloneNsMode==="other" ? $("#rsCloneTargetNs").value.trim() : $("#rsNs").value;
-      if((r.warnings||[]).length){   // laisser lire les avertissements ; la vérification est à un clic
-        $("#rsLog").insertAdjacentHTML("beforeend",'<div style="margin-top:8px"><button class="btn" id="rsGoVerify">Vérifier l\'application maintenant →</button></div>');
-        $("#rsGoVerify").onclick=()=>gotoVerify(tgt,true);
-      } else {
-        $("#rsLog").insertAdjacentHTML("afterbegin",'<div class="note">Ouverture de la vérification…</div>');
-        setTimeout(()=>gotoVerify(tgt,true),1200);
-      }
-    }
+    await runCloneApp(confirmedCtxCA);
     return;
   }
   let confirmedCtx="";
@@ -12991,6 +13031,7 @@ function rsAppLabel(){
 document.addEventListener("click", e=>{ const a=e.target.closest && e.target.closest(".rsWholeNs, #rsWholeNs");
   if(a){ e.preventDefault(); rsTargetWholeNs(); } });
 function openRestoreModal(ns, app){
+  rsDone=false; cloneBusy=false;
   ns = ns || state.ns || $("#rsNs").value; if(!ns) return;
   state.ns=ns; applyGlobalNs();
   // Application ciblée (page Applications) : {name, type, pvcs, whole_ns}. Sans
@@ -13077,7 +13118,15 @@ function rsWizSync(){
   else if(rsWizPage==="form"){
     const n=document.querySelectorAll(".rsChk:checked").length;
     const hyOn=!!(conn.hycu && conn.hycu.connected);
-    if(rsStatelessClone()){ lbl="Vérifier la copie"; act=()=>$("#rsPreview").click(); }
+    if(isCloneApp()){
+      // Clone d'application : lancement DIRECT depuis cette étape (une seule confirmation),
+      // clones HYCU compris ; en simulation, aperçu sans rien créer.
+      const items=collectItems(), filled=items.length>0 && items.every(i=>(i.new_ref||"").trim());
+      const batch=$("#hyBatchGo"), pending=!!batch && !filled;
+      lbl = dry() ? "Vérifier la copie" : "Lancer le clone de l'application";
+      dis = cloneBusy || (!rsStatelessClone() && (!n || (pending && batch.disabled)));
+      act = cloneAppDirect;
+    }
     else if(state.mode==="inplace" && hyOn){ src=$("#rsInplaceRun"); lbl="Restaurer"; }
     else {
       const items=collectItems(), filled=items.length>0 && items.every(i=>(i.new_ref||"").trim());
@@ -13086,7 +13135,8 @@ function rsWizSync(){
       else { dis=!n; act=()=>$("#rsPreview").click(); }
     }
     if(src){ dis=!n || src.disabled; act=()=>src.click(); }
-  } else { src=$("#rsGo"); lbl=(src.textContent||"").trim() || "Lancer"; dis=src.disabled; act=()=>src.click(); }
+  } else if(rsDone){ lbl="Vérifier l'application →"; dis=false; act=()=>gotoVerify(rsDoneTarget, true); }
+  else { src=$("#rsGo"); lbl=(src.textContent||"").trim() || "Lancer"; dis=src.disabled || cloneBusy; act=()=>src.click(); }
   const busy = src && src.querySelector(".spin");
   const html = busy ? '<span class="spin"></span>'+esc((src.textContent||"").trim()) : esc(lbl);
   if(html!==rsWizHtml){ go.innerHTML=html; rsWizHtml=html; }
@@ -13112,6 +13162,7 @@ var drAllowed=false, drBusy=false, drBackups=[], drMode="dr", drRecoverNs=null;
 // mêmes mécanismes que la page DR (sources depuis la sauvegarde seule), mais SANS
 // la dérogation allow_dr_restore (le serveur vérifie que la sauvegarde est d'ici).
 function openRecoverModal(ns){
+  rsDone=false; cloneBusy=false;
   state.ns=ns; state.app=null;         // la récupération recrée tout le namespace
   document.querySelectorAll('#rsPgType .opt').forEach(o=>{ o.style.display=""; });   // (masquées pour une app stateless)
   const note=$("#rsAppNote"); if(note){ note.style.display="none"; note.innerHTML=""; }
@@ -13389,8 +13440,8 @@ HTML_EN = r"""<!DOCTYPE html>
     --bg:#F3F4F9; --card:#FFFFFF; --title:#4B5274; --text:#3D4464; --strong:#2A2E44;
     --muted:#6B7089; --grey:#8A8FA3; --rule:#8A9BB0; --line:#E3E7EE;
   /* variantes « texte » conformes aux contrastes (≥ 4.5:1 sur blanc) */
-  --green-t:#047857; --red-t:#C53030; --orange-t:#9A6B1E;
-    --green:#05A274; --green-l:#9BDAC7; --red:#E9605A; --orange:#CA923E; --blue:#6688FF;
+  --green-t:#047857; --red-t:#C53030; --orange-t:#4B5274;
+    --green:#05A274; --green-l:#9BDAC7; --red:#E9605A; --orange:#8A94B8; --blue:#6688FF;
     /* alias historiques (utilisés par du HTML/JS existant) */
     --ink:var(--strong); --paper:var(--bg); --teal:var(--purple); --teal-d:var(--top);
     --accent:var(--purple); --amber:var(--orange); --good:var(--green); --warn:var(--orange);
@@ -13692,7 +13743,7 @@ HTML_EN = r"""<!DOCTYPE html>
            font-size:13px;color:var(--text)}
   .badge{font-size:11px;padding:2px 8px;border-radius:10px;font-weight:500}
   .b-bound{background:#E1F4EE;color:var(--green)} .b-lost{background:#FCE9E8;color:var(--red)}
-  .b-pending{background:#F8EFE0;color:var(--orange)} .b-na{background:#EEF0F5;color:var(--muted)}
+  .b-pending{background:#EEF0F5;color:var(--muted)} .b-na{background:#EEF0F5;color:var(--muted)}
   pre.box{background:var(--strong);color:#E6E8F0;border-radius:4px;padding:12px 14px;font-size:12px;
           overflow:auto;max-height:340px;white-space:pre-wrap;word-break:break-word}
   .drVol{display:flex;align-items:center;gap:12px;margin:7px 0}
@@ -13705,11 +13756,11 @@ HTML_EN = r"""<!DOCTYPE html>
   ol.plan li{margin:3px 0}
   .logline{display:flex;gap:8px;align-items:flex-start;font-size:13px;padding:7px 0;border-bottom:1px solid #F0F2F6}
   .logline .ic{margin-top:1px}
-  .ok{color:var(--green)} .ko{color:var(--red)} .sim{color:var(--orange)}
+  .ok{color:var(--green)} .ko{color:var(--red)} .sim{color:var(--muted)}
   .hint{font-size:12.5px;color:var(--muted);margin-top:8px}
   .note{background:#F7F5FD;border-left:3px solid var(--purple);padding:10px 14px;border-radius:0 4px 4px 0;
         font-size:13px;margin-top:12px;color:var(--text)}
-  .warnbox{background:#FBF5EB;border-left:3px solid var(--orange);padding:10px 14px;border-radius:0 4px 4px 0;
+  .warnbox{background:#F3F4F9;border-left:3px solid var(--grey);padding:10px 14px;border-radius:0 4px 4px 0;
         font-size:13px;margin-top:10px;color:#6E4E17}
   .err{background:#FDF0EF;border-left:3px solid var(--red);padding:10px 14px;border-radius:0 4px 4px 0;
        font-size:13px;color:#8E2F2A;margin-top:10px}
@@ -13726,6 +13777,7 @@ HTML_EN = r"""<!DOCTYPE html>
   .nextbar{display:none;align-items:center;justify-content:space-between;gap:12px;margin-top:14px;padding:10px 12px;
            background:#fff;border:1px solid var(--line);border-radius:6px}
   .nextbar.show{display:flex}
+  #rsStepsWrap:has(ol:empty){display:none}
   .step-no{display:none}
   /* ---------- Assistant de restauration : étapes visibles ---------- */
   .stepper{display:flex;gap:0;margin:0 0 16px;border:1px solid var(--line);border-radius:6px;overflow:hidden;background:#fff}
@@ -14342,7 +14394,7 @@ HTML_EN = r"""<!DOCTYPE html>
       <h3><span class="step-no">3</span>Review then launch</h3>
       <p class="sub">Review the derived replacements and the sequence, then launch.</p>
       <div id="rsRepl"></div>
-      <div><b style="font-size:13px">Planned sequence</b><ol class="plan" id="rsSteps"></ol></div>
+      <div id="rsStepsWrap"><b style="font-size:13px">Planned sequence</b><ol class="plan" id="rsSteps"></ol></div>
       <div id="rsCtxConfirm" style="display:none;margin-top:14px">
         <label class="fld">Target context confirmation before any action</label>
         <input type="text" id="rsCtxInput" placeholder="retype the kubectl context name">
@@ -14623,7 +14675,7 @@ function errHint(raw){
   if(/\b404\b|api-docs|endpoint.*not found/.test(e)) return "Endpoint not found — check the base URL and the API version (⚙ Settings).";
   if(/certificat|certificate|ssl|tls|self.?signed/.test(e)) return "TLS certificate — tick/untick “Verify the TLS certificate” in Connections to match your PKI.";
   if(/stockage objet|object storage/.test(e)) return "S3 endpoint unreachable — check the PORT (MinIO: 9000 = S3 API, not the 9001 console; Nutanix Objects: 443), the http/https scheme, and that the machine running the tool (the Pod, not your workstation) can reach that host.";
-  if(/timeout|timed out|délai|connexion impossible|connection failed|refused|unreachable|injoignable|getaddrinfo|name or service|errno|10061|10060/.test(e)) return "Host unreachable — check the URL:port (HYCU 8443, Prism 9440), the network and the firewall.";
+  if(/^(hôte|serveur|host|server) (injoignable|unreachable)|timed out|connexion impossible|connection (failed|refused)|getaddrinfo|name or service|errno \d+|10061|10060/.test(e)) return "Host unreachable — check the URL:port (HYCU 8443, Prism 9440), the network and the firewall.";
   if(/non connecté|connectez-vous|not connected|connect to at least|connect to hycu/.test(e)) return "Register the source first (⚙ at the top right).";
   if(/namespace.*(non autorisé|autorisé|not allowed)|(non autorisé).*namespace/.test(e)) return "Namespace not in the allowed list — see ⚙ Settings → allowed namespaces.";
   if(/contexte.*non autorisé|context.*not allowed|allowed_contexts/.test(e)) return "kubectl context not in the allowed list — see ⚙ Settings.";
@@ -15508,7 +15560,8 @@ async function lookupVgUuid(vgName){
 }
 // Clone TOUS les volumes prêts dans HYCU (séquentiel : suivi lisible ligne par ligne),
 // remplit les références, puis construit le plan automatiquement.
-async function hyBatchRun(){
+async function hyBatchRun(opts){
+  opts = (opts && !(opts instanceof Event)) ? opts : {};
   const rows=[...document.querySelectorAll("#rsVolCfgs .vol-cfg")].map(div=>{
     const sel=div.querySelector(".hyRp"); if(!sel || !sel.value) return null;
     const nameEl=div.querySelector(".hyVgName");
@@ -15516,11 +15569,11 @@ async function hyBatchRun(){
     return {pvc:div.dataset.pvc, vg:sel.dataset.vg, rp:sel.value,
             newName, stat:div.querySelector(".hyStat")};
   }).filter(Boolean);
-  if(!rows.length) return;
+  if(!rows.length) return false;
   const live=!dry();
-  if(live && !(await confirmDanger({title:"Confirm the HYCU clones", lines:[
+  if(live && !opts.skipConfirm && !(await confirmDanger({title:"Confirm the HYCU clones", lines:[
      "Trigger in HYCU the <b>clone</b> of <b>"+rows.length+"</b> Volume Group(s) at the chosen point?",
-     "The source VGs are <b>not</b> modified — <b>new</b> VGs are created."]}))) return;
+     "The source VGs are <b>not</b> modified — <b>new</b> VGs are created."]}))) return false;
   const b=$("#hyBatchGo"); b.disabled=true; b.innerHTML='<span class="spin"></span>HYCU clones in progress…';
   hideNextBar();
   let failed=0;
@@ -15548,15 +15601,18 @@ async function hyBatchRun(){
     row.stat.innerHTML=`<div class="note" style="margin-top:6px">✓ VG cloned — reference <code>${esc(lu.uuid)}</code> filled.</div>`;
   }
   b.disabled=false; b.textContent="Restore the VGs from HYCU ("+rows.length+" volume(s))";
-  if(dry()) return;                          // simulation : rien à préparer
+  if(dry()) return false;                    // simulation : rien à préparer
   const items=collectItems();
-  const allFilled=items.length && items.every(i=>(i.new_ref||"").trim());
-  if(!failed && allFilled){
+  const allFilled=!!(items.length && items.every(i=>(i.new_ref||"").trim()));
+  const ok=!failed && allFilled;
+  if(opts.noChain) return ok;
+  if(ok){
     // Enchaîner directement : construire le plan et amener l'opérateur au lancement.
     $("#rsPreview").click();
   } else {
     updateNextBar();
   }
+  return ok;
 }
 // --------- Orchestration RESTAURATION SUR PLACE (arrêt -> restore in-place -> redémarrage) ---------
 let rsInplaceSel={};   // {pvc: {source_vg_uuid, restore_point_id, vg_name}}
@@ -15632,19 +15688,21 @@ function cloneAppBody(){
           suffix: same? ($("#rsCloneSuffix").value.trim()||"-clone") : "",
           clone_refs: same? false : !!($("#rsCloneRefs")&&$("#rsCloneRefs").checked)};
 }
+function cloneWarnings(ws){
+  // Le résumé liste déjà les dépendances clonées : seules les limites restent, en une ligne.
+  return (ws||[]).filter(w=>!/^Dépendances clonées automatiquement/.test(w)).map(w=>`<div class="hint" style="margin-top:6px">${esc(w)}</div>`).join("");
+}
 function renderCloneAppPlan(r){
   if(!r.ok && !r.preview){ $("#rsErr").innerHTML=errBox(r.error); return; }
   const p=r.preview||{};
-  let html=`<div class="note">Preview ready. Review below, then click “<b>Launch the application clone (real)</b>” at the bottom to create the copy. <span class="hint">The original application is untouched.</span></div>
-     <div class="repl"><div class="nm">Application clone → namespace <b>${esc(p.target_namespace)}</b> ${p.same_namespace?'(same namespace, suffix)':'(other namespace)'}</div>
-     <div><span class="k">PVs created</span> : ${esc((p.pvs||[]).join(', ')||'—')}</div>
-     <div><span class="k">PVCs created</span> : ${esc((p.pvcs||[]).join(', ')||'—')}</div>
-     <div><span class="k">Cloned applications</span> : ${esc((p.workloads||[]).join(', ')||'none')}</div>
-     ${(p.dependencies&&p.dependencies.length)?`<div><span class="k">Cloned dependencies</span> : ${esc(p.dependencies.join(', '))}</div>`:''}</div>`;
-  (r.warnings||[]).forEach(w=>html+=`<div class="warnbox">⚠ ${esc(w)}</div>`);
-  if(r.manifests_preview){ html+=`<details style="margin-top:6px"><summary class="hint">View the cloned applications' manifests</summary><pre class="box">${esc(r.manifests_preview)}</pre></details>`; }
+  let html=`<div class="repl"><div class="nm">Copy → namespace <b>${esc(p.target_namespace)}</b>${p.same_namespace?' (suffix)':''}</div>
+     ${(p.pvcs||[]).length?`<div><span class="k">Volumes</span> : ${esc(p.pvcs.join(', '))}</div>`:''}
+     <div><span class="k">Applications</span>: ${esc((p.workloads||[]).join(', ')||'none')}</div>
+     ${(p.dependencies&&p.dependencies.length)?`<div><span class="k">Dependencies</span>: ${esc(p.dependencies.join(', '))}</div>`:''}</div>`;
+  html+=cloneWarnings(r.warnings);
+  if(r.manifests_preview){ html+=`<details style="margin-top:6px"><summary class="hint">View the manifests</summary><pre class="box">${esc(r.manifests_preview)}</pre></details>`; }
   $("#rsRepl").innerHTML=html;
-  $("#rsSteps").innerHTML='<li>Créer le namespace cible (si « autre »)</li>'+(rsStatelessClone()?'':'<li>Créer les PV/PVC clonés (sur le VG cloné)</li>')+'<li>Créer les applications clonées (elles démarrent automatiquement)</li><li>L\'application d\'origine n\'est PAS modifiée ni arrêtée</li>';
+  $("#rsSteps").innerHTML="";
   $("#rsPlan").style.display="block"; setRsStep(3);
   updateGoButton(r.ok);
   if($("#mRestore").style.display!=="none") rsShowPage("plan");
@@ -15701,6 +15759,7 @@ $("#rsPreview").onclick=async()=>{
 };
 // Toute modification des références/noms rend le plan périmé : il faut re-prévisualiser.
 function invalidatePlan(){
+  rsDone=false;
   if(!state.preview) return;
   state.preview=null; $("#rsPlan").style.display="none"; $("#rsLog").innerHTML="";
   if(typeof rsWizPage!=="undefined" && rsWizPage==="plan") rsShowPage("form");
@@ -15719,55 +15778,87 @@ function updateGoButton(ready){
   refreshDry();
   const live=!dry();
   const needConfirm = live && ctxInfo.require_confirm;
-  $("#rsCtxConfirm").style.display = needConfirm? "block":"none";
+  $("#rsCtxConfirm").style.display = "none";          // la confirmation se fait dans la boîte de dialogue
   $("#rsGoHint").textContent = live? "" : "Simulation mode: nothing will be changed.";
   $("#rsGo").className = live? "btn danger" : "btn";
   let act;
   if(state.mode!=="clone") act = "the in-place restore (manual flow)";
   else if(isCloneApp()) act = "the application clone";
   else act = "the clone";
-  $("#rsGo").textContent = (live? "Launch " : "Simulate ") + act + (live? " (real)" : "");
+  $("#rsGo").textContent = (live? "Launch " : "Simulate ") + act;
   $("#rsGo").disabled = !ready;
   updateNextBar();
 }
 $("#dry").addEventListener("change",()=>{ if($("#rsPlan").style.display!=="none") updateGoButton(!$("#rsGo").disabled); });
 
+
+// ----- Clone d'application : confirmation unique, exécution, état « finished » -----
+let rsDone=false, rsDoneTarget="", cloneBusy=false;
+function confirmCloneApp(withHycu){
+  const needCtx = ctxInfo.require_confirm ? (ctxInfo.context||"") : null;
+  const tgt = state.cloneNsMode==="same" ? "dans le <b>même namespace</b> (avec suffixe)"
+            : "in namespace <b>"+esc($("#rsCloneTargetNs").value.trim()||"?")+"</b>";
+  const lines=[];
+  if(withHycu) lines.push("Clone the Volume Groups in HYCU at the chosen points (the original volumes are not modified).");
+  lines.push("Create a copy of the application "+tgt+" — the original application is neither modified nor stopped.");
+  lines.push("Cluster: <b>"+esc(ctxInfo.context||"?")+"</b>");
+  return confirmDanger({title:"Confirm the application clone", requireText:needCtx, lines});
+}
+async function runCloneApp(confirmedCtxCA){
+  const live=!dry();
+  rsDone=false;
+  const bb=$("#rsGo"); bb.disabled=true; bb.innerHTML='<span class="spin"></span>…';
+  $("#rsLog").innerHTML='<div class="hint"><span class="spin"></span> Starting…</div>';
+  const caBody={...cloneAppBody(), dry:dry()};
+  if(live && ctxInfo.require_confirm) caBody.confirm_context=confirmedCtxCA;
+  const r=await runOp("/api/clone_app", caBody,
+    log=>{ $("#rsLog").innerHTML='<div class="hint"><span class="spin"></span> Cloning in progress…</div>'+renderLog(log); });
+  bb.disabled=false; updateGoButton(true);
+  if(r.error && !(r.log&&r.log.length)){ $("#rsLog").innerHTML=errBox(r.error); return; }
+  const lns=renderLog(r.log);
+  const hd=r.dry?'<div class="note">Simulation — resources that would be created (the original app stays intact).</div>'
+    :(r.ok?'<div class="note">Clone finished. The original application is intact.</div>':'<div class="err">Some steps failed — see details.</div>');
+  $("#rsLog").innerHTML=hd+lns+cloneWarnings(r.warnings);
+  if(!r.dry && r.ok){
+    // Terminé : plus de bouton de lancement, seule la vérification reste (pied de la fenêtre).
+    rsDone=true; rsDoneTarget = state.cloneNsMode==="other" ? $("#rsCloneTargetNs").value.trim() : $("#rsNs").value;
+    setRsStep(4); rsWizSync();
+  }
+}
+// Étape 2 -> lancement direct : une seule confirmation, clones HYCU si nécessaire, puis la copie.
+async function cloneAppDirect(){
+  $("#rsErr").innerHTML="";
+  const items=collectItems();
+  if(!items.length && !rsStatelessClone()){ $("#rsErr").innerHTML='<div class="err">Tick at least one PVC.</div>'; return; }
+  if(state.cloneNsMode==="other" && !$("#rsCloneTargetNs").value.trim()){ $("#rsErr").innerHTML='<div class="err">Provide the target namespace.</div>'; return; }
+  if(dry()){ $("#rsPreview").click(); return; }          // simulation : aperçu, rien n'est créé
+  const batch=$("#hyBatchGo");
+  const pending = !!batch && !(items.length && items.every(i=>(i.new_ref||"").trim()));
+  const res=await confirmCloneApp(pending);
+  if(!res) return;
+  const confirmedCtx = (typeof res==="string") ? res : "";
+  cloneBusy=true; rsWizSync();
+  try{
+    if(pending){
+      const ok=await hyBatchRun({skipConfirm:true, noChain:true});
+      if(!ok) return;                                      // erreurs affichées volume par volume
+    }
+    $("#rsRepl").innerHTML=""; $("#rsSteps").innerHTML=""; $("#rsLog").innerHTML="";
+    $("#rsPlan").style.display="block"; rsShowPage("plan");
+    await runCloneApp(confirmedCtx);
+  } finally { cloneBusy=false; rsWizSync(); }
+}
 $("#rsGo").onclick=async()=>{
   hideNextBar();   // pas de « prochaine action » pendant l'exécution
   const live=!dry();
   if(state.preview && state.preview._cloneapp){
     let confirmedCtxCA="";
     if(live){
-      const needCtx = ctxInfo.require_confirm ? (ctxInfo.context||"") : null;
-      const res = await confirmDanger({title:"Confirm the application clone", requireText:needCtx, lines:[
-         "A <b>COPY</b> of the application will be created"+(state.cloneNsMode==="same"?" in the <b>same namespace</b> (with a suffix)":" in the target namespace <b>"+esc($("#rsCloneTargetNs").value||"?")+"</b>")+".",
-         "Target cluster: <b>"+esc(ctxInfo.context||"?")+"</b>",
-         "The original application is <b>NOT</b> modified or stopped."]});
+      const res = await confirmCloneApp(false);
       if(!res) return;
       if(typeof res==="string") confirmedCtxCA=res;
     }
-    const bb=$("#rsGo"); bb.disabled=true; bb.innerHTML='<span class="spin"></span>…';
-    $("#rsLog").innerHTML='<div class="hint"><span class="spin"></span> Starting…</div>';
-    const caBody={...cloneAppBody(), dry:dry()};
-    if(live && ctxInfo.require_confirm) caBody.confirm_context=confirmedCtxCA;
-    const r=await runOp("/api/clone_app", caBody,
-      log=>{ $("#rsLog").innerHTML='<div class="hint"><span class="spin"></span> Cloning in progress…</div>'+renderLog(log); });
-    bb.disabled=false; updateGoButton(true);
-    if(r.error && !(r.log&&r.log.length)){ $("#rsLog").innerHTML=errBox(r.error); return; }
-    const lns=renderLog(r.log);
-    const hd=r.dry?'<div class="warnbox">Simulation — resources that would be created (the original app stays intact).</div>'
-      :(r.ok?'<div class="note">Application clone created. The original application is intact.</div>':'<div class="err">Some steps failed — see details.</div>');
-    $("#rsLog").innerHTML=hd+lns+((r.warnings||[]).map(w=>`<div class="warnbox">⚠ ${esc(w)}</div>`).join(""));
-    if(!r.dry && r.ok){
-      const tgt = state.cloneNsMode==="other" ? $("#rsCloneTargetNs").value.trim() : $("#rsNs").value;
-      if((r.warnings||[]).length){   // laisser lire les avertissements ; la vérification est à un clic
-        $("#rsLog").insertAdjacentHTML("beforeend",'<div style="margin-top:8px"><button class="btn" id="rsGoVerify">Verify the application now →</button></div>');
-        $("#rsGoVerify").onclick=()=>gotoVerify(tgt,true);
-      } else {
-        $("#rsLog").insertAdjacentHTML("afterbegin",'<div class="note">Opening the verification…</div>');
-        setTimeout(()=>gotoVerify(tgt,true),1200);
-      }
-    }
+    await runCloneApp(confirmedCtxCA);
     return;
   }
   let confirmedCtx="";
@@ -17192,6 +17283,7 @@ function rsAppLabel(){
 document.addEventListener("click", e=>{ const a=e.target.closest && e.target.closest(".rsWholeNs, #rsWholeNs");
   if(a){ e.preventDefault(); rsTargetWholeNs(); } });
 function openRestoreModal(ns, app){
+  rsDone=false; cloneBusy=false;
   ns = ns || state.ns || $("#rsNs").value; if(!ns) return;
   state.ns=ns; applyGlobalNs();
   // Application ciblée (page Applications) : {name, type, pvcs, whole_ns}. Sans
@@ -17278,7 +17370,15 @@ function rsWizSync(){
   else if(rsWizPage==="form"){
     const n=document.querySelectorAll(".rsChk:checked").length;
     const hyOn=!!(conn.hycu && conn.hycu.connected);
-    if(rsStatelessClone()){ lbl="Check the copy"; act=()=>$("#rsPreview").click(); }
+    if(isCloneApp()){
+      // Clone d'application : lancement DIRECT depuis cette étape (une seule confirmation),
+      // clones HYCU compris ; en simulation, aperçu sans rien créer.
+      const items=collectItems(), filled=items.length>0 && items.every(i=>(i.new_ref||"").trim());
+      const batch=$("#hyBatchGo"), pending=!!batch && !filled;
+      lbl = dry() ? "Check the copy" : "Launch the application clone";
+      dis = cloneBusy || (!rsStatelessClone() && (!n || (pending && batch.disabled)));
+      act = cloneAppDirect;
+    }
     else if(state.mode==="inplace" && hyOn){ src=$("#rsInplaceRun"); lbl="Restore"; }
     else {
       const items=collectItems(), filled=items.length>0 && items.every(i=>(i.new_ref||"").trim());
@@ -17287,7 +17387,8 @@ function rsWizSync(){
       else { dis=!n; act=()=>$("#rsPreview").click(); }
     }
     if(src){ dis=!n || src.disabled; act=()=>src.click(); }
-  } else { src=$("#rsGo"); lbl=(src.textContent||"").trim() || "Launch"; dis=src.disabled; act=()=>src.click(); }
+  } else if(rsDone){ lbl="Verify the application →"; dis=false; act=()=>gotoVerify(rsDoneTarget, true); }
+  else { src=$("#rsGo"); lbl=(src.textContent||"").trim() || "Launch"; dis=src.disabled || cloneBusy; act=()=>src.click(); }
   const busy = src && src.querySelector(".spin");
   const html = busy ? '<span class="spin"></span>'+esc((src.textContent||"").trim()) : esc(lbl);
   if(html!==rsWizHtml){ go.innerHTML=html; rsWizHtml=html; }
@@ -17313,6 +17414,7 @@ var drAllowed=false, drBusy=false, drBackups=[], drMode="dr", drRecoverNs=null;
 // mêmes mécanismes que la page DR (sources depuis la sauvegarde seule), mais SANS
 // la dérogation allow_dr_restore (le serveur vérifie que la sauvegarde est d'ici).
 function openRecoverModal(ns){
+  rsDone=false; cloneBusy=false;
   state.ns=ns; state.app=null;         // la récupération recrée tout le namespace
   document.querySelectorAll('#rsPgType .opt').forEach(o=>{ o.style.display=""; });   // (masquées pour une app stateless)
   const note=$("#rsAppNote"); if(note){ note.style.display="none"; note.innerHTML=""; }
@@ -19133,6 +19235,19 @@ I18N_EN = [
     ('Suivi interrompu (serveur injoignable) — rouvrez la fenêtre pour reprendre le suivi.', 'Tracking stopped (server unreachable) — reopen the window to resume tracking.'),
     ('Suivi du job : nouvelle tentative (', 'Job tracking: retrying ('),
     ('"Préparation impossible."', '"Preparation failed."'),
+    ('Copie → namespace <b>', 'Copy → namespace <b>'),
+    ("' (suffixe)'", "' (suffix)'"),
+    ('<span class="k">Applications</span> : ', '<span class="k">Applications</span>: '),
+    ('<span class="k">Dépendances</span> : ', '<span class="k">Dependencies</span>: '),
+    ('>Voir les manifestes<', '>View the manifests<'),
+    ("Cloner dans HYCU les Volume Groups aux points choisis (les volumes d'origine ne sont pas modifiés).", 'Clone the Volume Groups in HYCU at the chosen points (the original volumes are not modified).'),
+    ("Créer une copie de l'application ", 'Create a copy of the application '),
+    (" — l'application d'origine n'est ni modifiée ni arrêtée.", ' — the original application is neither modified nor stopped.'),
+    ('"Cluster : <b>"', '"Cluster: <b>"'),
+    ('dans le namespace <b>', 'in namespace <b>'),
+    ("Clone terminé. L\\'application d\\'origine est intacte.", 'Clone finished. The original application is intact.'),
+    ('"Lancer le clone de l\'application"', '"Launch the application clone"'),
+    ('"Vérifier l\'application →"', '"Verify the application →"'),
 ]
 # <<< I18N-END
 _I18N_SORTED = None          # (fr, en) triés du plus long au plus court

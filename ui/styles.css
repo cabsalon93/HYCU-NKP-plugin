@@ -10,8 +10,8 @@
     --bg:#F3F4F9; --card:#FFFFFF; --title:#4B5274; --text:#3D4464; --strong:#2A2E44;
     --muted:#6B7089; --grey:#8A8FA3; --rule:#8A9BB0; --line:#E3E7EE;
   /* variantes « texte » conformes aux contrastes (≥ 4.5:1 sur blanc) */
-  --green-t:#047857; --red-t:#C53030; --orange-t:#9A6B1E;
-    --green:#05A274; --green-l:#9BDAC7; --red:#E9605A; --orange:#CA923E; --blue:#6688FF;
+  --green-t:#047857; --red-t:#C53030; --orange-t:#4B5274;
+    --green:#05A274; --green-l:#9BDAC7; --red:#E9605A; --orange:#8A94B8; --blue:#6688FF;
     /* alias historiques (utilisés par du HTML/JS existant) */
     --ink:var(--strong); --paper:var(--bg); --teal:var(--purple); --teal-d:var(--top);
     --accent:var(--purple); --amber:var(--orange); --good:var(--green); --warn:var(--orange);
@@ -313,7 +313,7 @@
            font-size:13px;color:var(--text)}
   .badge{font-size:11px;padding:2px 8px;border-radius:10px;font-weight:500}
   .b-bound{background:#E1F4EE;color:var(--green)} .b-lost{background:#FCE9E8;color:var(--red)}
-  .b-pending{background:#F8EFE0;color:var(--orange)} .b-na{background:#EEF0F5;color:var(--muted)}
+  .b-pending{background:#EEF0F5;color:var(--muted)} .b-na{background:#EEF0F5;color:var(--muted)}
   pre.box{background:var(--strong);color:#E6E8F0;border-radius:4px;padding:12px 14px;font-size:12px;
           overflow:auto;max-height:340px;white-space:pre-wrap;word-break:break-word}
   .drVol{display:flex;align-items:center;gap:12px;margin:7px 0}
@@ -326,11 +326,11 @@
   ol.plan li{margin:3px 0}
   .logline{display:flex;gap:8px;align-items:flex-start;font-size:13px;padding:7px 0;border-bottom:1px solid #F0F2F6}
   .logline .ic{margin-top:1px}
-  .ok{color:var(--green)} .ko{color:var(--red)} .sim{color:var(--orange)}
+  .ok{color:var(--green)} .ko{color:var(--red)} .sim{color:var(--muted)}
   .hint{font-size:12.5px;color:var(--muted);margin-top:8px}
   .note{background:#F7F5FD;border-left:3px solid var(--purple);padding:10px 14px;border-radius:0 4px 4px 0;
         font-size:13px;margin-top:12px;color:var(--text)}
-  .warnbox{background:#FBF5EB;border-left:3px solid var(--orange);padding:10px 14px;border-radius:0 4px 4px 0;
+  .warnbox{background:#F3F4F9;border-left:3px solid var(--grey);padding:10px 14px;border-radius:0 4px 4px 0;
         font-size:13px;margin-top:10px;color:#6E4E17}
   .err{background:#FDF0EF;border-left:3px solid var(--red);padding:10px 14px;border-radius:0 4px 4px 0;
        font-size:13px;color:#8E2F2A;margin-top:10px}
@@ -347,6 +347,7 @@
   .nextbar{display:none;align-items:center;justify-content:space-between;gap:12px;margin-top:14px;padding:10px 12px;
            background:#fff;border:1px solid var(--line);border-radius:6px}
   .nextbar.show{display:flex}
+  #rsStepsWrap:has(ol:empty){display:none}
   .step-no{display:none}
   /* ---------- Assistant de restauration : étapes visibles ---------- */
   .stepper{display:flex;gap:0;margin:0 0 16px;border:1px solid var(--line);border-radius:6px;overflow:hidden;background:#fff}

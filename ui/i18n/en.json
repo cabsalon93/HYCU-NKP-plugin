@@ -6182,5 +6182,57 @@
 [
 "\"Préparation impossible.\"",
 "\"Preparation failed.\""
+],
+[
+"Copie → namespace <b>",
+"Copy → namespace <b>"
+],
+[
+"' (suffixe)'",
+"' (suffix)'"
+],
+[
+"<span class=\"k\">Applications</span> : ",
+"<span class=\"k\">Applications</span>: "
+],
+[
+"<span class=\"k\">Dépendances</span> : ",
+"<span class=\"k\">Dependencies</span>: "
+],
+[
+">Voir les manifestes<",
+">View the manifests<"
+],
+[
+"Cloner dans HYCU les Volume Groups aux points choisis (les volumes d'origine ne sont pas modifiés).",
+"Clone the Volume Groups in HYCU at the chosen points (the original volumes are not modified)."
+],
+[
+"Créer une copie de l'application ",
+"Create a copy of the application "
+],
+[
+" — l'application d'origine n'est ni modifiée ni arrêtée.",
+" — the original application is neither modified nor stopped."
+],
+[
+"\"Cluster : <b>\"",
+"\"Cluster: <b>\""
+],
+[
+"dans le namespace <b>",
+"in namespace <b>"
+],
+[
+"Clone terminé. L\\'application d\\'origine est intacte.",
+"Clone finished. The original application is intact."
+],
+[
+"\"Lancer le clone de l'application\"",
+"\"Launch the application clone\""
+],
+[
+"\"Vérifier l'application →\"",
+"\"Verify the application →\""
 ]
 ]
