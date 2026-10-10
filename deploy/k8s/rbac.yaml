@@ -31,6 +31,9 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch"]
+  - apiGroups: ["", "events.k8s.io"]
+    resources: ["events"]
+    verbs: ["get", "list"]                       # vérification : raison des pods bloqués (FailedMount…)
   - apiGroups: ["storage.k8s.io"]
     resources: ["volumeattachments", "storageclasses"]
     verbs: ["get", "list"]                       # pré-vol : détachement confirmé, StorageClass présente
@@ -47,7 +50,7 @@ rules:
   # --- Dépendances clonées (ConfigMaps, ServiceAccounts, Services) ---
   - apiGroups: [""]
     resources: ["configmaps", "serviceaccounts", "services"]
-    verbs: ["get", "list", "create"]
+    verbs: ["get", "list", "create", "patch"]    # restauration d'objets : kubectl apply sur l'existant
   # --- Sauvegarde de configuration ÉTENDUE : lecture seule des kinds exportés ---
   - apiGroups: ["batch"]
     resources: ["jobs", "cronjobs"]
@@ -93,7 +96,7 @@ metadata:
 rules:
   - apiGroups: [""]
     resources: ["secrets"]
-    verbs: ["get", "list", "create"]
+    verbs: ["get", "list", "create", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

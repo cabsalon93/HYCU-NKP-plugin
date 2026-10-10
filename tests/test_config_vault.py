@@ -88,3 +88,19 @@ def test_vault_legacy_blob_still_readable(H):
 def test_default_lang_and_simulation_defaults(H):
     assert H.CONFIG["default_lang"] == "en"
     assert H.CONFIG["simulation_mode_available"] is False
+
+
+def test_container_mode_accepts_unchanged_locked_keys(H, monkeypatch):
+    """En conteneur, l'interface renvoie tout le formulaire : une clé verrouillée INCHANGÉE
+    passe ; un changement est refusé ; une valeur venue de l'environnement n'est pas écrite."""
+    monkeypatch.setenv("HYCU_HOST", "0.0.0.0")
+    monkeypatch.setenv("HYCU_ALLOWED_HOSTS", "from-env.example")
+    H._rebuild_config()
+    assert H._container_mode()
+    ok, err = H.save_config({"kubectl_path": H.CONFIG["kubectl_path"], "default_lang": "fr",
+                             "allowed_hosts": ["from-env.example"]}, source="api")
+    assert ok, err
+    assert H.CONFIG["default_lang"] == "fr" and "kubectl_path" not in H.USER_CONFIG
+    assert "allowed_hosts" not in H.USER_CONFIG and H.CONFIG["allowed_hosts"] == ["from-env.example"]
+    ok2, err2 = H.save_config({"kubectl_path": "/usr/bin/kubectl"}, source="api")
+    assert not ok2 and "lecture seule" in err2

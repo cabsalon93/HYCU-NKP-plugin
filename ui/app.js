@@ -531,8 +531,8 @@ async function loadAutoBackup(){
 }
 $("#abSave").onclick=async()=>{
   const cfg={auto_backup_enabled:$("#abEnabled").checked,
-    auto_backup_interval_hours:Math.max(1,parseInt($("#abInterval").value)||24),
-    auto_backup_keep:Math.max(1,parseInt($("#abKeep").value)||15),
+    auto_backup_interval_hours:Math.max(0.25,parseFloat(String($("#abInterval").value).replace(",","."))||24),
+    auto_backup_keep:Math.max(0,parseInt($("#abKeep").value)||0),
     auto_backup_retention:$("#abRet").value,
     auto_backup_keep_daily:Math.max(0,parseInt($("#abGfsD").value)||0),
     auto_backup_keep_weekly:Math.max(0,parseInt($("#abGfsW").value)||0),
@@ -1107,6 +1107,7 @@ $("#rsPreview").onclick=async()=>{
   }
   const body={namespace:$("#rsNs").value,mode:state.mode,items,backup_path:state.backup_path,backup_root:state.backup_root,dry:dry()};
   const r=await post("/api/prepare_restore",body);
+  if(!r.ok && !(r.results||[]).length){ $("#rsErr").innerHTML=errBox(r.error||"Préparation impossible."); updateGoButton(false); return; }
   state.preview=body;
   let html="";
   (r.results||[]).forEach(res=>{
@@ -1577,9 +1578,16 @@ async function ntFindRef(pvc){
 // Suivi générique d'un job HYCU : barre de progression + polling (backup ou restore).
 async function pollJobBar(id, target){
   const el=(typeof target==="string")?$(target):target; if(!el) return false;
+  let errs=0;
   for(let i=0;i<240;i++){                       // ~12 min max (240 * 3s)
     const r=await post("/api/hycu/job",{job_id:id});
-    if(!r.ok){ el.innerHTML=`<div class="hint">Suivi du job indisponible : ${esc(r.error||'')}</div>`; return false; }
+    if(!r.ok){
+      if((r.http_status===0 || r.http_status>=500) && ++errs<=10){     // coupure passagère : on réessaie
+        el.innerHTML=`<div class="hint">Suivi du job : nouvelle tentative (${errs}/10)…</div>`;
+        await new Promise(s=>setTimeout(s,3000)); continue;
+      }
+      el.innerHTML=`<div class="hint">Suivi du job indisponible : ${esc(r.error||'')}</div>`; return false; }
+    errs=0;
     const pct=(r.progress!=null)?r.progress:0, status=r.status||"?";
     el.innerHTML=`<div class="hint" style="margin-top:8px">Job <code>${esc(id)}</code> — ${esc(status)}${r.progress!=null?(' · '+pct+'%'):''}</div>
        <div class="jbar"><span style="width:${pct}%"></span></div>`;
@@ -1666,7 +1674,7 @@ refreshDry();
 // ============================================================================
 var rsAutoCheck=false;            // assistant ouvert : volumes présélectionnés (cf. renderRsPvcs)
 var pageTimer=null;
-const MODALS=["mBackup","mPolicy","mRestore","mSources"];
+const MODALS=["mBackup","mPolicy","mRestore","mSources","mBulk"];
 const FOCUSABLE='a[href],button:not([disabled]),input:not([disabled]):not([type=hidden]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])';
 let modalReturnFocus={};
 function openModal(id){
@@ -2019,7 +2027,7 @@ function openPolicyModal(ns){
 // Plan (lecture seule) -> Simuler (journal, arrière-plan) -> Lancer (réel : simulation
 // du même plan exigée par le serveur, confirmation du contexte) ; suivi par polling,
 // arrêt propre et reprise (les namespaces déjà recréés ne sont jamais refaits).
-let bulkPlan=null, bulkStatus=null, bulkTimer=null, bulkWasRunning=false;
+let bulkPlan=null, bulkStatus=null, bulkTimer=null, bulkWasRunning=false, bulkPollErrors=0;
 function bulkNowLocal(){ const d=new Date(); const p=n=>String(n).padStart(2,"0");
   return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`; }
 function bulkExclude(){ return ($("#bulkExclude").value||"").split(",").map(s=>s.trim()).filter(Boolean); }
@@ -2099,7 +2107,13 @@ $("#bulkResume").onclick=async()=>{
 async function bulkPoll(){
   clearTimeout(bulkTimer);
   if($("#mBulk").style.display==="none") return;
-  const st=await get("/api/bulk/status"); if(!st.ok) return;
+  const st=await get("/api/bulk/status");
+  if(!st.ok){                                   // coupure passagère : on réessaie (borné), sans figer les boutons
+    if(++bulkPollErrors<=30){ bulkTimer=setTimeout(bulkPoll, 3000); }
+    else { $("#bulkRunOut").insertAdjacentHTML("beforeend", '<div class="hint">Suivi interrompu (serveur injoignable) — rouvrez la fenêtre pour reprendre le suivi.</div>'); }
+    return;
+  }
+  bulkPollErrors=0;
   bulkStatus=st; bulkRenderStatus(st); bulkSyncBtns();
   if(st.running){ bulkWasRunning=true; bulkTimer=setTimeout(bulkPoll, 2000); }
   else if(bulkWasRunning){ bulkWasRunning=false; loadApps(true); }   // namespaces recréés : inventaire à jour
@@ -2579,7 +2593,7 @@ document.querySelectorAll("#rsPgTarget .opt").forEach(o=>{
 function rsShowPage(p){
   rsWizPage=p;
   if(p==="target"){ rsTgtMode=state.cloneNsMode||"same"; rsSyncTgtOpts(); }
-  setRsStep(p==="type" ? 1 : p==="form" ? 2 : 3);
+  setRsStep(p==="type" ? 1 : p==="plan" ? 3 : 2);
   $("#rsPgType").style.display = p==="type" ? "block" : "none";
   $("#rsPgTarget").style.display = p==="target" ? "block" : "none";
   $("#rsPgObjects").style.display = p==="objects" ? "block" : "none";
@@ -2731,6 +2745,7 @@ var drAllowed=false, drBusy=false, drBackups=[], drMode="dr", drRecoverNs=null;
 // la dérogation allow_dr_restore (le serveur vérifie que la sauvegarde est d'ici).
 function openRecoverModal(ns){
   state.ns=ns; state.app=null;         // la récupération recrée tout le namespace
+  document.querySelectorAll('#rsPgType .opt').forEach(o=>{ o.style.display=""; });   // (masquées pour une app stateless)
   const note=$("#rsAppNote"); if(note){ note.style.display="none"; note.innerHTML=""; }
   rsWizKind="recover"; rsSyncOpts();   // kind dédié : « Retour » puis « Suivant » ne devient jamais une DR
   ["#rsLog","#rsInplaceLog","#rsErr"].forEach(id=>{ const e=$(id); if(e) e.innerHTML=""; });

@@ -206,3 +206,38 @@ def test_backup_partial_when_pv_unreadable(H, monkeypatch):
     assert not r["ok"] and r["partial"] and "PARTIELLE" in r["error"] and "data-2" in r["error"]
     idx = json.load(open(os.path.join(r["dir"], "index.json"), encoding="utf-8"))
     assert idx["partial"] and idx["pv_errors"] and not idx["complete"]
+
+
+def test_restart_failed_resume_keeps_transaction(H, monkeypatch):
+    """Scale-up refusé après des volumes restaurés -> transaction restart_failed. Une reprise
+    dont le scale-up échoue ENCORE garde la transaction (sinon un passage suivant rejouerait
+    toute la séquence destructive, sans réplicas mémorisés) ; la reprise suivante réussit."""
+    seed(H, replicas=0)                     # app déjà à 0 : rien à arrêter, le redémarrage vient de la transaction
+    bk = H.action_backup("app", kind="pre_restore", internal=True)
+    assert bk["ok"]
+    prep = H.action_prepare_restore(dict(PAYLOAD))
+    prepared = [r for r in prep["results"] if r.get("ok")]
+    H._save_txn("app", {"status": "in_progress", "started": "2026-10-10T10:00:00", "mode": "clone",
+                        "backup_dir": bk["dir"], "signature": H._txn_signature("clone", prepared),
+                        "workloads": [{"kind": "deployment", "name": "web", "replicas": 2}],
+                        "volumes": [{"pvc": r["pvc"], "new_pv": r["new_pv_name"], "status": "pending",
+                                     "manifest": r["manifest"], "pvc_manifest": r.get("pvc_manifest")} for r in prepared]})
+    monkeypatch.setenv("FAKE_FAIL_AT", "scale:deployments:web")
+    res = H._execute_restore_locked(dict(PAYLOAD))
+    assert res["aborted"] and not res["ok"]
+    assert set(read_state(H)["pvs"]) == {"pv-new-1", "pv-new-2"}, "volumes restaurés"
+    txn = H._load_txn("app")
+    assert txn and txn["status"] == "restart_failed"
+    # Reprise « redémarrage seul » qui échoue encore : transaction CONSERVÉE, volumes intacts.
+    res2 = H._execute_restore_locked(dict(PAYLOAD))
+    assert res2["aborted"] and not res2["ok"]
+    txn = H._load_txn("app")
+    assert txn and txn["status"] == "restart_failed", "la transaction doit survivre à un nouvel échec du redémarrage"
+    assert txn["workloads"] == [{"kind": "deployment", "name": "web", "replicas": 2}]
+    assert set(read_state(H)["pvs"]) == {"pv-new-1", "pv-new-2"}
+    # Le redémarrage finit par réussir -> transaction effacée, réplicas repris de la transaction.
+    monkeypatch.delenv("FAKE_FAIL_AT")
+    res3 = H._execute_restore_locked(dict(PAYLOAD))
+    assert res3["ok"], labels(res3)
+    assert read_state(H)["deployments"]["app"]["web"]["spec"]["replicas"] == 2
+    assert H._load_txn("app") is None

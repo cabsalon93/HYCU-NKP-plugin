@@ -336,7 +336,7 @@ CONFIG_SCHEMA = {
     "open_browser": (bool, None),
     "logo_path": (str, None),
     "remember_credentials": (bool, None),
-    "pbkdf2_iterations": (int, lambda v: 100000 <= v <= 10000000),
+    "pbkdf2_iterations": (int, lambda v: 1000 <= v <= 10000000),
     "hycu_url": (str, None), "hycu_api_base": (str, None), "hycu_test_path": (str, None),
     "hycu_verify_tls": (bool, None),
     "nutanix_url": (str, None), "nutanix_api_base": (str, None), "nutanix_verify_tls": (bool, None),
@@ -427,12 +427,18 @@ def validate_config(updates, source="api"):
     for k, v in (updates or {}).items():
         if k not in CONFIG_SCHEMA:
             continue
-        if source == "api" and k in _CONTAINER_LOCKED_KEYS and _container_mode():
-            return None, "Clé « %s » en lecture seule en mode conteneur (fichier ou variable d'environnement)." % k
         try:
-            out[k] = _coerce_config_value(k, v)
+            cv = _coerce_config_value(k, v)
         except ValueError as e:
             return None, "Configuration : clé « %s » invalide (%s)." % (k, e)
+        if source == "api" and k in _CONTAINER_LOCKED_KEYS and _container_mode():
+            # L'interface renvoie toujours le formulaire complet (Réglages, assistant de
+            # premier lancement) : une valeur IDENTIQUE à l'actuelle est simplement ignorée ;
+            # seule une tentative de CHANGEMENT est refusée.
+            if cv == CONFIG.get(k):
+                continue
+            return None, "Clé « %s » en lecture seule en mode conteneur (fichier ou variable d'environnement)." % k
+        out[k] = cv
     return out, None
 
 
@@ -545,8 +551,13 @@ def save_config(updates, source="internal"):
     if err:
         return False, err
     with CONFIG_LOCK:
-        USER_CONFIG.update(vals)
+        env = _env_overrides()
+        # Une valeur égale à la surcharge d'environnement n'est pas écrite dans le fichier
+        # (elle vient de l'environnement, pas de l'opérateur) ; la reconstruction garde la
+        # priorité env > fichier > défauts, même après une sauvegarde depuis l'interface.
+        USER_CONFIG.update({k: v for k, v in vals.items() if not (k in env and env[k] == v)})
         CONFIG.update(vals)          # effet immédiat ; CONFIG garde ses autres valeurs à chaud
+        CONFIG.update(env)           # l'environnement garde la priorité sur une saisie
         try:
             _write_json_atomic(CONFIG_PATH, USER_CONFIG, mode=0o644)
             return True, None
@@ -556,7 +567,7 @@ def save_config(updates, source="internal"):
 
 # Version horodatée de la build (format AAAAMMJJ-HHMM). À incrémenter à chaque
 # changement notable du programme ; affichée dans l'en-tête de l'interface.
-VERSION = "20261009-2300"
+VERSION = "20261010-1200"
 
 # Jeton anti-CSRF généré au démarrage, injecté dans la page et exigé sur les POST.
 CSRF_TOKEN = secrets.token_urlsafe(32)
@@ -1978,7 +1989,7 @@ def enforce_storage_quota(root=None):
             try:
                 with open(os.path.join(dirpath, "_restore_txn.json"), encoding="utf-8") as f:
                     t = json.load(f)
-                if t.get("status") == "in_progress" and t.get("backup_dir"):
+                if t.get("status") in ("in_progress", "restart_failed") and t.get("backup_dir"):
                     protected.add(os.path.realpath(t["backup_dir"]))
             except (OSError, ValueError):
                 pass
@@ -2881,13 +2892,16 @@ def _auto_backup_run(now=None, runner=None):
             parts = []
             cids = _cluster_ids()
             for cid in cids:
-                with use_cluster(cid, req_timeout=60):
-                    # Cluster local non configuré (outil utilisé uniquement avec des
-                    # clusters ajoutés) : ignoré sans le compter comme un échec.
-                    if cid == LOCAL_CID and len(cids) > 1 and not action_context().get("kubectl_ok"):
-                        continue
-                    parts.append((_cluster_label(cid),) + _auto_backup_one(
-                        lambda d: action_backup_all(d, kind="auto", internal=True), dest))
+                try:
+                    with use_cluster(cid, req_timeout=60):
+                        # Cluster local non configuré (outil utilisé uniquement avec des
+                        # clusters ajoutés) : ignoré sans le compter comme un échec.
+                        if cid == LOCAL_CID and len(cids) > 1 and not action_context().get("kubectl_ok"):
+                            continue
+                        parts.append((_cluster_label(cid),) + _auto_backup_one(
+                            lambda d: action_backup_all(d, kind="auto", internal=True), dest))
+                except Exception as e:          # un cluster en erreur n'arrête pas les autres
+                    parts.append((_cluster_label(cid), False, "erreur : %s" % e))
         ok = bool(parts) and all(p[1] for p in parts)
         if len(parts) <= 1:
             summary = parts[0][2] if parts else "aucun cluster disponible"
@@ -4870,10 +4884,20 @@ def _restore_preflight(ns, prepared, mode, dry, current, log):
 
     # 8) Écriture de la transaction possible (sinon aucune reprise ne serait possible).
     if not dry:
-        okw, werr = _save_txn(ns, {"status": "preflight", "started": datetime.datetime.now().isoformat()})
+        # Sonde dans un fichier VOISIN : une transaction in_progress/restart_failed en cours
+        # de reprise ne doit jamais être écrasée ni effacée par le préflight.
+        probe = _txn_path(ns) + ".probe"
+        try:
+            _write_json_atomic(probe, {"status": "preflight", "started": datetime.datetime.now().isoformat()},
+                               mode=0o600)
+            okw, werr = True, None
+        except Exception as e:
+            okw, werr = False, str(e)
         add("Écriture de la transaction de reprise", okw, werr or _txn_path(ns))
-        if okw:
-            _clear_txn(ns)
+        try:
+            os.remove(probe)
+        except OSError:
+            pass
 
     for c in checks:
         mark = "✓" if c["ok"] else ("?" if c["ok"] is None else "✕")
@@ -4942,7 +4966,10 @@ def _execute_restore_locked(payload, log=None):
         return {"ok": False, "error": prep.get("error") or "Aucun volume préparé.", "log": [],
                 "results": prep.get("results")}
 
-    destructive_started = False      # vrai dès la première suppression réelle
+    # La transaction de reprise n'est effacée après un abandon que si RIEN d'irréversible
+    # n'a eu lieu : ni reprise d'une transaction existante, ni arrêt de l'application
+    # (les réplicas mémorisés seraient perdus), ni suppression. Vrai dès l'un des trois.
+    destructive_started = bool(txn)
     # Garde AVANT toute destruction (la prévisualisation n'émet qu'un avertissement) :
     # une référence qui est le NOM du VG (« pvc-<uuid-du-PVC> ») ou, en clone, l'UUID du
     # VG SOURCE détruirait PVC/PV pour recréer un PV sur un VG inexistant / partagé.
@@ -5004,7 +5031,8 @@ def _execute_restore_locked(payload, log=None):
     if not dry:
         backup_dir = (txn or {}).get("backup_dir")
         if not txn and CONFIG.get("backup_before_restore", True):
-            b = action_backup(ns, protect=[payload.get("backup_path")], kind="pre_restore", internal=True)
+            b = action_backup(ns, protect=[payload.get("backup_path")], kind="pre_restore", internal=True,
+                              defer_quota=True)          # jamais de purge au milieu d'une restauration
             log.append(logentry("Sauvegarde de sécurité du namespace avant restauration",
                                 ok=bool(b.get("ok")), rc=0 if b.get("ok") else -1,
                                 stdout=("Manifestes : %s" % b.get("dir")) if b.get("dir") else "",
@@ -5039,6 +5067,8 @@ def _execute_restore_locked(payload, log=None):
     # 2. Arrêt de l'application puis attente de l'arrêt effectif des pods (réel).
     if not restart_only:
         ok_stop, detail_stop = _stop_workloads(current, ns, dry, log)
+        if not dry and any(int(w.get("replicas") or 0) > 0 for w in current):
+            destructive_started = True       # l'application a été (au moins partiellement) arrêtée
         if not ok_stop:
             aborted = True
             abort_detail = detail_stop
@@ -5123,7 +5153,10 @@ def _execute_restore_locked(payload, log=None):
                 aborted = True
                 abort_detail = "suppression du PVC %s" % pvc_name
                 break
-            for p in [x for x in dict.fromkeys([pv_old, cur_pv]) if x and x != new_name]:
+            # Y compris quand l'ancien PV porte le MÊME nom que le nouveau (restauration sur
+            # place) : un `apply` par-dessus un PV Released garderait le claimRef.uid périmé
+            # et le PVC recréé ne se lierait jamais. Il est en Retain : suppression sans risque.
+            for p in [x for x in dict.fromkeys([pv_old, cur_pv]) if x]:
                 if not _wait_volume_attachments_gone(p, CONFIG["wait_timeout"], log):
                     aborted = True
                     abort_detail = "détachement du volume %s (VolumeAttachment encore présent)" % p
@@ -5599,6 +5632,9 @@ def _s3_object_url(key=""):
     return "%s://%s%s" % (u.scheme, host, path), host, path
 
 
+_S3_MAX_DOWNLOAD = 512 * 1024 * 1024      # import d'un export : lu en mémoire, donc borné
+
+
 def _s3_request(method, key="", body=b"", query="", want_body=False):
     """Requête S3 signée SigV4. Renvoie {"ok", "status", "error", "body"} ;
     `want_body=True` renvoie le corps COMPLET en octets dans "data" (listing XML,
@@ -5630,8 +5666,21 @@ def _s3_request(method, key="", body=b"", query="", want_body=False):
     try:
         with urllib.request.urlopen(req, timeout=300 if want_body else 60, context=ctx) as resp:
             if want_body:
-                return {"ok": True, "status": resp.status, "error": None,
-                        "data": resp.read(), "body": ""}
+                # Objet lu en mémoire (import) : borné pour ne pas faire tomber le Pod (OOM).
+                try:
+                    clen = int(resp.getheader("Content-Length") or 0)
+                except (TypeError, ValueError):
+                    clen = 0
+                if clen > _S3_MAX_DOWNLOAD:
+                    return {"ok": False, "status": resp.status, "data": b"", "body": "",
+                            "error": "objet trop volumineux pour un import direct (%d Mo > %d Mo)"
+                                     % (clen // (1024 * 1024), _S3_MAX_DOWNLOAD // (1024 * 1024))}
+                data = resp.read(_S3_MAX_DOWNLOAD + 1)
+                if len(data) > _S3_MAX_DOWNLOAD:
+                    return {"ok": False, "status": resp.status, "data": b"", "body": "",
+                            "error": "objet trop volumineux pour un import direct (> %d Mo)"
+                                     % (_S3_MAX_DOWNLOAD // (1024 * 1024))}
+                return {"ok": True, "status": resp.status, "error": None, "data": data, "body": ""}
             return {"ok": True, "status": resp.status, "error": None,
                     "body": resp.read(2048).decode("utf-8", "replace")}
     except urllib.error.HTTPError as e:
@@ -5750,8 +5799,13 @@ def action_s3_import(payload):
             continue
         cluster, nsname, fname = rel[-3], rel[-2], rel[-1]
         ts = fname[:-8] if fname.endswith(".zip.enc") else fname[:-4]
-        if not (K8S_NAME_RE.match(nsname) and re.fullmatch(r"[A-Za-z0-9._-]{1,80}", cluster)
-                and re.fullmatch(r"[A-Za-z0-9._-]{1,80}", ts)):
+        if not (K8S_NAME_RE.match(nsname) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}", cluster)
+                and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}", ts)):
+            results.append({"key": label, "ok": False, "error": "clé invalide"})
+            continue
+        imports_root = os.path.realpath(os.path.join(CONFIG["backup_root"], "_imports"))
+        dest = os.path.join(CONFIG["backup_root"], "_imports", cluster, nsname, ts)
+        if not os.path.realpath(dest).startswith(imports_root + os.sep):
             results.append({"key": label, "ok": False, "error": "clé invalide"})
             continue
         ferr = _storage_floor_error(CONFIG["backup_root"])   # AVANT de télécharger
@@ -5773,7 +5827,6 @@ def action_s3_import(payload):
                 results.append({"key": label, "ok": False,
                                 "error": "déchiffrement impossible (phrase incorrecte ou objet altéré)"})
                 continue
-        dest = os.path.join(CONFIG["backup_root"], "_imports", cluster, nsname, ts)
         n, err = _safe_extract_zip(data, dest)
         if err:
             shutil.rmtree(dest, ignore_errors=True)
@@ -7601,14 +7654,16 @@ def action_orchestrate_inplace(payload, log=None):
                     log.append(logentry("Rafraîchissement du PV interrompu : %s" % detail_ref, ok=False, rc=-1))
                     break
 
+        restart_failed = []
         if not aborted:
-            if _restart_workloads(desired, ns, dry, log):
+            ok_restart, restart_failed = _restart_workloads(desired, ns, dry, log)
+            if not ok_restart:
                 aborted = True
         if aborted:
             log.append({"ok": False, "dry": dry, "label": "SÉQUENCE INTERROMPUE", "rc": -1, "stdout": "", "cmd": "",
                         "stderr": "Une étape a échoué. L'application reste ARRÊTÉE pour éviter de redémarrer sur "
                         "des données incohérentes. Corrigez puis relancez, ou redémarrez : " +
-                        "; ".join("kubectl scale %s %s -n %s --replicas=%s" % (w["kind"], w["name"], ns, w["replicas"]) for w in desired)})
+                        "; ".join(restart_failed or ["kubectl scale %s %s -n %s --replicas=%s" % (w["kind"], w["name"], ns, w["replicas"]) for w in desired])})
 
         if not dry:
             v = action_verify(ns)
@@ -8110,6 +8165,9 @@ def action_bulk_run(payload):
     with BULK_LOCK:
         if BULK["running"]:
             return _err("Une restauration en masse est déjà en cours.")
+        if not payload.get("dry", True) and (ACTION_LOCK.locked() or AUTO_BACKUP["running"]):
+            return _err("Une autre opération (restauration, clone ou sauvegarde automatique) est en cours : "
+                        "relancez la restauration en masse quand elle sera terminée.")
         if not dry:
             guard = _context_guard(payload)
             if guard:
@@ -8837,16 +8895,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._do_POST()
 
     def _do_GET(self):
-        if not self._origin_ok():
-            return self._send(403, "Forbidden", "text/plain")
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
-        qs = {k: v[0] for k, v in urllib.parse.parse_qs(parsed.query).items()}
         if path in ("/healthz", "/readyz"):
-            # Sonde de santé (Docker HEALTHCHECK, sondes K8s) : AUCUNE logique de
-            # session ici — charger « / » sans cookie tournerait la session et
-            # effacerait les identifiants.
+            # Sonde de santé (Docker HEALTHCHECK, sondes K8s) : répond AVANT la garde Host
+            # (une sonde kubelet n'envoie pas forcément l'en-tête attendu) et sans AUCUNE
+            # logique de session — charger « / » sans cookie tournerait la session.
             return self._send(200, "ok", "text/plain")
+        if not self._origin_ok():
+            return self._send(403, "Forbidden", "text/plain")
+        qs = {k: v[0] for k, v in urllib.parse.parse_qs(parsed.query).items()}
         if path == "/":
             # La rotation de session n'a de sens que pour un navigateur (Accept: text/html) ;
             # un outil ou une sonde qui touche « / » ne doit pas évincer l'opérateur.
@@ -9464,6 +9522,9 @@ HTML = r"""<!DOCTYPE html>
   .pulse{animation:pulseRing 1s ease-out 3}
   /* Anciens éléments de navigation du parcours Restaurer : remplacés par l'assistant */
   #rsNextBar{display:none !important}
+  .nextbar{display:none;align-items:center;justify-content:space-between;gap:12px;margin-top:14px;padding:10px 12px;
+           background:#fff;border:1px solid var(--line);border-radius:6px}
+  .nextbar.show{display:flex}
   .step-no{display:none}
   /* ---------- Assistant de restauration : étapes visibles ---------- */
   .stepper{display:flex;gap:0;margin:0 0 16px;border:1px solid var(--line);border-radius:6px;overflow:hidden;background:#fff}
@@ -10838,8 +10899,8 @@ async function loadAutoBackup(){
 }
 $("#abSave").onclick=async()=>{
   const cfg={auto_backup_enabled:$("#abEnabled").checked,
-    auto_backup_interval_hours:Math.max(1,parseInt($("#abInterval").value)||24),
-    auto_backup_keep:Math.max(1,parseInt($("#abKeep").value)||15),
+    auto_backup_interval_hours:Math.max(0.25,parseFloat(String($("#abInterval").value).replace(",","."))||24),
+    auto_backup_keep:Math.max(0,parseInt($("#abKeep").value)||0),
     auto_backup_retention:$("#abRet").value,
     auto_backup_keep_daily:Math.max(0,parseInt($("#abGfsD").value)||0),
     auto_backup_keep_weekly:Math.max(0,parseInt($("#abGfsW").value)||0),
@@ -11414,6 +11475,7 @@ $("#rsPreview").onclick=async()=>{
   }
   const body={namespace:$("#rsNs").value,mode:state.mode,items,backup_path:state.backup_path,backup_root:state.backup_root,dry:dry()};
   const r=await post("/api/prepare_restore",body);
+  if(!r.ok && !(r.results||[]).length){ $("#rsErr").innerHTML=errBox(r.error||"Préparation impossible."); updateGoButton(false); return; }
   state.preview=body;
   let html="";
   (r.results||[]).forEach(res=>{
@@ -11884,9 +11946,16 @@ async function ntFindRef(pvc){
 // Suivi générique d'un job HYCU : barre de progression + polling (backup ou restore).
 async function pollJobBar(id, target){
   const el=(typeof target==="string")?$(target):target; if(!el) return false;
+  let errs=0;
   for(let i=0;i<240;i++){                       // ~12 min max (240 * 3s)
     const r=await post("/api/hycu/job",{job_id:id});
-    if(!r.ok){ el.innerHTML=`<div class="hint">Suivi du job indisponible : ${esc(r.error||'')}</div>`; return false; }
+    if(!r.ok){
+      if((r.http_status===0 || r.http_status>=500) && ++errs<=10){     // coupure passagère : on réessaie
+        el.innerHTML=`<div class="hint">Suivi du job : nouvelle tentative (${errs}/10)…</div>`;
+        await new Promise(s=>setTimeout(s,3000)); continue;
+      }
+      el.innerHTML=`<div class="hint">Suivi du job indisponible : ${esc(r.error||'')}</div>`; return false; }
+    errs=0;
     const pct=(r.progress!=null)?r.progress:0, status=r.status||"?";
     el.innerHTML=`<div class="hint" style="margin-top:8px">Job <code>${esc(id)}</code> — ${esc(status)}${r.progress!=null?(' · '+pct+'%'):''}</div>
        <div class="jbar"><span style="width:${pct}%"></span></div>`;
@@ -11973,7 +12042,7 @@ refreshDry();
 // ============================================================================
 var rsAutoCheck=false;            // assistant ouvert : volumes présélectionnés (cf. renderRsPvcs)
 var pageTimer=null;
-const MODALS=["mBackup","mPolicy","mRestore","mSources"];
+const MODALS=["mBackup","mPolicy","mRestore","mSources","mBulk"];
 const FOCUSABLE='a[href],button:not([disabled]),input:not([disabled]):not([type=hidden]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])';
 let modalReturnFocus={};
 function openModal(id){
@@ -12326,7 +12395,7 @@ function openPolicyModal(ns){
 // Plan (lecture seule) -> Simuler (journal, arrière-plan) -> Lancer (réel : simulation
 // du même plan exigée par le serveur, confirmation du contexte) ; suivi par polling,
 // arrêt propre et reprise (les namespaces déjà recréés ne sont jamais refaits).
-let bulkPlan=null, bulkStatus=null, bulkTimer=null, bulkWasRunning=false;
+let bulkPlan=null, bulkStatus=null, bulkTimer=null, bulkWasRunning=false, bulkPollErrors=0;
 function bulkNowLocal(){ const d=new Date(); const p=n=>String(n).padStart(2,"0");
   return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`; }
 function bulkExclude(){ return ($("#bulkExclude").value||"").split(",").map(s=>s.trim()).filter(Boolean); }
@@ -12406,7 +12475,13 @@ $("#bulkResume").onclick=async()=>{
 async function bulkPoll(){
   clearTimeout(bulkTimer);
   if($("#mBulk").style.display==="none") return;
-  const st=await get("/api/bulk/status"); if(!st.ok) return;
+  const st=await get("/api/bulk/status");
+  if(!st.ok){                                   // coupure passagère : on réessaie (borné), sans figer les boutons
+    if(++bulkPollErrors<=30){ bulkTimer=setTimeout(bulkPoll, 3000); }
+    else { $("#bulkRunOut").insertAdjacentHTML("beforeend", '<div class="hint">Suivi interrompu (serveur injoignable) — rouvrez la fenêtre pour reprendre le suivi.</div>'); }
+    return;
+  }
+  bulkPollErrors=0;
   bulkStatus=st; bulkRenderStatus(st); bulkSyncBtns();
   if(st.running){ bulkWasRunning=true; bulkTimer=setTimeout(bulkPoll, 2000); }
   else if(bulkWasRunning){ bulkWasRunning=false; loadApps(true); }   // namespaces recréés : inventaire à jour
@@ -12886,7 +12961,7 @@ document.querySelectorAll("#rsPgTarget .opt").forEach(o=>{
 function rsShowPage(p){
   rsWizPage=p;
   if(p==="target"){ rsTgtMode=state.cloneNsMode||"same"; rsSyncTgtOpts(); }
-  setRsStep(p==="type" ? 1 : p==="form" ? 2 : 3);
+  setRsStep(p==="type" ? 1 : p==="plan" ? 3 : 2);
   $("#rsPgType").style.display = p==="type" ? "block" : "none";
   $("#rsPgTarget").style.display = p==="target" ? "block" : "none";
   $("#rsPgObjects").style.display = p==="objects" ? "block" : "none";
@@ -13038,6 +13113,7 @@ var drAllowed=false, drBusy=false, drBackups=[], drMode="dr", drRecoverNs=null;
 // la dérogation allow_dr_restore (le serveur vérifie que la sauvegarde est d'ici).
 function openRecoverModal(ns){
   state.ns=ns; state.app=null;         // la récupération recrée tout le namespace
+  document.querySelectorAll('#rsPgType .opt').forEach(o=>{ o.style.display=""; });   // (masquées pour une app stateless)
   const note=$("#rsAppNote"); if(note){ note.style.display="none"; note.innerHTML=""; }
   rsWizKind="recover"; rsSyncOpts();   // kind dédié : « Retour » puis « Suivant » ne devient jamais une DR
   ["#rsLog","#rsInplaceLog","#rsErr"].forEach(id=>{ const e=$(id); if(e) e.innerHTML=""; });
@@ -13647,6 +13723,9 @@ HTML_EN = r"""<!DOCTYPE html>
   .pulse{animation:pulseRing 1s ease-out 3}
   /* Anciens éléments de navigation du parcours Restaurer : remplacés par l'assistant */
   #rsNextBar{display:none !important}
+  .nextbar{display:none;align-items:center;justify-content:space-between;gap:12px;margin-top:14px;padding:10px 12px;
+           background:#fff;border:1px solid var(--line);border-radius:6px}
+  .nextbar.show{display:flex}
   .step-no{display:none}
   /* ---------- Assistant de restauration : étapes visibles ---------- */
   .stepper{display:flex;gap:0;margin:0 0 16px;border:1px solid var(--line);border-radius:6px;overflow:hidden;background:#fff}
@@ -15021,8 +15100,8 @@ async function loadAutoBackup(){
 }
 $("#abSave").onclick=async()=>{
   const cfg={auto_backup_enabled:$("#abEnabled").checked,
-    auto_backup_interval_hours:Math.max(1,parseInt($("#abInterval").value)||24),
-    auto_backup_keep:Math.max(1,parseInt($("#abKeep").value)||15),
+    auto_backup_interval_hours:Math.max(0.25,parseFloat(String($("#abInterval").value).replace(",","."))||24),
+    auto_backup_keep:Math.max(0,parseInt($("#abKeep").value)||0),
     auto_backup_retention:$("#abRet").value,
     auto_backup_keep_daily:Math.max(0,parseInt($("#abGfsD").value)||0),
     auto_backup_keep_weekly:Math.max(0,parseInt($("#abGfsW").value)||0),
@@ -15597,6 +15676,7 @@ $("#rsPreview").onclick=async()=>{
   }
   const body={namespace:$("#rsNs").value,mode:state.mode,items,backup_path:state.backup_path,backup_root:state.backup_root,dry:dry()};
   const r=await post("/api/prepare_restore",body);
+  if(!r.ok && !(r.results||[]).length){ $("#rsErr").innerHTML=errBox(r.error||"Preparation failed."); updateGoButton(false); return; }
   state.preview=body;
   let html="";
   (r.results||[]).forEach(res=>{
@@ -16067,9 +16147,16 @@ async function ntFindRef(pvc){
 // Suivi générique d'un job HYCU : barre de progression + polling (backup ou restore).
 async function pollJobBar(id, target){
   const el=(typeof target==="string")?$(target):target; if(!el) return false;
+  let errs=0;
   for(let i=0;i<240;i++){                       // ~12 min max (240 * 3s)
     const r=await post("/api/hycu/job",{job_id:id});
-    if(!r.ok){ el.innerHTML=`<div class="hint">Job tracking unavailable: ${esc(r.error||'')}</div>`; return false; }
+    if(!r.ok){
+      if((r.http_status===0 || r.http_status>=500) && ++errs<=10){     // coupure passagère : on réessaie
+        el.innerHTML=`<div class="hint">Job tracking: retrying (${errs}/10)…</div>`;
+        await new Promise(s=>setTimeout(s,3000)); continue;
+      }
+      el.innerHTML=`<div class="hint">Job tracking unavailable: ${esc(r.error||'')}</div>`; return false; }
+    errs=0;
     const pct=(r.progress!=null)?r.progress:0, status=r.status||"?";
     el.innerHTML=`<div class="hint" style="margin-top:8px">Job <code>${esc(id)}</code> — ${esc(status)}${r.progress!=null?(' · '+pct+'%'):''}</div>
        <div class="jbar"><span style="width:${pct}%"></span></div>`;
@@ -16156,7 +16243,7 @@ refreshDry();
 // ============================================================================
 var rsAutoCheck=false;            // assistant ouvert : volumes présélectionnés (cf. renderRsPvcs)
 var pageTimer=null;
-const MODALS=["mBackup","mPolicy","mRestore","mSources"];
+const MODALS=["mBackup","mPolicy","mRestore","mSources","mBulk"];
 const FOCUSABLE='a[href],button:not([disabled]),input:not([disabled]):not([type=hidden]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])';
 let modalReturnFocus={};
 function openModal(id){
@@ -16509,7 +16596,7 @@ function openPolicyModal(ns){
 // Plan (lecture seule) -> Simuler (journal, arrière-plan) -> Lancer (réel : simulation
 // du même plan exigée par le serveur, confirmation du contexte) ; suivi par polling,
 // arrêt propre et reprise (les namespaces déjà recréés ne sont jamais refaits).
-let bulkPlan=null, bulkStatus=null, bulkTimer=null, bulkWasRunning=false;
+let bulkPlan=null, bulkStatus=null, bulkTimer=null, bulkWasRunning=false, bulkPollErrors=0;
 function bulkNowLocal(){ const d=new Date(); const p=n=>String(n).padStart(2,"0");
   return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`; }
 function bulkExclude(){ return ($("#bulkExclude").value||"").split(",").map(s=>s.trim()).filter(Boolean); }
@@ -16589,7 +16676,13 @@ $("#bulkResume").onclick=async()=>{
 async function bulkPoll(){
   clearTimeout(bulkTimer);
   if($("#mBulk").style.display==="none") return;
-  const st=await get("/api/bulk/status"); if(!st.ok) return;
+  const st=await get("/api/bulk/status");
+  if(!st.ok){                                   // coupure passagère : on réessaie (borné), sans figer les boutons
+    if(++bulkPollErrors<=30){ bulkTimer=setTimeout(bulkPoll, 3000); }
+    else { $("#bulkRunOut").insertAdjacentHTML("beforeend", '<div class="hint">Tracking stopped (server unreachable) — reopen the window to resume tracking.</div>'); }
+    return;
+  }
+  bulkPollErrors=0;
   bulkStatus=st; bulkRenderStatus(st); bulkSyncBtns();
   if(st.running){ bulkWasRunning=true; bulkTimer=setTimeout(bulkPoll, 2000); }
   else if(bulkWasRunning){ bulkWasRunning=false; loadApps(true); }   // namespaces recréés : inventaire à jour
@@ -17069,7 +17162,7 @@ document.querySelectorAll("#rsPgTarget .opt").forEach(o=>{
 function rsShowPage(p){
   rsWizPage=p;
   if(p==="target"){ rsTgtMode=state.cloneNsMode||"same"; rsSyncTgtOpts(); }
-  setRsStep(p==="type" ? 1 : p==="form" ? 2 : 3);
+  setRsStep(p==="type" ? 1 : p==="plan" ? 3 : 2);
   $("#rsPgType").style.display = p==="type" ? "block" : "none";
   $("#rsPgTarget").style.display = p==="target" ? "block" : "none";
   $("#rsPgObjects").style.display = p==="objects" ? "block" : "none";
@@ -17221,6 +17314,7 @@ var drAllowed=false, drBusy=false, drBackups=[], drMode="dr", drRecoverNs=null;
 // la dérogation allow_dr_restore (le serveur vérifie que la sauvegarde est d'ici).
 function openRecoverModal(ns){
   state.ns=ns; state.app=null;         // la récupération recrée tout le namespace
+  document.querySelectorAll('#rsPgType .opt').forEach(o=>{ o.style.display=""; });   // (masquées pour une app stateless)
   const note=$("#rsAppNote"); if(note){ note.style.display="none"; note.innerHTML=""; }
   rsWizKind="recover"; rsSyncOpts();   // kind dédié : « Retour » puis « Next » ne devient jamais une DR
   ["#rsLog","#rsInplaceLog","#rsErr"].forEach(id=>{ const e=$(id); if(e) e.innerHTML=""; });
@@ -19036,6 +19130,9 @@ I18N_EN = [
     ('Simulation terminée — voici ce qui serait exécuté.', 'Simulation finished — here is what would be executed.'),
     ('id="dmOk">Confirmer</button>', 'id="dmOk">Confirm</button>'),
     ('Confirmation du contexte cible avant toute action', 'Target context confirmation before any action'),
+    ('Suivi interrompu (serveur injoignable) — rouvrez la fenêtre pour reprendre le suivi.', 'Tracking stopped (server unreachable) — reopen the window to resume tracking.'),
+    ('Suivi du job : nouvelle tentative (', 'Job tracking: retrying ('),
+    ('"Préparation impossible."', '"Preparation failed."'),
 ]
 # <<< I18N-END
 _I18N_SORTED = None          # (fr, en) triés du plus long au plus court

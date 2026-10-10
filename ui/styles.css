@@ -344,6 +344,9 @@
   .pulse{animation:pulseRing 1s ease-out 3}
   /* Anciens éléments de navigation du parcours Restaurer : remplacés par l'assistant */
   #rsNextBar{display:none !important}
+  .nextbar{display:none;align-items:center;justify-content:space-between;gap:12px;margin-top:14px;padding:10px 12px;
+           background:#fff;border:1px solid var(--line);border-radius:6px}
+  .nextbar.show{display:flex}
   .step-no{display:none}
   /* ---------- Assistant de restauration : étapes visibles ---------- */
   .stepper{display:flex;gap:0;margin:0 0 16px;border:1px solid var(--line);border-radius:6px;overflow:hidden;background:#fff}

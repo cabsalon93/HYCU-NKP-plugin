@@ -6170,5 +6170,17 @@
 [
 "Confirmation du contexte cible avant toute action",
 "Target context confirmation before any action"
+],
+[
+"Suivi interrompu (serveur injoignable) — rouvrez la fenêtre pour reprendre le suivi.",
+"Tracking stopped (server unreachable) — reopen the window to resume tracking."
+],
+[
+"Suivi du job : nouvelle tentative (",
+"Job tracking: retrying ("
+],
+[
+"\"Préparation impossible.\"",
+"\"Preparation failed.\""
 ]
 ]
