@@ -9532,7 +9532,7 @@ HTML = r"""<!DOCTYPE html>
     </div>
     <div class="modal-actions">
       <button class="btn ghost" id="dmCancel">Annuler</button>
-      <button class="btn danger" id="dmOk">Confirmer en mode réel</button>
+      <button class="btn danger" id="dmOk">Confirmer</button>
     </div>
   </div>
 </div>
@@ -10082,7 +10082,7 @@ HTML = r"""<!DOCTYPE html>
       <div id="rsRepl"></div>
       <div><b style="font-size:13px">Séquence prévue</b><ol class="plan" id="rsSteps"></ol></div>
       <div id="rsCtxConfirm" style="display:none;margin-top:14px">
-        <label class="fld">Confirmation du contexte cible (mode réel)</label>
+        <label class="fld">Confirmation du contexte cible avant toute action</label>
         <input type="text" id="rsCtxInput" placeholder="retapez le nom du contexte kubectl">
       </div>
       <div style="margin-top:16px;display:flex;gap:10px;flex-wrap:wrap;align-items:center">
@@ -10365,7 +10365,7 @@ function errHint(raw){
   if(/non connecté|connectez-vous|not connected|connect to at least|connect to hycu/.test(e)) return "Enregistrez d'abord la source (⚙ en haut à droite).";
   if(/namespace.*(non autorisé|autorisé|not allowed)|(non autorisé).*namespace/.test(e)) return "Namespace hors liste autorisée — voir ⚙ Réglages → namespaces autorisés.";
   if(/contexte.*non autorisé|context.*not allowed|allowed_contexts/.test(e)) return "Contexte kubectl hors liste autorisée — voir ⚙ Réglages.";
-  if(/confirmation du contexte|context confirmation/.test(e)) return "Retapez le nom exact du contexte cible pour confirmer (mode réel).";
+  if(/confirmation du contexte|context confirmation/.test(e)) return "Retapez le nom exact du contexte cible pour confirmer.";
   if(/jeton anti-csrf|csrf token/.test(e)) return "Rechargez la page (Ctrl+Shift+R) : le jeton de sécurité a expiré.";
   return "";
 }
@@ -10518,7 +10518,7 @@ function refreshDry(){
   const live=!dry();
   $("#dryBar").classList.toggle("live",live);
   document.body.classList.toggle("realmode",live);   // barre rouge fixe + indicateur en-tête
-  $("#dryLabel").textContent = live? "MODE RÉEL — les commandes seront exécutées" : "Mode simulation activé";
+  $("#dryLabel").textContent = live? "Simulation désactivée — les commandes seront exécutées" : "Mode simulation activé";
   $("#dry").setAttribute("aria-checked", dry() ? "true" : "false");
 }
 $("#dry").onchange=refreshDry;
@@ -10964,7 +10964,7 @@ $("#bkProtect").onclick=async()=>{
   if(!vg_uuids.length){ $("#bkProtectLog").innerHTML='<div class="err">Cochez au moins un Volume Group (les correspondances « par nom » doivent être confirmées).</div>'; return; }
   const live=!dry(), pol=$("#bkPolicy").value;
   const names=sel.map(c=>"• "+(c.dataset.name||c.dataset.uuid)+(c.dataset.ext?(" ("+c.dataset.ext+")"):""));
-  if(live && !(await confirmDanger({title:"Protection HYCU RÉELLE", lines:[
+  if(live && !(await confirmDanger({title:"Confirmer la protection HYCU", lines:[
      (pol?"Assigner la politique puis <b>sauvegarder</b>":"<b>Sauvegarder</b>")+" ces Volume Groups :",
      "<b>"+names.map(esc).join("</b>, <b>")+"</b>"]}))) return;
   const b=$("#bkProtect"); b.disabled=true; b.innerHTML='<span class="spin"></span>…';
@@ -11256,7 +11256,7 @@ async function hyBatchRun(){
   }).filter(Boolean);
   if(!rows.length) return;
   const live=!dry();
-  if(live && !(await confirmDanger({title:"Clones HYCU RÉELS", lines:[
+  if(live && !(await confirmDanger({title:"Confirmer les clones HYCU", lines:[
      "Déclencher dans HYCU le <b>clone</b> de <b>"+rows.length+"</b> Volume Group(s) au point choisi ?",
      "Les VG sources ne sont <b>pas</b> modifiés — de <b>nouveaux</b> VG sont créés."]}))) return;
   const b=$("#hyBatchGo"); b.disabled=true; b.innerHTML='<span class="spin"></span>Clones HYCU en cours…';
@@ -11304,7 +11304,7 @@ function updateInplaceRunBtn(){
   if(!$("#rsInplaceRun")) return;
   $("#rsInplaceRun").disabled = ready.length===0;
   $("#rsInplaceHint").textContent = ready.length
-    ? (ready.length+" / "+chosen.length+" volume(s) prêt(s)"+(dry()?" · simulation":" · MODE RÉEL"))
+    ? (ready.length+" / "+chosen.length+" volume(s) prêt(s)"+(dry()?" · simulation":""))
     : "Sélectionnez un point de restauration par volume.";
   updateNextBar();
 }
@@ -11317,7 +11317,7 @@ $("#rsInplaceRun").onclick=async()=>{
   let confirmedCtx="";
   if(live){
     const needCtx = ctxInfo.require_confirm ? (ctxInfo.context||"") : null;
-    const res = await confirmDanger({title:"Restauration SUR PLACE RÉELLE", requireText:needCtx, lines:[
+    const res = await confirmDanger({title:"Confirmer la restauration sur place", requireText:needCtx, lines:[
        "Namespace : <b>"+esc((rsHyMatch?rsHyMatch.ns:$("#rsNs").value)||"?")+"</b>",
        "Cluster ciblé : <b>"+esc(ctxInfo.context||"?")+"</b>",
        "L'application sera <b>ARRÊTÉE</b>, les volumes restaurés <b>in-place</b> dans HYCU (données écrasées par le point choisi), puis l'application <b>REDÉMARRÉE</b>."]});
@@ -11476,7 +11476,7 @@ $("#rsGo").onclick=async()=>{
     let confirmedCtxCA="";
     if(live){
       const needCtx = ctxInfo.require_confirm ? (ctxInfo.context||"") : null;
-      const res = await confirmDanger({title:"Clone d'application RÉEL", requireText:needCtx, lines:[
+      const res = await confirmDanger({title:"Confirmer le clone d'application", requireText:needCtx, lines:[
          "Une <b>COPIE</b> de l'application sera créée"+(state.cloneNsMode==="same"?" dans le <b>même namespace</b> (avec suffixe)":" dans le namespace cible <b>"+esc($("#rsCloneTargetNs").value||"?")+"</b>")+".",
          "Cluster ciblé : <b>"+esc(ctxInfo.context||"?")+"</b>",
          "L'application d'origine n'est <b>PAS</b> modifiée ni arrêtée."]});
@@ -11510,7 +11510,7 @@ $("#rsGo").onclick=async()=>{
   let confirmedCtx="";
   if(live){
     const needCtx = ctxInfo.require_confirm ? (ctxInfo.context||"") : null;
-    const res = await confirmDanger({title:"Restauration RÉELLE", requireText:needCtx, lines:[
+    const res = await confirmDanger({title:"Confirmer la restauration", requireText:needCtx, lines:[
       "Namespace : <b>"+esc($("#rsNs").value||"?")+"</b>",
       "Cluster ciblé : <b>"+esc(ctxInfo.context||"?")+"</b>",
       "L'application sera <b>arrêtée</b>, les anciens PVC/PV <b>supprimés</b> puis recréés sur le(s) Volume Group(s) restauré(s)."]});
@@ -11536,7 +11536,7 @@ $("#rsGo").onclick=async()=>{
   if(r.error && !(r.log&&r.log.length)){$("#rsLog").innerHTML=errBox(r.error)+renderPreflight(r.preflight);return;}
   const lines=renderLog(r.log);
   let head;
-  if(r.dry) head='<div class="note">Simulation terminée — voici ce qui serait exécuté en mode réel.</div>';
+  if(r.dry) head='<div class="note">Simulation terminée — voici ce qui serait exécuté.</div>';
   else if(r.aborted) head='<div class="err"><b>Séquence interrompue</b> — l\'application est restée arrêtée pour éviter un redémarrage incohérent. Voir le détail.</div>';
   else if(r.ok) head='<div class="note">Restauration terminée.</div>';
   else head='<div class="err">Des étapes ont échoué — voir ci-dessous.</div>';
@@ -12373,7 +12373,7 @@ async function bulkStart(dryRun){
   let confirmedCtx="";
   if(!dryRun){
     const needCtx = ctxInfo.require_confirm ? (ctxInfo.context||"") : null;
-    const res=await confirmDanger({title:"Restauration en masse RÉELLE", requireText:needCtx, lines:[
+    const res=await confirmDanger({title:"Confirmer la restauration en masse", requireText:needCtx, lines:[
       "<b>"+bulkPlan.items.length+"</b> namespace(s) seront RECRÉÉS sur <b>"+esc(ctxInfo.context||"?")+"</b> depuis leurs sauvegardes.",
       "Exécution séquentielle et journalisée ; les Volume Groups disparus seront restaurés par HYCU (opérations réelles).",
       "Les namespaces présents ne sont pas touchés."]});
@@ -12394,7 +12394,7 @@ $("#bulkResume").onclick=async()=>{
   let confirmedCtx="";
   if(!j.dry){
     const needCtx = ctxInfo.require_confirm ? (ctxInfo.context||"") : null;
-    const res=await confirmDanger({title:"Reprendre la restauration en masse (RÉEL)", requireText:needCtx, lines:[
+    const res=await confirmDanger({title:"Reprendre la restauration en masse", requireText:needCtx, lines:[
       "Les namespaces restants (en attente, arrêtés ou en échec) seront recréés ; ceux déjà recréés ne sont pas refaits."]});
     if(!res) return; if(typeof res==="string") confirmedCtx=res;
   }
@@ -13134,7 +13134,7 @@ $("#drAuto").onclick=async()=>{
     source_vg_uuid:hy[t.dataset.pvc]||refs[t.dataset.pvc]||"", vg_name:names[t.dataset.pvc]||""}));
   if(!volumes.length || volumes.some(v=>!v.source_vg_uuid)){
     $("#drErr").innerHTML=errBox("UUID du VG source absent de la sauvegarde : automatisation impossible, saisissez les UUID manuellement."); return; }
-  if(!dry() && !(await confirmDanger({title:"Clones HYCU RÉELS", lines:[
+  if(!dry() && !(await confirmDanger({title:"Confirmer les clones HYCU", lines:[
       "Déclencher dans HYCU le <b>clone</b> de <b>"+volumes.length+"</b> Volume Group(s) (nouveaux VG créés) ?",
       "Les nouveaux identifiants seront inscrits automatiquement dans la grille."]}))) return;
   const btn=$("#drAuto"); btn.disabled=true; drBusy=true; rsWizSync();
@@ -13157,7 +13157,7 @@ async function drRun(){
   let confirmedCtx="";
   if(live){
     const needCtx = ctxInfo.require_confirm ? (ctxInfo.context||"") : null;
-    const res=await confirmDanger({title:(drMode==="recover"?"Restauration d'une application SUPPRIMÉE":"Restauration DR RÉELLE"), requireText:needCtx, lines:[
+    const res=await confirmDanger({title:(drMode==="recover"?"Confirmer la restauration de l'application supprimée":"Confirmer la restauration DR"), requireText:needCtx, lines:[
       "Sauvegarde source : <b>"+esc(b.cluster)+" › "+esc(b.namespace)+" › "+esc(b.timestamp)+"</b>",
       "Cluster CIBLE : <b>"+esc(ctxInfo.context||"?")+"</b> · namespace cible : <b>"+esc($("#drTargetNs").value)+"</b>",
       drMode==="recover"
@@ -13264,7 +13264,7 @@ async function objApply(){
   let confirmedCtx="";
   if(live){
     const needCtx = ctxInfo.require_confirm ? (ctxInfo.context||"") : null;
-    const res=await confirmDanger({title:"Restauration d'objets RÉELLE", requireText:needCtx, lines:[
+    const res=await confirmDanger({title:"Confirmer la restauration d'objets", requireText:needCtx, lines:[
       "Namespace : <b>"+esc($("#rsNs").value||state.ns||"?")+"</b>",
       "Cluster ciblé : <b>"+esc(ctxInfo.context||"?")+"</b>",
       "<b>"+objSelIdx().length+"</b> objet(s) de configuration seront ÉCRASÉS par la version de la sauvegarde (kubectl apply). Les volumes et les données ne sont pas touchés."]});
@@ -13715,7 +13715,7 @@ HTML_EN = r"""<!DOCTYPE html>
     </div>
     <div class="modal-actions">
       <button class="btn ghost" id="dmCancel">Cancel</button>
-      <button class="btn danger" id="dmOk">Confirm in real mode</button>
+      <button class="btn danger" id="dmOk">Confirm</button>
     </div>
   </div>
 </div>
@@ -14265,7 +14265,7 @@ HTML_EN = r"""<!DOCTYPE html>
       <div id="rsRepl"></div>
       <div><b style="font-size:13px">Planned sequence</b><ol class="plan" id="rsSteps"></ol></div>
       <div id="rsCtxConfirm" style="display:none;margin-top:14px">
-        <label class="fld">Target context confirmation (real mode)</label>
+        <label class="fld">Target context confirmation before any action</label>
         <input type="text" id="rsCtxInput" placeholder="retype the kubectl context name">
       </div>
       <div style="margin-top:16px;display:flex;gap:10px;flex-wrap:wrap;align-items:center">
@@ -14548,7 +14548,7 @@ function errHint(raw){
   if(/non connecté|connectez-vous|not connected|connect to at least|connect to hycu/.test(e)) return "Register the source first (⚙ at the top right).";
   if(/namespace.*(non autorisé|autorisé|not allowed)|(non autorisé).*namespace/.test(e)) return "Namespace not in the allowed list — see ⚙ Settings → allowed namespaces.";
   if(/contexte.*non autorisé|context.*not allowed|allowed_contexts/.test(e)) return "kubectl context not in the allowed list — see ⚙ Settings.";
-  if(/confirmation du contexte|context confirmation/.test(e)) return "Retype the exact target context name to confirm (real mode).";
+  if(/confirmation du contexte|context confirmation/.test(e)) return "Retype the exact target context name to confirm.";
   if(/jeton anti-csrf|csrf token/.test(e)) return "Reload the page (Ctrl+Shift+R): the security token has expired.";
   return "";
 }
@@ -14701,7 +14701,7 @@ function refreshDry(){
   const live=!dry();
   $("#dryBar").classList.toggle("live",live);
   document.body.classList.toggle("realmode",live);   // barre rouge fixe + indicateur en-tête
-  $("#dryLabel").textContent = live? "REAL MODE — commands will be executed" : "Simulation mode on";
+  $("#dryLabel").textContent = live? "Simulation off — commands will be executed" : "Simulation mode on";
   $("#dry").setAttribute("aria-checked", dry() ? "true" : "false");
 }
 $("#dry").onchange=refreshDry;
@@ -15147,7 +15147,7 @@ $("#bkProtect").onclick=async()=>{
   if(!vg_uuids.length){ $("#bkProtectLog").innerHTML='<div class="err">Check at least one Volume Group (“by name” matches must be confirmed).</div>'; return; }
   const live=!dry(), pol=$("#bkPolicy").value;
   const names=sel.map(c=>"• "+(c.dataset.name||c.dataset.uuid)+(c.dataset.ext?(" ("+c.dataset.ext+")"):""));
-  if(live && !(await confirmDanger({title:"REAL HYCU protection", lines:[
+  if(live && !(await confirmDanger({title:"Confirm the HYCU protection", lines:[
      (pol?"Assign the policy then <b>back up</b>":"<b>Back up</b>")+" these Volume Groups:",
      "<b>"+names.map(esc).join("</b>, <b>")+"</b>"]}))) return;
   const b=$("#bkProtect"); b.disabled=true; b.innerHTML='<span class="spin"></span>…';
@@ -15439,7 +15439,7 @@ async function hyBatchRun(){
   }).filter(Boolean);
   if(!rows.length) return;
   const live=!dry();
-  if(live && !(await confirmDanger({title:"REAL HYCU clones", lines:[
+  if(live && !(await confirmDanger({title:"Confirm the HYCU clones", lines:[
      "Trigger in HYCU the <b>clone</b> of <b>"+rows.length+"</b> Volume Group(s) at the chosen point?",
      "The source VGs are <b>not</b> modified — <b>new</b> VGs are created."]}))) return;
   const b=$("#hyBatchGo"); b.disabled=true; b.innerHTML='<span class="spin"></span>HYCU clones in progress…';
@@ -15487,7 +15487,7 @@ function updateInplaceRunBtn(){
   if(!$("#rsInplaceRun")) return;
   $("#rsInplaceRun").disabled = ready.length===0;
   $("#rsInplaceHint").textContent = ready.length
-    ? (ready.length+" / "+chosen.length+" volume(s) ready"+(dry()?" · simulation":" · REAL MODE"))
+    ? (ready.length+" / "+chosen.length+" volume(s) ready"+(dry()?" · simulation":""))
     : "Select a restore point for each volume.";
   updateNextBar();
 }
@@ -15500,7 +15500,7 @@ $("#rsInplaceRun").onclick=async()=>{
   let confirmedCtx="";
   if(live){
     const needCtx = ctxInfo.require_confirm ? (ctxInfo.context||"") : null;
-    const res = await confirmDanger({title:"REAL IN-PLACE restore", requireText:needCtx, lines:[
+    const res = await confirmDanger({title:"Confirm the in-place restore", requireText:needCtx, lines:[
        "Namespace: <b>"+esc((rsHyMatch?rsHyMatch.ns:$("#rsNs").value)||"?")+"</b>",
        "Target cluster: <b>"+esc(ctxInfo.context||"?")+"</b>",
        "The application will be <b>STOPPED</b>, the volumes restored <b>in-place</b> in HYCU (data overwritten by the chosen point), then the application <b>RESTARTED</b>."]});
@@ -15659,7 +15659,7 @@ $("#rsGo").onclick=async()=>{
     let confirmedCtxCA="";
     if(live){
       const needCtx = ctxInfo.require_confirm ? (ctxInfo.context||"") : null;
-      const res = await confirmDanger({title:"REAL application clone", requireText:needCtx, lines:[
+      const res = await confirmDanger({title:"Confirm the application clone", requireText:needCtx, lines:[
          "A <b>COPY</b> of the application will be created"+(state.cloneNsMode==="same"?" in the <b>same namespace</b> (with a suffix)":" in the target namespace <b>"+esc($("#rsCloneTargetNs").value||"?")+"</b>")+".",
          "Target cluster: <b>"+esc(ctxInfo.context||"?")+"</b>",
          "The original application is <b>NOT</b> modified or stopped."]});
@@ -15693,7 +15693,7 @@ $("#rsGo").onclick=async()=>{
   let confirmedCtx="";
   if(live){
     const needCtx = ctxInfo.require_confirm ? (ctxInfo.context||"") : null;
-    const res = await confirmDanger({title:"REAL restore", requireText:needCtx, lines:[
+    const res = await confirmDanger({title:"Confirm the restore", requireText:needCtx, lines:[
       "Namespace: <b>"+esc($("#rsNs").value||"?")+"</b>",
       "Target cluster: <b>"+esc(ctxInfo.context||"?")+"</b>",
       "The application will be <b>stopped</b>, the old PVCs/PVs <b>deleted</b> then recreated on the restored Volume Group(s)."]});
@@ -15719,7 +15719,7 @@ $("#rsGo").onclick=async()=>{
   if(r.error && !(r.log&&r.log.length)){$("#rsLog").innerHTML=errBox(r.error)+renderPreflight(r.preflight);return;}
   const lines=renderLog(r.log);
   let head;
-  if(r.dry) head='<div class="note">Simulation complete — here is what would be executed in real mode.</div>';
+  if(r.dry) head='<div class="note">Simulation finished — here is what would be executed.</div>';
   else if(r.aborted) head='<div class="err"><b>Sequence aborted</b> — the application was left stopped to avoid an inconsistent restart. See details.</div>';
   else if(r.ok) head='<div class="note">Restore complete.</div>';
   else head='<div class="err">Some steps failed — see below.</div>';
@@ -16556,7 +16556,7 @@ async function bulkStart(dryRun){
   let confirmedCtx="";
   if(!dryRun){
     const needCtx = ctxInfo.require_confirm ? (ctxInfo.context||"") : null;
-    const res=await confirmDanger({title:"REAL bulk restore", requireText:needCtx, lines:[
+    const res=await confirmDanger({title:"Confirm the bulk restore", requireText:needCtx, lines:[
       "<b>"+bulkPlan.items.length+"</b> namespace(s) will be RECREATED on <b>"+esc(ctxInfo.context||"?")+"</b> from their backups.",
       "Sequential, journaled execution; vanished Volume Groups will be restored by HYCU (real operations).",
       "Present namespaces are left untouched."]});
@@ -16577,7 +16577,7 @@ $("#bulkResume").onclick=async()=>{
   let confirmedCtx="";
   if(!j.dry){
     const needCtx = ctxInfo.require_confirm ? (ctxInfo.context||"") : null;
-    const res=await confirmDanger({title:"Resume the bulk restore (REAL)", requireText:needCtx, lines:[
+    const res=await confirmDanger({title:"Resume the bulk restore", requireText:needCtx, lines:[
       "The remaining namespaces (pending, stopped or failed) will be recreated; those already recreated are not redone."]});
     if(!res) return; if(typeof res==="string") confirmedCtx=res;
   }
@@ -17317,7 +17317,7 @@ $("#drAuto").onclick=async()=>{
     source_vg_uuid:hy[t.dataset.pvc]||refs[t.dataset.pvc]||"", vg_name:names[t.dataset.pvc]||""}));
   if(!volumes.length || volumes.some(v=>!v.source_vg_uuid)){
     $("#drErr").innerHTML=errBox("Source VG UUID missing from the backup: automation not possible, enter the UUIDs manually."); return; }
-  if(!dry() && !(await confirmDanger({title:"REAL HYCU clones", lines:[
+  if(!dry() && !(await confirmDanger({title:"Confirm the HYCU clones", lines:[
       "Trigger in HYCU the <b>clone</b> of <b>"+volumes.length+"</b> Volume Group(s) (nouveaux VG créés) ?",
       "The new IDs will be filled into the grid automatically."]}))) return;
   const btn=$("#drAuto"); btn.disabled=true; drBusy=true; rsWizSync();
@@ -17340,7 +17340,7 @@ async function drRun(){
   let confirmedCtx="";
   if(live){
     const needCtx = ctxInfo.require_confirm ? (ctxInfo.context||"") : null;
-    const res=await confirmDanger({title:(drMode==="recover"?"Restore of a DELETED application":"REAL DR restore"), requireText:needCtx, lines:[
+    const res=await confirmDanger({title:(drMode==="recover"?"Confirm the deleted application restore":"Confirm the DR restore"), requireText:needCtx, lines:[
       "Source backup: <b>"+esc(b.cluster)+" › "+esc(b.namespace)+" › "+esc(b.timestamp)+"</b>",
       "TARGET cluster: <b>"+esc(ctxInfo.context||"?")+"</b> · target namespace: <b>"+esc($("#drTargetNs").value)+"</b>",
       drMode==="recover"
@@ -17447,7 +17447,7 @@ async function objApply(){
   let confirmedCtx="";
   if(live){
     const needCtx = ctxInfo.require_confirm ? (ctxInfo.context||"") : null;
-    const res=await confirmDanger({title:"REAL object restore", requireText:needCtx, lines:[
+    const res=await confirmDanger({title:"Confirm the object restore", requireText:needCtx, lines:[
       "Namespace: <b>"+esc($("#rsNs").value||state.ns||"?")+"</b>",
       "Target cluster: <b>"+esc(ctxInfo.context||"?")+"</b>",
       "<b>"+objSelIdx().length+"</b> configuration object(s) will be OVERWRITTEN by the backup version (kubectl apply). Volumes and data are untouched."]});
@@ -19021,6 +19021,21 @@ I18N_EN = [
     ('<h2 class="dtitle">Politique</h2>', '<h2 class="dtitle">Policy</h2>'),
     ('<h2 class="dtitle">Stockage</h2>', '<h2 class="dtitle">Storage</h2>'),
     ('Demande transmise à HYCU : politique assignée, sauvegarde lancée. Vous pouvez continuer — le suivi du job s’affiche ci-dessous et dans HYCU.', 'Request sent to HYCU: policy assigned, backup started. You can carry on — the job progress is shown below and in HYCU.'),
+    ('Retapez le nom exact du contexte cible pour confirmer.', 'Retype the exact target context name to confirm.'),
+    ('Simulation désactivée — les commandes seront exécutées', 'Simulation off — commands will be executed'),
+    ('"Confirmer la protection HYCU"', '"Confirm the HYCU protection"'),
+    ('"Confirmer les clones HYCU"', '"Confirm the HYCU clones"'),
+    ('"Confirmer la restauration sur place"', '"Confirm the in-place restore"'),
+    ('"Confirmer le clone d\'application"', '"Confirm the application clone"'),
+    ('"Confirmer la restauration en masse"', '"Confirm the bulk restore"'),
+    ('"Reprendre la restauration en masse"', '"Resume the bulk restore"'),
+    ('"Confirmer la restauration de l\'application supprimée"', '"Confirm the deleted application restore"'),
+    ('"Confirmer la restauration DR"', '"Confirm the DR restore"'),
+    ('"Confirmer la restauration d\'objets"', '"Confirm the object restore"'),
+    ('"Confirmer la restauration"', '"Confirm the restore"'),
+    ('Simulation terminée — voici ce qui serait exécuté.', 'Simulation finished — here is what would be executed.'),
+    ('id="dmOk">Confirmer</button>', 'id="dmOk">Confirm</button>'),
+    ('Confirmation du contexte cible avant toute action', 'Target context confirmation before any action'),
 ]
 # <<< I18N-END
 _I18N_SORTED = None          # (fr, en) triés du plus long au plus court

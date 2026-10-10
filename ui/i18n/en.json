@@ -6110,5 +6110,65 @@
 [
 "Demande transmise à HYCU : politique assignée, sauvegarde lancée. Vous pouvez continuer — le suivi du job s’affiche ci-dessous et dans HYCU.",
 "Request sent to HYCU: policy assigned, backup started. You can carry on — the job progress is shown below and in HYCU."
+],
+[
+"Retapez le nom exact du contexte cible pour confirmer.",
+"Retype the exact target context name to confirm."
+],
+[
+"Simulation désactivée — les commandes seront exécutées",
+"Simulation off — commands will be executed"
+],
+[
+"\"Confirmer la protection HYCU\"",
+"\"Confirm the HYCU protection\""
+],
+[
+"\"Confirmer les clones HYCU\"",
+"\"Confirm the HYCU clones\""
+],
+[
+"\"Confirmer la restauration sur place\"",
+"\"Confirm the in-place restore\""
+],
+[
+"\"Confirmer le clone d'application\"",
+"\"Confirm the application clone\""
+],
+[
+"\"Confirmer la restauration en masse\"",
+"\"Confirm the bulk restore\""
+],
+[
+"\"Reprendre la restauration en masse\"",
+"\"Resume the bulk restore\""
+],
+[
+"\"Confirmer la restauration de l'application supprimée\"",
+"\"Confirm the deleted application restore\""
+],
+[
+"\"Confirmer la restauration DR\"",
+"\"Confirm the DR restore\""
+],
+[
+"\"Confirmer la restauration d'objets\"",
+"\"Confirm the object restore\""
+],
+[
+"\"Confirmer la restauration\"",
+"\"Confirm the restore\""
+],
+[
+"Simulation terminée — voici ce qui serait exécuté.",
+"Simulation finished — here is what would be executed."
+],
+[
+"id=\"dmOk\">Confirmer</button>",
+"id=\"dmOk\">Confirm</button>"
+],
+[
+"Confirmation du contexte cible avant toute action",
+"Target context confirmation before any action"
 ]
 ]
