@@ -3472,10 +3472,22 @@ def action_applications():
 # le bouton Actualiser force un recalcul (?fresh=1).
 _APPS_CACHE = {}
 _APPS_CACHE_LOCK = threading.Lock()
+# Dernière correspondance PVC <-> Volume Group HYCU par (cluster, namespace) : calculée
+# par « Analyser », réutilisée quelques minutes par la garde anti-stale des opérations
+# HYCU (protéger, restaurer) au lieu de re-parcourir tous les VG HYCU à chaque clic.
+_MATCH_CACHE = {}
+_MATCH_CACHE_LOCK = threading.Lock()
+_MATCH_CACHE_TTL = 600
 _APPS_INFLIGHT = {}
 
 
+def _match_cache_clear():
+    with _MATCH_CACHE_LOCK:
+        _MATCH_CACHE.clear()
+
+
 def _apps_cache_clear():
+    _match_cache_clear()          # toute écriture invalide aussi la correspondance mémorisée
     with _APPS_CACHE_LOCK:
         _APPS_CACHE.clear()
 
@@ -7214,7 +7226,10 @@ def action_hycu_match(ns):
             "policy": hy.get("protectionGroupName") if hy else None,
             "has_backups": bool(hy.get("hasBackups")) if hy else False,
         })
-    return {"ok": True, "namespace": ns, "matches": matches}
+    out = {"ok": True, "namespace": ns, "matches": matches}
+    with _MATCH_CACHE_LOCK:
+        _MATCH_CACHE[(_current_cid(), ns)] = {"at": time.time(), "match": out}
+    return out
 
 
 def _reject_stale_vgs(ns, uuids, confirmed_by_name=None):
@@ -7223,7 +7238,17 @@ def _reject_stale_vgs(ns, uuids, confirmed_by_name=None):
     un message d'erreur si l'un est hors-correspondance, sinon None."""
     if not ns:
         return None
-    match = action_hycu_match(ns)
+    # La correspondance vient en général d'être calculée par l'interface (« Analyser ») :
+    # réutilisée si récente — un nouveau parcours complet des VG HYCU prendrait de
+    # longues secondes à chaque clic — sinon recalculée. Toute écriture (restauration,
+    # clone, sauvegarde) vide ce cache.
+    match = None
+    with _MATCH_CACHE_LOCK:
+        cached = _MATCH_CACHE.get((_current_cid(), ns))
+    if cached and time.time() - cached["at"] <= _MATCH_CACHE_TTL:
+        match = cached["match"]
+    if match is None:
+        match = action_hycu_match(ns)
     if not match.get("ok"):
         return "Re-vérification de la correspondance impossible : %s" % match.get("error")
     # Seule une correspondance de CONFIANCE (UUID exact) autorise une opération HYCU :
@@ -7346,22 +7371,35 @@ def _collect_restore_contract(ns, volumes):
 def action_hycu_protect(payload):
     """Assigne (optionnellement) une politique HYCU aux Volume Groups, puis
     déclenche une sauvegarde à la demande. dry-run par défaut : montre les appels.
-    Garde-fou : si 'namespace' est fourni, on RE-CALCULE la correspondance côté
-    serveur et on REFUSE tout VG hors de ce match courant (anti-état périmé /
-    anti-mauvaise cible)."""
+    Deux formes de charge :
+      - un namespace : { namespace, vg_uuids, confirm_name_uuids, ... } ;
+      - PLUSIEURS applications en une fois : { items: [{namespace, vg_uuids,
+        confirm_name_uuids}, ...], ... } — un seul appel HYCU d'assignation et un
+        seul lancement de sauvegarde pour tous les Volume Groups.
+    Garde-fou par namespace : tout VG hors de la correspondance courante est REFUSÉ
+    (anti-état périmé / anti-mauvaise cible) ; rien n'est envoyé à HYCU si un seul
+    namespace échoue à cette vérification."""
     dry = bool(payload.get("dry", True))
-    ns = payload.get("namespace")
-    vg_uuids = sorted({u for u in (payload.get("vg_uuids") or []) if u})
     policy_uuid = (payload.get("policy_uuid") or "").strip()
     force_full = bool(payload.get("force_full"))
+    items = payload.get("items")
+    if not isinstance(items, list) or not items:
+        items = [{"namespace": payload.get("namespace"), "vg_uuids": payload.get("vg_uuids") or [],
+                  "confirm_name_uuids": payload.get("confirm_name_uuids") or []}]
+    vg_uuids = sorted({u for it in items for u in (it.get("vg_uuids") or []) if u})
+    namespaces = [it.get("namespace") for it in items if it.get("namespace")]
+    ns = namespaces[0] if len(namespaces) == 1 else None      # audit / compatibilité
     if not vg_uuids:
         return {"ok": False, "error": "Aucun Volume Group HYCU à protéger "
                 "(correspondance introuvable — voir l'analyse)."}
 
-    if ns:
-        stale = _reject_stale_vgs(ns, vg_uuids, confirmed_by_name=payload.get("confirm_name_uuids") or [])
-        if stale:
-            return _err(stale)
+    for it in items:
+        it_ns = it.get("namespace")
+        it_vgs = sorted({u for u in (it.get("vg_uuids") or []) if u})
+        if it_ns and it_vgs:
+            stale = _reject_stale_vgs(it_ns, it_vgs, confirmed_by_name=it.get("confirm_name_uuids") or [])
+            if stale:
+                return _err(stale)
 
     acquired = False
     if not dry:
@@ -7383,7 +7421,7 @@ def action_hycu_protect(payload):
                               "error": r.get("error"), "raw": (r.get("raw") or "")[:300]})
                 if not r["ok"]:
                     audit("hycu_protect", ok=False, step="assign", namespace=ns,
-                          policy=policy_uuid, vgs=vg_uuids)
+                          namespaces=namespaces, policy=policy_uuid, vgs=vg_uuids)
                     return {"ok": False, "error": "Échec de l'assignation de politique : %s" % r.get("error"),
                             "steps": steps, "dry": False}
 
@@ -7398,8 +7436,9 @@ def action_hycu_protect(payload):
         steps.append({"label": "Lancer la sauvegarde maintenant", "ok": r["ok"],
                       "error": r.get("error"), "job_id": job_id, "raw": (r.get("raw") or "")[:300]})
         audit("hycu_protect", ok=r["ok"], policy=policy_uuid or None, force_full=force_full,
-              namespace=ns, vgs=vg_uuids, job=job_id)
-        return {"ok": r["ok"], "dry": False, "steps": steps, "job_id": job_id}
+              namespace=ns, namespaces=namespaces, vgs=vg_uuids, job=job_id)
+        return {"ok": r["ok"], "dry": False, "steps": steps, "job_id": job_id,
+                "namespaces": namespaces, "count": len(vg_uuids)}
     finally:
         if acquired:
             ACTION_LOCK.release()
@@ -9179,8 +9218,6 @@ HTML = r"""<!DOCTYPE html>
   .dry b{color:var(--strong)}
   .dry.live{border-left-color:var(--red);background:#FDF0EF}
   .dry.live b{color:var(--red)}
-  .realbar{position:fixed;top:0;left:0;right:0;height:4px;background:var(--red);z-index:200;display:none}
-  body.realmode .realbar{display:block}
 
   /* ---------- Cartes, champs, boutons ---------- */
   .card{background:var(--card);border-radius:6px;padding:18px 20px;margin-bottom:16px;
@@ -9447,11 +9484,6 @@ HTML = r"""<!DOCTYPE html>
   .preflight{margin:10px 0}
   .preflight summary{cursor:pointer;font-size:13px}
   /* ---------- Mode réel : indicateur permanent dans la barre du haut ---------- */
-  .tb-real{display:none;align-items:center;font-size:12px;font-weight:700;letter-spacing:.4px;color:#fff;background:var(--red);
-           border-radius:4px;padding:4px 10px}
-  body.realmode .tb-real{display:inline-flex}
-  body.realmode .topbar{box-shadow:inset 0 -6px 0 var(--red)}
-  body.realmode .realbar{height:6px}
   #netBanner{margin-bottom:12px}
   .dq{display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;border:1.5px solid var(--muted);
       border-radius:50%;font-size:11px;font-weight:700;color:var(--grey);cursor:help;vertical-align:middle}
@@ -9489,7 +9521,6 @@ HTML = r"""<!DOCTYPE html>
 </style>
 </head>
 <body>
-<div class="realbar"></div>
 <!-- ===================== MODALE DE CONFIRMATION (actions destructives) ===================== -->
 <div id="dangerModal" class="modal-bg" style="display:none">
   <div class="modal">
@@ -9609,7 +9640,6 @@ HTML = r"""<!DOCTYPE html>
 <header class="topbar">
   <a class="tb-brand" id="tbHome" href="#" title="Tableau de bord">__LOGO__<span class="tb-word">HYCU<sup>®</sup></span><span class="tb-prod">Kubernetes · Nutanix</span></a>
   <div class="tb-right">
-    <span id="tbReal" class="tb-real" role="status">MODE RÉEL</span>
     <span id="hdrConn" class="hdrconn" title="État des sources — cliquer pour ouvrir les Sources"></span>
     <button class="tb-link" id="ctxLink" type="button" title="Cluster Kubernetes actif — cliquer pour en choisir un autre"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="16" height="6.5" rx="1.3"/><rect x="4" y="13.5" width="16" height="6.5" rx="1.3"/><path d="M7.6 7.25h.01M7.6 16.75h.01"/></svg><u id="ctx">…</u><span id="ctxWarn"></span><svg class="caret" width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M2.5 4.5l3.5 3.5 3.5-3.5" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round"/></svg></button>
     <button class="tb-ico" id="srcBtn" type="button" title="Sources & Réglages"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></button>
@@ -10306,14 +10336,16 @@ async function api(u, opts){
     setNet(false);
     const txt=await r.text();
     let j=null; try{ j=txt?JSON.parse(txt):{}; }catch(e){ j=null; }
-    if(j===null) return {ok:false, status:r.status, error:(r.status>=400?("HTTP "+r.status+" — "):"")+(txt||"réponse illisible").slice(0,200)};
+    if(j===null) return {ok:false, status:r.status, http_status:r.status, error:(r.status>=400?("HTTP "+r.status+" — "):"")+(txt||"réponse illisible").slice(0,200)};
     if(j && typeof j==="object" && j.ok===undefined && j.error && r.status>=400) j.ok=false;
-    if(j && typeof j==="object") j.status=r.status;
+    // Le code HTTP est exposé à part : `status` appartient à la réponse du serveur
+    // (statut d'un job HYCU, d'une comparaison d'objets…) et ne doit jamais être écrasé.
+    if(j && typeof j==="object" && j.http_status===undefined) j.http_status=r.status;
     return j;
   }catch(e){
     const aborted = e && e.name==="AbortError";
     if(!aborted) setNet(true);
-    return {ok:false, status:0, error: aborted ? "Délai dépassé : le serveur ne répond pas." : "Serveur injoignable (réseau ou outil arrêté)."};
+    return {ok:false, status:0, http_status:0, error: aborted ? "Délai dépassé : le serveur ne répond pas." : "Serveur injoignable (réseau ou outil arrêté)."};
   }finally{ clearTimeout(t); }
 }
 async function get(u, cid){ return api(u, {cid}); }
@@ -10488,7 +10520,6 @@ function refreshDry(){
   document.body.classList.toggle("realmode",live);   // barre rouge fixe + indicateur en-tête
   $("#dryLabel").textContent = live? "MODE RÉEL — les commandes seront exécutées" : "Mode simulation activé";
   $("#dry").setAttribute("aria-checked", dry() ? "true" : "false");
-  const tb=$("#tbReal"); if(tb) tb.textContent = "MODE RÉEL · " + (ctxInfo.context || clById(ACTIVE_CID)&&clById(ACTIVE_CID).name || "cluster");
 }
 $("#dry").onchange=refreshDry;
 
@@ -10539,7 +10570,7 @@ async function followOp(opId, onProgress){
   for(let i=0;i<6000;i++){            // garde-fou : ~90 min à 0,9 s
     const st = await get("/api/op_status?id="+encodeURIComponent(opId));
     if(!st.ok){
-      if(st.status===0 || st.status>=500){      // coupure réseau / serveur : on réessaie (borné)
+      if(st.http_status===0 || st.http_status>=500){   // coupure réseau / serveur : on réessaie (borné)
         if(++errors<=20){ await sleep(2000); continue; }
       }
       rememberOp(null);
@@ -10856,7 +10887,7 @@ $("#bkRunAll").onclick=async()=>{
 };
 
 // --------- Protection HYCU (assigner politique + sauvegarder) ---------
-let bkMatches=[], bkMatchNs=null;
+let bkMatches=[], bkMatchNs=null, bkNsList=[];   // bkNsList : namespaces ciblés (plusieurs applications en une fois)
 function clearBkProtect(){ bkMatches=[]; bkMatchNs=null; $("#bkMatchOut").innerHTML=""; $("#bkProtectForm").style.display="none"; $("#bkProtectLog").innerHTML=""; }
 
 // Re-protection HYCU après un clone : bascule sur l'onglet Sauvegarder, cible le bon
@@ -10868,18 +10899,27 @@ $("#bkNs").onchange=()=>{ state.ns=$("#bkNs").value; savePref("ns",state.ns); ap
 $("#vfNs").onchange=()=>{ state.ns=$("#vfNs").value; savePref("ns",state.ns); applyGlobalNs(); };
 $("#bkDest").addEventListener("change",()=>savePref("bkDest",$("#bkDest").value.trim()));
 $("#bkMatch").onclick=async()=>{
-  const ns=$("#bkNs").value; clearBkProtect();
+  // Une application (namespace courant) ou PLUSIEURS (sélection de la page Applications) :
+  // une analyse par namespace, un seul formulaire, un seul envoi à HYCU.
+  const list = bkNsList.length ? bkNsList.slice() : [$("#bkNs").value];
+  clearBkProtect();
   $("#bkMatchOut").innerHTML='<div class="hint">Analyse en cours…</div>';
-  const r=await get("/api/hycu/match?ns="+encodeURIComponent(ns));
-  if(!r.ok){ $("#bkMatchOut").innerHTML=errBox(r.error); return; }
-  bkMatches=r.matches||[]; bkMatchNs=r.namespace||ns;
-  const rows=bkMatches.map(m=>{
+  const results=[];
+  for(const ns of list){
+    const r=await get("/api/hycu/match?ns="+encodeURIComponent(ns));
+    if(!r.ok){ $("#bkMatchOut").innerHTML=errBox((list.length>1?("Namespace « "+ns+" » : "):"")+r.error); return; }
+    (r.matches||[]).forEach(m=>{ m.ns=r.namespace||ns; });
+    results.push({ns:r.namespace||ns, matches:r.matches||[]});
+  }
+  bkMatches=results.flatMap(x=>x.matches); bkMatchNs=list.length===1 ? results[0].ns : null;
+  const rowOf=m=>{
     let chk="", label="";
     if(m.match_kind==="exact"){
-      chk=`<input type="checkbox" class="bkMchk" data-uuid="${esc(m.hycu_vg_uuid)}" data-name="${esc(m.hycu_vg_name||'')}" data-ext="${esc(m.hycu_external_id||'')}" checked style="width:auto;margin-right:8px">`;
+      chk=`<input type="checkbox" class="bkMchk" data-ns="${esc(m.ns)}" data-uuid="${esc(m.hycu_vg_uuid)}" data-name="${esc(m.hycu_vg_name||'')}" data-ext="${esc(m.hycu_external_id||'')}" checked style="width:auto;margin-right:8px">`;
       label=`→ VG <b>${esc(m.hycu_vg_name||m.hycu_vg_uuid)}</b> <span class="hint">(externalId ${esc(m.hycu_external_id||'')})</span>`;
     } else if(m.match_kind==="name"){
-      chk=`<input type="checkbox" class="bkMchk" data-uuid="${esc(m.hycu_vg_uuid)}" data-name="${esc(m.hycu_vg_name||'')}" data-ext="${esc(m.hycu_external_id||'')}" style="width:auto;margin-right:8px">`;
+      // data-kind : cocher cette ligne vaut CONFIRMATION du match par nom (transmise au serveur)
+      chk=`<input type="checkbox" class="bkMchk" data-kind="name" data-ns="${esc(m.ns)}" data-uuid="${esc(m.hycu_vg_uuid)}" data-name="${esc(m.hycu_vg_name||'')}" data-ext="${esc(m.hycu_external_id||'')}" style="width:auto;margin-right:8px">`;
       label=`→ VG <b>${esc(m.hycu_vg_name||m.hycu_vg_uuid)}</b> <span class="sim">par nom — à confirmer</span>`;
     } else if(m.match_kind==="ambiguous"){
       chk=`<span class="ic ko" style="width:18px;display:inline-block;text-align:center;margin-right:8px">⚠</span>`;
@@ -10898,7 +10938,11 @@ $("#bkMatch").onclick=async()=>{
       prot=`<div class="meta">${cb}${unp} · politique : <b>${esc(m.policy||'aucune')}</b> · backups : ${m.has_backups?'oui':'non'}</div>`;
     }
     return `<li class="logline">${chk}<span style="flex:1"><b>${esc(m.pvc)}</b> ${label}${prot}</span></li>`;
-  }).join("") || '<div class="hint">Aucun PVC dans ce namespace.</div>';
+  };
+  const rows = list.length===1
+    ? (bkMatches.map(rowOf).join("") || '<div class="hint">Aucun PVC dans ce namespace.</div>')
+    : results.map(x=>`<li class="logline" style="background:#F6F7FB;font-weight:700">${esc(x.ns)} <span class="hint" style="font-weight:400;margin-left:8px">${x.matches.length} PVC</span></li>`
+        + (x.matches.map(rowOf).join("") || '<li class="logline"><span class="hint">Aucun PVC dans ce namespace.</span></li>')).join("");
   const nx=bkMatches.filter(m=>m.match_kind==="exact").length, nn=bkMatches.filter(m=>m.match_kind==="name").length,
         na=bkMatches.filter(m=>m.match_kind==="ambiguous").length, n0=bkMatches.filter(m=>m.match_kind==="none").length;
   $("#bkMatchOut").innerHTML=`<ul class="pvc-list" style="margin-top:10px">${rows}</ul>
@@ -10912,7 +10956,7 @@ async function loadBkPolicies(){
   $("#bkPolicy").innerHTML=`<option value="">(ne pas changer la politique)</option>`+
     (r.ok? (r.policies||[]).map(p=>`<option value="${esc(p.uuid)}">${esc(p.name||p.uuid)}</option>`).join("") : "");
 }
-function updateBkHint(){ $("#bkProtectHint").textContent = dry()? "Mode simulation (bandeau du haut) : montre les appels HYCU." : "Mode réel : exécute sur HYCU."; }
+function updateBkHint(){ $("#bkProtectHint").textContent = dry()? "Mode simulation (bandeau du haut) : montre les appels HYCU." : ""; }
 $("#dry").addEventListener("change",()=>{ if($("#bkProtectForm").style.display!=="none") updateBkHint(); });
 $("#bkProtect").onclick=async()=>{
   const sel=[...document.querySelectorAll(".bkMchk:checked")];
@@ -10925,7 +10969,12 @@ $("#bkProtect").onclick=async()=>{
      "<b>"+names.map(esc).join("</b>, <b>")+"</b>"]}))) return;
   const b=$("#bkProtect"); b.disabled=true; b.innerHTML='<span class="spin"></span>…';
   const byName=sel.filter(c=>c.dataset.kind==="name").map(c=>c.dataset.uuid);   // cochés = confirmés par l'opérateur
-  const r=await post("/api/hycu/protect",{namespace:bkMatchNs, vg_uuids, policy_uuid:pol, force_full:$("#bkForceFull").checked, dry:dry(), confirm_name_uuids:byName});
+  // Regroupement par namespace : la garde anti-stale du serveur est faite namespace par
+  // namespace, puis UN SEUL appel HYCU (assignation) + UN SEUL lancement de sauvegarde.
+  const byNs={};
+  sel.forEach(c=>{ const k=c.dataset.ns||bkMatchNs||""; (byNs[k]=byNs[k]||{namespace:k, vg_uuids:[], confirm_name_uuids:[]}).vg_uuids.push(c.dataset.uuid);
+    if(c.dataset.kind==="name") byNs[k].confirm_name_uuids.push(c.dataset.uuid); });
+  const r=await post("/api/hycu/protect",{items:Object.values(byNs), namespace:bkMatchNs, vg_uuids, policy_uuid:pol, force_full:$("#bkForceFull").checked, dry:dry(), confirm_name_uuids:byName});
   b.disabled=false; b.textContent="Assigner + sauvegarder maintenant";
   if(!r.ok && !(r.steps&&r.steps.length)){ $("#bkProtectLog").innerHTML=errBox(r.error); return; }
   const lines=(r.steps||[]).map(s=> s.dry
@@ -10933,7 +10982,7 @@ $("#bkProtect").onclick=async()=>{
     : `<div class="logline"><span class="ic ${s.ok?'ok':'ko'}">${s.ok?'✓':'✕'}</span><span><b>${esc(s.label)}</b>${s.job_id?(' · job '+esc(s.job_id)):''}${(s.error&&!s.ok)?(' — <span class="ko">'+esc(s.error)+'</span>'):''}</span></div>`
   ).join("");
   const head = r.dry? '<div class="warnbox">Simulation — appels qui seraient envoyés à HYCU :</div>'
-     : (r.ok? '<div class="note">Politique assignée / sauvegarde HYCU déclenchée.</div>' : '<div class="err">Échec — voir le détail.</div>');
+     : (r.ok? '<div class="note">Demande transmise à HYCU : politique assignée, sauvegarde lancée. Vous pouvez continuer — le suivi du job s’affiche ci-dessous et dans HYCU.</div>' : '<div class="err">Échec — voir le détail.</div>');
   $("#bkProtectLog").innerHTML=head+lines;
   if(!r.dry && r.ok && r.job_id){ $("#bkProtectLog").innerHTML+='<div id="bkJobProgress"></div>'; pollJobBar(r.job_id,"#bkJobProgress"); }
 };
@@ -11408,8 +11457,7 @@ function updateGoButton(ready){
   const live=!dry();
   const needConfirm = live && ctxInfo.require_confirm;
   $("#rsCtxConfirm").style.display = needConfirm? "block":"none";
-  $("#rsGoHint").textContent = live? "Mode réel : ces opérations seront exécutées sur le cluster."
-     : "Mode simulation : rien ne sera modifié.";
+  $("#rsGoHint").textContent = live? "" : "Mode simulation : rien ne sera modifié.";
   $("#rsGo").className = live? "btn danger" : "btn";
   let act;
   if(state.mode!=="clone") act = "la restauration sur place (flux manuel)";
@@ -12180,7 +12228,10 @@ function selApps(){ return selNsObjs().map(a=>a.name); }
 function updateAppActs(){
   const objs=selAppObjs(), n=objs.length, anyMissing=objs.some(a=>a.missing), anyEmpty=objs.some(a=>a.type==="empty");
   $("#actBackup").disabled = !n || anyMissing || anyEmpty;
-  ["#actPolicy","#actVerify"].forEach(id=>$(id).disabled = n!==1 || anyMissing);
+  $("#actVerify").disabled = n!==1 || anyMissing;
+  // Définir la politique : une ou PLUSIEURS applications (du même cluster) en une fois.
+  const oneCluster = n>=1 && new Set(objs.map(a=>a.cluster_id||ACTIVE_CID)).size===1;
+  $("#actPolicy").disabled = !oneCluster || anyMissing || anyEmpty;
   // Restaurer : une application, OU plusieurs applications du MÊME namespace (= tout le
   // namespace, ex. mariadb + wordpress séparés par leurs étiquettes). Un namespace vide
   // reste restaurable s'il a des sauvegardes (application supprimée mais namespace
@@ -12208,7 +12259,7 @@ $("#actRestore").onclick=async()=>{ const objs=selAppObjs(), a=objs[0]; await en
   if(a.missing) return openRecoverModal(appNs(a));
   // Plusieurs applications du même namespace sélectionnées -> tout le namespace.
   openRestoreModal(appNs(a), objs.length>1 ? null : a); };
-$("#actPolicy").onclick=async()=>{ const a=selAppObjs()[0]; await ensureCluster(a); openPolicyModal(appNs(a)); };
+$("#actPolicy").onclick=async()=>{ const objs=selNsObjs(); await ensureCluster(objs[0]); openPolicyModal(objs.length>1 ? objs.map(a=>a.name) : appNs(selAppObjs()[0])); };
 $("#actVerify").onclick=async()=>{ const a=selAppObjs()[0]; await ensureCluster(a); gotoVerify(appNs(a), false); };
 
 // ============================ Modale Sauvegarde ============================
@@ -12249,6 +12300,16 @@ $("#bkRunSel").onclick=async()=>{
 
 // ============================ Modale Définir la politique ============================
 function openPolicyModal(ns){
+  // ns : un namespace (chaîne) ou une liste de namespaces (plusieurs applications en une fois).
+  bkNsList = Array.isArray(ns) ? ns.slice() : [];
+  if(bkNsList.length){
+    clearBkProtect();
+    $("#mPolicyTitle").innerHTML=esc("Définir la politique")+'<span class="sep">›</span>'+esc(bkNsList.length+" applications")
+      +' <span class="hint" style="font-weight:400">'+esc(bkNsList.join(", "))+'</span>';
+    openModal("mPolicy");
+    if(conn.hycu && conn.hycu.connected) setTimeout(()=>$("#bkMatch").click(), 30);
+    return;
+  }
   if(ns){ state.ns=ns; applyGlobalNs(); $("#bkNs").value=ns;
     if($("#bkNs").value!==ns){                 // namespace disparu / kubectl en panne
       clearBkProtect(); openModal("mPolicy");
@@ -12956,8 +13017,8 @@ function rsWizSync(){
   if(html!==rsWizHtml){ go.innerHTML=html; rsWizHtml=html; }
   go.disabled=dis; rsWizAct=act;
   const live=!dry(), m=$("#rsWizMode");
-  m.textContent = live ? "Mode réel" : "Simulation";
-  m.className="badge "+(live ? "live" : "sim");
+  m.textContent = live ? "" : "Simulation";       // la production est le mode normal : rien à signaler
+  m.className="badge sim"; m.style.display = live ? "none" : "";
 }
 $("#rsWizGo").onclick=()=>{ if(rsWizAct && !$("#rsWizGo").disabled) rsWizAct(); };
 $("#rsWizBack").onclick=()=>{
@@ -13340,8 +13401,6 @@ HTML_EN = r"""<!DOCTYPE html>
   .dry b{color:var(--strong)}
   .dry.live{border-left-color:var(--red);background:#FDF0EF}
   .dry.live b{color:var(--red)}
-  .realbar{position:fixed;top:0;left:0;right:0;height:4px;background:var(--red);z-index:200;display:none}
-  body.realmode .realbar{display:block}
 
   /* ---------- Cartes, champs, boutons ---------- */
   .card{background:var(--card);border-radius:6px;padding:18px 20px;margin-bottom:16px;
@@ -13608,11 +13667,6 @@ HTML_EN = r"""<!DOCTYPE html>
   .preflight{margin:10px 0}
   .preflight summary{cursor:pointer;font-size:13px}
   /* ---------- Mode réel : indicateur permanent dans la barre du haut ---------- */
-  .tb-real{display:none;align-items:center;font-size:12px;font-weight:700;letter-spacing:.4px;color:#fff;background:var(--red);
-           border-radius:4px;padding:4px 10px}
-  body.realmode .tb-real{display:inline-flex}
-  body.realmode .topbar{box-shadow:inset 0 -6px 0 var(--red)}
-  body.realmode .realbar{height:6px}
   #netBanner{margin-bottom:12px}
   .dq{display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;border:1.5px solid var(--muted);
       border-radius:50%;font-size:11px;font-weight:700;color:var(--grey);cursor:help;vertical-align:middle}
@@ -13650,7 +13704,6 @@ HTML_EN = r"""<!DOCTYPE html>
 </style>
 </head>
 <body>
-<div class="realbar"></div>
 <!-- ===================== MODALE DE CONFIRMATION (actions destructives) ===================== -->
 <div id="dangerModal" class="modal-bg" style="display:none">
   <div class="modal">
@@ -13770,7 +13823,6 @@ HTML_EN = r"""<!DOCTYPE html>
 <header class="topbar">
   <a class="tb-brand" id="tbHome" href="#" title="Dashboard">__LOGO__<span class="tb-word">HYCU<sup>®</sup></span><span class="tb-prod">Kubernetes · Nutanix</span></a>
   <div class="tb-right">
-    <span id="tbReal" class="tb-real" role="status">LIVE MODE</span>
     <span id="hdrConn" class="hdrconn" title="Source status — click to open Sources"></span>
     <button class="tb-link" id="ctxLink" type="button" title="Active Kubernetes cluster — click to choose another one"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="16" height="6.5" rx="1.3"/><rect x="4" y="13.5" width="16" height="6.5" rx="1.3"/><path d="M7.6 7.25h.01M7.6 16.75h.01"/></svg><u id="ctx">…</u><span id="ctxWarn"></span><svg class="caret" width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M2.5 4.5l3.5 3.5 3.5-3.5" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round"/></svg></button>
     <button class="tb-ico" id="srcBtn" type="button" title="Sources & Settings"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></button>
@@ -14467,14 +14519,16 @@ async function api(u, opts){
     setNet(false);
     const txt=await r.text();
     let j=null; try{ j=txt?JSON.parse(txt):{}; }catch(e){ j=null; }
-    if(j===null) return {ok:false, status:r.status, error:(r.status>=400?("HTTP "+r.status+" — "):"")+(txt||"unreadable response").slice(0,200)};
+    if(j===null) return {ok:false, status:r.status, http_status:r.status, error:(r.status>=400?("HTTP "+r.status+" — "):"")+(txt||"unreadable response").slice(0,200)};
     if(j && typeof j==="object" && j.ok===undefined && j.error && r.status>=400) j.ok=false;
-    if(j && typeof j==="object") j.status=r.status;
+    // Le code HTTP est exposé à part : `status` appartient à la réponse du serveur
+    // (statut d'un job HYCU, d'une comparaison d'objets…) et ne doit jamais être écrasé.
+    if(j && typeof j==="object" && j.http_status===undefined) j.http_status=r.status;
     return j;
   }catch(e){
     const aborted = e && e.name==="AbortError";
     if(!aborted) setNet(true);
-    return {ok:false, status:0, error: aborted ? "Timeout: the server is not responding." : "Server unreachable (network or tool stopped)."};
+    return {ok:false, status:0, http_status:0, error: aborted ? "Timeout: the server is not responding." : "Server unreachable (network or tool stopped)."};
   }finally{ clearTimeout(t); }
 }
 async function get(u, cid){ return api(u, {cid}); }
@@ -14649,7 +14703,6 @@ function refreshDry(){
   document.body.classList.toggle("realmode",live);   // barre rouge fixe + indicateur en-tête
   $("#dryLabel").textContent = live? "REAL MODE — commands will be executed" : "Simulation mode on";
   $("#dry").setAttribute("aria-checked", dry() ? "true" : "false");
-  const tb=$("#tbReal"); if(tb) tb.textContent = "LIVE MODE · " + (ctxInfo.context || clById(ACTIVE_CID)&&clById(ACTIVE_CID).name || "cluster");
 }
 $("#dry").onchange=refreshDry;
 
@@ -14700,7 +14753,7 @@ async function followOp(opId, onProgress){
   for(let i=0;i<6000;i++){            // garde-fou : ~90 min à 0,9 s
     const st = await get("/api/op_status?id="+encodeURIComponent(opId));
     if(!st.ok){
-      if(st.status===0 || st.status>=500){      // coupure réseau / serveur : on réessaie (borné)
+      if(st.http_status===0 || st.http_status>=500){   // coupure réseau / serveur : on réessaie (borné)
         if(++errors<=20){ await sleep(2000); continue; }
       }
       rememberOp(null);
@@ -15017,7 +15070,7 @@ $("#bkRunAll").onclick=async()=>{
 };
 
 // --------- Protection HYCU (assigner politique + sauvegarder) ---------
-let bkMatches=[], bkMatchNs=null;
+let bkMatches=[], bkMatchNs=null, bkNsList=[];   // bkNsList : namespaces ciblés (plusieurs applications en une fois)
 function clearBkProtect(){ bkMatches=[]; bkMatchNs=null; $("#bkMatchOut").innerHTML=""; $("#bkProtectForm").style.display="none"; $("#bkProtectLog").innerHTML=""; }
 
 // Re-protection HYCU après un clone : bascule sur l'onglet Back up, cible le bon
@@ -15029,18 +15082,27 @@ $("#bkNs").onchange=()=>{ state.ns=$("#bkNs").value; savePref("ns",state.ns); ap
 $("#vfNs").onchange=()=>{ state.ns=$("#vfNs").value; savePref("ns",state.ns); applyGlobalNs(); };
 $("#bkDest").addEventListener("change",()=>savePref("bkDest",$("#bkDest").value.trim()));
 $("#bkMatch").onclick=async()=>{
-  const ns=$("#bkNs").value; clearBkProtect();
+  // Une application (namespace courant) ou PLUSIEURS (sélection de la page Applications) :
+  // une analyse par namespace, un seul formulaire, un seul envoi à HYCU.
+  const list = bkNsList.length ? bkNsList.slice() : [$("#bkNs").value];
+  clearBkProtect();
   $("#bkMatchOut").innerHTML='<div class="hint">Analyzing…</div>';
-  const r=await get("/api/hycu/match?ns="+encodeURIComponent(ns));
-  if(!r.ok){ $("#bkMatchOut").innerHTML=errBox(r.error); return; }
-  bkMatches=r.matches||[]; bkMatchNs=r.namespace||ns;
-  const rows=bkMatches.map(m=>{
+  const results=[];
+  for(const ns of list){
+    const r=await get("/api/hycu/match?ns="+encodeURIComponent(ns));
+    if(!r.ok){ $("#bkMatchOut").innerHTML=errBox((list.length>1?("Namespace « "+ns+" » : "):"")+r.error); return; }
+    (r.matches||[]).forEach(m=>{ m.ns=r.namespace||ns; });
+    results.push({ns:r.namespace||ns, matches:r.matches||[]});
+  }
+  bkMatches=results.flatMap(x=>x.matches); bkMatchNs=list.length===1 ? results[0].ns : null;
+  const rowOf=m=>{
     let chk="", label="";
     if(m.match_kind==="exact"){
-      chk=`<input type="checkbox" class="bkMchk" data-uuid="${esc(m.hycu_vg_uuid)}" data-name="${esc(m.hycu_vg_name||'')}" data-ext="${esc(m.hycu_external_id||'')}" checked style="width:auto;margin-right:8px">`;
+      chk=`<input type="checkbox" class="bkMchk" data-ns="${esc(m.ns)}" data-uuid="${esc(m.hycu_vg_uuid)}" data-name="${esc(m.hycu_vg_name||'')}" data-ext="${esc(m.hycu_external_id||'')}" checked style="width:auto;margin-right:8px">`;
       label=`→ VG <b>${esc(m.hycu_vg_name||m.hycu_vg_uuid)}</b> <span class="hint">(externalId ${esc(m.hycu_external_id||'')})</span>`;
     } else if(m.match_kind==="name"){
-      chk=`<input type="checkbox" class="bkMchk" data-uuid="${esc(m.hycu_vg_uuid)}" data-name="${esc(m.hycu_vg_name||'')}" data-ext="${esc(m.hycu_external_id||'')}" style="width:auto;margin-right:8px">`;
+      // data-kind : cocher cette ligne vaut CONFIRMATION du match par nom (transmise au serveur)
+      chk=`<input type="checkbox" class="bkMchk" data-kind="name" data-ns="${esc(m.ns)}" data-uuid="${esc(m.hycu_vg_uuid)}" data-name="${esc(m.hycu_vg_name||'')}" data-ext="${esc(m.hycu_external_id||'')}" style="width:auto;margin-right:8px">`;
       label=`→ VG <b>${esc(m.hycu_vg_name||m.hycu_vg_uuid)}</b> <span class="sim">by name — to be confirmed</span>`;
     } else if(m.match_kind==="ambiguous"){
       chk=`<span class="ic ko" style="width:18px;display:inline-block;text-align:center;margin-right:8px">⚠</span>`;
@@ -15059,7 +15121,11 @@ $("#bkMatch").onclick=async()=>{
       prot=`<div class="meta">${cb}${unp} · policy: <b>${esc(m.policy||'none')}</b> · backups: ${m.has_backups?'yes':'no'}</div>`;
     }
     return `<li class="logline">${chk}<span style="flex:1"><b>${esc(m.pvc)}</b> ${label}${prot}</span></li>`;
-  }).join("") || '<div class="hint">No PVC in this namespace.</div>';
+  };
+  const rows = list.length===1
+    ? (bkMatches.map(rowOf).join("") || '<div class="hint">No PVC in this namespace.</div>')
+    : results.map(x=>`<li class="logline" style="background:#F6F7FB;font-weight:700">${esc(x.ns)} <span class="hint" style="font-weight:400;margin-left:8px">${x.matches.length} PVC</span></li>`
+        + (x.matches.map(rowOf).join("") || '<li class="logline"><span class="hint">No PVC in this namespace.</span></li>')).join("");
   const nx=bkMatches.filter(m=>m.match_kind==="exact").length, nn=bkMatches.filter(m=>m.match_kind==="name").length,
         na=bkMatches.filter(m=>m.match_kind==="ambiguous").length, n0=bkMatches.filter(m=>m.match_kind==="none").length;
   $("#bkMatchOut").innerHTML=`<ul class="pvc-list" style="margin-top:10px">${rows}</ul>
@@ -15073,7 +15139,7 @@ async function loadBkPolicies(){
   $("#bkPolicy").innerHTML=`<option value="">(do not change the policy)</option>`+
     (r.ok? (r.policies||[]).map(p=>`<option value="${esc(p.uuid)}">${esc(p.name||p.uuid)}</option>`).join("") : "");
 }
-function updateBkHint(){ $("#bkProtectHint").textContent = dry()? "Simulation mode (banner at top): shows the HYCU calls." : "Real mode: executes on HYCU."; }
+function updateBkHint(){ $("#bkProtectHint").textContent = dry()? "Simulation mode (banner at top): shows the HYCU calls." : ""; }
 $("#dry").addEventListener("change",()=>{ if($("#bkProtectForm").style.display!=="none") updateBkHint(); });
 $("#bkProtect").onclick=async()=>{
   const sel=[...document.querySelectorAll(".bkMchk:checked")];
@@ -15086,7 +15152,12 @@ $("#bkProtect").onclick=async()=>{
      "<b>"+names.map(esc).join("</b>, <b>")+"</b>"]}))) return;
   const b=$("#bkProtect"); b.disabled=true; b.innerHTML='<span class="spin"></span>…';
   const byName=sel.filter(c=>c.dataset.kind==="name").map(c=>c.dataset.uuid);   // cochés = confirmés par l'opérateur
-  const r=await post("/api/hycu/protect",{namespace:bkMatchNs, vg_uuids, policy_uuid:pol, force_full:$("#bkForceFull").checked, dry:dry(), confirm_name_uuids:byName});
+  // Regroupement par namespace : la garde anti-stale du serveur est faite namespace par
+  // namespace, puis UN SEUL appel HYCU (assignation) + UN SEUL lancement de sauvegarde.
+  const byNs={};
+  sel.forEach(c=>{ const k=c.dataset.ns||bkMatchNs||""; (byNs[k]=byNs[k]||{namespace:k, vg_uuids:[], confirm_name_uuids:[]}).vg_uuids.push(c.dataset.uuid);
+    if(c.dataset.kind==="name") byNs[k].confirm_name_uuids.push(c.dataset.uuid); });
+  const r=await post("/api/hycu/protect",{items:Object.values(byNs), namespace:bkMatchNs, vg_uuids, policy_uuid:pol, force_full:$("#bkForceFull").checked, dry:dry(), confirm_name_uuids:byName});
   b.disabled=false; b.textContent="Assign + back up now";
   if(!r.ok && !(r.steps&&r.steps.length)){ $("#bkProtectLog").innerHTML=errBox(r.error); return; }
   const lines=(r.steps||[]).map(s=> s.dry
@@ -15094,7 +15165,7 @@ $("#bkProtect").onclick=async()=>{
     : `<div class="logline"><span class="ic ${s.ok?'ok':'ko'}">${s.ok?'✓':'✕'}</span><span><b>${esc(s.label)}</b>${s.job_id?(' · job '+esc(s.job_id)):''}${(s.error&&!s.ok)?(' — <span class="ko">'+esc(s.error)+'</span>'):''}</span></div>`
   ).join("");
   const head = r.dry? '<div class="warnbox">Simulation — calls that would be sent to HYCU:</div>'
-     : (r.ok? '<div class="note">Policy assigned / HYCU backup triggered.</div>' : '<div class="err">Failed — see details.</div>');
+     : (r.ok? '<div class="note">Request sent to HYCU: policy assigned, backup started. You can carry on — the job progress is shown below and in HYCU.</div>' : '<div class="err">Failed — see details.</div>');
   $("#bkProtectLog").innerHTML=head+lines;
   if(!r.dry && r.ok && r.job_id){ $("#bkProtectLog").innerHTML+='<div id="bkJobProgress"></div>'; pollJobBar(r.job_id,"#bkJobProgress"); }
 };
@@ -15569,8 +15640,7 @@ function updateGoButton(ready){
   const live=!dry();
   const needConfirm = live && ctxInfo.require_confirm;
   $("#rsCtxConfirm").style.display = needConfirm? "block":"none";
-  $("#rsGoHint").textContent = live? "Real mode: these operations will be executed on the cluster."
-     : "Simulation mode: nothing will be changed.";
+  $("#rsGoHint").textContent = live? "" : "Simulation mode: nothing will be changed.";
   $("#rsGo").className = live? "btn danger" : "btn";
   let act;
   if(state.mode!=="clone") act = "the in-place restore (manual flow)";
@@ -16341,7 +16411,10 @@ function selApps(){ return selNsObjs().map(a=>a.name); }
 function updateAppActs(){
   const objs=selAppObjs(), n=objs.length, anyMissing=objs.some(a=>a.missing), anyEmpty=objs.some(a=>a.type==="empty");
   $("#actBackup").disabled = !n || anyMissing || anyEmpty;
-  ["#actPolicy","#actVerify"].forEach(id=>$(id).disabled = n!==1 || anyMissing);
+  $("#actVerify").disabled = n!==1 || anyMissing;
+  // Set Policy : une ou PLUSIEURS applications (du même cluster) en une fois.
+  const oneCluster = n>=1 && new Set(objs.map(a=>a.cluster_id||ACTIVE_CID)).size===1;
+  $("#actPolicy").disabled = !oneCluster || anyMissing || anyEmpty;
   // Restaurer : une application, OU plusieurs applications du MÊME namespace (= tout le
   // namespace, ex. mariadb + wordpress séparés par leurs étiquettes). Un namespace vide
   // reste restaurable s'il a des sauvegardes (application supprimée mais namespace
@@ -16369,7 +16442,7 @@ $("#actRestore").onclick=async()=>{ const objs=selAppObjs(), a=objs[0]; await en
   if(a.missing) return openRecoverModal(appNs(a));
   // Plusieurs applications du même namespace sélectionnées -> tout le namespace.
   openRestoreModal(appNs(a), objs.length>1 ? null : a); };
-$("#actPolicy").onclick=async()=>{ const a=selAppObjs()[0]; await ensureCluster(a); openPolicyModal(appNs(a)); };
+$("#actPolicy").onclick=async()=>{ const objs=selNsObjs(); await ensureCluster(objs[0]); openPolicyModal(objs.length>1 ? objs.map(a=>a.name) : appNs(selAppObjs()[0])); };
 $("#actVerify").onclick=async()=>{ const a=selAppObjs()[0]; await ensureCluster(a); gotoVerify(appNs(a), false); };
 
 // ============================ Modale Sauvegarde ============================
@@ -16410,6 +16483,16 @@ $("#bkRunSel").onclick=async()=>{
 
 // ============================ Modale Set Policy ============================
 function openPolicyModal(ns){
+  // ns : un namespace (chaîne) ou une liste de namespaces (plusieurs applications en une fois).
+  bkNsList = Array.isArray(ns) ? ns.slice() : [];
+  if(bkNsList.length){
+    clearBkProtect();
+    $("#mPolicyTitle").innerHTML=esc("Set Policy")+'<span class="sep">›</span>'+esc(bkNsList.length+" applications")
+      +' <span class="hint" style="font-weight:400">'+esc(bkNsList.join(", "))+'</span>';
+    openModal("mPolicy");
+    if(conn.hycu && conn.hycu.connected) setTimeout(()=>$("#bkMatch").click(), 30);
+    return;
+  }
   if(ns){ state.ns=ns; applyGlobalNs(); $("#bkNs").value=ns;
     if($("#bkNs").value!==ns){                 // namespace disparu / kubectl en panne
       clearBkProtect(); openModal("mPolicy");
@@ -17117,8 +17200,8 @@ function rsWizSync(){
   if(html!==rsWizHtml){ go.innerHTML=html; rsWizHtml=html; }
   go.disabled=dis; rsWizAct=act;
   const live=!dry(), m=$("#rsWizMode");
-  m.textContent = live ? "Real mode" : "Simulation";
-  m.className="badge "+(live ? "live" : "sim");
+  m.textContent = live ? "" : "Simulation";       // la production est le mode normal : rien à signaler
+  m.className="badge sim"; m.style.display = live ? "none" : "";
 }
 $("#rsWizGo").onclick=()=>{ if(rsWizAct && !$("#rsWizGo").disabled) rsWizAct(); };
 $("#rsWizBack").onclick=()=>{
@@ -18909,8 +18992,6 @@ I18N_EN = [
     ('>3 · Vérifier &amp; lancer<', '>3 · Verify &amp; run<'),
     ('>4 · Suivi<', '>4 · Follow-up<'),
     (">Arrêter après l'étape en cours<", '>Stop after the current step<'),
-    ('MODE RÉEL · ', 'LIVE MODE · '),
-    ('>MODE RÉEL<', '>LIVE MODE<'),
     ("Serveur injoignable — vérifiez que l'outil tourne (ou le port-forward), puis rechargez.", 'Server unreachable — check the tool is running (or the port-forward), then reload.'),
     ('Serveur injoignable (réseau ou outil arrêté).', 'Server unreachable (network or tool stopped).'),
     ('Délai dépassé : le serveur ne répond pas.', 'Timeout: the server is not responding.'),
@@ -18939,6 +19020,7 @@ I18N_EN = [
     ("Nom DNS d'un Ingress ou d'un reverse-proxy. L'outil n'a pas d'authentification : placez une authentification (SSO, oauth2-proxy, liste d'IP) et TLS devant lui dès qu'il quitte la boucle locale.", 'DNS name of an Ingress or reverse proxy. The tool has no authentication: put authentication (SSO, oauth2-proxy, IP allowlist) and TLS in front of it as soon as it leaves the loopback.'),
     ('<h2 class="dtitle">Politique</h2>', '<h2 class="dtitle">Policy</h2>'),
     ('<h2 class="dtitle">Stockage</h2>', '<h2 class="dtitle">Storage</h2>'),
+    ('Demande transmise à HYCU : politique assignée, sauvegarde lancée. Vous pouvez continuer — le suivi du job s’affiche ci-dessous et dans HYCU.', 'Request sent to HYCU: policy assigned, backup started. You can carry on — the job progress is shown below and in HYCU.'),
 ]
 # <<< I18N-END
 _I18N_SORTED = None          # (fr, en) triés du plus long au plus court

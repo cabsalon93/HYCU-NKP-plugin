@@ -166,3 +166,34 @@ def test_allowed_hosts_from_env(H, monkeypatch):
     H.load_config()
     assert H.CONFIG["allowed_hosts"] == ["hycu.exemple.fr", "backup.exemple.fr"]
     assert H._host_is_local("backup.exemple.fr:8765")
+
+
+def test_protect_many_namespaces_single_hycu_calls(H, monkeypatch):
+    """Définir la politique sur plusieurs applications : garde anti-stale PAR namespace,
+    puis UN SEUL appel d'assignation et UN SEUL lancement de sauvegarde pour tous les VG."""
+    calls = []
+
+    def fake_rest(system, method, path, body=None, **kw):
+        calls.append((method, path, body))
+        return {"ok": True, "json": {"uuid": "job-1", "status": "QUEUED"}, "raw": ""}
+    checked = []
+    monkeypatch.setattr(H, "_rest", fake_rest)
+    monkeypatch.setattr(H, "_reject_stale_vgs",
+                        lambda ns, uuids, confirmed_by_name=None: checked.append((ns, tuple(uuids))) or None)
+    monkeypatch.setattr(H, "_hycu_job_id", lambda j: (j or {}).get("uuid"))
+    r = H.action_hycu_protect({"dry": False, "policy_uuid": "pol-1", "items": [
+        {"namespace": "app1", "vg_uuids": ["vg-a", "vg-b"]},
+        {"namespace": "app2", "vg_uuids": ["vg-c"], "confirm_name_uuids": ["vg-c"]}]})
+    assert r["ok"] and r["job_id"] == "job-1" and r["count"] == 3 and r["namespaces"] == ["app1", "app2"]
+    assert checked == [("app1", ("vg-a", "vg-b")), ("app2", ("vg-c",))]
+    assign = [c for c in calls if c[1].endswith("/assign")]
+    backup = [c for c in calls if c[1].endswith("/backupVolumeGroup")]
+    assert len(assign) == 1 and assign[0][2]["volumeGroupUuidList"] == ["vg-a", "vg-b", "vg-c"]
+    assert len(backup) == 1 and backup[0][2]["uuidList"] == ["vg-a", "vg-b", "vg-c"]
+    # Un namespace refusé par la garde -> rien n'est envoyé à HYCU.
+    calls.clear()
+    monkeypatch.setattr(H, "_reject_stale_vgs",
+                        lambda ns, uuids, confirmed_by_name=None: "hors correspondance" if ns == "app2" else None)
+    r2 = H.action_hycu_protect({"dry": False, "items": [{"namespace": "app1", "vg_uuids": ["vg-a"]},
+                                                        {"namespace": "app2", "vg_uuids": ["vg-c"]}]})
+    assert not r2["ok"] and "hors correspondance" in r2["error"] and not calls

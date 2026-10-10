@@ -29,14 +29,16 @@ async function api(u, opts){
     setNet(false);
     const txt=await r.text();
     let j=null; try{ j=txt?JSON.parse(txt):{}; }catch(e){ j=null; }
-    if(j===null) return {ok:false, status:r.status, error:(r.status>=400?("HTTP "+r.status+" — "):"")+(txt||"réponse illisible").slice(0,200)};
+    if(j===null) return {ok:false, status:r.status, http_status:r.status, error:(r.status>=400?("HTTP "+r.status+" — "):"")+(txt||"réponse illisible").slice(0,200)};
     if(j && typeof j==="object" && j.ok===undefined && j.error && r.status>=400) j.ok=false;
-    if(j && typeof j==="object") j.status=r.status;
+    // Le code HTTP est exposé à part : `status` appartient à la réponse du serveur
+    // (statut d'un job HYCU, d'une comparaison d'objets…) et ne doit jamais être écrasé.
+    if(j && typeof j==="object" && j.http_status===undefined) j.http_status=r.status;
     return j;
   }catch(e){
     const aborted = e && e.name==="AbortError";
     if(!aborted) setNet(true);
-    return {ok:false, status:0, error: aborted ? "Délai dépassé : le serveur ne répond pas." : "Serveur injoignable (réseau ou outil arrêté)."};
+    return {ok:false, status:0, http_status:0, error: aborted ? "Délai dépassé : le serveur ne répond pas." : "Serveur injoignable (réseau ou outil arrêté)."};
   }finally{ clearTimeout(t); }
 }
 async function get(u, cid){ return api(u, {cid}); }
@@ -211,7 +213,6 @@ function refreshDry(){
   document.body.classList.toggle("realmode",live);   // barre rouge fixe + indicateur en-tête
   $("#dryLabel").textContent = live? "MODE RÉEL — les commandes seront exécutées" : "Mode simulation activé";
   $("#dry").setAttribute("aria-checked", dry() ? "true" : "false");
-  const tb=$("#tbReal"); if(tb) tb.textContent = "MODE RÉEL · " + (ctxInfo.context || clById(ACTIVE_CID)&&clById(ACTIVE_CID).name || "cluster");
 }
 $("#dry").onchange=refreshDry;
 
@@ -262,7 +263,7 @@ async function followOp(opId, onProgress){
   for(let i=0;i<6000;i++){            // garde-fou : ~90 min à 0,9 s
     const st = await get("/api/op_status?id="+encodeURIComponent(opId));
     if(!st.ok){
-      if(st.status===0 || st.status>=500){      // coupure réseau / serveur : on réessaie (borné)
+      if(st.http_status===0 || st.http_status>=500){   // coupure réseau / serveur : on réessaie (borné)
         if(++errors<=20){ await sleep(2000); continue; }
       }
       rememberOp(null);
@@ -579,7 +580,7 @@ $("#bkRunAll").onclick=async()=>{
 };
 
 // --------- Protection HYCU (assigner politique + sauvegarder) ---------
-let bkMatches=[], bkMatchNs=null;
+let bkMatches=[], bkMatchNs=null, bkNsList=[];   // bkNsList : namespaces ciblés (plusieurs applications en une fois)
 function clearBkProtect(){ bkMatches=[]; bkMatchNs=null; $("#bkMatchOut").innerHTML=""; $("#bkProtectForm").style.display="none"; $("#bkProtectLog").innerHTML=""; }
 
 // Re-protection HYCU après un clone : bascule sur l'onglet Sauvegarder, cible le bon
@@ -591,18 +592,27 @@ $("#bkNs").onchange=()=>{ state.ns=$("#bkNs").value; savePref("ns",state.ns); ap
 $("#vfNs").onchange=()=>{ state.ns=$("#vfNs").value; savePref("ns",state.ns); applyGlobalNs(); };
 $("#bkDest").addEventListener("change",()=>savePref("bkDest",$("#bkDest").value.trim()));
 $("#bkMatch").onclick=async()=>{
-  const ns=$("#bkNs").value; clearBkProtect();
+  // Une application (namespace courant) ou PLUSIEURS (sélection de la page Applications) :
+  // une analyse par namespace, un seul formulaire, un seul envoi à HYCU.
+  const list = bkNsList.length ? bkNsList.slice() : [$("#bkNs").value];
+  clearBkProtect();
   $("#bkMatchOut").innerHTML='<div class="hint">Analyse en cours…</div>';
-  const r=await get("/api/hycu/match?ns="+encodeURIComponent(ns));
-  if(!r.ok){ $("#bkMatchOut").innerHTML=errBox(r.error); return; }
-  bkMatches=r.matches||[]; bkMatchNs=r.namespace||ns;
-  const rows=bkMatches.map(m=>{
+  const results=[];
+  for(const ns of list){
+    const r=await get("/api/hycu/match?ns="+encodeURIComponent(ns));
+    if(!r.ok){ $("#bkMatchOut").innerHTML=errBox((list.length>1?("Namespace « "+ns+" » : "):"")+r.error); return; }
+    (r.matches||[]).forEach(m=>{ m.ns=r.namespace||ns; });
+    results.push({ns:r.namespace||ns, matches:r.matches||[]});
+  }
+  bkMatches=results.flatMap(x=>x.matches); bkMatchNs=list.length===1 ? results[0].ns : null;
+  const rowOf=m=>{
     let chk="", label="";
     if(m.match_kind==="exact"){
-      chk=`<input type="checkbox" class="bkMchk" data-uuid="${esc(m.hycu_vg_uuid)}" data-name="${esc(m.hycu_vg_name||'')}" data-ext="${esc(m.hycu_external_id||'')}" checked style="width:auto;margin-right:8px">`;
+      chk=`<input type="checkbox" class="bkMchk" data-ns="${esc(m.ns)}" data-uuid="${esc(m.hycu_vg_uuid)}" data-name="${esc(m.hycu_vg_name||'')}" data-ext="${esc(m.hycu_external_id||'')}" checked style="width:auto;margin-right:8px">`;
       label=`→ VG <b>${esc(m.hycu_vg_name||m.hycu_vg_uuid)}</b> <span class="hint">(externalId ${esc(m.hycu_external_id||'')})</span>`;
     } else if(m.match_kind==="name"){
-      chk=`<input type="checkbox" class="bkMchk" data-uuid="${esc(m.hycu_vg_uuid)}" data-name="${esc(m.hycu_vg_name||'')}" data-ext="${esc(m.hycu_external_id||'')}" style="width:auto;margin-right:8px">`;
+      // data-kind : cocher cette ligne vaut CONFIRMATION du match par nom (transmise au serveur)
+      chk=`<input type="checkbox" class="bkMchk" data-kind="name" data-ns="${esc(m.ns)}" data-uuid="${esc(m.hycu_vg_uuid)}" data-name="${esc(m.hycu_vg_name||'')}" data-ext="${esc(m.hycu_external_id||'')}" style="width:auto;margin-right:8px">`;
       label=`→ VG <b>${esc(m.hycu_vg_name||m.hycu_vg_uuid)}</b> <span class="sim">par nom — à confirmer</span>`;
     } else if(m.match_kind==="ambiguous"){
       chk=`<span class="ic ko" style="width:18px;display:inline-block;text-align:center;margin-right:8px">⚠</span>`;
@@ -621,7 +631,11 @@ $("#bkMatch").onclick=async()=>{
       prot=`<div class="meta">${cb}${unp} · politique : <b>${esc(m.policy||'aucune')}</b> · backups : ${m.has_backups?'oui':'non'}</div>`;
     }
     return `<li class="logline">${chk}<span style="flex:1"><b>${esc(m.pvc)}</b> ${label}${prot}</span></li>`;
-  }).join("") || '<div class="hint">Aucun PVC dans ce namespace.</div>';
+  };
+  const rows = list.length===1
+    ? (bkMatches.map(rowOf).join("") || '<div class="hint">Aucun PVC dans ce namespace.</div>')
+    : results.map(x=>`<li class="logline" style="background:#F6F7FB;font-weight:700">${esc(x.ns)} <span class="hint" style="font-weight:400;margin-left:8px">${x.matches.length} PVC</span></li>`
+        + (x.matches.map(rowOf).join("") || '<li class="logline"><span class="hint">Aucun PVC dans ce namespace.</span></li>')).join("");
   const nx=bkMatches.filter(m=>m.match_kind==="exact").length, nn=bkMatches.filter(m=>m.match_kind==="name").length,
         na=bkMatches.filter(m=>m.match_kind==="ambiguous").length, n0=bkMatches.filter(m=>m.match_kind==="none").length;
   $("#bkMatchOut").innerHTML=`<ul class="pvc-list" style="margin-top:10px">${rows}</ul>
@@ -635,7 +649,7 @@ async function loadBkPolicies(){
   $("#bkPolicy").innerHTML=`<option value="">(ne pas changer la politique)</option>`+
     (r.ok? (r.policies||[]).map(p=>`<option value="${esc(p.uuid)}">${esc(p.name||p.uuid)}</option>`).join("") : "");
 }
-function updateBkHint(){ $("#bkProtectHint").textContent = dry()? "Mode simulation (bandeau du haut) : montre les appels HYCU." : "Mode réel : exécute sur HYCU."; }
+function updateBkHint(){ $("#bkProtectHint").textContent = dry()? "Mode simulation (bandeau du haut) : montre les appels HYCU." : ""; }
 $("#dry").addEventListener("change",()=>{ if($("#bkProtectForm").style.display!=="none") updateBkHint(); });
 $("#bkProtect").onclick=async()=>{
   const sel=[...document.querySelectorAll(".bkMchk:checked")];
@@ -648,7 +662,12 @@ $("#bkProtect").onclick=async()=>{
      "<b>"+names.map(esc).join("</b>, <b>")+"</b>"]}))) return;
   const b=$("#bkProtect"); b.disabled=true; b.innerHTML='<span class="spin"></span>…';
   const byName=sel.filter(c=>c.dataset.kind==="name").map(c=>c.dataset.uuid);   // cochés = confirmés par l'opérateur
-  const r=await post("/api/hycu/protect",{namespace:bkMatchNs, vg_uuids, policy_uuid:pol, force_full:$("#bkForceFull").checked, dry:dry(), confirm_name_uuids:byName});
+  // Regroupement par namespace : la garde anti-stale du serveur est faite namespace par
+  // namespace, puis UN SEUL appel HYCU (assignation) + UN SEUL lancement de sauvegarde.
+  const byNs={};
+  sel.forEach(c=>{ const k=c.dataset.ns||bkMatchNs||""; (byNs[k]=byNs[k]||{namespace:k, vg_uuids:[], confirm_name_uuids:[]}).vg_uuids.push(c.dataset.uuid);
+    if(c.dataset.kind==="name") byNs[k].confirm_name_uuids.push(c.dataset.uuid); });
+  const r=await post("/api/hycu/protect",{items:Object.values(byNs), namespace:bkMatchNs, vg_uuids, policy_uuid:pol, force_full:$("#bkForceFull").checked, dry:dry(), confirm_name_uuids:byName});
   b.disabled=false; b.textContent="Assigner + sauvegarder maintenant";
   if(!r.ok && !(r.steps&&r.steps.length)){ $("#bkProtectLog").innerHTML=errBox(r.error); return; }
   const lines=(r.steps||[]).map(s=> s.dry
@@ -656,7 +675,7 @@ $("#bkProtect").onclick=async()=>{
     : `<div class="logline"><span class="ic ${s.ok?'ok':'ko'}">${s.ok?'✓':'✕'}</span><span><b>${esc(s.label)}</b>${s.job_id?(' · job '+esc(s.job_id)):''}${(s.error&&!s.ok)?(' — <span class="ko">'+esc(s.error)+'</span>'):''}</span></div>`
   ).join("");
   const head = r.dry? '<div class="warnbox">Simulation — appels qui seraient envoyés à HYCU :</div>'
-     : (r.ok? '<div class="note">Politique assignée / sauvegarde HYCU déclenchée.</div>' : '<div class="err">Échec — voir le détail.</div>');
+     : (r.ok? '<div class="note">Demande transmise à HYCU : politique assignée, sauvegarde lancée. Vous pouvez continuer — le suivi du job s’affiche ci-dessous et dans HYCU.</div>' : '<div class="err">Échec — voir le détail.</div>');
   $("#bkProtectLog").innerHTML=head+lines;
   if(!r.dry && r.ok && r.job_id){ $("#bkProtectLog").innerHTML+='<div id="bkJobProgress"></div>'; pollJobBar(r.job_id,"#bkJobProgress"); }
 };
@@ -1131,8 +1150,7 @@ function updateGoButton(ready){
   const live=!dry();
   const needConfirm = live && ctxInfo.require_confirm;
   $("#rsCtxConfirm").style.display = needConfirm? "block":"none";
-  $("#rsGoHint").textContent = live? "Mode réel : ces opérations seront exécutées sur le cluster."
-     : "Mode simulation : rien ne sera modifié.";
+  $("#rsGoHint").textContent = live? "" : "Mode simulation : rien ne sera modifié.";
   $("#rsGo").className = live? "btn danger" : "btn";
   let act;
   if(state.mode!=="clone") act = "la restauration sur place (flux manuel)";
@@ -1903,7 +1921,10 @@ function selApps(){ return selNsObjs().map(a=>a.name); }
 function updateAppActs(){
   const objs=selAppObjs(), n=objs.length, anyMissing=objs.some(a=>a.missing), anyEmpty=objs.some(a=>a.type==="empty");
   $("#actBackup").disabled = !n || anyMissing || anyEmpty;
-  ["#actPolicy","#actVerify"].forEach(id=>$(id).disabled = n!==1 || anyMissing);
+  $("#actVerify").disabled = n!==1 || anyMissing;
+  // Définir la politique : une ou PLUSIEURS applications (du même cluster) en une fois.
+  const oneCluster = n>=1 && new Set(objs.map(a=>a.cluster_id||ACTIVE_CID)).size===1;
+  $("#actPolicy").disabled = !oneCluster || anyMissing || anyEmpty;
   // Restaurer : une application, OU plusieurs applications du MÊME namespace (= tout le
   // namespace, ex. mariadb + wordpress séparés par leurs étiquettes). Un namespace vide
   // reste restaurable s'il a des sauvegardes (application supprimée mais namespace
@@ -1931,7 +1952,7 @@ $("#actRestore").onclick=async()=>{ const objs=selAppObjs(), a=objs[0]; await en
   if(a.missing) return openRecoverModal(appNs(a));
   // Plusieurs applications du même namespace sélectionnées -> tout le namespace.
   openRestoreModal(appNs(a), objs.length>1 ? null : a); };
-$("#actPolicy").onclick=async()=>{ const a=selAppObjs()[0]; await ensureCluster(a); openPolicyModal(appNs(a)); };
+$("#actPolicy").onclick=async()=>{ const objs=selNsObjs(); await ensureCluster(objs[0]); openPolicyModal(objs.length>1 ? objs.map(a=>a.name) : appNs(selAppObjs()[0])); };
 $("#actVerify").onclick=async()=>{ const a=selAppObjs()[0]; await ensureCluster(a); gotoVerify(appNs(a), false); };
 
 // ============================ Modale Sauvegarde ============================
@@ -1972,6 +1993,16 @@ $("#bkRunSel").onclick=async()=>{
 
 // ============================ Modale Définir la politique ============================
 function openPolicyModal(ns){
+  // ns : un namespace (chaîne) ou une liste de namespaces (plusieurs applications en une fois).
+  bkNsList = Array.isArray(ns) ? ns.slice() : [];
+  if(bkNsList.length){
+    clearBkProtect();
+    $("#mPolicyTitle").innerHTML=esc("Définir la politique")+'<span class="sep">›</span>'+esc(bkNsList.length+" applications")
+      +' <span class="hint" style="font-weight:400">'+esc(bkNsList.join(", "))+'</span>';
+    openModal("mPolicy");
+    if(conn.hycu && conn.hycu.connected) setTimeout(()=>$("#bkMatch").click(), 30);
+    return;
+  }
   if(ns){ state.ns=ns; applyGlobalNs(); $("#bkNs").value=ns;
     if($("#bkNs").value!==ns){                 // namespace disparu / kubectl en panne
       clearBkProtect(); openModal("mPolicy");
@@ -2679,8 +2710,8 @@ function rsWizSync(){
   if(html!==rsWizHtml){ go.innerHTML=html; rsWizHtml=html; }
   go.disabled=dis; rsWizAct=act;
   const live=!dry(), m=$("#rsWizMode");
-  m.textContent = live ? "Mode réel" : "Simulation";
-  m.className="badge "+(live ? "live" : "sim");
+  m.textContent = live ? "" : "Simulation";       // la production est le mode normal : rien à signaler
+  m.className="badge sim"; m.style.display = live ? "none" : "";
 }
 $("#rsWizGo").onclick=()=>{ if(rsWizAct && !$("#rsWizGo").disabled) rsWizAct(); };
 $("#rsWizBack").onclick=()=>{

@@ -98,8 +98,6 @@
   .dry b{color:var(--strong)}
   .dry.live{border-left-color:var(--red);background:#FDF0EF}
   .dry.live b{color:var(--red)}
-  .realbar{position:fixed;top:0;left:0;right:0;height:4px;background:var(--red);z-index:200;display:none}
-  body.realmode .realbar{display:block}
 
   /* ---------- Cartes, champs, boutons ---------- */
   .card{background:var(--card);border-radius:6px;padding:18px 20px;margin-bottom:16px;
@@ -366,11 +364,6 @@
   .preflight{margin:10px 0}
   .preflight summary{cursor:pointer;font-size:13px}
   /* ---------- Mode réel : indicateur permanent dans la barre du haut ---------- */
-  .tb-real{display:none;align-items:center;font-size:12px;font-weight:700;letter-spacing:.4px;color:#fff;background:var(--red);
-           border-radius:4px;padding:4px 10px}
-  body.realmode .tb-real{display:inline-flex}
-  body.realmode .topbar{box-shadow:inset 0 -6px 0 var(--red)}
-  body.realmode .realbar{height:6px}
   #netBanner{margin-bottom:12px}
   .dq{display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;border:1.5px solid var(--muted);
       border-radius:50%;font-size:11px;font-weight:700;color:var(--grey);cursor:help;vertical-align:middle}

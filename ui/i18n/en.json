@@ -5996,14 +5996,6 @@
 ">Stop after the current step<"
 ],
 [
-"MODE RÉEL · ",
-"LIVE MODE · "
-],
-[
-">MODE RÉEL<",
-">LIVE MODE<"
-],
-[
 "Serveur injoignable — vérifiez que l'outil tourne (ou le port-forward), puis rechargez.",
 "Server unreachable — check the tool is running (or the port-forward), then reload."
 ],
@@ -6114,5 +6106,9 @@
 [
 "<h2 class=\"dtitle\">Stockage</h2>",
 "<h2 class=\"dtitle\">Storage</h2>"
+],
+[
+"Demande transmise à HYCU : politique assignée, sauvegarde lancée. Vous pouvez continuer — le suivi du job s’affiche ci-dessous et dans HYCU.",
+"Request sent to HYCU: policy assigned, backup started. You can carry on — the job progress is shown below and in HYCU."
 ]
 ]
