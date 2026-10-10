@@ -10,7 +10,7 @@ FROM python:3.12-slim
 
 # kubectl épinglé (>= 1.23 requis par l'outil). TARGETARCH est fourni par buildx
 # (amd64 / arm64) ; checksum vérifié depuis le .sha256 officiel.
-ARG KUBECTL_VERSION=v1.33.4     # règle de skew ±1 mineur vs l'API server : à suivre avec vos clusters
+ARG KUBECTL_VERSION=v1.33.13    # règle de skew ±1 mineur vs l'API server : à suivre avec vos clusters
 ARG TARGETARCH=amd64
 RUN set -eux; \
     apt-get update; \
