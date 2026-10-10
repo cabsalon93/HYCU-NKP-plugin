@@ -171,6 +171,88 @@ cp hycu_config.example.json hycu_config.json   # puis éditer (voir §6)
 
 Tout reste modifiable ensuite via la page **Réglages**.
 
+### Mise à jour (update) — Kubernetes, Docker, mode Python
+
+Chaque build publie l'image sous trois tags : `vAAAAMMJJ-HHMM` (la version du programme,
+affichée en bas de la barre latérale), `:main` et `:latest`. En production, épinglez
+**toujours** un tag versionné : la montée de version et le retour arrière deviennent une
+commande, et l'image est reproductible.
+
+**Kubernetes (Option B)** — montée de version, vérification, retour arrière :
+
+```bash
+# 1) Nouvelle image (remplacez le tag par la version visée)
+kubectl -n hycu set image deployment/hycu hycu=ghcr.io/cabsalon93/hycu-nkp-plugin:v20261009-2300
+
+# 2) Attendre la fin du déploiement (1 réplica, stratégie Recreate : coupure de quelques secondes)
+kubectl -n hycu rollout status deployment/hycu
+
+# 3) Vérifier l'image effectivement déployée et la santé
+kubectl -n hycu get deployment hycu -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
+kubectl -n hycu get pods -l app=hycu
+
+# Retour arrière (révision précédente, ou --to-revision=N d'après `rollout history`)
+kubectl -n hycu rollout history deployment/hycu
+kubectl -n hycu rollout undo deployment/hycu
+```
+
+Si vous gérez le manifeste (GitOps), modifiez plutôt la ligne `image:` de
+`deploy/k8s/hycu.yaml` puis `kubectl apply -f deploy/k8s/hycu.yaml` : le résultat est le
+même, et la version est tracée dans votre dépôt. Avec un tag mobile (`:latest`, `:main`),
+forcez le re-téléchargement par `kubectl -n hycu rollout restart deployment/hycu`
+(`imagePullPolicy: Always` requis).
+
+Ce qui est conservé : le PVC `hycu-data` (configuration, coffre chiffré, sauvegardes,
+journal d'audit) n'est pas touché par une mise à jour. Évitez de la lancer pendant une
+restauration ou un clone : à l'arrêt (SIGTERM) l'outil termine l'opération destructive en
+cours avant de quitter, mais une nouvelle opération serait refusée entre-temps.
+
+Vérifier la signature de l'image (optionnel, cosign keyless) :
+
+```bash
+cosign verify ghcr.io/cabsalon93/hycu-nkp-plugin:v20261009-2300 \
+  --certificate-identity-regexp 'https://github.com/cabsalon93/HYCU-NKP-plugin/' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+**Docker Compose** (`deploy/docker-compose.yml`) — le dossier `./hycu-data` est conservé :
+
+```bash
+docker compose -f deploy/docker-compose.yml pull
+docker compose -f deploy/docker-compose.yml up -d
+```
+
+Pour épingler une version, remplacez `:latest` par `:vAAAAMMJJ-HHMM` dans `image:` avant
+le `pull`.
+
+**`docker run`** — récupérer l'image, remplacer le conteneur, relancer avec les **mêmes
+volumes** (`-v …/hycu-data:/data` et le kubeconfig) :
+
+```bash
+docker pull ghcr.io/cabsalon93/hycu-nkp-plugin:v20261009-2300
+docker stop hycu-nkp && docker rm hycu-nkp
+docker run -d --name hycu-nkp -p 127.0.0.1:8765:8765 \
+  -v "$PWD/hycu-data:/data" -v "$PWD/kubeconfig:/home/app/.kube/config:ro" \
+  ghcr.io/cabsalon93/hycu-nkp-plugin:v20261009-2300
+```
+
+**Sans accès Internet (air-gap)** — récupérez le tarball `hycu-nkp-<tag>-amd64.tar.gz`
+produit par le workflow (artefact d'un tag `vX.Y.Z`), ou créez-le depuis un poste connecté
+avec `docker save`, puis :
+
+```bash
+docker load -i hycu-nkp-<tag>-amd64.tar.gz
+docker tag hycu-nkp:<tag> registre.interne/hycu-nkp-plugin:<tag>
+docker push registre.interne/hycu-nkp-plugin:<tag>
+kubectl -n hycu set image deployment/hycu hycu=registre.interne/hycu-nkp-plugin:<tag>
+```
+
+**Mode Python (Option A)** — remplacez `hycu_k8s_nutanix.py` (ou `git pull`) et relancez
+le programme ; `hycu_config.json`, le coffre et les sauvegardes restent en place.
+
+Après toute mise à jour : rechargez l'interface sans cache (Ctrl+Shift+R) et contrôlez la
+version en bas de la barre latérale ; `/healthz` doit répondre `200`.
+
 ### Langue / Language
 
 L'interface est **bilingue français / anglais** : le bouton **EN** / **FR** dans
