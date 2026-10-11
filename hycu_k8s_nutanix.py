@@ -611,7 +611,7 @@ def save_config(updates, source="internal"):
 
 # Version horodatée de la build (format AAAAMMJJ-HHMM). À incrémenter à chaque
 # changement notable du programme ; affichée dans l'en-tête de l'interface.
-VERSION = "20261011-2200"
+VERSION = "20261012-0030"
 
 # Jeton anti-CSRF généré au démarrage, injecté dans la page et exigé sur les POST.
 CSRF_TOKEN = secrets.token_urlsafe(32)
@@ -7978,33 +7978,43 @@ def _hycu_ts_label(b):
 
 
 def _share_browse(backup_uuid, path):
-    """Contenu d'un dossier d'une sauvegarde de partage (lecture seule, session FLR
-    refermée ensuite). Renvoie (éléments, erreur) ; chaque élément garde fullItemName."""
-    items, sess, err = [], None, None
-    for page in range(1, 21):
-        q = urllib.parse.urlencode({"path": path or "/", "pageSize": 1000, "pageNumber": page,
-                                    "restoreSource": "AUTO"})
+    """Contenu d'un dossier d'une sauvegarde de partage (lecture seule). Même protocole que
+    l'interface HYCU : session FLR créée côté client (flrSessId), chemin RELATIF au partage
+    (« » pour la racine, « a/b » sinon), 503 passager pendant le montage de la sauvegarde
+    (nouvelles tentatives) ; la session est refermée à la fin. Renvoie (éléments, erreur) ;
+    chaque élément garde fullItemName (format attendu par restoreShareItems)."""
+    sess = "hycu-k8s-%d" % int(time.time() * 1000)
+    rel = (path or "").strip("/")
+    items, err, page, tries, diag = [], None, 1, 0, None
+    while page <= 20:
+        params = {"path": rel, "flrSessId": sess, "restoreSource": "AUTO", "pageNumber": page,
+                  "pageSize": 1000, "orderBy": "displayName"}
         r = _rest("hycu", "GET", "/shares/backup/%s/browseShare?%s"
-                  % (urllib.parse.quote(str(backup_uuid)), q), timeout=120)
-        if not r["ok"]:
-            err = r.get("error") or "browse failed"
-            break
-        data = r.get("json") or {}
-        meta = data.get("metadata") if isinstance(data, dict) else None
-        for src in (meta or {}, data if isinstance(data, dict) else {}):
-            if isinstance(src, dict):
-                for k, v in src.items():
-                    if "flrsess" in str(k).lower() and v:
-                        sess = v
-        got = [e for e in _hycu_items(data)
+                  % (urllib.parse.quote(str(backup_uuid)), urllib.parse.urlencode(params)), timeout=120)
+        data = r.get("json") if r["ok"] else None
+        got = [e for e in _hycu_items(data or {})
                if isinstance(e, dict) and (e.get("fullItemName") or e.get("displayName"))]
+        if diag is None:
+            diag = (json.dumps(data, ensure_ascii=False) if data else (r.get("raw") or r.get("error") or ""))[:400]
+        # Montage de la sauvegarde en cours : 503, ou première page vide -> on réessaie.
+        if (not r["ok"] and r.get("status") in (502, 503, 504)) or (r["ok"] and not got and not items):
+            if tries < 8:
+                tries += 1
+                time.sleep(3)
+                continue
+        if not r["ok"]:
+            err = ("%s %s" % (r.get("error") or "browse failed", (r.get("raw") or "")[:300])).strip()
+            break
         items.extend(got)
-        total = (meta or {}).get("totalEntityCount") if isinstance(meta, dict) else None
+        meta = data.get("metadata") if isinstance(data, dict) else None
+        total = meta.get("totalEntityCount") if isinstance(meta, dict) else None
         if len(got) < 1000 or (total is not None and len(items) >= int(total)):
             break
-    if sess:
-        _rest("hycu", "POST", "/shares/backup/%s/browseShareClose?flrSessId=%s"
-              % (urllib.parse.quote(str(backup_uuid)), urllib.parse.quote(str(sess))))
+        page += 1
+    _rest("hycu", "POST", "/shares/backup/%s/browseShareClose?%s"
+          % (urllib.parse.quote(str(backup_uuid)), urllib.parse.urlencode({"flrSessId": sess})))
+    if not items and not err:
+        err = "HYCU answered: %s" % (diag or "nothing")
     return (None, err) if err else (items, None)
 
 
@@ -8055,11 +8065,9 @@ def _nfs_copy_plan(nfs, pvc_name):
     if sub != "/":
         root_path = root_path[:-len(sub)] or "/"
     entries, err = _share_browse(bk["uuid"], sub)
-    if entries is None:
-        return None, "Reading the backup of share “%s” failed: %s" % (sh.get("shareName"), err)
     return {"share_uuid": sh["uuid"], "share_name": sh.get("shareName") or "", "backup_uuid": bk["uuid"],
             "backup_time": _hycu_ts_label(bk), "sub": sub, "root_path": root_path,
-            "server": nfs["server"], "entries": entries}, None
+            "server": nfs["server"], "entries": entries or [], "browse_error": err}, None
 
 
 def _nfs_copy_target(plan, folder):
@@ -8072,6 +8080,10 @@ def _nfs_copy_target(plan, folder):
     if plan["sub"] == "/":
         excluded = _nfs_copy_excluded(plan["root_path"], plan["server"]) | {folder.split("/")[0]}
     sel, skipped = [], []
+    if not plan["entries"]:
+        # Parcours vide ou indisponible : on restaure le dossier monté par le PV en entier
+        # (« / » pour la racine du partage) ; HYCU garde l'arborescence sous le dossier cible.
+        sel = [plan["sub"]]
     for e in plan["entries"]:
         full = str(e.get("fullItemName") or e.get("displayName") or "")
         top = full.strip("/").split("/")[-1] if plan["sub"] == "/" else None
@@ -9269,6 +9281,9 @@ def action_clone_app(payload, log=None):
                 if cperr:
                     return {"ok": False, "log": [], "error": cperr}
             src_pvc = _load_backup_pvc(backup_path, pvc_name, backup_root)
+            if src_pvc is None and not from_backup:      # copie sans sauvegarde de config : PVC vivant
+                live, _ = kubectl_json(["get", "pvc", pvc_name, "-n", ns])
+                src_pvc = clean_pvc(json.loads(json.dumps(live))) if live else None
             if src_pvc is None:
                 return {"ok": False, "error": "PVC manifest not found for “%s”." % pvc_name, "log": []}
             orig_pv_name = (old_pv.get("metadata") or {}).get("name") or ""
@@ -9563,6 +9578,10 @@ def action_clone_app(payload, log=None):
                             % (p["pvc"], folder.split("/")[0]))
         if skipped:
             warnings.append("Folders of existing copies not copied again: %s." % ", ".join(sorted(set(skipped))))
+        if not cp["entries"]:
+            warnings.append("“%s”: the share backup could not be listed%s; the whole folder “%s” is restored "
+                            "(earlier copy folders included)." % (p["pvc"], (" (%s)" % cp["browse_error"])
+                                                                  if cp.get("browse_error") else "", cp["sub"]))
         log.append(logentry("HYCU restore of share “%s” to “%s” (%d item(s))"
                             % (cp["share_name"], folder, len(sel)), dry=dry, rc=None,
                             stdout=json.dumps(body, ensure_ascii=False)))
@@ -11011,7 +11030,6 @@ HTML = r"""<!DOCTYPE html>
         <div id="bkProtectForm" style="display:none">
           <label class="fld">HYCU policy to assign (optional)</label>
           <select id="bkPolicy"></select>
-          <label class="fld" style="margin-top:10px"><input type="checkbox" id="bkForceFull" style="width:auto"> Full backup (forceFull)</label>
           <div style="margin-top:12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
             <button class="btn" id="bkProtect">Assign + back up now</button>
             <span class="hint" id="bkProtectHint" style="margin:0"></span>
@@ -12095,7 +12113,7 @@ $("#bkProtect").onclick=async()=>{
   const r=await post("/api/hycu/protect",{items:Object.values(byNs), namespace:bkMatchNs,
     vg_uuids:sel.filter(c=>c.dataset.type!=="share").map(c=>c.dataset.uuid),
     share_uuids:sel.filter(c=>c.dataset.type==="share").map(c=>c.dataset.uuid),
-    policy_uuid:pol, force_full:$("#bkForceFull").checked, dry:dry(), confirm_name_uuids:byName});
+    policy_uuid:pol, dry:dry(), confirm_name_uuids:byName});
   b.disabled=false; b.textContent="Assign + back up now";
   if(!r.ok && !(r.steps&&r.steps.length)){ $("#bkProtectLog").innerHTML=errBox(r.error); return; }
   const lines=(r.steps||[]).map(s=> s.dry

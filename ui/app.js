@@ -681,7 +681,7 @@ $("#bkProtect").onclick=async()=>{
   const r=await post("/api/hycu/protect",{items:Object.values(byNs), namespace:bkMatchNs,
     vg_uuids:sel.filter(c=>c.dataset.type!=="share").map(c=>c.dataset.uuid),
     share_uuids:sel.filter(c=>c.dataset.type==="share").map(c=>c.dataset.uuid),
-    policy_uuid:pol, force_full:$("#bkForceFull").checked, dry:dry(), confirm_name_uuids:byName});
+    policy_uuid:pol, dry:dry(), confirm_name_uuids:byName});
   b.disabled=false; b.textContent="Assign + back up now";
   if(!r.ok && !(r.steps&&r.steps.length)){ $("#bkProtectLog").innerHTML=errBox(r.error); return; }
   const lines=(r.steps||[]).map(s=> s.dry

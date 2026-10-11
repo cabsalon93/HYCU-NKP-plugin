@@ -177,7 +177,9 @@ def test_copy_restores_share_into_namespace_folder(H, monkeypatch):
     assert any("NAS copy" in w and "bk-" not in w for w in r["warnings"]), r["warnings"]
     assert any("will see the folder" in w for w in r["warnings"])
     assert not any("restoreShareItems" in c[1] for c in calls), "simulation: aucune restauration lancée"
-    assert any("browseShareClose" in c[1] and "s1" in c[1] for c in calls), "session de parcours refermée"
+    browse = [c[1] for c in calls if "/browseShare?" in c[1]]
+    assert browse and "path=&" in browse[0] and "flrSessId=hycu-k8s-" in browse[0], browse
+    assert any("browseShareClose" in c[1] and "flrSessId=hycu-k8s-" in c[1] for c in calls), "session refermée"
     # Réel : restauration HYCU de la sauvegarde la plus récente dans « copie », puis PV vers ce dossier.
     monkeypatch.setattr(H, "_context_guard", lambda p: None)
     calls.clear()
@@ -197,9 +199,37 @@ def test_copy_of_subfolder_volume_and_failures(H, monkeypatch):
     _fake_hycu(H, monkeypatch, calls)
     plan, err = H._nfs_copy_plan({"server": "nutanix-afs", "path": "/pvc-k8s/app1"}, "data")
     assert not err and plan["sub"] == "/app1" and plan["root_path"] == "/pvc-k8s"
+    assert any("/browseShare?" in c[1] and "path=app1&" in c[1] for c in calls), "chemin relatif au partage"
     body, pv_path, sel, _ = H._nfs_copy_target(plan, "copie")
     assert pv_path == "/pvc-k8s/copie/app1", "HYCU garde l'arborescence: copie/app1"
     assert sel == ["/nas-demo", "/copie"], "sous-dossier: rien n'est écarté"
     H.SESSION_CREDS.pop("hycu", None)
     _p, err = H._nfs_copy_plan({"server": "nutanix-afs", "path": "/pvc-k8s"}, "data")
     assert "Connect HYCU" in err
+
+
+def test_copy_without_config_backup_uses_live_pvc(H, monkeypatch):
+    """Copy started from the live cluster (no config backup yet): PV and PVC are read live."""
+    seed_nas(H)
+    calls = []
+    _fake_hycu(H, monkeypatch, calls)
+    r = H.action_clone_app({"namespace": "app", "target_namespace": "copie", "dry": True,
+                            "backup_path": None, "items": [{"pvc": "data", "new_ref": ""}]})
+    assert r.get("ok") or r.get("dry"), r.get("error") or r
+    assert any("NAS copy" in w for w in r["warnings"]), r["warnings"]
+
+
+def test_browse_retries_while_hycu_mounts_the_backup(H, monkeypatch):
+    """HYCU answers 503 while it mounts the backup (seen in the real UI): retry, then list."""
+    H.SESSION_CREDS["hycu"] = {"user": "x"}
+    monkeypatch.setattr(H.time, "sleep", lambda s: None)
+    answers = [{"ok": False, "status": 503, "error": "HTTP 503", "raw": ""},
+               {"ok": True, "json": {"entities": [{"fullItemName": "nas-demo"}]}}]
+
+    def rest(system, method, path, body=None, **kw):
+        if "/browseShare?" in path:
+            return answers.pop(0)
+        return {"ok": True, "json": {}}
+    monkeypatch.setattr(H, "_rest", rest)
+    items, err = H._share_browse("bk", "/")
+    assert err is None and [i["fullItemName"] for i in items] == ["nas-demo"]
