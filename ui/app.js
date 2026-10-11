@@ -4,6 +4,7 @@ const dry = () => $("#dry").checked;
 let state = {selected:{}, mode:"clone", cloneSub:"reattach", cloneNsMode:"same", backup_path:null, backup_root:null, preview:null, ns:null, app:null};
 let ctxInfo = {};
 function isCloneApp(){ return state.mode==="clone" && state.cloneSub==="cloneapp"; }
+function refOk(i){ return !!(i.nfs && isCloneApp()) || !!(i.new_ref||"").trim(); }
 
 function badge(phase){
   const p=(phase||"").toLowerCase();
@@ -176,7 +177,7 @@ function updateNextBar(){
   }
   // Clone / flux manuel : compte des références VG remplies.
   const items=collectItems();
-  const filled=items.filter(i=>(i.new_ref||"").trim()).length;
+  const filled=items.filter(refOk).length;
   if(filled===items.length)
     return rsNext("Toutes les références VG sont remplies.","Continuer : vérifier et lancer",()=>$("#rsPreview").click());
   const batch=$("#hyBatchGo");   // panneau HYCU groupé disponible -> c'est l'action naturelle
@@ -766,7 +767,7 @@ function renderRsPvcs(pvcs, src){
   // ne sont pas touchées par défaut.
   if(rsAutoCheck && pvcs.length){
     const only = state.app && state.app.pvcs && state.app.pvcs.length ? new Set(state.app.pvcs) : null;
-    document.querySelectorAll(".rsChk").forEach(c=>c.checked = !c.dataset.nfs && (!only || only.has(c.dataset.pvc)));
+    document.querySelectorAll(".rsChk").forEach(c=>c.checked = (!c.dataset.nfs || isCloneApp()) && (!only || only.has(c.dataset.pvc)));
     if(only && ![...document.querySelectorAll(".rsChk")].some(c=>c.checked)) document.querySelectorAll(".rsChk").forEach(c=>c.checked=true);
     rebuildVolCfgs();
   }
@@ -851,7 +852,7 @@ function syncContinueVisibility(){
   const hyOn = conn.hycu && conn.hycu.connected;
   if(state.mode==="inplace" && hyOn){ $("#rsContinueWrap").style.display="none"; return; }
   const items=collectItems();
-  const allFilled=items.length && items.every(i=>(i.new_ref||"").trim());
+  const allFilled=items.length && items.every(refOk);
   $("#rsContinueWrap").style.display = (rsFullOrch && !allFilled)? "none":"block";
 }
 // État « référence remplie / à remplir » affiché à côté de chaque volume.
@@ -860,7 +861,8 @@ function refreshRefStats(){
   const inplaceOrch = state.mode==="inplace" && conn.hycu && conn.hycu.connected;
   document.querySelectorAll(".refStat").forEach(el=>{
     const ta=document.querySelector(`.rsRef[data-pvc="${CSS.escape(el.dataset.pvc)}"]`);
-    el.innerHTML = inplaceOrch? "" :
+    const nasCopy = isCloneApp() && !!(document.querySelector(`.rsChk[data-pvc="${CSS.escape(el.dataset.pvc)}"]`)||{dataset:{}}).dataset.nfs;
+    el.innerHTML = (inplaceOrch || nasCopy)? "" :
       ((ta && ta.value.trim())? '<span class="ok">✓ référence remplie</span>' : '<span class="sim">— référence à remplir</span>');
   });
 }
@@ -902,7 +904,9 @@ async function buildHyPanel(){
     if(!slot) return;
     const card=slot.closest(".vol-cfg");
     if(r.nfs){
-      slot.innerHTML='<div class="warnbox" style="margin-top:6px">'+esc("Volume NAS ("+r.nfs+") : ses données se restaurent dans HYCU (partage NAS). Décochez-le pour ce parcours.")+'</div>';
+      slot.innerHTML = isCloneApp()
+        ? '<div class="hint" style="margin-top:6px">'+esc("Volume NAS ("+r.nfs+") : HYCU restaure la dernière sauvegarde du partage dans un dossier au nom du namespace cible, et le nouveau PV vise ce dossier.")+'</div>'
+        : '<div class="warnbox" style="margin-top:6px">'+esc("Volume NAS ("+r.nfs+") : ses données se restaurent dans HYCU (partage NAS). Décochez-le pour ce parcours.")+'</div>';
       return;
     }
     if(!r.matched){
@@ -934,7 +938,8 @@ async function buildHyPanel(){
          </div>`;
       $("#hyBatchGo").onclick=hyBatchRun;
     }
-    rsFullOrch = ready.length===chks.length && ready.length>0;
+    const nas = isCloneApp() ? rows.filter(r=>r.nfs).length : 0;
+    rsFullOrch = ready.length+nas===chks.length && ready.length>0;
     syncContinueVisibility();
   } else {
     // Sur place : pré-sélectionner le point le plus récent de chaque volume.
@@ -1016,7 +1021,7 @@ async function hyBatchRun(opts){
   b.disabled=false; b.textContent="Restaurer les VG depuis HYCU ("+rows.length+" volume(s))";
   if(dry()) return false;                    // simulation : rien à préparer
   const items=collectItems();
-  const allFilled=!!(items.length && items.every(i=>(i.new_ref||"").trim()));
+  const allFilled=!!(items.length && items.every(refOk));
   const ok=!failed && allFilled;
   if(opts.noChain) return ok;
   if(ok){
@@ -1127,7 +1132,7 @@ function collectItems(){
     const pvc=c.dataset.pvc;
     const ref=(document.querySelector(`.rsRef[data-pvc="${CSS.escape(pvc)}"]`)||{}).value||"";
     const nameEl=document.querySelector(`.rsName[data-pvc="${CSS.escape(pvc)}"]`);
-    items.push({pvc, new_ref:ref, new_name:nameEl?nameEl.value:""});
+    items.push({pvc, new_ref:ref, new_name:nameEl?nameEl.value:"", nfs:!!c.dataset.nfs});
   });
   return items;
 }
@@ -1266,7 +1271,7 @@ async function cloneAppDirect(){
   if(state.cloneNsMode==="other" && !$("#rsCloneTargetNs").value.trim()){ $("#rsErr").innerHTML='<div class="err">Indiquez le namespace cible.</div>'; return; }
   if(dry()){ $("#rsPreview").click(); return; }          // simulation : aperçu, rien n'est créé
   const batch=$("#hyBatchGo");
-  const pending = !rsStatelessClone() && !!batch && !(items.length && items.every(i=>(i.new_ref||"").trim()));
+  const pending = !rsStatelessClone() && !!batch && !(items.length && items.every(refOk));
   const res=await confirmCloneApp(pending);
   if(!res) return;
   const confirmedCtx = (typeof res==="string") ? res : "";
@@ -2171,9 +2176,49 @@ $("#bkRunSel").onclick=async()=>{
 };
 
 // ============================ Modale Définir la politique ============================
+// ----- Politique de sauvegarde de la CONFIGURATION du/des namespace(s) de la fenêtre -----
+let cfgPolNs=[], cfgPolAll=[];
+async function loadCfgPolicy(nsList){
+  cfgPolNs=nsList.filter(Boolean);
+  const sel=$("#bkCfgPol"); $("#bkCfgPolMsg").textContent="";
+  sel.innerHTML='<option value="">…</option>'; sel.disabled=true;
+  const [ab, mem]=await Promise.all([get("/api/auto_backup"), get("/api/policy_members")]);
+  cfgPolAll=(ab&&ab.policies)||[];
+  const members=(mem&&mem.ok)?(mem.members||{}):{};
+  const cur=new Set(cfgPolNs.map(ns=>{ for(const k in members){ if((members[k]||[]).includes(ns)) return k; } return ""; }));
+  const curOne = cur.size===1 ? [...cur][0] : null;
+  const defLbl = "Par défaut"+(ab && ab.enabled ? " · "+Math.round(ab.interval_hours||24)+" h" : " (désactivée)");
+  sel.innerHTML=(curOne===null?'<option value="__mixed">(politiques différentes)</option>':"")+
+    `<option value="">${esc(defLbl)}</option>`+
+    cfgPolAll.map(p=>`<option value="${esc(p.name)}">${esc(p.name+" · "+(+p.interval_hours)+" h · "+p.keep+" versions")}</option>`).join("");
+  sel.value = curOne===null ? "__mixed" : curOne;
+  sel.disabled=false;
+}
+$("#bkCfgPolSave").onclick=async()=>{
+  const choice=$("#bkCfgPol").value;
+  if(choice==="__mixed" || !cfgPolNs.length) return;
+  const list=cfgPolAll.map(p=>{
+    const nss=(p.namespaces||[]).filter(n=>!cfgPolNs.includes(n));
+    if(p.name===choice) cfgPolNs.forEach(n=>{ if(!nss.includes(n)) nss.push(n); });
+    return {name:p.name, namespaces:nss, label_selector:p.label_selector||"", interval_hours:+p.interval_hours,
+            keep:+p.keep, enabled:p.enabled!==false, hycu_policy:p.hycu_policy||"", hycu_policy_name:p.hycu_policy_name||""};
+  }).filter(p=>p.namespaces.length || p.label_selector);
+  const dropped=cfgPolAll.filter(p=>!list.some(x=>x.name===p.name)).map(p=>p.name);
+  if(dropped.length && !(await confirmDanger({title:"Politique sans namespace", lines:[
+      "La politique <b>"+esc(dropped.join(", "))+"</b> n'aurait plus aucun namespace ni sélecteur : elle sera supprimée."]}))) return;
+  const b=$("#bkCfgPolSave"); b.disabled=true;
+  const r=await post("/api/config",{config:{backup_policies:list}});
+  b.disabled=false;
+  if(!r.ok){ $("#bkCfgPolMsg").innerHTML=errBox(r.error); return; }
+  await loadCfgPolicy(cfgPolNs);
+  const now=$("#bkCfgPol").value;
+  $("#bkCfgPolMsg").textContent = (now===choice) ? "Enregistré."
+    : "Enregistré — mais « "+(now||"Par défaut")+" » s'applique encore par son sélecteur d'étiquettes.";
+};
 function openPolicyModal(ns){
   // ns : un namespace (chaîne) ou une liste de namespaces (plusieurs applications en une fois).
   bkNsList = Array.isArray(ns) ? ns.slice() : [];
+  loadCfgPolicy(bkNsList.length ? bkNsList : [ns || $("#bkNs").value]);
   if(bkNsList.length){
     clearBkProtect();
     $("#mPolicyTitle").innerHTML=esc("Définir la politique")+'<span class="sep">›</span>'+esc(bkNsList.length+" applications")
@@ -2974,7 +3019,7 @@ function rsWizSync(){
     if(isCloneApp()){
       // Clone d'application : lancement DIRECT depuis cette étape (une seule confirmation),
       // clones HYCU compris ; en simulation, aperçu sans rien créer.
-      const items=collectItems(), filled=items.length>0 && items.every(i=>(i.new_ref||"").trim());
+      const items=collectItems(), filled=items.length>0 && items.every(refOk);
       const batch=$("#hyBatchGo"), pending=!!batch && !filled;
       lbl = dry() ? "Vérifier la copie" : "Lancer le clone de l'application";
       dis = cloneBusy || (!rsStatelessClone() && (!n || (pending && batch.disabled)));
@@ -2982,7 +3027,7 @@ function rsWizSync(){
     }
     else if(state.mode==="inplace" && hyOn){ src=$("#rsInplaceRun"); lbl="Restaurer sur place"; }
     else {
-      const items=collectItems(), filled=items.length>0 && items.every(i=>(i.new_ref||"").trim());
+      const items=collectItems(), filled=items.length>0 && items.every(refOk);
       const batch=$("#hyBatchGo");
       if(batch && !filled){ src=batch; lbl="Cloner les VG dans HYCU →"; }
       else { dis=!n; act=()=>$("#rsPreview").click(); }

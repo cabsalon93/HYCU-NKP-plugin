@@ -17,7 +17,8 @@ Python (bibliothèque standard uniquement), livré aussi en image conteneur.
 - **Protège** les volumes dans HYCU : correspondance PVC ↔ Volume Group, politique HYCU.
   Les volumes **NAS (NFS)** — Nutanix Files ou NAS générique — sont associés à leur
   **partage HYCU** (politique + sauvegarde immédiate) et recréés à l'identique lors d'une
-  récupération ; leurs données se restaurent dans HYCU.
+  récupération. Une **copie** d'application fait restaurer par HYCU la dernière sauvegarde du
+  partage dans un dossier au nom du namespace cible.
 - **Restaure** : vers de **nouveaux volumes** (clone HYCU), **sur place** (restore HYCU
   in-place), une **application supprimée**, **en masse**, ou sur un **autre cluster** (DR).
   L'outil enchaîne arrêt de l'application → recréation des PV/PVC → redémarrage →
@@ -106,7 +107,7 @@ Tout se règle dans l'interface (⚙ **Réglages**, ⚙ **Sources**) ou dans `hy
 | `allowed_contexts` | `[]` | Clusters/contextes autorisés en mode réel (vide = tous, avec confirmation). |
 | `allowed_hosts` | `[]` | Noms DNS acceptés en plus de `127.0.0.1` (Ingress / reverse-proxy, à protéger par une authentification). |
 | `auto_backup_enabled` | `false` | Politique par défaut : sauvegarde automatique des namespaces sans autre politique. |
-| `backup_policies` | `[]` | Politiques nommées (page Politiques) : namespaces et/ou sélecteur d'étiquettes, intervalle, versions à conserver, politique HYCU optionnelle. La première qui correspond l'emporte. |
+| `backup_policies` | `[]` | Politiques nommées (page Politiques) : namespaces et/ou sélecteur d'étiquettes, intervalle, versions à conserver, politique HYCU optionnelle. Un namespace nommé explicitement l'emporte sur un sélecteur ; sinon la première qui correspond. |
 | `auto_backup_interval_hours` | `24` | Intervalle de la sauvegarde automatique. |
 | `auto_backup_keep` | `15` | Versions conservées par namespace (`0` = illimité). `auto_backup_retention: "gfs"` pour une rétention jour/semaine/mois. |
 | `storage_quota_gb` / `storage_min_free_mb` | `0` / `500` | Quota du dossier de sauvegardes et plancher d'espace libre. |

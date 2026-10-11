@@ -16,7 +16,8 @@ library only), also shipped as a container image.
   restorable on a new instance (⚙ Sources → S3 object storage).
 - **Protects** volumes in HYCU: PVC ↔ Volume Group matching, HYCU policy.
   **NAS (NFS)** volumes — Nutanix Files or generic NAS — are matched to their **HYCU share**
-  (policy + immediate backup) and recreated as-is on recovery; their data is restored in HYCU.
+  (policy + immediate backup) and recreated as-is on recovery. An application **copy** has HYCU
+  restore the share's latest backup into a folder named after the target namespace.
 - **Restores**: to **new volumes** (HYCU clone), **in place** (HYCU in-place restore), a
   **deleted application**, **in bulk**, or onto **another cluster** (DR). The tool runs
   stop the application → recreate PV/PVC → restart → verify, with a preflight, volume
@@ -105,7 +106,7 @@ Everything is set from the UI (⚙ **Settings**, ⚙ **Sources**) or in `hycu_co
 | `allowed_contexts` | `[]` | Clusters/contexts allowed in live mode (empty = all, with confirmation). |
 | `allowed_hosts` | `[]` | DNS names accepted besides `127.0.0.1` (Ingress / reverse proxy; put authentication in front). |
 | `auto_backup_enabled` | `false` | Default policy: automatic backup of namespaces without another policy. |
-| `backup_policies` | `[]` | Named policies (Policies page): namespaces and/or label selector, interval, versions to keep, optional HYCU policy. The first match wins. |
+| `backup_policies` | `[]` | Named policies (Policies page): namespaces and/or label selector, interval, versions to keep, optional HYCU policy. A namespace named explicitly wins over a selector; otherwise the first match. |
 | `auto_backup_interval_hours` | `24` | Automatic backup interval. |
 | `auto_backup_keep` | `15` | Versions kept per namespace (`0` = unlimited). `auto_backup_retention: "gfs"` for daily/weekly/monthly retention. |
 | `storage_quota_gb` / `storage_min_free_mb` | `0` / `500` | Backup folder quota and free-space floor. |

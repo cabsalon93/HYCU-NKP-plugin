@@ -226,7 +226,7 @@
         <div><label class="fld">Politique HYCU (optionnel)</label><select id="peHycu"></select></div>
         <div style="flex:none;align-self:flex-end"><label class="fld"><input type="checkbox" id="peEnabled" style="width:auto" checked> Activée</label></div>
       </div>
-      <div class="hint" style="margin-top:6px">La première politique de la liste qui correspond à un namespace l'emporte ; un namespace sans politique suit la politique par défaut. La politique HYCU est assignée aux volumes qui n'en ont pas encore.</div>
+      <div class="hint" style="margin-top:6px">Un namespace nommé explicitement l'emporte sur un sélecteur d'étiquettes ; sinon, la première politique de la liste qui correspond. Un namespace sans politique suit la politique par défaut. La politique HYCU est assignée aux volumes qui n'en ont pas encore.</div>
       <div style="margin-top:12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
         <button class="btn" id="peSave" type="button">Enregistrer</button>
         <button class="btn ghost" id="peCancel" type="button">Annuler</button>
@@ -425,13 +425,20 @@
     <div class="hm-body">
     <div class="card" id="bkProtectCard">
       <h3><span class="step-no">2</span>Protéger les données dans HYCU</h3>
-      <p class="sub">L'export ci-dessus ne sauvegarde que les <b>manifestes</b> (la « recette » du restore).
-        Les <b>données</b> vivent dans les Volume Groups Nutanix : seul HYCU les sauvegarde réellement.
-        Ici, on associe les PVC du namespace aux Volume Groups HYCU, on assigne une politique, et on lance
-        une sauvegarde.</p>
+      <div id="bkCfgPolWrap" style="margin-bottom:14px;padding-bottom:12px;border-bottom:1px solid var(--line)">
+        <label class="fld">Politique de sauvegarde de la configuration</label>
+        <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+          <select id="bkCfgPol" style="max-width:360px"></select>
+          <button class="btn ghost" id="bkCfgPolSave" type="button">Appliquer</button>
+          <span class="hint" id="bkCfgPolMsg" style="margin:0"></span>
+        </div>
+      </div>
+      <p class="sub">Les <b>données</b> vivent dans les Volume Groups Nutanix ou sur des partages NAS : seul HYCU
+        les sauvegarde réellement. Ici, on associe les PVC du namespace à leurs Volume Groups ou partages HYCU,
+        on assigne une politique HYCU, et on lance une sauvegarde.</p>
       <div id="bkProtectOff" class="warnbox">Enregistrez la source HYCU (⚙ en haut à droite) pour activer cette section.</div>
       <div id="bkProtectOn" style="display:none">
-        <button class="btn ghost" id="bkMatch">Analyser la correspondance PVC ↔ Volume Group HYCU</button>
+        <button class="btn ghost" id="bkMatch">Analyser la correspondance PVC ↔ HYCU (Volume Groups, partages NAS)</button>
         <div id="bkMatchOut"></div>
         <div id="bkProtectForm" style="display:none">
           <label class="fld">Politique HYCU à assigner (optionnel)</label>

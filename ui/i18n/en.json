@@ -6786,5 +6786,193 @@
 [
 "pas par ce parcours réservé aux Volume Groups. Décochez-le.",
 "not through this Volume Group flow. Untick it."
+],
+[
+">Politique de sauvegarde de la configuration<",
+">Configuration backup policy<"
+],
+[
+">Appliquer<",
+">Apply<"
+],
+[
+"Les <b>données</b> vivent dans les Volume Groups Nutanix ou sur des partages NAS : seul HYCU",
+"The <b>data</b> lives in Nutanix Volume Groups or on NAS shares: only HYCU"
+],
+[
+"les sauvegarde réellement. Ici, on associe les PVC du namespace à leurs Volume Groups ou partages HYCU,",
+"actually backs it up. Here the namespace's PVCs are matched to their HYCU Volume Groups or shares,"
+],
+[
+"on assigne une politique HYCU, et on lance une sauvegarde.",
+"a HYCU policy is assigned, and a backup is started."
+],
+[
+"Analyser la correspondance PVC ↔ HYCU (Volume Groups, partages NAS)",
+"Analyze the PVC ↔ HYCU mapping (Volume Groups, NAS shares)"
+],
+[
+"Un namespace nommé explicitement l'emporte sur un sélecteur d'étiquettes ; sinon, la première politique de la liste qui correspond. Un namespace sans politique suit la politique par défaut.",
+"A namespace named explicitly wins over a label selector; otherwise, the first matching policy in the list. A namespace without a policy follows the default policy."
+],
+[
+"\"Par défaut\"+(ab && ab.enabled ?",
+"\"Default\"+(ab && ab.enabled ?"
+],
+[
+"\" (désactivée)\"",
+"\" (disabled)\""
+],
+[
+"'<option value=\"__mixed\">(politiques différentes)</option>'",
+"'<option value=\"__mixed\">(different policies)</option>'"
+],
+[
+"title:\"Politique sans namespace\"",
+"title:\"Policy without namespace\""
+],
+[
+"\"</b> n'aurait plus aucun namespace ni sélecteur : elle sera supprimée.\"",
+"\"</b> would no longer have any namespace or selector: it will be deleted.\""
+],
+[
+"\"Enregistré — mais « \"",
+"\"Saved — but « \""
+],
+[
+"\" » s'applique encore par son sélecteur d'étiquettes.\"",
+"\" » still applies through its label selector.\""
+],
+[
+"(now||\"Par défaut\")",
+"(now||\"Default\")"
+],
+[
+") : HYCU restaure la dernière sauvegarde du partage dans un dossier au nom du namespace cible, et le nouveau PV vise ce dossier.",
+"): HYCU restores the latest share backup into a folder named after the target namespace, and the new PV points to that folder."
+],
+[
+" est un volume NAS : sa copie passe par une restauration HYCU du ",
+" is a NAS volume: its copy goes through an HYCU restore of the "
+],
+[
+"partage dans un nouveau dossier. Connectez HYCU puis relancez.",
+"share into a new folder. Connect HYCU and try again."
+],
+[
+"Partages HYCU illisibles : ",
+"HYCU shares unreadable: "
+],
+[
+" : aucun partage HYCU ne correspond exactement à cet export (%s) — ",
+": no HYCU share exactly matches this export (%s) — "
+],
+[
+" : aucun partage HYCU ne correspond exactement à cet export (",
+": no HYCU share exactly matches this export ("
+],
+[
+"ajoutez ce NAS dans HYCU.",
+"add this NAS in HYCU."
+],
+[
+"correspondance par chemin seulement",
+"path-only match"
+],
+[
+"plusieurs partages possibles",
+"several possible shares"
+],
+[
+"Sauvegardes du partage « ",
+"Backups of share « "
+],
+[
+"Le partage HYCU « ",
+"HYCU share « "
+],
+[
+" n'a encore aucune sauvegarde : lancez-en une ",
+" has no backup yet: run one "
+],
+[
+"(Set Policy) puis relancez la copie.",
+"(Set Policy), then run the copy again."
+],
+[
+"Lecture de la sauvegarde du partage « ",
+"Reading the backup of share « "
+],
+[
+" : copie prise en charge pour les PV NFS natifs (spec.nfs) ; ce volume ",
+": copy is supported for native NFS PVs (spec.nfs); this volume "
+],
+[
+"passe par un driver CSI NFS — restaurez ses données dans HYCU.",
+"uses a CSI NFS driver — restore its data in HYCU."
+],
+[
+" : la sauvegarde du partage « ",
+": the backup of share « "
+],
+[
+"contient aucun fichier à copier pour ce volume.",
+"contains no file to copy for this volume."
+],
+[
+" : copie NAS — HYCU restaure la sauvegarde du ",
+": NAS copy — HYCU restores the backup of "
+],
+[
+" du partage « ",
+" of share « "
+],
+[
+"» dans le ",
+"» into the "
+],
+[
+"dossier « ",
+"folder « "
+],
+[
+"» ; le nouveau PV vise ",
+"»; the new PV points to "
+],
+[
+" : l'application d'origine monte la racine du partage, elle verra le dossier ",
+": the original application mounts the share root, it will see the folder "
+],
+[
+"». Pour isoler les copies, montez plutôt un sous-dossier par application.",
+"». To isolate copies, mount one subfolder per application instead."
+],
+[
+"Dossiers de copies existantes non recopiés : ",
+"Folders of existing copies not copied again: "
+],
+[
+"Restauration HYCU du partage « ",
+"HYCU restore of share « "
+],
+[
+" élément(s))",
+" item(s))"
+],
+[
+" : restauration HYCU du partage refusée : ",
+": HYCU share restore refused: "
+],
+[
+" : la restauration HYCU du partage n'a pas abouti — aucun ",
+": the HYCU share restore did not complete — no "
+],
+[
+"objet Kubernetes créé.",
+"Kubernetes object created."
+],
+[
+"Copie NAS de ",
+"NAS copy of "
 ]
 ]

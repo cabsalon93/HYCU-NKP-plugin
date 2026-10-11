@@ -141,3 +141,65 @@ def test_named_policy_assigns_hycu_policy_to_unassigned_share(H, monkeypatch):
     assert ok and calls == [("/policies/pol/assign", {"volumeGroupUuidList": [], "includeDependencies": False,
                                                       "shareUuidList": ["sh-1"]})]
     assert "1 volume(s) rattaché(s)" in msg and "1 volume(s) déjà dans une autre politique" in msg
+
+
+def _fake_hycu(H, monkeypatch, calls):
+    H.SESSION_CREDS["hycu"] = {"user": "x"}
+    monkeypatch.setattr(H, "_hycu_list_shares", lambda: ([SHARE], None))
+
+    def rest(system, method, path, body=None, **kw):
+        calls.append((method, path, body))
+        if path.startswith("/shares/sh-1/backups"):
+            return {"ok": True, "json": {"entities": [{"uuid": "bk-old", "endTime": 1000},
+                                                      {"uuid": "bk-new", "endTime": 2000000000000}]}}
+        if "/browseShare?" in path:
+            return {"ok": True, "json": {"entities": [{"fullItemName": "/nas-demo", "directory": True},
+                                                      {"fullItemName": "/copie", "directory": True}],
+                                         "metadata": {"flrSessId": "s1"}}}
+        if "restoreShareItems" in path:
+            return {"ok": True, "json": {"entities": [{"uuid": "job-1"}]}}
+        if path.startswith("/jobs/"):
+            return {"ok": True, "json": {"entities": [{"status": "OK"}]}}
+        return {"ok": True, "json": {}}
+    monkeypatch.setattr(H, "_rest", rest)
+
+
+def test_copy_restores_share_into_namespace_folder(H, monkeypatch):
+    seed_nas(H)
+    b = H.action_backup("app")
+    assert b["ok"]
+    calls = []
+    _fake_hycu(H, monkeypatch, calls)
+    payload = {"namespace": "app", "target_namespace": "copie", "backup_path": b["dir"],
+               "items": [{"pvc": "data", "new_ref": ""}]}
+    r = H.action_clone_app(dict(payload, dry=True))
+    assert r.get("ok") or r.get("dry"), r
+    assert any("copie NAS" in w and "bk" not in w for w in r["warnings"]), r["warnings"]
+    assert any("verra le dossier" in w for w in r["warnings"])
+    assert not any("restoreShareItems" in c[1] for c in calls), "simulation : aucune restauration lancée"
+    assert any("browseShareClose" in c[1] and "s1" in c[1] for c in calls), "session de parcours refermée"
+    # Réel : restauration HYCU de la sauvegarde la plus récente dans « copie », puis PV vers ce dossier.
+    monkeypatch.setattr(H, "_context_guard", lambda p: None)
+    calls.clear()
+    r2 = H.action_clone_app(dict(payload, dry=False))
+    assert r2.get("ok"), r2.get("error") or r2
+    rs = [c for c in calls if "restoreShareItems" in c[1]]
+    assert len(rs) == 1 and "/bk-new/" in rs[0][1]
+    body = rs[0][2]
+    assert body["restoreTargetPath"] == "copie" and body["targetShareUuid"] == "sh-1"
+    assert body["selectedItems"] == ["/nas-demo"], "le dossier cible lui-même n'est jamais recopié"
+    pv = read_state(H)["pvs"].get("nas-pv-copie")
+    assert pv and pv["spec"]["nfs"] == {"server": "nutanix-afs.amsdemo.ct", "path": "/pvc-k8s/copie"}, pv
+
+
+def test_copy_of_subfolder_volume_and_failures(H, monkeypatch):
+    calls = []
+    _fake_hycu(H, monkeypatch, calls)
+    plan, err = H._nfs_copy_plan({"server": "nutanix-afs", "path": "/pvc-k8s/app1"}, "data")
+    assert not err and plan["sub"] == "/app1" and plan["root_path"] == "/pvc-k8s"
+    body, pv_path, sel, _ = H._nfs_copy_target(plan, "copie")
+    assert pv_path == "/pvc-k8s/copie/app1", "HYCU garde l'arborescence : copie/app1"
+    assert sel == ["/nas-demo", "/copie"], "sous-dossier : rien n'est écarté"
+    H.SESSION_CREDS.pop("hycu", None)
+    _p, err = H._nfs_copy_plan({"server": "nutanix-afs", "path": "/pvc-k8s"}, "data")
+    assert "Connectez HYCU" in err

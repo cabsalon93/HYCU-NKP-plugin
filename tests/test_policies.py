@@ -59,9 +59,9 @@ def test_policy_resolution_first_match_and_selector(H, monkeypatch):
     fake_selectors(H, monkeypatch, {"tier=gold": ["shop", "billing"]})
     pmap, err = H._policy_map(["app", "shop", "billing", "misc"])
     assert err is None
-    assert pmap["shop"]["name"] == "or", "première politique de la liste prioritaire"
+    assert pmap["shop"]["name"] == "argent", "un namespace nommé explicitement l'emporte sur un sélecteur"
     assert pmap["billing"]["name"] == "or" and pmap["app"]["name"] == "argent" and pmap["misc"] is None
-    assert H._retention_for("shop") == (30, "count")
+    assert H._retention_for("shop") == (7, "count") and H._retention_for("billing") == (30, "count")
     assert H._retention_for("misc") == (H.CONFIG["auto_backup_keep"], None)
 
 
@@ -246,3 +246,17 @@ def test_purge_versions_guards(H):
         assert not H.action_backups_delete({"ns": "app", "paths": [other]})["ok"]
     finally:
         H.ACTION_LOCK.release()
+
+
+def test_exclude_policy_counts_as_unprotected(H, monkeypatch):
+    set_policies(H, [pol("or", namespaces=["app"], hycu_policy="pol", hycu_policy_name="Gold")])
+    p = H._named_policies()[0]
+    H.SESSION_CREDS["hycu"] = {"user": "x"}
+    monkeypatch.setattr(H, "_hycu_list_vgs", lambda: ([], None))
+    monkeypatch.setattr(H, "action_hycu_match", lambda ns, vg_items=None: {"ok": True, "matches": [
+        {"matched": True, "trusted": True, "hycu_vg_uuid": "vg-x", "policy": "Exclude"}]})
+    calls = []
+    monkeypatch.setattr(H, "_rest", lambda system, method, path, body=None, **kw:
+                        calls.append((path, body)) or {"ok": True, "json": {}})
+    ok, _msg = H._policy_hycu_assign(p, ["app"])
+    assert ok and calls and calls[0][1]["volumeGroupUuidList"] == ["vg-x"]
