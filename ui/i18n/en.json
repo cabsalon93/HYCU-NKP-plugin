@@ -6690,5 +6690,101 @@
 [
 " : choisissez une sauvegarde source.",
 ": choose a source backup."
+],
+[
+"→ partage NAS <b>",
+"→ NAS share <b>"
+],
+[
+" <span class=\"sim\">même chemin, serveur à confirmer</span>",
+" <span class=\"sim\">same path, server to confirm</span>"
+],
+[
+"ambigu : plusieurs partages HYCU correspondent à ",
+"ambiguous: several HYCU shares match "
+],
+[
+" — vérifiez dans HYCU</span>",
+" — check in HYCU</span>"
+],
+[
+"\"partages HYCU illisibles : \"",
+"\"HYCU shares unreadable: \""
+],
+[
+"\"aucun partage HYCU pour \"",
+"\"no HYCU share for \""
+],
+[
+"\" — ajoutez ce NAS dans HYCU\"",
+"\" — add this NAS in HYCU\""
+],
+[
+"Cochez au moins un volume (les correspondances « par nom » doivent être confirmées).",
+"Tick at least one volume (“by name” matches must be confirmed)."
+],
+[
+"\" · données restaurées dans HYCU (partage NAS)\"",
+"\" · data restored in HYCU (NAS share)\""
+],
+[
+"\"Volume NAS (\"",
+"\"NAS volume (\""
+],
+[
+"\") : ses données se restaurent dans HYCU (partage NAS). Décochez-le pour ce parcours.\"",
+"\"): its data is restored in HYCU (NAS share). Untick it for this flow.\""
+],
+[
+"\"Même export NFS (\"",
+"\"Same NFS export (\""
+],
+[
+"\") : rien à saisir, les données restent sur le NAS.\"",
+"\"): nothing to enter, the data stays on the NAS.\""
+],
+[
+"Aucun Volume Group ni partage HYCU à protéger ",
+"No HYCU Volume Group or share to protect "
+],
+[
+"Lancer la sauvegarde des partages NAS",
+"Start the NAS shares backup"
+],
+[
+" est un volume NAS (",
+" is a NAS volume ("
+],
+[
+") : une copie partagerait les données de ",
+"): a copy would share the data of "
+],
+[
+"l'application d'origine (même export NFS, en écriture). Copie non prise en ",
+"the original application (same NFS export, writable). Copy not supported "
+],
+[
+"charge pour les volumes NAS — utilisez la restauration des données dans HYCU.",
+"for NAS volumes — use the data restore in HYCU."
+],
+[
+" : volume NAS recréé vers le même export (",
+": NAS volume recreated on the same export ("
+],
+[
+") — les données restent ",
+") — the data stays "
+],
+[
+"celles du NAS.",
+"on the NAS."
+],
+[
+") : ses données se restaurent dans HYCU (partage NAS), ",
+"): its data is restored in HYCU (NAS share), "
+],
+[
+"pas par ce parcours réservé aux Volume Groups. Décochez-le.",
+"not through this Volume Group flow. Untick it."
 ]
 ]

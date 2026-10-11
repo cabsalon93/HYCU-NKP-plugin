@@ -609,7 +609,24 @@ $("#bkMatch").onclick=async()=>{
   bkMatches=results.flatMap(x=>x.matches); bkMatchNs=list.length===1 ? results[0].ns : null;
   const rowOf=m=>{
     let chk="", label="";
-    if(m.match_kind==="exact"){
+    if(m.volume_kind==="nfs"){
+      // Volume NAS : partage HYCU (Nutanix Files ou NAS générique) au lieu d'un Volume Group.
+      const shareLbl=`→ partage NAS <b>${esc(m.hycu_share_name||"")}</b> <span class="hint">(${esc(m.hycu_file_server||m.nfs||"")})</span>`;
+      if(m.match_kind==="exact"){
+        chk=`<input type="checkbox" class="bkMchk" data-type="share" data-ns="${esc(m.ns)}" data-uuid="${esc(m.hycu_share_uuid)}" data-name="${esc(m.hycu_share_name||'')}" checked style="width:auto;margin-right:8px">`;
+        label=shareLbl;
+      } else if(m.match_kind==="name"){
+        chk=`<input type="checkbox" class="bkMchk" data-type="share" data-kind="name" data-ns="${esc(m.ns)}" data-uuid="${esc(m.hycu_share_uuid)}" data-name="${esc(m.hycu_share_name||'')}" style="width:auto;margin-right:8px">`;
+        label=shareLbl+' <span class="sim">même chemin, serveur à confirmer</span>';
+      } else if(m.match_kind==="ambiguous"){
+        chk=`<span class="ic ko" style="width:18px;display:inline-block;text-align:center;margin-right:8px">⚠</span>`;
+        label=`<span class="ko">ambigu : plusieurs partages HYCU correspondent à ${esc(m.nfs||"")} — vérifiez dans HYCU</span>`;
+      } else {
+        chk=`<span class="ic ko" style="width:18px;display:inline-block;text-align:center;margin-right:8px">✕</span>`;
+        label=`<span class="ko">${m.error ? esc("partages HYCU illisibles : "+m.error) : "aucun partage HYCU pour "+esc(m.nfs||"")+" — ajoutez ce NAS dans HYCU"}</span>`;
+      }
+    }
+    else if(m.match_kind==="exact"){
       chk=`<input type="checkbox" class="bkMchk" data-ns="${esc(m.ns)}" data-uuid="${esc(m.hycu_vg_uuid)}" data-name="${esc(m.hycu_vg_name||'')}" data-ext="${esc(m.hycu_external_id||'')}" checked style="width:auto;margin-right:8px">`;
       label=`→ VG <b>${esc(m.hycu_vg_name||m.hycu_vg_uuid)}</b> <span class="hint">(externalId ${esc(m.hycu_external_id||'')})</span>`;
     } else if(m.match_kind==="name"){
@@ -656,7 +673,7 @@ $("#dry").addEventListener("change",()=>{ if($("#bkProtectForm").style.display!=
 $("#bkProtect").onclick=async()=>{
   const sel=[...document.querySelectorAll(".bkMchk:checked")];
   const vg_uuids=sel.map(c=>c.dataset.uuid);
-  if(!vg_uuids.length){ $("#bkProtectLog").innerHTML='<div class="err">Cochez au moins un Volume Group (les correspondances « par nom » doivent être confirmées).</div>'; return; }
+  if(!vg_uuids.length){ $("#bkProtectLog").innerHTML='<div class="err">Cochez au moins un volume (les correspondances « par nom » doivent être confirmées).</div>'; return; }
   const live=!dry(), pol=$("#bkPolicy").value;
   const names=sel.map(c=>"• "+(c.dataset.name||c.dataset.uuid)+(c.dataset.ext?(" ("+c.dataset.ext+")"):""));
   if(live && !(await confirmDanger({title:"Confirmer la protection HYCU", lines:[
@@ -667,9 +684,14 @@ $("#bkProtect").onclick=async()=>{
   // Regroupement par namespace : la garde anti-stale du serveur est faite namespace par
   // namespace, puis UN SEUL appel HYCU (assignation) + UN SEUL lancement de sauvegarde.
   const byNs={};
-  sel.forEach(c=>{ const k=c.dataset.ns||bkMatchNs||""; (byNs[k]=byNs[k]||{namespace:k, vg_uuids:[], confirm_name_uuids:[]}).vg_uuids.push(c.dataset.uuid);
-    if(c.dataset.kind==="name") byNs[k].confirm_name_uuids.push(c.dataset.uuid); });
-  const r=await post("/api/hycu/protect",{items:Object.values(byNs), namespace:bkMatchNs, vg_uuids, policy_uuid:pol, force_full:$("#bkForceFull").checked, dry:dry(), confirm_name_uuids:byName});
+  sel.forEach(c=>{ const k=c.dataset.ns||bkMatchNs||"";
+    const it=(byNs[k]=byNs[k]||{namespace:k, vg_uuids:[], share_uuids:[], confirm_name_uuids:[]});
+    (c.dataset.type==="share" ? it.share_uuids : it.vg_uuids).push(c.dataset.uuid);
+    if(c.dataset.kind==="name") it.confirm_name_uuids.push(c.dataset.uuid); });
+  const r=await post("/api/hycu/protect",{items:Object.values(byNs), namespace:bkMatchNs,
+    vg_uuids:sel.filter(c=>c.dataset.type!=="share").map(c=>c.dataset.uuid),
+    share_uuids:sel.filter(c=>c.dataset.type==="share").map(c=>c.dataset.uuid),
+    policy_uuid:pol, force_full:$("#bkForceFull").checked, dry:dry(), confirm_name_uuids:byName});
   b.disabled=false; b.textContent="Assigner + sauvegarder maintenant";
   if(!r.ok && !(r.steps&&r.steps.length)){ $("#bkProtectLog").innerHTML=errBox(r.error); return; }
   const lines=(r.steps||[]).map(s=> s.dry
@@ -719,7 +741,7 @@ async function applyBackupSelection(){
   if(rsBackups.length && i!=="" && rsBackups[i*1]){
     const b=rsBackups[i*1];
     state.backup_path=b.path;
-    pvcs=((b.index||{}).volumes||[]).map(v=>({name:v.pvc,pv:v.pv,phase:"sauvegardé"}));
+    pvcs=((b.index||{}).volumes||[]).map(v=>({name:v.pvc,pv:v.pv,phase:"sauvegardé",nfs:v.nfs?(v.nfs.server+":"+v.nfs.path):""}));
     src=customRoot?"sauvegarde (dossier perso)":(i==="0"?"dernière sauvegarde":"sauvegarde choisie");
     const _dl=$("#rsBackupDl"); if(_dl){ _dl.href="/api/backup/download?path="+encodeURIComponent(b.path)+(customRoot?("&root="+encodeURIComponent(customRoot)):"")+"&cluster="+encodeURIComponent(ACTIVE_CID); _dl.style.display="inline"; }
   }else{
@@ -732,9 +754,9 @@ async function applyBackupSelection(){
 }
 function renderRsPvcs(pvcs, src){
   $("#rsPvcs").innerHTML = pvcs.length? pvcs.map(p=>`
-     <li><input type="checkbox" style="width:auto" class="rsChk" data-pvc="${esc(p.name)}" data-pv="${esc(p.pv||'')}">
-       <div style="flex:1"><div class="nm">${esc(p.name)}</div>
-       <div class="meta">PV ${esc(p.pv||'—')} · source : ${src}</div></div>${badge(p.phase)}</li>`).join("")
+     <li><input type="checkbox" style="width:auto" class="rsChk" data-pvc="${esc(p.name)}" data-pv="${esc(p.pv||'')}"${p.nfs?' data-nfs="1"':''}>
+       <div style="flex:1"><div class="nm">${esc(p.name)}${p.nfs?' <span class="badge b-na">NAS</span>':''}</div>
+       <div class="meta">${p.nfs ? esc("NFS "+p.nfs)+" · données restaurées dans HYCU (partage NAS)" : "PV "+esc(p.pv||'—')} · source : ${src}</div></div>${badge(p.phase)}</li>`).join("")
      : `<div class="hint">Aucun volume. Sauvegardez d'abord la configuration de cette application (Applications → Sauvegarder).</div>`;
   document.querySelectorAll(".rsChk").forEach(c=>c.onchange=rebuildVolCfgs);
   $("#rsConfig").style.display="none"; $("#rsPlan").style.display="none"; setRsStep(1);
@@ -744,7 +766,7 @@ function renderRsPvcs(pvcs, src){
   // ne sont pas touchées par défaut.
   if(rsAutoCheck && pvcs.length){
     const only = state.app && state.app.pvcs && state.app.pvcs.length ? new Set(state.app.pvcs) : null;
-    document.querySelectorAll(".rsChk").forEach(c=>c.checked = !only || only.has(c.dataset.pvc));
+    document.querySelectorAll(".rsChk").forEach(c=>c.checked = !c.dataset.nfs && (!only || only.has(c.dataset.pvc)));
     if(only && ![...document.querySelectorAll(".rsChk")].some(c=>c.checked)) document.querySelectorAll(".rsChk").forEach(c=>c.checked=true);
     rebuildVolCfgs();
   }
@@ -867,6 +889,7 @@ async function buildHyPanel(){
   }
   const rows=await Promise.all(chks.map(async pvc=>{
     const m=(rsHyMatch.matches||[]).find(x=>x.pvc===pvc);
+    if(m && m.volume_kind==="nfs") return {pvc, matched:false, nfs:m.nfs||"NFS"};
     if(!m || !m.matched) return {pvc, matched:false};
     const rp=await get("/api/hycu/restorepoints?source="+encodeURIComponent(m.hycu_vg_uuid));
     return {pvc, matched:true, vg:m.hycu_vg_uuid, vgName:m.hycu_vg_name||"", kind:m.match_kind,
@@ -878,6 +901,10 @@ async function buildHyPanel(){
     const slot=document.querySelector(`#rsVolCfgs .hySlot[data-pvc="${CSS.escape(r.pvc)}"]`);
     if(!slot) return;
     const card=slot.closest(".vol-cfg");
+    if(r.nfs){
+      slot.innerHTML='<div class="warnbox" style="margin-top:6px">'+esc("Volume NAS ("+r.nfs+") : ses données se restaurent dans HYCU (partage NAS). Décochez-le pour ce parcours.")+'</div>';
+      return;
+    }
     if(!r.matched){
       slot.innerHTML='<div class="warnbox" style="margin-top:6px">Aucun Volume Group HYCU associé — collez la référence dans « Avancé ».</div>';
       const d=card&&card.querySelector("details.rsAdv"); if(d) d.open=true;
@@ -2924,7 +2951,7 @@ function rsWizSync(){
   if(rsDone){ lbl="Vérifier l'application →"; act=()=>gotoVerify(rsDoneTarget, true); }
   else if(rsWizPage==="type"){ dis=!rsWizKind; act=rsNextFromType; }
   else if(rsWizPage==="dr"){
-    const n=document.querySelectorAll(".drRef").length;
+    const n=document.querySelectorAll(".drRef").length, nNfs=document.querySelectorAll(".drNfs").length;
     const filled=[...document.querySelectorAll(".drRef")].filter(t=>t.value.trim()).length;
     // Réutilisation des volumes d'origine : aucun UUID requis (le serveur les déduit
     // de la sauvegarde). Sinon, tous les volumes doivent avoir une référence. Une
@@ -2932,7 +2959,7 @@ function rsWizSync(){
     const needRefs = !drRecoverReuse();
     const b=drSel(), noVol = !n && !!(b && b.stateless);
     lbl=dry()? "Restaurer (simulation)" : "Restaurer";
-    dis=!drAllowed || (!n && !noVol) || (needRefs && filled<n) || drBusy || !$("#drTargetNs").value.trim();
+    dis=!drAllowed || (!n && !nNfs && !noVol) || (needRefs && filled<n) || drBusy || !$("#drTargetNs").value.trim();
     act=drRun;
   }
   else if(rsWizPage==="objects"){
@@ -3051,8 +3078,11 @@ function drRenderVols(){
   const refs=(b&&b.vol_refs)||{};
   // En récupération, chaque champ est PRÉ-REMPLI avec l'UUID d'origine (issu de la
   // sauvegarde) : l'humain n'a rien à taper. En DR, les champs restent vides (nouveaux VG).
-  $("#drVols").innerHTML = b && b.volumes.length? b.volumes.map(v=>
-    `<div class="drVol"><div class="drVolNm">${esc(v)}</div>
+  const nfsOf=(b&&b.vol_nfs)||{};
+  $("#drVols").innerHTML = b && b.volumes.length? b.volumes.map(v=> nfsOf[v]
+    ? `<div class="drVol drNfs" data-pvc="${esc(v)}"><div class="drVolNm">${esc(v)} <span class="badge b-na">NAS</span></div>
+       <div class="hint" style="margin:0">${esc("Même export NFS ("+nfsOf[v]+") : rien à saisir, les données restent sur le NAS.")}</div></div>`
+    : `<div class="drVol"><div class="drVolNm">${esc(v)}</div>
      <input type="text" class="drRef" data-pvc="${esc(v)}" spellcheck="false" autocomplete="off"
        value="${drMode==="recover"&&refs[v]?esc(refs[v]):""}"
        placeholder="${esc(drMode==="recover"?"UUID du Volume Group (8-4-4-4-12)":"UUID du VG restauré/cloné sur le site cible (8-4-4-4-12)")}"></div>`).join("")
@@ -3107,7 +3137,8 @@ async function drRun(){
   // Réutilisation des volumes d'origine : on n'envoie PAS d'UUID, le serveur le déduit
   // de la sauvegarde (source de vérité). Sinon on transmet ce que l'humain a saisi.
   const reuse=drRecoverReuse();
-  const items=[...document.querySelectorAll(".drRef")].map(t=>({pvc:t.dataset.pvc, new_ref:reuse?"":t.value.trim()}));
+  const items=[...document.querySelectorAll(".drRef")].map(t=>({pvc:t.dataset.pvc, new_ref:reuse?"":t.value.trim()}))
+    .concat([...document.querySelectorAll(".drNfs")].map(d=>({pvc:d.dataset.pvc, new_ref:""})));   // NAS : même export
   const live=!dry();
   let confirmedCtx="";
   if(live){

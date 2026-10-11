@@ -15,6 +15,8 @@ library only), also shipped as a container image.
 - **Backs itself up**: configuration, policies and vault exported daily to the bucket,
   restorable on a new instance (⚙ Sources → S3 object storage).
 - **Protects** volumes in HYCU: PVC ↔ Volume Group matching, HYCU policy.
+  **NAS (NFS)** volumes — Nutanix Files or generic NAS — are matched to their **HYCU share**
+  (policy + immediate backup) and recreated as-is on recovery; their data is restored in HYCU.
 - **Restores**: to **new volumes** (HYCU clone), **in place** (HYCU in-place restore), a
   **deleted application**, **in bulk**, or onto **another cluster** (DR). The tool runs
   stop the application → recreate PV/PVC → restart → verify, with a preflight, volume

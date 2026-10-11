@@ -15,6 +15,9 @@ Python (bibliothèque standard uniquement), livré aussi en image conteneur.
 - **Se sauvegarde lui-même** : configuration, politiques et coffre exportés chaque jour dans le
   bucket, restaurables sur une nouvelle instance (⚙ Sources → Stockage objet S3).
 - **Protège** les volumes dans HYCU : correspondance PVC ↔ Volume Group, politique HYCU.
+  Les volumes **NAS (NFS)** — Nutanix Files ou NAS générique — sont associés à leur
+  **partage HYCU** (politique + sauvegarde immédiate) et recréés à l'identique lors d'une
+  récupération ; leurs données se restaurent dans HYCU.
 - **Restaure** : vers de **nouveaux volumes** (clone HYCU), **sur place** (restore HYCU
   in-place), une **application supprimée**, **en masse**, ou sur un **autre cluster** (DR).
   L'outil enchaîne arrêt de l'application → recréation des PV/PVC → redémarrage →

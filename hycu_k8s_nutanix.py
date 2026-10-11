@@ -615,7 +615,7 @@ def save_config(updates, source="internal"):
 
 # Version horodatée de la build (format AAAAMMJJ-HHMM). À incrémenter à chaque
 # changement notable du programme ; affichée dans l'en-tête de l'interface.
-VERSION = "20261010-2200"
+VERSION = "20261011-1500"
 
 # Jeton anti-CSRF généré au démarrage, injecté dans la page et exigé sur les POST.
 CSRF_TOKEN = secrets.token_urlsafe(32)
@@ -1861,6 +1861,32 @@ def analyse_pv(pv_dict):
     }
 
 
+def _pv_nfs_info(pv):
+    """Volume NAS (NFS) : {"server", "path"} si le PV monte un export NFS — plugin NFS
+    natif (spec.nfs) ou driver CSI NFS (attributs server/share, nfsServer/nfsPath…).
+    None pour un volume bloc (Volume Group Nutanix) ou un type inconnu."""
+    spec = (pv or {}).get("spec") or {}
+    nfs = spec.get("nfs")
+    if isinstance(nfs, dict) and nfs.get("server") and nfs.get("path"):
+        return {"server": str(nfs["server"]).strip(), "path": str(nfs["path"]).strip()}
+    csi = spec.get("csi")
+    if isinstance(csi, dict):
+        va = csi.get("volumeAttributes") or {}
+        drv = str(csi.get("driver") or "").lower()
+        server = va.get("server") or va.get("nfsServer") or va.get("nfsServerName")
+        path = va.get("share") or va.get("nfsPath") or va.get("exportPath") or va.get("path")
+        if server and path and ("nfs" in drv or "nfs" in " ".join(str(k).lower() for k in va)
+                                or va.get("share")):
+            sub = (va.get("subdir") or "").strip("/")
+            p = str(path).rstrip("/") + ("/" + sub if sub else "")
+            return {"server": str(server).strip(), "path": p or "/"}
+    return None
+
+
+def _nfs_label(info):
+    return "%s:%s" % (info.get("server"), info.get("path")) if info else ""
+
+
 def _replace_in_leaves(node, pairs, exact_pairs=None):
     """Édition structurelle : on n'opère que sur des feuilles chaîne du manifeste.
     - 'pairs'       : remplacement de sous-chaîne (old -> new) — pour IQN/handle ;
@@ -2164,7 +2190,7 @@ def list_backups(ns, root=None):
 # S3). Un catalogue supprimé ou corrompu est simplement reconstruit au prochain accès.
 # ------------------------------------------------------------------------------
 CATALOG_FILE = "_catalog.json"
-CATALOG_VERSION = 1
+CATALOG_VERSION = 2          # 2 : volumes NAS (vol_nfs)
 _CATALOG_LOCK = threading.RLock()
 _CATALOGS = {}            # base (chemin absolu) -> {"ns": {ns: {"key", "versions", "pending"}}, "dirty"}
 
@@ -2172,12 +2198,15 @@ _CATALOGS = {}            # base (chemin absolu) -> {"ns": {ns: {"key", "version
 def _catalog_summary(path, idx):
     """Résumé d'UNE version (index.json déjà lu) : uniquement les champs consommés par
     l'inventaire, la page Applications, la DR et le quota — jamais les manifestes."""
-    vols, vol_refs, vol_hycu, vol_names = [], {}, {}, {}
+    vols, vol_refs, vol_hycu, vol_names, vol_nfs = [], {}, {}, {}, {}
     for v in (idx.get("volumes") or []):
         pvc = v.get("pvc")
         if not pvc:
             continue
         vols.append(pvc)
+        if v.get("nfs"):
+            vol_nfs[pvc] = _nfs_label(v["nfs"])
+            continue                     # pas de Volume Group derrière un export NFS
         m = UUID_RE.search(((v.get("analysis") or {}).get("old_volume_handle")) or "")
         if m:
             vol_refs[pvc] = m.group(0)
@@ -2193,6 +2222,7 @@ def _catalog_summary(path, idx):
             "namespace": idx.get("namespace") or "", "context": idx.get("context") or "",
             "cluster": idx.get("cluster") or "", "cluster_id": idx.get("cluster_id") or "",
             "volumes": vols, "vol_refs": vol_refs, "vol_hycu": vol_hycu, "vol_names": vol_names,
+            "vol_nfs": vol_nfs,
             "resources_count": idx.get("resources_count"),
             "has_resources": os.path.isfile(os.path.join(path, "resources.json")),
             "partial": bool(idx.get("partial")), "apps": idx.get("apps") or [],
@@ -2608,6 +2638,9 @@ def action_backup(ns, dest=None, protect=None, pv_cache=None, defer_quota=False,
                 files.append(os.path.basename(pv_path))
                 entry["pv_file"] = os.path.basename(pv_path)
                 entry["analysis"] = analyse_pv(clean_v)
+                nfs_info = _pv_nfs_info(clean_v)
+                if nfs_info:
+                    entry["nfs"] = nfs_info
                 entry["storage_class"] = (clean_v.get("spec") or {}).get("storageClassName")
                 entry["capacity"] = ((clean_v.get("spec") or {}).get("capacity") or {}).get("storage")
             else:
@@ -2977,10 +3010,12 @@ def _policy_due(p, now):
     return (not last) or (now - last) >= _policy_interval_s(p)
 
 
-def _hycu_assign_policy(policy_uuid, vg_uuids):
+def _hycu_assign_policy(policy_uuid, vg_uuids, share_uuids=None):
     path = "/policies/%s/assign" % urllib.parse.quote(policy_uuid)
-    return _rest("hycu", "POST", path, body={"volumeGroupUuidList": sorted(set(vg_uuids)),
-                                              "includeDependencies": False})
+    body = {"volumeGroupUuidList": sorted(set(vg_uuids)), "includeDependencies": False}
+    if share_uuids:
+        body["shareUuidList"] = sorted(set(share_uuids))
+    return _rest("hycu", "POST", path, body=body)
 
 
 def _policy_hycu_assign(p, namespaces):
@@ -2995,27 +3030,28 @@ def _policy_hycu_assign(p, namespaces):
     items, herr = _hycu_list_vgs()
     if herr is not None:
         return False, "politique HYCU non appliquée (%s)" % herr
-    todo, other = [], 0
+    todo, todo_shares, other = [], [], 0
     for ns in namespaces:
         m = action_hycu_match(ns, vg_items=items)
         if not m.get("ok"):
             continue
         for x in m.get("matches") or []:
-            if not (x.get("matched") and x.get("trusted") and x.get("hycu_vg_uuid")):
+            ident = x.get("hycu_vg_uuid") or x.get("hycu_share_uuid")
+            if not (x.get("matched") and x.get("trusted") and ident):
                 continue
             cur = (x.get("policy") or "").strip()
             if not cur:
-                todo.append(x["hycu_vg_uuid"])
+                (todo_shares if x.get("hycu_share_uuid") else todo).append(ident)
             elif cur != p.get("hycu_policy_name"):
                 other += 1
     msgs, ok = [], True
-    if todo:
-        r = _hycu_assign_policy(pol_uuid, todo)
+    if todo or todo_shares:
+        r = _hycu_assign_policy(pol_uuid, todo, todo_shares)
         ok = bool(r.get("ok"))
         audit("hycu_protect", ok=ok, auto=True, policy=pol_uuid, policy_name=p["name"],
-              namespaces=namespaces, vgs=sorted(set(todo)))
+              namespaces=namespaces, vgs=sorted(set(todo)), shares=sorted(set(todo_shares)))
         msgs.append(("%d volume(s) rattaché(s) à la politique HYCU « %s »"
-                     % (len(set(todo)), p.get("hycu_policy_name") or pol_uuid)) if ok
+                     % (len(set(todo)) + len(set(todo_shares)), p.get("hycu_policy_name") or pol_uuid)) if ok
                     else "assignation HYCU refusée : %s" % r.get("error"))
     if other:
         msgs.append("%d volume(s) déjà dans une autre politique HYCU (non modifiés)" % other)
@@ -4786,6 +4822,15 @@ def _prepare_one(ns, item, mode, backup_path, backup_root=None):
 
     if not pvc_name:
         return {"ok": False, "pvc": pvc_name, "error": "PVC manquant."}
+    try:
+        _nfs_pv, _ = _load_old_pv(ns, pvc_name, backup_path, backup_root)
+    except RuntimeError:
+        _nfs_pv = None
+    if _pv_nfs_info(_nfs_pv):
+        return {"ok": False, "pvc": pvc_name, "nfs": True,
+                "error": "« %s » est un volume NAS (%s) : ses données se restaurent dans HYCU (partage NAS), "
+                         "pas par ce parcours réservé aux Volume Groups. Décochez-le."
+                         % (pvc_name, _nfs_label(_pv_nfs_info(_nfs_pv)))}
     if not new_ref:
         return {"ok": False, "pvc": pvc_name,
                 "error": "Indiquez la référence du Volume Group cloné/restauré pour « %s » "
@@ -7765,15 +7810,81 @@ def _namespace_nutanix_vgs(ns):
     for pvc in pvc_data.get("items", []):
         name = pvc["metadata"]["name"]
         pv_name = pvc.get("spec", {}).get("volumeName")
-        nutanix_uuid = None
+        nutanix_uuid, nfs = None, None
         if pv_name:
             pv_data, _ = kubectl_json(["get", "pv", pv_name])
             if pv_data:
+                nfs = _pv_nfs_info(pv_data)
                 info = analyse_pv(pv_data)
-                if info["old_volume_handle"]:
+                if info["old_volume_handle"] and not nfs:
                     nutanix_uuid = split_volume_handle(info["old_volume_handle"])[1]
-        out.append({"pvc": name, "pv": pv_name, "nutanix_uuid": nutanix_uuid})
+        out.append({"pvc": name, "pv": pv_name, "nutanix_uuid": nutanix_uuid, "nfs": nfs})
     return out, None
+
+
+def _hycu_list_shares():
+    """Tous les partages connus de HYCU (Nutanix Files et NAS génériques), paginés.
+    Renvoie (items, erreur)."""
+    out, seen = [], set()
+    page, page_size = 1, 500
+    for _guard in range(80):
+        r = _rest("hycu", "GET", "/shares?pageSize=%d&pageNumber=%d" % (page_size, page))
+        if not r["ok"]:
+            return None, r.get("error")
+        data = r.get("json") or {}
+        items = [it for it in _hycu_items(data) if isinstance(it, dict)]
+        fresh = 0
+        for it in items:
+            uid = it.get("uuid") or it.get("externalId") or (it.get("fileServerName"), it.get("shareName"))
+            if uid in seen:
+                continue
+            seen.add(uid)
+            out.append(it)
+            fresh += 1
+        total = (data.get("metadata") or {}).get("totalEntityCount")
+        if not items or fresh == 0 or (total is not None and len(out) >= int(total)) \
+                or (total is None and len(items) < page_size):
+            break
+        page += 1
+    return out, None
+
+
+def _share_root(share):
+    """Chemin d'export d'un partage HYCU, normalisé : « serveur:/a/b » -> « /a/b »."""
+    p = str(share.get("sharePath") or "").strip()
+    if ":/" in p:
+        p = p.split(":", 1)[1]
+    p = "/" + p.strip("/") if p.strip("/") else ""
+    return p or ("/" + str(share.get("shareName") or "").strip("/"))
+
+
+def _match_share(nfs, shares):
+    """Partage HYCU d'un export NFS. Correspondance EXACTE = même chemin d'export (ou
+    sous-dossier) ET même serveur de fichiers ; chemin seul = suggestion à confirmer
+    (serveur nommé autrement, IP…). Plusieurs candidats égaux = ambigu.
+    Renvoie (partage ou None, 'exact'|'name'|'ambiguous'|'none', sous-chemin)."""
+    path = "/" + (nfs.get("path") or "").strip("/")
+    host = (nfs.get("server") or "").strip().lower().rstrip(".")
+    short = host.split(".")[0]
+    cands = []
+    for sh in shares or []:
+        root = _share_root(sh).lower()
+        if not root or not (path.lower() == root or path.lower().startswith(root + "/")):
+            continue
+        names = {str(sh.get(k) or "").strip().lower().rstrip(".")
+                 for k in ("fileServerName", "externalHypervisorName", "svm_name") if sh.get(k)}
+        srv = bool(names) and any(n == host or n == short or n.split(".")[0] == short for n in names)
+        cands.append((len(root), srv, sh, path[len(root):] or "/"))
+    if not cands:
+        return None, "none", ""
+    best = max(c[0] for c in cands)
+    top = [c for c in cands if c[0] == best]
+    exact = [c for c in top if c[1]]
+    if len(exact) == 1:
+        return exact[0][2], "exact", exact[0][3]
+    if len(exact) > 1 or len(top) > 1:
+        return None, "ambiguous", ""
+    return top[0][2], "name", top[0][3]
 
 
 def action_hycu_match(ns, vg_items=None):
@@ -7803,8 +7914,33 @@ def action_hycu_match(ns, vg_items=None):
         nm = (vg.get("name") or "").strip().lower()
         if nm:
             by_name.setdefault(nm, []).append(vg)
+    shares, sherr = None, None
+    if any(v.get("nfs") for v in vols):
+        shares, sherr = _hycu_list_shares()
     matches = []
     for v in vols:
+        if v.get("nfs"):
+            # Volume NAS : correspondance avec un PARTAGE HYCU (Nutanix Files ou NAS générique).
+            sh, kind = (None, "none")
+            sub = ""
+            if shares is not None:
+                sh, kind, sub = _match_share(v["nfs"], shares)
+            matches.append({
+                "pvc": v["pvc"], "pv": v.get("pv"), "nutanix_uuid": None,
+                "volume_kind": "nfs", "nfs": _nfs_label(v["nfs"]),
+                "hycu_vg_uuid": None, "hycu_vg_name": None, "hycu_external_id": None,
+                "hycu_share_uuid": sh.get("uuid") if sh else None,
+                "hycu_share_name": (sh.get("shareName") if sh else None),
+                "hycu_file_server": (sh.get("fileServerName") or sh.get("externalHypervisorName")) if sh else None,
+                "share_subpath": sub,
+                "match_kind": kind, "trusted": kind == "exact", "matched": sh is not None,
+                "protected": sh.get("status") if sh else None,
+                "compliancy": sh.get("compliancyStatus") if sh else None,
+                "policy": sh.get("protectionGroupName") if sh else None,
+                "has_backups": bool(sh and (sh.get("status") == "PROTECTED" or sh.get("compliancyStatus") == "GREEN")),
+                "error": sherr if (shares is None and sherr) else None,
+            })
+            continue
         nu = (v.get("nutanix_uuid") or "").lower()
         pv = (v.get("pv") or "").strip().lower()
         ext_c = by_ext.get(nu, []) if nu else []
@@ -7860,10 +7996,12 @@ def _reject_stale_vgs(ns, uuids, confirmed_by_name=None):
     # Seule une correspondance de CONFIANCE (UUID exact) autorise une opération HYCU :
     # un match « par nom » n'est qu'une suggestion (cf. action_hycu_match) et ne doit
     # jamais suffire à restaurer/protéger un volume.
-    allowed = {m["hycu_vg_uuid"] for m in match.get("matches", [])
-               if m.get("matched") and m.get("hycu_vg_uuid") and m.get("trusted")}
-    by_name = {m["hycu_vg_uuid"] for m in match.get("matches", [])
-               if m.get("matched") and m.get("hycu_vg_uuid") and not m.get("trusted")}
+    def ident(m):                          # Volume Group OU partage NAS
+        return m.get("hycu_vg_uuid") or m.get("hycu_share_uuid")
+    allowed = {ident(m) for m in match.get("matches", [])
+               if m.get("matched") and ident(m) and m.get("trusted")}
+    by_name = {ident(m) for m in match.get("matches", [])
+               if m.get("matched") and ident(m) and not m.get("trusted")}
     if confirmed_by_name:
         allowed |= (by_name & set(confirmed_by_name))
     bad = [u for u in uuids if u and u not in allowed]
@@ -7991,17 +8129,19 @@ def action_hycu_protect(payload):
     items = payload.get("items")
     if not isinstance(items, list) or not items:
         items = [{"namespace": payload.get("namespace"), "vg_uuids": payload.get("vg_uuids") or [],
+                  "share_uuids": payload.get("share_uuids") or [],
                   "confirm_name_uuids": payload.get("confirm_name_uuids") or []}]
     vg_uuids = sorted({u for it in items for u in (it.get("vg_uuids") or []) if u})
+    share_uuids = sorted({u for it in items for u in (it.get("share_uuids") or []) if u})
     namespaces = [it.get("namespace") for it in items if it.get("namespace")]
     ns = namespaces[0] if len(namespaces) == 1 else None      # audit / compatibilité
-    if not vg_uuids:
-        return {"ok": False, "error": "Aucun Volume Group HYCU à protéger "
+    if not vg_uuids and not share_uuids:
+        return {"ok": False, "error": "Aucun Volume Group ni partage HYCU à protéger "
                 "(correspondance introuvable — voir l'analyse)."}
 
     for it in items:
         it_ns = it.get("namespace")
-        it_vgs = sorted({u for u in (it.get("vg_uuids") or []) if u})
+        it_vgs = sorted({u for u in (it.get("vg_uuids") or []) + (it.get("share_uuids") or []) if u})
         if it_ns and it_vgs:
             stale = _reject_stale_vgs(it_ns, it_vgs, confirmed_by_name=it.get("confirm_name_uuids") or [])
             if stale:
@@ -8018,6 +8158,8 @@ def action_hycu_protect(payload):
         if policy_uuid:
             path = "/policies/%s/assign" % urllib.parse.quote(policy_uuid)
             body = {"volumeGroupUuidList": vg_uuids, "includeDependencies": False}
+            if share_uuids:
+                body["shareUuidList"] = share_uuids
             if dry:
                 steps.append({"label": "Assigner la politique", "ok": True, "dry": True,
                               "planned": {"method": "POST", "url": base + api + path, "body": body}})
@@ -8031,20 +8173,29 @@ def action_hycu_protect(payload):
                     return {"ok": False, "error": "Échec de l'assignation de politique : %s" % r.get("error"),
                             "steps": steps, "dry": False}
 
-        path = "/schedules/backupVolumeGroup"
-        body = {"uuidList": vg_uuids, "forceFull": force_full}
+        runs = []
+        if vg_uuids:
+            runs.append(("Lancer la sauvegarde maintenant", "/schedules/backupVolumeGroup", vg_uuids))
+        if share_uuids:
+            runs.append(("Lancer la sauvegarde des partages NAS", "/schedules/backupShare", share_uuids))
         if dry:
-            steps.append({"label": "Lancer la sauvegarde maintenant", "ok": True, "dry": True,
-                          "planned": {"method": "POST", "url": base + api + path, "body": body}})
+            for label, path, uuids in runs:
+                steps.append({"label": label, "ok": True, "dry": True,
+                              "planned": {"method": "POST", "url": base + api + path,
+                                          "body": {"uuidList": uuids, "forceFull": force_full}}})
             return {"ok": True, "dry": True, "steps": steps}
-        r = _rest("hycu", "POST", path, body=body)
-        job_id = _hycu_job_id(r.get("json") or {})
-        steps.append({"label": "Lancer la sauvegarde maintenant", "ok": r["ok"],
-                      "error": r.get("error"), "job_id": job_id, "raw": (r.get("raw") or "")[:300]})
-        audit("hycu_protect", ok=r["ok"], policy=policy_uuid or None, force_full=force_full,
-              namespace=ns, namespaces=namespaces, vgs=vg_uuids, job=job_id)
-        return {"ok": r["ok"], "dry": False, "steps": steps, "job_id": job_id,
-                "namespaces": namespaces, "count": len(vg_uuids)}
+        ok_all, job_id = True, None
+        for label, path, uuids in runs:
+            r = _rest("hycu", "POST", path, body={"uuidList": uuids, "forceFull": force_full})
+            jid = _hycu_job_id(r.get("json") or {})
+            job_id = job_id or jid
+            ok_all = ok_all and bool(r["ok"])
+            steps.append({"label": label, "ok": r["ok"], "error": r.get("error"), "job_id": jid,
+                          "raw": (r.get("raw") or "")[:300]})
+        audit("hycu_protect", ok=ok_all, policy=policy_uuid or None, force_full=force_full,
+              namespace=ns, namespaces=namespaces, vgs=vg_uuids, shares=share_uuids, job=job_id)
+        return {"ok": ok_all, "dry": False, "steps": steps, "job_id": job_id,
+                "namespaces": namespaces, "count": len(vg_uuids) + len(share_uuids)}
     finally:
         if acquired:
             ACTION_LOCK.release()
@@ -8506,6 +8657,7 @@ def action_dr_backups():
                             "vol_refs": dict(v.get("vol_refs") or {}),
                             "vol_hycu": dict(v.get("vol_hycu") or {}),
                             "vol_names": dict(v.get("vol_names") or {}),
+                            "vol_nfs": dict(v.get("vol_nfs") or {}),
                             "resources_count": v.get("resources_count"),
                             "has_resources": bool(v.get("has_resources")),
                             # Sauvegarde STATELESS : aucun volume, mais des workloads à recréer.
@@ -8898,6 +9050,40 @@ def action_clone_app(payload, log=None):
             return {"ok": False, "error": "Manifeste du PV introuvable pour « %s »%s." % (
                 pvc_name, " dans la sauvegarde (aucune lecture du cluster en mode « depuis la sauvegarde seule »)"
                 if from_backup else ""), "log": []}
+        nfs = _pv_nfs_info(old_pv)
+        if nfs:
+            # Volume NAS : les données sont sur le NAS, pas dans un Volume Group. En
+            # récupération ou en DR, le PV est recréé à l'IDENTIQUE vers le même export.
+            # Une COPIE d'une application vivante partagerait au contraire les données de
+            # production (même export, en écriture) : refusée.
+            if not (recover or dr):
+                return {"ok": False, "log": [], "error":
+                        "« %s » est un volume NAS (%s) : une copie partagerait les données de "
+                        "l'application d'origine (même export NFS, en écriture). Copie non prise en "
+                        "charge pour les volumes NAS — utilisez la restauration des données dans HYCU."
+                        % (pvc_name, _nfs_label(nfs))}
+            src_pvc = _load_backup_pvc(backup_path, pvc_name, backup_root)
+            if src_pvc is None:
+                return {"ok": False, "error": "Manifeste du PVC introuvable pour « %s »." % pvc_name, "log": []}
+            orig_pv_name = (old_pv.get("metadata") or {}).get("name") or ""
+            clone_pv_name = (it.get("new_name") or "").strip() or ((orig_pv_name or pvc_name) + (suffix or "-r"))
+            if clone_pv_name == orig_pv_name:
+                clone_pv_name = orig_pv_name + "-r"
+            pv = clean_pv(json.loads(json.dumps(old_pv)))
+            pv.setdefault("metadata", {})["name"] = clone_pv_name
+            pv["metadata"].setdefault("labels", {})[CLONE_LABEL] = CLONE_LABEL_VAL
+            new_pvc_name, pvc_manifest = _clone_pvc_manifest(src_pvc, target_ns, same_ns, suffix, clone_pv_name)
+            cr = (pv.get("spec") or {}).get("claimRef")
+            if isinstance(cr, dict):
+                cr["name"] = new_pvc_name
+                cr["namespace"] = target_ns
+            pvc_rename[pvc_name] = new_pvc_name
+            warnings.append("« %s » : volume NAS recréé vers le même export (%s) — les données restent "
+                            "celles du NAS." % (pvc_name, _nfs_label(nfs)))
+            prepared.append({"pvc": pvc_name, "pv": pv, "pvc_manifest": pvc_manifest,
+                             "new_pv_name": clone_pv_name, "new_pvc_name": new_pvc_name,
+                             "orig_pv_name": orig_pv_name, "src_disk_attr": False, "nfs": True})
+            continue
         # Récupération : si l'humain n'a rien saisi, on réutilise le VG d'ORIGINE dont
         # l'UUID (Source UUID Nutanix) est dans la sauvegarde. MAIS si ce VG n'existe plus
         # sur le cluster (reclaimPolicy=Delete) et qu'il est « Protected deleted » dans
@@ -9188,7 +9374,7 @@ def action_clone_app(payload, log=None):
                 if h:
                     handles.setdefault(h, []).append((pv.get("metadata") or {}).get("name"))
             for p in prepared:
-                if p["pvc"] in deferred_clone:
+                if p["pvc"] in deferred_clone or p.get("nfs"):   # NAS : plusieurs PV peuvent viser un export
                     continue
                 h = ((p["pv"].get("spec") or {}).get("csi") or {}).get("volumeHandle")
                 others = [n for n in handles.get(h, []) if n != p["new_pv_name"]]
@@ -9223,6 +9409,8 @@ def action_clone_app(payload, log=None):
         # Pré-résoudre le disque de CHAQUE VG cloné (renseigne hypervisorAttachedDiskUUIDs)
         # AVANT toute création : si introuvable en réel, on abandonne sans rien créer.
         for p in prepared:
+            if p.get("nfs"):                                  # volume NAS : ni disque ni cible iSCSI
+                continue
             handle = ((p["pv"].get("spec") or {}).get("csi") or {}).get("volumeHandle")
             _fix_clone_iqn(p["pv"], handle, dry, log)        # cible iSCSI réelle (VG HYCU : « hycu-clone-vg-… »)
             if not _set_clone_disk_uuids(p["pv"], handle, dry, log, source_had=p.get("src_disk_attr", True)) \
@@ -11594,7 +11782,24 @@ $("#bkMatch").onclick=async()=>{
   bkMatches=results.flatMap(x=>x.matches); bkMatchNs=list.length===1 ? results[0].ns : null;
   const rowOf=m=>{
     let chk="", label="";
-    if(m.match_kind==="exact"){
+    if(m.volume_kind==="nfs"){
+      // Volume NAS : partage HYCU (Nutanix Files ou NAS générique) au lieu d'un Volume Group.
+      const shareLbl=`→ partage NAS <b>${esc(m.hycu_share_name||"")}</b> <span class="hint">(${esc(m.hycu_file_server||m.nfs||"")})</span>`;
+      if(m.match_kind==="exact"){
+        chk=`<input type="checkbox" class="bkMchk" data-type="share" data-ns="${esc(m.ns)}" data-uuid="${esc(m.hycu_share_uuid)}" data-name="${esc(m.hycu_share_name||'')}" checked style="width:auto;margin-right:8px">`;
+        label=shareLbl;
+      } else if(m.match_kind==="name"){
+        chk=`<input type="checkbox" class="bkMchk" data-type="share" data-kind="name" data-ns="${esc(m.ns)}" data-uuid="${esc(m.hycu_share_uuid)}" data-name="${esc(m.hycu_share_name||'')}" style="width:auto;margin-right:8px">`;
+        label=shareLbl+' <span class="sim">même chemin, serveur à confirmer</span>';
+      } else if(m.match_kind==="ambiguous"){
+        chk=`<span class="ic ko" style="width:18px;display:inline-block;text-align:center;margin-right:8px">⚠</span>`;
+        label=`<span class="ko">ambigu : plusieurs partages HYCU correspondent à ${esc(m.nfs||"")} — vérifiez dans HYCU</span>`;
+      } else {
+        chk=`<span class="ic ko" style="width:18px;display:inline-block;text-align:center;margin-right:8px">✕</span>`;
+        label=`<span class="ko">${m.error ? esc("partages HYCU illisibles : "+m.error) : "aucun partage HYCU pour "+esc(m.nfs||"")+" — ajoutez ce NAS dans HYCU"}</span>`;
+      }
+    }
+    else if(m.match_kind==="exact"){
       chk=`<input type="checkbox" class="bkMchk" data-ns="${esc(m.ns)}" data-uuid="${esc(m.hycu_vg_uuid)}" data-name="${esc(m.hycu_vg_name||'')}" data-ext="${esc(m.hycu_external_id||'')}" checked style="width:auto;margin-right:8px">`;
       label=`→ VG <b>${esc(m.hycu_vg_name||m.hycu_vg_uuid)}</b> <span class="hint">(externalId ${esc(m.hycu_external_id||'')})</span>`;
     } else if(m.match_kind==="name"){
@@ -11641,7 +11846,7 @@ $("#dry").addEventListener("change",()=>{ if($("#bkProtectForm").style.display!=
 $("#bkProtect").onclick=async()=>{
   const sel=[...document.querySelectorAll(".bkMchk:checked")];
   const vg_uuids=sel.map(c=>c.dataset.uuid);
-  if(!vg_uuids.length){ $("#bkProtectLog").innerHTML='<div class="err">Cochez au moins un Volume Group (les correspondances « par nom » doivent être confirmées).</div>'; return; }
+  if(!vg_uuids.length){ $("#bkProtectLog").innerHTML='<div class="err">Cochez au moins un volume (les correspondances « par nom » doivent être confirmées).</div>'; return; }
   const live=!dry(), pol=$("#bkPolicy").value;
   const names=sel.map(c=>"• "+(c.dataset.name||c.dataset.uuid)+(c.dataset.ext?(" ("+c.dataset.ext+")"):""));
   if(live && !(await confirmDanger({title:"Confirmer la protection HYCU", lines:[
@@ -11652,9 +11857,14 @@ $("#bkProtect").onclick=async()=>{
   // Regroupement par namespace : la garde anti-stale du serveur est faite namespace par
   // namespace, puis UN SEUL appel HYCU (assignation) + UN SEUL lancement de sauvegarde.
   const byNs={};
-  sel.forEach(c=>{ const k=c.dataset.ns||bkMatchNs||""; (byNs[k]=byNs[k]||{namespace:k, vg_uuids:[], confirm_name_uuids:[]}).vg_uuids.push(c.dataset.uuid);
-    if(c.dataset.kind==="name") byNs[k].confirm_name_uuids.push(c.dataset.uuid); });
-  const r=await post("/api/hycu/protect",{items:Object.values(byNs), namespace:bkMatchNs, vg_uuids, policy_uuid:pol, force_full:$("#bkForceFull").checked, dry:dry(), confirm_name_uuids:byName});
+  sel.forEach(c=>{ const k=c.dataset.ns||bkMatchNs||"";
+    const it=(byNs[k]=byNs[k]||{namespace:k, vg_uuids:[], share_uuids:[], confirm_name_uuids:[]});
+    (c.dataset.type==="share" ? it.share_uuids : it.vg_uuids).push(c.dataset.uuid);
+    if(c.dataset.kind==="name") it.confirm_name_uuids.push(c.dataset.uuid); });
+  const r=await post("/api/hycu/protect",{items:Object.values(byNs), namespace:bkMatchNs,
+    vg_uuids:sel.filter(c=>c.dataset.type!=="share").map(c=>c.dataset.uuid),
+    share_uuids:sel.filter(c=>c.dataset.type==="share").map(c=>c.dataset.uuid),
+    policy_uuid:pol, force_full:$("#bkForceFull").checked, dry:dry(), confirm_name_uuids:byName});
   b.disabled=false; b.textContent="Assigner + sauvegarder maintenant";
   if(!r.ok && !(r.steps&&r.steps.length)){ $("#bkProtectLog").innerHTML=errBox(r.error); return; }
   const lines=(r.steps||[]).map(s=> s.dry
@@ -11704,7 +11914,7 @@ async function applyBackupSelection(){
   if(rsBackups.length && i!=="" && rsBackups[i*1]){
     const b=rsBackups[i*1];
     state.backup_path=b.path;
-    pvcs=((b.index||{}).volumes||[]).map(v=>({name:v.pvc,pv:v.pv,phase:"sauvegardé"}));
+    pvcs=((b.index||{}).volumes||[]).map(v=>({name:v.pvc,pv:v.pv,phase:"sauvegardé",nfs:v.nfs?(v.nfs.server+":"+v.nfs.path):""}));
     src=customRoot?"sauvegarde (dossier perso)":(i==="0"?"dernière sauvegarde":"sauvegarde choisie");
     const _dl=$("#rsBackupDl"); if(_dl){ _dl.href="/api/backup/download?path="+encodeURIComponent(b.path)+(customRoot?("&root="+encodeURIComponent(customRoot)):"")+"&cluster="+encodeURIComponent(ACTIVE_CID); _dl.style.display="inline"; }
   }else{
@@ -11717,9 +11927,9 @@ async function applyBackupSelection(){
 }
 function renderRsPvcs(pvcs, src){
   $("#rsPvcs").innerHTML = pvcs.length? pvcs.map(p=>`
-     <li><input type="checkbox" style="width:auto" class="rsChk" data-pvc="${esc(p.name)}" data-pv="${esc(p.pv||'')}">
-       <div style="flex:1"><div class="nm">${esc(p.name)}</div>
-       <div class="meta">PV ${esc(p.pv||'—')} · source : ${src}</div></div>${badge(p.phase)}</li>`).join("")
+     <li><input type="checkbox" style="width:auto" class="rsChk" data-pvc="${esc(p.name)}" data-pv="${esc(p.pv||'')}"${p.nfs?' data-nfs="1"':''}>
+       <div style="flex:1"><div class="nm">${esc(p.name)}${p.nfs?' <span class="badge b-na">NAS</span>':''}</div>
+       <div class="meta">${p.nfs ? esc("NFS "+p.nfs)+" · données restaurées dans HYCU (partage NAS)" : "PV "+esc(p.pv||'—')} · source : ${src}</div></div>${badge(p.phase)}</li>`).join("")
      : `<div class="hint">Aucun volume. Sauvegardez d'abord la configuration de cette application (Applications → Sauvegarder).</div>`;
   document.querySelectorAll(".rsChk").forEach(c=>c.onchange=rebuildVolCfgs);
   $("#rsConfig").style.display="none"; $("#rsPlan").style.display="none"; setRsStep(1);
@@ -11729,7 +11939,7 @@ function renderRsPvcs(pvcs, src){
   // ne sont pas touchées par défaut.
   if(rsAutoCheck && pvcs.length){
     const only = state.app && state.app.pvcs && state.app.pvcs.length ? new Set(state.app.pvcs) : null;
-    document.querySelectorAll(".rsChk").forEach(c=>c.checked = !only || only.has(c.dataset.pvc));
+    document.querySelectorAll(".rsChk").forEach(c=>c.checked = !c.dataset.nfs && (!only || only.has(c.dataset.pvc)));
     if(only && ![...document.querySelectorAll(".rsChk")].some(c=>c.checked)) document.querySelectorAll(".rsChk").forEach(c=>c.checked=true);
     rebuildVolCfgs();
   }
@@ -11852,6 +12062,7 @@ async function buildHyPanel(){
   }
   const rows=await Promise.all(chks.map(async pvc=>{
     const m=(rsHyMatch.matches||[]).find(x=>x.pvc===pvc);
+    if(m && m.volume_kind==="nfs") return {pvc, matched:false, nfs:m.nfs||"NFS"};
     if(!m || !m.matched) return {pvc, matched:false};
     const rp=await get("/api/hycu/restorepoints?source="+encodeURIComponent(m.hycu_vg_uuid));
     return {pvc, matched:true, vg:m.hycu_vg_uuid, vgName:m.hycu_vg_name||"", kind:m.match_kind,
@@ -11863,6 +12074,10 @@ async function buildHyPanel(){
     const slot=document.querySelector(`#rsVolCfgs .hySlot[data-pvc="${CSS.escape(r.pvc)}"]`);
     if(!slot) return;
     const card=slot.closest(".vol-cfg");
+    if(r.nfs){
+      slot.innerHTML='<div class="warnbox" style="margin-top:6px">'+esc("Volume NAS ("+r.nfs+") : ses données se restaurent dans HYCU (partage NAS). Décochez-le pour ce parcours.")+'</div>';
+      return;
+    }
     if(!r.matched){
       slot.innerHTML='<div class="warnbox" style="margin-top:6px">Aucun Volume Group HYCU associé — collez la référence dans « Avancé ».</div>';
       const d=card&&card.querySelector("details.rsAdv"); if(d) d.open=true;
@@ -13909,7 +14124,7 @@ function rsWizSync(){
   if(rsDone){ lbl="Vérifier l'application →"; act=()=>gotoVerify(rsDoneTarget, true); }
   else if(rsWizPage==="type"){ dis=!rsWizKind; act=rsNextFromType; }
   else if(rsWizPage==="dr"){
-    const n=document.querySelectorAll(".drRef").length;
+    const n=document.querySelectorAll(".drRef").length, nNfs=document.querySelectorAll(".drNfs").length;
     const filled=[...document.querySelectorAll(".drRef")].filter(t=>t.value.trim()).length;
     // Réutilisation des volumes d'origine : aucun UUID requis (le serveur les déduit
     // de la sauvegarde). Sinon, tous les volumes doivent avoir une référence. Une
@@ -13917,7 +14132,7 @@ function rsWizSync(){
     const needRefs = !drRecoverReuse();
     const b=drSel(), noVol = !n && !!(b && b.stateless);
     lbl=dry()? "Restaurer (simulation)" : "Restaurer";
-    dis=!drAllowed || (!n && !noVol) || (needRefs && filled<n) || drBusy || !$("#drTargetNs").value.trim();
+    dis=!drAllowed || (!n && !nNfs && !noVol) || (needRefs && filled<n) || drBusy || !$("#drTargetNs").value.trim();
     act=drRun;
   }
   else if(rsWizPage==="objects"){
@@ -14036,8 +14251,11 @@ function drRenderVols(){
   const refs=(b&&b.vol_refs)||{};
   // En récupération, chaque champ est PRÉ-REMPLI avec l'UUID d'origine (issu de la
   // sauvegarde) : l'humain n'a rien à taper. En DR, les champs restent vides (nouveaux VG).
-  $("#drVols").innerHTML = b && b.volumes.length? b.volumes.map(v=>
-    `<div class="drVol"><div class="drVolNm">${esc(v)}</div>
+  const nfsOf=(b&&b.vol_nfs)||{};
+  $("#drVols").innerHTML = b && b.volumes.length? b.volumes.map(v=> nfsOf[v]
+    ? `<div class="drVol drNfs" data-pvc="${esc(v)}"><div class="drVolNm">${esc(v)} <span class="badge b-na">NAS</span></div>
+       <div class="hint" style="margin:0">${esc("Même export NFS ("+nfsOf[v]+") : rien à saisir, les données restent sur le NAS.")}</div></div>`
+    : `<div class="drVol"><div class="drVolNm">${esc(v)}</div>
      <input type="text" class="drRef" data-pvc="${esc(v)}" spellcheck="false" autocomplete="off"
        value="${drMode==="recover"&&refs[v]?esc(refs[v]):""}"
        placeholder="${esc(drMode==="recover"?"UUID du Volume Group (8-4-4-4-12)":"UUID du VG restauré/cloné sur le site cible (8-4-4-4-12)")}"></div>`).join("")
@@ -14092,7 +14310,8 @@ async function drRun(){
   // Réutilisation des volumes d'origine : on n'envoie PAS d'UUID, le serveur le déduit
   // de la sauvegarde (source de vérité). Sinon on transmet ce que l'humain a saisi.
   const reuse=drRecoverReuse();
-  const items=[...document.querySelectorAll(".drRef")].map(t=>({pvc:t.dataset.pvc, new_ref:reuse?"":t.value.trim()}));
+  const items=[...document.querySelectorAll(".drRef")].map(t=>({pvc:t.dataset.pvc, new_ref:reuse?"":t.value.trim()}))
+    .concat([...document.querySelectorAll(".drNfs")].map(d=>({pvc:d.dataset.pvc, new_ref:""})));   // NAS : même export
   const live=!dry();
   let confirmedCtx="";
   if(live){
@@ -16100,7 +16319,24 @@ $("#bkMatch").onclick=async()=>{
   bkMatches=results.flatMap(x=>x.matches); bkMatchNs=list.length===1 ? results[0].ns : null;
   const rowOf=m=>{
     let chk="", label="";
-    if(m.match_kind==="exact"){
+    if(m.volume_kind==="nfs"){
+      // Volume NAS : partage HYCU (Nutanix Files ou NAS générique) au lieu d'un Volume Group.
+      const shareLbl=`→ NAS share <b>${esc(m.hycu_share_name||"")}</b> <span class="hint">(${esc(m.hycu_file_server||m.nfs||"")})</span>`;
+      if(m.match_kind==="exact"){
+        chk=`<input type="checkbox" class="bkMchk" data-type="share" data-ns="${esc(m.ns)}" data-uuid="${esc(m.hycu_share_uuid)}" data-name="${esc(m.hycu_share_name||'')}" checked style="width:auto;margin-right:8px">`;
+        label=shareLbl;
+      } else if(m.match_kind==="name"){
+        chk=`<input type="checkbox" class="bkMchk" data-type="share" data-kind="name" data-ns="${esc(m.ns)}" data-uuid="${esc(m.hycu_share_uuid)}" data-name="${esc(m.hycu_share_name||'')}" style="width:auto;margin-right:8px">`;
+        label=shareLbl+' <span class="sim">same path, server to confirm</span>';
+      } else if(m.match_kind==="ambiguous"){
+        chk=`<span class="ic ko" style="width:18px;display:inline-block;text-align:center;margin-right:8px">⚠</span>`;
+        label=`<span class="ko">ambiguous: several HYCU shares match ${esc(m.nfs||"")} — check in HYCU</span>`;
+      } else {
+        chk=`<span class="ic ko" style="width:18px;display:inline-block;text-align:center;margin-right:8px">✕</span>`;
+        label=`<span class="ko">${m.error ? esc("HYCU shares unreadable: "+m.error) : "no HYCU share for "+esc(m.nfs||"")+" — add this NAS in HYCU"}</span>`;
+      }
+    }
+    else if(m.match_kind==="exact"){
       chk=`<input type="checkbox" class="bkMchk" data-ns="${esc(m.ns)}" data-uuid="${esc(m.hycu_vg_uuid)}" data-name="${esc(m.hycu_vg_name||'')}" data-ext="${esc(m.hycu_external_id||'')}" checked style="width:auto;margin-right:8px">`;
       label=`→ VG <b>${esc(m.hycu_vg_name||m.hycu_vg_uuid)}</b> <span class="hint">(externalId ${esc(m.hycu_external_id||'')})</span>`;
     } else if(m.match_kind==="name"){
@@ -16147,7 +16383,7 @@ $("#dry").addEventListener("change",()=>{ if($("#bkProtectForm").style.display!=
 $("#bkProtect").onclick=async()=>{
   const sel=[...document.querySelectorAll(".bkMchk:checked")];
   const vg_uuids=sel.map(c=>c.dataset.uuid);
-  if(!vg_uuids.length){ $("#bkProtectLog").innerHTML='<div class="err">Check at least one Volume Group (“by name” matches must be confirmed).</div>'; return; }
+  if(!vg_uuids.length){ $("#bkProtectLog").innerHTML='<div class="err">Tick at least one volume (“by name” matches must be confirmed).</div>'; return; }
   const live=!dry(), pol=$("#bkPolicy").value;
   const names=sel.map(c=>"• "+(c.dataset.name||c.dataset.uuid)+(c.dataset.ext?(" ("+c.dataset.ext+")"):""));
   if(live && !(await confirmDanger({title:"Confirm the HYCU protection", lines:[
@@ -16158,9 +16394,14 @@ $("#bkProtect").onclick=async()=>{
   // Regroupement par namespace : la garde anti-stale du serveur est faite namespace par
   // namespace, puis UN SEUL appel HYCU (assignation) + UN SEUL lancement de sauvegarde.
   const byNs={};
-  sel.forEach(c=>{ const k=c.dataset.ns||bkMatchNs||""; (byNs[k]=byNs[k]||{namespace:k, vg_uuids:[], confirm_name_uuids:[]}).vg_uuids.push(c.dataset.uuid);
-    if(c.dataset.kind==="name") byNs[k].confirm_name_uuids.push(c.dataset.uuid); });
-  const r=await post("/api/hycu/protect",{items:Object.values(byNs), namespace:bkMatchNs, vg_uuids, policy_uuid:pol, force_full:$("#bkForceFull").checked, dry:dry(), confirm_name_uuids:byName});
+  sel.forEach(c=>{ const k=c.dataset.ns||bkMatchNs||"";
+    const it=(byNs[k]=byNs[k]||{namespace:k, vg_uuids:[], share_uuids:[], confirm_name_uuids:[]});
+    (c.dataset.type==="share" ? it.share_uuids : it.vg_uuids).push(c.dataset.uuid);
+    if(c.dataset.kind==="name") it.confirm_name_uuids.push(c.dataset.uuid); });
+  const r=await post("/api/hycu/protect",{items:Object.values(byNs), namespace:bkMatchNs,
+    vg_uuids:sel.filter(c=>c.dataset.type!=="share").map(c=>c.dataset.uuid),
+    share_uuids:sel.filter(c=>c.dataset.type==="share").map(c=>c.dataset.uuid),
+    policy_uuid:pol, force_full:$("#bkForceFull").checked, dry:dry(), confirm_name_uuids:byName});
   b.disabled=false; b.textContent="Assign + back up now";
   if(!r.ok && !(r.steps&&r.steps.length)){ $("#bkProtectLog").innerHTML=errBox(r.error); return; }
   const lines=(r.steps||[]).map(s=> s.dry
@@ -16210,7 +16451,7 @@ async function applyBackupSelection(){
   if(rsBackups.length && i!=="" && rsBackups[i*1]){
     const b=rsBackups[i*1];
     state.backup_path=b.path;
-    pvcs=((b.index||{}).volumes||[]).map(v=>({name:v.pvc,pv:v.pv,phase:"backed up"}));
+    pvcs=((b.index||{}).volumes||[]).map(v=>({name:v.pvc,pv:v.pv,phase:"backed up",nfs:v.nfs?(v.nfs.server+":"+v.nfs.path):""}));
     src=customRoot?"backup (custom folder)":(i==="0"?"latest backup":"selected backup");
     const _dl=$("#rsBackupDl"); if(_dl){ _dl.href="/api/backup/download?path="+encodeURIComponent(b.path)+(customRoot?("&root="+encodeURIComponent(customRoot)):"")+"&cluster="+encodeURIComponent(ACTIVE_CID); _dl.style.display="inline"; }
   }else{
@@ -16223,9 +16464,9 @@ async function applyBackupSelection(){
 }
 function renderRsPvcs(pvcs, src){
   $("#rsPvcs").innerHTML = pvcs.length? pvcs.map(p=>`
-     <li><input type="checkbox" style="width:auto" class="rsChk" data-pvc="${esc(p.name)}" data-pv="${esc(p.pv||'')}">
-       <div style="flex:1"><div class="nm">${esc(p.name)}</div>
-       <div class="meta">PV ${esc(p.pv||'—')} · source: ${src}</div></div>${badge(p.phase)}</li>`).join("")
+     <li><input type="checkbox" style="width:auto" class="rsChk" data-pvc="${esc(p.name)}" data-pv="${esc(p.pv||'')}"${p.nfs?' data-nfs="1"':''}>
+       <div style="flex:1"><div class="nm">${esc(p.name)}${p.nfs?' <span class="badge b-na">NAS</span>':''}</div>
+       <div class="meta">${p.nfs ? esc("NFS "+p.nfs)+" · data restored in HYCU (NAS share)" : "PV "+esc(p.pv||'—')} · source: ${src}</div></div>${badge(p.phase)}</li>`).join("")
      : `<div class="hint">No volume. First back up this application's configuration (Applications → Back up).</div>`;
   document.querySelectorAll(".rsChk").forEach(c=>c.onchange=rebuildVolCfgs);
   $("#rsConfig").style.display="none"; $("#rsPlan").style.display="none"; setRsStep(1);
@@ -16235,7 +16476,7 @@ function renderRsPvcs(pvcs, src){
   // ne sont pas touchées par défaut.
   if(rsAutoCheck && pvcs.length){
     const only = state.app && state.app.pvcs && state.app.pvcs.length ? new Set(state.app.pvcs) : null;
-    document.querySelectorAll(".rsChk").forEach(c=>c.checked = !only || only.has(c.dataset.pvc));
+    document.querySelectorAll(".rsChk").forEach(c=>c.checked = !c.dataset.nfs && (!only || only.has(c.dataset.pvc)));
     if(only && ![...document.querySelectorAll(".rsChk")].some(c=>c.checked)) document.querySelectorAll(".rsChk").forEach(c=>c.checked=true);
     rebuildVolCfgs();
   }
@@ -16358,6 +16599,7 @@ async function buildHyPanel(){
   }
   const rows=await Promise.all(chks.map(async pvc=>{
     const m=(rsHyMatch.matches||[]).find(x=>x.pvc===pvc);
+    if(m && m.volume_kind==="nfs") return {pvc, matched:false, nfs:m.nfs||"NFS"};
     if(!m || !m.matched) return {pvc, matched:false};
     const rp=await get("/api/hycu/restorepoints?source="+encodeURIComponent(m.hycu_vg_uuid));
     return {pvc, matched:true, vg:m.hycu_vg_uuid, vgName:m.hycu_vg_name||"", kind:m.match_kind,
@@ -16369,6 +16611,10 @@ async function buildHyPanel(){
     const slot=document.querySelector(`#rsVolCfgs .hySlot[data-pvc="${CSS.escape(r.pvc)}"]`);
     if(!slot) return;
     const card=slot.closest(".vol-cfg");
+    if(r.nfs){
+      slot.innerHTML='<div class="warnbox" style="margin-top:6px">'+esc("NAS volume ("+r.nfs+"): its data is restored in HYCU (NAS share). Untick it for this flow.")+'</div>';
+      return;
+    }
     if(!r.matched){
       slot.innerHTML='<div class="warnbox" style="margin-top:6px">No HYCU Volume Group matched — paste the reference under “Advanced”.</div>';
       const d=card&&card.querySelector("details.rsAdv"); if(d) d.open=true;
@@ -18415,7 +18661,7 @@ function rsWizSync(){
   if(rsDone){ lbl="Verify the application →"; act=()=>gotoVerify(rsDoneTarget, true); }
   else if(rsWizPage==="type"){ dis=!rsWizKind; act=rsNextFromType; }
   else if(rsWizPage==="dr"){
-    const n=document.querySelectorAll(".drRef").length;
+    const n=document.querySelectorAll(".drRef").length, nNfs=document.querySelectorAll(".drNfs").length;
     const filled=[...document.querySelectorAll(".drRef")].filter(t=>t.value.trim()).length;
     // Réutilisation des volumes d'origine : aucun UUID requis (le serveur les déduit
     // de la sauvegarde). Sinon, tous les volumes doivent avoir une référence. Une
@@ -18423,7 +18669,7 @@ function rsWizSync(){
     const needRefs = !drRecoverReuse();
     const b=drSel(), noVol = !n && !!(b && b.stateless);
     lbl=dry()? "Restore (simulation)" : "Restore";
-    dis=!drAllowed || (!n && !noVol) || (needRefs && filled<n) || drBusy || !$("#drTargetNs").value.trim();
+    dis=!drAllowed || (!n && !nNfs && !noVol) || (needRefs && filled<n) || drBusy || !$("#drTargetNs").value.trim();
     act=drRun;
   }
   else if(rsWizPage==="objects"){
@@ -18542,8 +18788,11 @@ function drRenderVols(){
   const refs=(b&&b.vol_refs)||{};
   // En récupération, chaque champ est PRÉ-REMPLI avec l'UUID d'origine (issu de la
   // sauvegarde) : l'humain n'a rien à taper. En DR, les champs restent vides (nouveaux VG).
-  $("#drVols").innerHTML = b && b.volumes.length? b.volumes.map(v=>
-    `<div class="drVol"><div class="drVolNm">${esc(v)}</div>
+  const nfsOf=(b&&b.vol_nfs)||{};
+  $("#drVols").innerHTML = b && b.volumes.length? b.volumes.map(v=> nfsOf[v]
+    ? `<div class="drVol drNfs" data-pvc="${esc(v)}"><div class="drVolNm">${esc(v)} <span class="badge b-na">NAS</span></div>
+       <div class="hint" style="margin:0">${esc("Same NFS export ("+nfsOf[v]+"): nothing to enter, the data stays on the NAS.")}</div></div>`
+    : `<div class="drVol"><div class="drVolNm">${esc(v)}</div>
      <input type="text" class="drRef" data-pvc="${esc(v)}" spellcheck="false" autocomplete="off"
        value="${drMode==="recover"&&refs[v]?esc(refs[v]):""}"
        placeholder="${esc(drMode==="recover"?"Volume Group UUID (8-4-4-4-12)":"UUID of the VG restored/cloned on the target site (8-4-4-4-12)")}"></div>`).join("")
@@ -18598,7 +18847,8 @@ async function drRun(){
   // Réutilisation des volumes d'origine : on n'envoie PAS d'UUID, le serveur le déduit
   // de la sauvegarde (source de vérité). Sinon on transmet ce que l'humain a saisi.
   const reuse=drRecoverReuse();
-  const items=[...document.querySelectorAll(".drRef")].map(t=>({pvc:t.dataset.pvc, new_ref:reuse?"":t.value.trim()}));
+  const items=[...document.querySelectorAll(".drRef")].map(t=>({pvc:t.dataset.pvc, new_ref:reuse?"":t.value.trim()}))
+    .concat([...document.querySelectorAll(".drNfs")].map(d=>({pvc:d.dataset.pvc, new_ref:""})));   // NAS : même export
   const live=!dry();
   let confirmedCtx="";
   if(live){
@@ -20441,6 +20691,30 @@ I18N_EN = [
     ('" de l’application « "', '" of the application « "'),
     ('id="drOpenCfg" type="button">Ouvrir les réglages<', 'id="drOpenCfg" type="button">Open the settings<'),
     (' : choisissez une sauvegarde source.', ': choose a source backup.'),
+    ('→ partage NAS <b>', '→ NAS share <b>'),
+    (' <span class="sim">même chemin, serveur à confirmer</span>', ' <span class="sim">same path, server to confirm</span>'),
+    ('ambigu : plusieurs partages HYCU correspondent à ', 'ambiguous: several HYCU shares match '),
+    (' — vérifiez dans HYCU</span>', ' — check in HYCU</span>'),
+    ('"partages HYCU illisibles : "', '"HYCU shares unreadable: "'),
+    ('"aucun partage HYCU pour "', '"no HYCU share for "'),
+    ('" — ajoutez ce NAS dans HYCU"', '" — add this NAS in HYCU"'),
+    ('Cochez au moins un volume (les correspondances « par nom » doivent être confirmées).', 'Tick at least one volume (“by name” matches must be confirmed).'),
+    ('" · données restaurées dans HYCU (partage NAS)"', '" · data restored in HYCU (NAS share)"'),
+    ('"Volume NAS ("', '"NAS volume ("'),
+    ('") : ses données se restaurent dans HYCU (partage NAS). Décochez-le pour ce parcours."', '"): its data is restored in HYCU (NAS share). Untick it for this flow."'),
+    ('"Même export NFS ("', '"Same NFS export ("'),
+    ('") : rien à saisir, les données restent sur le NAS."', '"): nothing to enter, the data stays on the NAS."'),
+    ('Aucun Volume Group ni partage HYCU à protéger ', 'No HYCU Volume Group or share to protect '),
+    ('Lancer la sauvegarde des partages NAS', 'Start the NAS shares backup'),
+    (' est un volume NAS (', ' is a NAS volume ('),
+    (') : une copie partagerait les données de ', '): a copy would share the data of '),
+    ("l'application d'origine (même export NFS, en écriture). Copie non prise en ", 'the original application (same NFS export, writable). Copy not supported '),
+    ('charge pour les volumes NAS — utilisez la restauration des données dans HYCU.', 'for NAS volumes — use the data restore in HYCU.'),
+    (' : volume NAS recréé vers le même export (', ': NAS volume recreated on the same export ('),
+    (') — les données restent ', ') — the data stays '),
+    ('celles du NAS.', 'on the NAS.'),
+    (') : ses données se restaurent dans HYCU (partage NAS), ', '): its data is restored in HYCU (NAS share), '),
+    ('pas par ce parcours réservé aux Volume Groups. Décochez-le.', 'not through this Volume Group flow. Untick it.'),
 ]
 # <<< I18N-END
 _I18N_SORTED = None          # (fr, en) triés du plus long au plus court
