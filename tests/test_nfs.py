@@ -233,3 +233,20 @@ def test_browse_retries_while_hycu_mounts_the_backup(H, monkeypatch):
     monkeypatch.setattr(H, "_rest", rest)
     items, err = H._share_browse("bk", "/")
     assert err is None and [i["fullItemName"] for i in items] == ["nas-demo"]
+
+
+def test_copy_takes_only_the_source_namespace_folder(H, monkeypatch):
+    """A share serves several namespaces (one folder each): only the source namespace's folder is copied."""
+    calls = []
+    _fake_hycu(H, monkeypatch, calls)
+    plan, err = H._nfs_copy_plan({"server": "nutanix-afs", "path": "/pvc-k8s"}, "data")
+    assert not err
+    plan["entries"] = [{"fullItemName": "/namespace3"}, {"fullItemName": "/nas-demo"}, {"fullItemName": "/other"}]
+    body, pv_path, sel, left = H._nfs_copy_target(plan, "nas-demo-copy", "nas-demo")
+    assert sel == ["/nas-demo"] and body["selectedItems"] == ["/nas-demo"]
+    assert pv_path == "/pvc-k8s/nas-demo-copy", "the app keeps writing to /data/nas-demo inside the copy"
+    assert left == ["namespace3", "other"] and plan["ns_folder"] == "nas-demo"
+    # No folder named after the namespace: previous behaviour (whole root minus copies).
+    plan.pop("ns_folder")
+    _b, _p, sel2, _l = H._nfs_copy_target(plan, "x-copy", "unknown-ns")
+    assert sorted(sel2) == ["/namespace3", "/nas-demo", "/other"]

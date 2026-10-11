@@ -611,7 +611,7 @@ def save_config(updates, source="internal"):
 
 # Version horodatée de la build (format AAAAMMJJ-HHMM). À incrémenter à chaque
 # changement notable du programme ; affichée dans l'en-tête de l'interface.
-VERSION = "20261012-0030"
+VERSION = "20261012-0100"
 
 # Jeton anti-CSRF généré au démarrage, injecté dans la page et exigé sur les POST.
 CSRF_TOKEN = secrets.token_urlsafe(32)
@@ -8070,12 +8070,26 @@ def _nfs_copy_plan(nfs, pvc_name):
             "server": nfs["server"], "entries": entries or [], "browse_error": err}, None
 
 
-def _nfs_copy_target(plan, folder):
+def _nfs_copy_target(plan, folder, src_ns=None):
     """Dossier cible (relatif au partage) -> corps de la restauration HYCU, chemin d'export
     du nouveau PV, éléments retenus et écartés. HYCU conserve l'arborescence d'origine
     sous le dossier cible (« /nas-demo » restauré dans « copie » donne « copie/nas-demo ») :
     le PV de la copie vise donc <racine>/<dossier><sous-chemin d'origine>, et l'application
-    copiée retrouve exactement sa structure, sans déplacer de fichiers."""
+    copiée retrouve exactement sa structure, sans déplacer de fichiers.
+    Partage monté à la racine : un partage sert souvent plusieurs namespaces (un dossier par
+    namespace) — seul le dossier au nom du namespace SOURCE est copié s'il existe."""
+    if plan["sub"] == "/" and src_ns:
+        mine = [str(e.get("fullItemName") or e.get("displayName") or "") for e in plan["entries"]
+                if str(e.get("fullItemName") or e.get("displayName") or "").strip("/").split("/")[-1] == src_ns]
+        if mine:
+            others = sorted({str(e.get("fullItemName") or e.get("displayName") or "").strip("/").split("/")[-1]
+                             for e in plan["entries"]} - {src_ns})
+            plan["ns_folder"] = src_ns
+            body = {"shareUuid": plan["share_uuid"], "targetShareUuid": plan["share_uuid"],
+                    "restoreItemType": "FILESYSTEM", "selectedItems": mine[:1], "restoreSource": "AUTO",
+                    "restoreOverwriteMode": "OVERWRITE", "restoreACLs": False, "sharedLocation": False,
+                    "restoreTargetPath": folder}
+            return body, plan["root_path"].rstrip("/") + "/" + folder, mine[:1], others
     excluded = set()
     if plan["sub"] == "/":
         excluded = _nfs_copy_excluded(plan["root_path"], plan["server"]) | {folder.split("/")[0]}
@@ -9563,7 +9577,7 @@ def action_clone_app(payload, log=None):
         base = (target_ns + suffix) if same_ns else target_ns
         siblings = [q for q in nas_copies if q["nfs_copy"]["share_uuid"] == cp["share_uuid"]]
         folder = base if len(siblings) == 1 else "%s/%s" % (base, p["pvc"])
-        body, pv_path, sel, skipped = _nfs_copy_target(cp, folder)
+        body, pv_path, sel, skipped = _nfs_copy_target(cp, folder, ns)
         if not sel:
             return {"ok": False, "log": log, "error": "“%s”: the backup of share “%s” (%s) "
                                                       "contains no file to copy for this volume." % (p["pvc"], cp["share_name"], cp["backup_time"])}
@@ -9576,8 +9590,15 @@ def action_clone_app(payload, log=None):
             warnings.append("“%s”: the original application mounts the share root, it will see the "
                             "folder “%s”. To isolate copies, mount one subfolder per application instead."
                             % (p["pvc"], folder.split("/")[0]))
-        if skipped:
+        if cp.get("ns_folder"):
+            warnings.append("“%s”: only the folder “%s” of the share is copied (one folder per namespace)%s."
+                            % (p["pvc"], cp["ns_folder"], ("; left out: %s" % ", ".join(skipped)) if skipped else ""))
+        elif skipped:
             warnings.append("Folders of existing copies not copied again: %s." % ", ".join(sorted(set(skipped))))
+        elif cp["sub"] == "/" and len(cp["entries"]) > 1:
+            warnings.append("“%s”: no folder named “%s” at the share root — the whole share is copied (%s)."
+                            % (p["pvc"], ns, ", ".join(str(e.get("fullItemName") or e.get("displayName") or "")
+                                                        .strip("/") for e in cp["entries"][:6])))
         if not cp["entries"]:
             warnings.append("“%s”: the share backup could not be listed%s; the whole folder “%s” is restored "
                             "(earlier copy folders included)." % (p["pvc"], (" (%s)" % cp["browse_error"])
