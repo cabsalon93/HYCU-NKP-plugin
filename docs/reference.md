@@ -518,7 +518,6 @@ Copy `hycu_config.example.json` → `hycu_config.json`. Also editable via the
 | `cluster_namespace_filters` | `{}` | Namespace whitelists of the clusters **added in ⚙ Sources**, by cluster name: `{"prod-paris": ["shop"]}`. Maintained by the filter editor. |
 | `wait_timeout` | `120` | Max wait (s) for a deletion / a `Bound` transition / pod shutdown. |
 | `subprocess_margin` | `30` | Margin (s) of the subprocess timeout above `wait_timeout` (so `kubectl wait` is not killed before its verdict). |
-| `clone_name_suffix` | `"0000"` | HYCU convention for the cloned PV name (pre-filled suggestion, editable). |
 | `volume_handle_prefix` | `""` | **Empty = auto-detected** from the existing PV (follows the customer's CSI driver). Only set to force a prefix. |
 | `strip_claimref` | `false` | `true` = remove `claimRef` entirely from the PV (lets the recreated PVC rebind). `false` = keep `claimRef` (name+namespace) without uid/resourceVersion. |
 | `auto_backup_enabled` | `false` | Scheduled automatic backup of all namespaces allowed by the filter, while the tool runs. |

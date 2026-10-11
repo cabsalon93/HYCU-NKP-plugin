@@ -179,8 +179,8 @@ H._load_backup_pvc = _ORIG["_load_backup_pvc"]
 _tmp2 = tempfile.mkdtemp()
 _inside = _os.path.join(_tmp2, "wordpress", "2026-01-01_00-00-00_0")
 _os.makedirs(_inside, exist_ok=True)
-check(H._safe_backup_path(_inside, _tmp2) == _os.path.realpath(_inside),
-      "chemin sous le dossier perso DÉSIGNÉ -> autorisé")
+check(H._safe_backup_path(_inside, _tmp2) is None,
+      "dossier perso SANS sauvegarde (aucun index.json) -> refusé")
 check(H._safe_backup_path(_inside, None) is None,
       "même chemin SANS dossier perso -> refusé (sécurité default conservée)")
 check(H._safe_backup_path("/etc", _tmp2) is None, "chemin hors zone -> refusé même avec dossier perso")
@@ -188,8 +188,11 @@ with open(_os.path.join(_inside, "index.json"), "w", encoding="utf-8") as f:
     f.write('{"namespace":"wordpress","volumes":[{"pvc":"mariadb-pvc","pv":"pvc-x","pv_file":"pv_pvc-x.json"}]}')
 with open(_os.path.join(_inside, "pv_pvc-x.json"), "w", encoding="utf-8") as f:
     f.write('{"kind":"PersistentVolume","metadata":{"name":"pvc-x"}}')
+check(H._safe_backup_path(_inside, _tmp2) == _os.path.realpath(_inside),
+      "chemin sous le dossier perso DÉSIGNÉ (avec sauvegarde) -> autorisé")
 _bks = H.list_backups("wordpress", _tmp2)
-check(len(_bks) == 1 and _bks[0]["path"] == _inside, "list_backups(dossier perso) trouve la sauvegarde")
+check(len(_bks) == 1 and _os.path.realpath(_bks[0]["path"]) == _os.path.realpath(_inside),
+      "list_backups(dossier perso) trouve la sauvegarde")
 _pv, _pvn = H._load_old_pv("wordpress", "mariadb-pvc", _inside, _tmp2)
 check(_pv is not None and _pv.get("metadata", {}).get("name") == "pvc-x" and _pvn == "pvc-x",
       "_load_old_pv charge le PV depuis le dossier perso désigné")

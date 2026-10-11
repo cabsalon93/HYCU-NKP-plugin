@@ -378,13 +378,13 @@ $("#unlockGo").onclick=async()=>{
 
 // ----- Assistant de configuration (affiché si hycu_config.json est absent) -----
 const wcfg = {kubectl_path:"kubectl", allowed_contexts:[], namespace_filter:[],
-  require_context_confirm:true, wait_timeout:120, clone_name_suffix:"0000", volume_handle_prefix:""};
+  require_context_confirm:true, wait_timeout:120, volume_handle_prefix:""};
 let wizStep=0, wizSteps=[];
 
 function wizFinalConfig(){
   return {kubectl_path:wcfg.kubectl_path, allowed_contexts:wcfg.allowed_contexts,
     namespace_filter:wcfg.namespace_filter, require_context_confirm:wcfg.require_context_confirm,
-    wait_timeout:wcfg.wait_timeout, clone_name_suffix:wcfg.clone_name_suffix,
+    wait_timeout:wcfg.wait_timeout,
     volume_handle_prefix:wcfg.volume_handle_prefix};
 }
 function buildWizSteps(){
@@ -443,14 +443,11 @@ function buildWizSteps(){
 
     {render:()=>`<h3>Advanced settings (optional)</h3>
       <p class="q">The defaults suit most environments.</p>
-      <div class="row">
-        <div><label class="fld">Wait timeout (s)</label><input type="text" id="wWait" value="${wcfg.wait_timeout}"></div>
-        <div><label class="fld">Clone name suffix</label><input type="text" id="wSuf" value="${esc(wcfg.clone_name_suffix)}"></div>
-      </div>
+      <label class="fld">Wait timeout (s)</label><input type="text" id="wWait" value="${wcfg.wait_timeout}">
       <label class="fld">volumeHandle prefix (empty = auto-detected)</label>
       <input type="text" id="wVh" value="${esc(wcfg.volume_handle_prefix)}" placeholder="auto-detected from the existing PV">`,
      commit:()=>{ wcfg.wait_timeout=parseInt($("#wWait").value)||120;
-        wcfg.clone_name_suffix=$("#wSuf").value.trim()||"0000"; wcfg.volume_handle_prefix=$("#wVh").value.trim(); }},
+        wcfg.volume_handle_prefix=$("#wVh").value.trim(); }},
 
     {final:true, render:()=>`<h3>Create the configuration</h3>
       <p class="q">Review then create <code>hycu_config.json</code> (editable later in ⚙ Settings).</p>
@@ -1420,7 +1417,7 @@ async function loadConfig(){
   $("#cfgQuota").value=(c.storage_quota_gb??0);
   $("#cfgDr").checked=!!c.allow_dr_restore;
   $("#cfgHosts").value=(c.allowed_hosts||[]).join(", ");
-  $("#cfgWait").value=c.wait_timeout; $("#cfgSuffix").value=c.clone_name_suffix||"";
+  $("#cfgWait").value=c.wait_timeout;
   $("#cfgConfirm").checked=!!c.require_context_confirm; $("#cfgStrip").checked=!!c.strip_claimref;
   $("#cfgSim").checked=!!c.simulation_mode_available;
   applySimAvailability(c.simulation_mode_available);
@@ -1454,7 +1451,7 @@ $("#cfgSave").onclick=async()=>{
     storage_min_free_mb:Math.max(0,parseInt($("#cfgMinFree").value)||0),
     storage_quota_gb:Math.max(0,parseInt($("#cfgQuota").value)||0),
     allow_dr_restore:$("#cfgDr").checked,
-    wait_timeout:parseInt($("#cfgWait").value)||120, clone_name_suffix:$("#cfgSuffix").value.trim()||"0000",
+    wait_timeout:parseInt($("#cfgWait").value)||120,
     require_context_confirm:$("#cfgConfirm").checked, strip_claimref:$("#cfgStrip").checked,
     simulation_mode_available:$("#cfgSim").checked};
   const r=await post("/api/config",{config:cfg});

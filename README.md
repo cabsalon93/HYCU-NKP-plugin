@@ -43,7 +43,7 @@ library only), also shipped as a container image.
 ```bash
 kubectl create namespace hycu
 kubectl apply -f deploy/k8s/rbac.yaml                 # ServiceAccount hycu-operator + rights
-./deploy/k8s/make-kubeconfig.sh                       # writes ./kubeconfig (SA token, no exec plugin)
+./deploy/k8s/make-kubeconfig.sh                       # writes ./kubeconfig (1-year SA token; rerun to renew)
 kubectl -n hycu create secret generic hycu-kubeconfig --from-file=config=./kubeconfig
 kubectl apply -f deploy/k8s/hycu.yaml                 # PVC + Deployment (ghcr.io image, :latest) + Service
 ```

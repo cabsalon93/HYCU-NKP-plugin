@@ -347,8 +347,7 @@
           <div class="hint" style="margin-top:4px">DNS name of an Ingress or reverse proxy. The tool has no authentication: put authentication (SSO, oauth2-proxy, IP allowlist) and TLS in front of it as soon as it leaves the loopback.</div></div>
       </div>
       <div class="row">
-        <div><label class="fld">Wait timeout (s)</label><input type="text" id="cfgWait" placeholder="120"></div>
-        <div><label class="fld">Clone name suffix</label><input type="text" id="cfgSuffix" placeholder="0000"></div>
+        <div style="flex:none;width:260px"><label class="fld">Wait timeout (s)</label><input type="text" id="cfgWait" placeholder="120"></div>
       </div>
       <label class="fld" style="margin-top:14px"><input type="checkbox" id="cfgConfirm" style="width:auto"> Require context confirmation before any real action</label>
       <label class="fld"><input type="checkbox" id="cfgStrip" style="width:auto"> Strip claimRef entirely from the PV (let the PVC rebind)</label>

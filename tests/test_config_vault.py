@@ -35,7 +35,7 @@ def test_env_overrides_are_never_persisted(H, monkeypatch):
     monkeypatch.setenv("HYCU_HOST", "0.0.0.0")
     H.load_config()
     assert H.CONFIG["host"] == "0.0.0.0"
-    assert H.save_config({"clone_name_suffix": "-x"})[0]
+    assert H.save_config({"wait_timeout": 90})[0]
     on_disk = json.load(open(H.CONFIG_PATH, encoding="utf-8"))
     assert "host" not in on_disk
 

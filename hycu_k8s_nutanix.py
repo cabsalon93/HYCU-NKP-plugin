@@ -147,7 +147,6 @@ DEFAULT_CONFIG = {
     "namespace_label_selector": "",
     "wait_timeout": 120,            # secondes : attente max d'une suppression / Bound
     "subprocess_margin": 30,        # marge subprocess au-dessus de kubectl wait
-    "clone_name_suffix": "0000",    # convention HYCU pour le nom du PV cloné
     "volume_handle_prefix": "",     # "" = auto-détection depuis le PV existant
     "strip_claimref": False,        # True = retirer claimRef (laisse le PVC rebinder)
     # CSI Nutanix (NKP) : `volumeAttributes.hypervisorAttachedDiskUUIDs` = extId du
@@ -341,7 +340,6 @@ CONFIG_SCHEMA = {
     "cluster_namespace_filters": (dict, lambda v: all(isinstance(x, list) and _is_str_list(x) for x in v.values())),
     "wait_timeout": (int, lambda v: 1 <= v <= 86400),
     "subprocess_margin": (int, lambda v: 0 <= v <= 3600),
-    "clone_name_suffix": (str, None),
     "volume_handle_prefix": (str, None),
     "strip_claimref": (bool, None),
     "clone_strip_runtime_attrs": (bool, None),
@@ -613,7 +611,7 @@ def save_config(updates, source="internal"):
 
 # Version horodatée de la build (format AAAAMMJJ-HHMM). À incrémenter à chaque
 # changement notable du programme ; affichée dans l'en-tête de l'interface.
-VERSION = "20261011-2100"
+VERSION = "20261011-2200"
 
 # Jeton anti-CSRF généré au démarrage, injecté dans la page et exigé sur les POST.
 CSRF_TOKEN = secrets.token_urlsafe(32)
@@ -2124,16 +2122,63 @@ def _safe_backup_path(p, extra_root=None):
     if not p:
         return None
     full = os.path.realpath(p)
-    roots = [os.path.realpath(CONFIG["backup_root"])]
+    root = os.path.realpath(CONFIG["backup_root"])
+    if full == root or full.startswith(root + os.sep):
+        return full
     extra = (extra_root or "").strip()
-    if extra:
-        er = os.path.realpath(os.path.expanduser(extra))
-        if os.path.isdir(er):
-            roots.append(er)
-    for root in roots:
-        if full == root or full.startswith(root + os.sep):
-            return full
+    if not extra:
+        return None
+    er = os.path.realpath(os.path.expanduser(extra))
+    if not _extra_root_ok(er):
+        return None
+    if (full == er or full.startswith(er + os.sep)) and _holds_backup(full):
+        return full
     return None
+
+
+def _holds_backup(path, depth=4, budget=5000):
+    """Vrai si `path` est une sauvegarde (index.json) ou contient des sauvegardes à au
+    plus `depth` niveaux (racine/<ns>/<horodatage>, ou _contexts/<ctx>/<ns>/<horodatage>).
+    Parcours borné (budget d'entrées) : jamais de balayage complet d'un disque."""
+    if not os.path.isdir(path):
+        return False
+    stack, seen = [(path, 0)], 0
+    while stack:
+        d, lvl = stack.pop()
+        if os.path.isfile(os.path.join(d, "index.json")):
+            return True
+        if lvl >= depth:
+            continue
+        try:
+            entries = os.listdir(d)
+        except OSError:
+            continue
+        for n in entries:
+            seen += 1
+            if seen > budget:
+                return False
+            sub = os.path.join(d, n)
+            if os.path.isdir(sub) and not os.path.islink(sub):
+                stack.append((sub, lvl + 1))
+    return False
+
+
+def _extra_root_ok(er):
+    """Dossier de sauvegarde PERSONNALISÉ fourni par l'interface : accepté seulement s'il
+    existe, n'est ni une racine de disque ni le dossier personnel, ne contient pas la
+    configuration ni le coffre de l'outil, et contient réellement des sauvegardes. Sans
+    cette garde, `root=/` ferait passer n'importe quel dossier pour une zone de sauvegarde."""
+    if not er or not os.path.isdir(er):
+        return False
+    if os.path.dirname(er) == er:                                  # racine (/, C:\)
+        return False
+    if er == os.path.realpath(os.path.expanduser("~")):
+        return False
+    for f in (CONFIG_PATH, SECRETS_PATH):
+        d = os.path.dirname(os.path.realpath(f))
+        if d == er or d.startswith(er + os.sep):
+            return False
+    return _holds_backup(er)
 
 
 def _scan_backup_dir(base):
@@ -2160,7 +2205,14 @@ def list_backups(ns, root=None):
     local, les sauvegardes de l'ancienne disposition (<root>/<ns>, antérieure à la
     hiérarchie par contexte) sont incluses SI leur index porte le contexte courant
     (ou aucun contexte). Triées plus récentes d'abord."""
-    root = os.path.expanduser(root.strip()) if (root and root.strip()) else CONFIG["backup_root"]
+    if not ns or not K8S_NAME_RE.match(ns):                  # nom RFC 1123 : jamais de « ../ »
+        return []
+    if root and root.strip():
+        root = os.path.realpath(os.path.expanduser(root.strip()))
+        if root != os.path.realpath(CONFIG["backup_root"]) and not _extra_root_ok(root):
+            return []
+    else:
+        root = CONFIG["backup_root"]
     croot = _cluster_root(root)
     out = _scan_backup_dir(os.path.join(croot, ns))
     if _current_cid() == LOCAL_CID and croot != root:
@@ -10869,8 +10921,7 @@ HTML = r"""<!DOCTYPE html>
           <div class="hint" style="margin-top:4px">DNS name of an Ingress or reverse proxy. The tool has no authentication: put authentication (SSO, oauth2-proxy, IP allowlist) and TLS in front of it as soon as it leaves the loopback.</div></div>
       </div>
       <div class="row">
-        <div><label class="fld">Wait timeout (s)</label><input type="text" id="cfgWait" placeholder="120"></div>
-        <div><label class="fld">Clone name suffix</label><input type="text" id="cfgSuffix" placeholder="0000"></div>
+        <div style="flex:none;width:260px"><label class="fld">Wait timeout (s)</label><input type="text" id="cfgWait" placeholder="120"></div>
       </div>
       <label class="fld" style="margin-top:14px"><input type="checkbox" id="cfgConfirm" style="width:auto"> Require context confirmation before any real action</label>
       <label class="fld"><input type="checkbox" id="cfgStrip" style="width:auto"> Strip claimRef entirely from the PV (let the PVC rebind)</label>
@@ -11741,13 +11792,13 @@ $("#unlockGo").onclick=async()=>{
 
 // ----- Assistant de configuration (affiché si hycu_config.json est absent) -----
 const wcfg = {kubectl_path:"kubectl", allowed_contexts:[], namespace_filter:[],
-  require_context_confirm:true, wait_timeout:120, clone_name_suffix:"0000", volume_handle_prefix:""};
+  require_context_confirm:true, wait_timeout:120, volume_handle_prefix:""};
 let wizStep=0, wizSteps=[];
 
 function wizFinalConfig(){
   return {kubectl_path:wcfg.kubectl_path, allowed_contexts:wcfg.allowed_contexts,
     namespace_filter:wcfg.namespace_filter, require_context_confirm:wcfg.require_context_confirm,
-    wait_timeout:wcfg.wait_timeout, clone_name_suffix:wcfg.clone_name_suffix,
+    wait_timeout:wcfg.wait_timeout,
     volume_handle_prefix:wcfg.volume_handle_prefix};
 }
 function buildWizSteps(){
@@ -11806,14 +11857,11 @@ function buildWizSteps(){
 
     {render:()=>`<h3>Advanced settings (optional)</h3>
       <p class="q">The defaults suit most environments.</p>
-      <div class="row">
-        <div><label class="fld">Wait timeout (s)</label><input type="text" id="wWait" value="${wcfg.wait_timeout}"></div>
-        <div><label class="fld">Clone name suffix</label><input type="text" id="wSuf" value="${esc(wcfg.clone_name_suffix)}"></div>
-      </div>
+      <label class="fld">Wait timeout (s)</label><input type="text" id="wWait" value="${wcfg.wait_timeout}">
       <label class="fld">volumeHandle prefix (empty = auto-detected)</label>
       <input type="text" id="wVh" value="${esc(wcfg.volume_handle_prefix)}" placeholder="auto-detected from the existing PV">`,
      commit:()=>{ wcfg.wait_timeout=parseInt($("#wWait").value)||120;
-        wcfg.clone_name_suffix=$("#wSuf").value.trim()||"0000"; wcfg.volume_handle_prefix=$("#wVh").value.trim(); }},
+        wcfg.volume_handle_prefix=$("#wVh").value.trim(); }},
 
     {final:true, render:()=>`<h3>Create the configuration</h3>
       <p class="q">Review then create <code>hycu_config.json</code> (editable later in ⚙ Settings).</p>
@@ -12783,7 +12831,7 @@ async function loadConfig(){
   $("#cfgQuota").value=(c.storage_quota_gb??0);
   $("#cfgDr").checked=!!c.allow_dr_restore;
   $("#cfgHosts").value=(c.allowed_hosts||[]).join(", ");
-  $("#cfgWait").value=c.wait_timeout; $("#cfgSuffix").value=c.clone_name_suffix||"";
+  $("#cfgWait").value=c.wait_timeout;
   $("#cfgConfirm").checked=!!c.require_context_confirm; $("#cfgStrip").checked=!!c.strip_claimref;
   $("#cfgSim").checked=!!c.simulation_mode_available;
   applySimAvailability(c.simulation_mode_available);
@@ -12817,7 +12865,7 @@ $("#cfgSave").onclick=async()=>{
     storage_min_free_mb:Math.max(0,parseInt($("#cfgMinFree").value)||0),
     storage_quota_gb:Math.max(0,parseInt($("#cfgQuota").value)||0),
     allow_dr_restore:$("#cfgDr").checked,
-    wait_timeout:parseInt($("#cfgWait").value)||120, clone_name_suffix:$("#cfgSuffix").value.trim()||"0000",
+    wait_timeout:parseInt($("#cfgWait").value)||120,
     require_context_confirm:$("#cfgConfirm").checked, strip_claimref:$("#cfgStrip").checked,
     simulation_mode_available:$("#cfgSim").checked};
   const r=await post("/api/config",{config:cfg});
