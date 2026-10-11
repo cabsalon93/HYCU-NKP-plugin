@@ -40,7 +40,7 @@ try:
     # Filtre vide = tous les namespaces autorisés -> rien à faire.
     H.CONFIG["namespace_filter"] = []
     H._allow_namespace("autre", log)
-    check(H.CONFIG["namespace_filter"] == [], "filtre vide : inchangé (tous autorisés)")
+    check(H.CONFIG["namespace_filter"] == [], "filtre vide: inchangé (tous autorisés)")
 
     # action_verify signale le cas au client (bouton « Autoriser »).
     H.CONFIG["namespace_filter"] = ["a"]
@@ -51,5 +51,5 @@ finally:
     H.CONFIG["namespace_filter"] = old_flt
     shutil.rmtree(tmp, ignore_errors=True)
 
-print("\nRÉSULTAT : %d OK, %d FAIL" % (passed, failed))
+print("\nRÉSULTAT: %d OK, %d FAIL" % (passed, failed))
 raise SystemExit(1 if failed else 0)

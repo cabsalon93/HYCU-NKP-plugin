@@ -42,14 +42,14 @@ def test_env_overrides_are_never_persisted(H, monkeypatch):
 
 def test_kubectl_path_validation(H):
     ok, err = H.save_config({"kubectl_path": "cmd /c calc"}, source="api")
-    assert not ok and "binaire" in err
+    assert not ok and "binary" in err
     assert H.save_config({"kubectl_path": "microk8s kubectl"}, source="api")[0]
 
 
 def test_container_mode_locks_path_keys(H, monkeypatch):
     monkeypatch.setenv("HYCU_HOST", "0.0.0.0")
     ok, err = H.save_config({"backup_root": "/tmp/x"}, source="api")
-    assert not ok and "lecture seule" in err
+    assert not ok and "read-only" in err
     assert H.save_config({"backup_root": "/tmp/x"}, source="internal")[0]
 
 
@@ -85,8 +85,8 @@ def test_vault_legacy_blob_still_readable(H):
     assert H.decrypt_secret(blob, "pw") == b"legacy"
 
 
-def test_default_lang_and_simulation_defaults(H):
-    assert H.CONFIG["default_lang"] == "en"
+def test_simulation_default(H):
+    assert "default_lang" not in H.CONFIG, "interface 100 % anglophone : plus de langue configurable"
     assert H.CONFIG["simulation_mode_available"] is False
 
 
@@ -97,10 +97,10 @@ def test_container_mode_accepts_unchanged_locked_keys(H, monkeypatch):
     monkeypatch.setenv("HYCU_ALLOWED_HOSTS", "from-env.example")
     H._rebuild_config()
     assert H._container_mode()
-    ok, err = H.save_config({"kubectl_path": H.CONFIG["kubectl_path"], "default_lang": "fr",
+    ok, err = H.save_config({"kubectl_path": H.CONFIG["kubectl_path"], "wait_timeout": 300,
                              "allowed_hosts": ["from-env.example"]}, source="api")
     assert ok, err
-    assert H.CONFIG["default_lang"] == "fr" and "kubectl_path" not in H.USER_CONFIG
+    assert H.CONFIG["wait_timeout"] == 300 and "kubectl_path" not in H.USER_CONFIG
     assert "allowed_hosts" not in H.USER_CONFIG and H.CONFIG["allowed_hosts"] == ["from-env.example"]
     ok2, err2 = H.save_config({"kubectl_path": "/usr/bin/kubectl"}, source="api")
-    assert not ok2 and "lecture seule" in err2
+    assert not ok2 and "read-only" in err2

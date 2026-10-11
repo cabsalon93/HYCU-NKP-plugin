@@ -33,7 +33,7 @@ try:
     H._LOCAL_CTX.update({"name": "ctx-test", "at": time.time() + 9999})
     H.action_context = lambda: {"context": "ctx-test"}
 
-    print("== C2 _vg_exists : 404 = absent, autre erreur = indéterminé ==")
+    print("== C2 _vg_exists: 404 = absent, autre erreur = indéterminé ==")
     with H.CRED_LOCK:
         H.SESSION_CREDS["prismcentral"] = {"a": 1}
     H._rest = lambda *a, **k: {"ok": False, "status": 404, "error": "HTTP 404"}
@@ -79,15 +79,15 @@ try:
             json.dump({"namespace": "app", "created": "2026-09-2%dT00:00:00" % i, "context": "ctx-test",
                        "cluster_id": "local", "volumes": []}, f)
     r = H.action_backup("app")
-    check(not r["ok"] and r.get("partial") and "PARTIELLE" in r["error"], "backup marqué PARTIEL et non OK")
+    check(not r["ok"] and r.get("partial") and "PARTIAL" in r["error"], "backup marqué PARTIEL et non OK")
     idx = json.load(open(os.path.join(r["dir"], "index.json")))
-    check(idx.get("partial") is True and idx["volumes"][0].get("pv_error"), "index.json : partial + pv_error")
+    check(idx.get("partial") is True and idx["volumes"][0].get("pv_error"), "index.json: partial + pv_error")
     remaining = [b for b in H.list_backups("app") ]
     check(len(remaining) == 4, "aucune purge des versions complètes (%d présentes)" % len(remaining))
 
     print("\n== B6 rétention compteur 0 = illimité ==")
-    check(H._prune_backups(tmp, "app", 0) == 0 and len(H.list_backups("app")) == 4, "keep=0 : rien supprimé")
-    check(H._prune_backups(tmp, "app", 2) == 2 and len(H.list_backups("app")) == 2, "keep=2 : 2 supprimées (auditées)")
+    check(H._prune_backups(tmp, "app", 0) == 0 and len(H.list_backups("app")) == 4, "keep=0: rien supprimé")
+    check(H._prune_backups(tmp, "app", 2) == 2 and len(H.list_backups("app")) == 2, "keep=2: 2 supprimées (auditées)")
     recs = [json.loads(l) for l in open(os.path.join(tmp, "audit.log"))]
     check(any(x["event"] == "backup_prune" and x.get("removed") == 2 for x in recs), "audit backup_prune")
 
@@ -98,7 +98,7 @@ try:
     check(H._pbkdf2_iters() == 10_000_000, "1e9 -> 1e7")
     H.CONFIG["pbkdf2_iterations"] = 200000
 
-    print("\n== B1/B2 SigV4 : chaîne de requête canonique triée, chemin non ré-encodé ==")
+    print("\n== B1/B2 SigV4: chaîne de requête canonique triée, chemin non ré-encodé ==")
     hd = {"host": "h", "x-amz-date": "20260925T000000Z"}
     a1 = H._sigv4_auth("GET", "h", "/b", "prefix=p&continuation-token=t", hd, "0" * 64, "r", "s3", "AK", "SK", "20260925T000000Z")
     a2 = H._sigv4_auth("GET", "h", "/b", "continuation-token=t&prefix=p", hd, "0" * 64, "r", "s3", "AK", "SK", "20260925T000000Z")
@@ -107,7 +107,7 @@ try:
     e2 = H._sigv4_auth("GET", "h", "/b/pr%25C3%25A9", "", hd, "0" * 64, "r", "s3", "AK", "SK", "20260925T000000Z")
     check(e1 != e2, "un chemin déjà encodé n'est pas ré-encodé")
 
-    print("\n== B3 nom de VG cloné : unicité conservée pour des PVC longs ==")
+    print("\n== B3 nom de VG cloné: unicité conservée pour des PVC longs ==")
     H._rest = S["_rest"]
     H.action_hycu_restore_points = lambda src: {"ok": True, "points": [{"id": "rp", "restorable": True}]}
     long1 = "data-my-application-postgresql-primary-replica-0"
@@ -118,7 +118,7 @@ try:
     check(r["ok"] and len(set(names)) == 2 and all(len(n) <= 60 for n in names), "2 noms distincts, <= 60 caractères")
     H.action_hycu_restore_points = S["_rest"] and H.action_hycu_restore_points
 
-    print("\n== B4 repli HYCU : l'uuid interne n'est jamais pris pour l'UUID Nutanix ==")
+    print("\n== B4 repli HYCU: l'uuid interne n'est jamais pris pour l'UUID Nutanix ==")
     H.action_nutanix_vgs = lambda query="": {"ok": True, "vgs": []}
     H._hycu_list_vgs = lambda: ([{"uuid": "hycu-internal", "name": "vgx"}], None)   # sans externalId
     u, e = H._discover_vg_uuid_by_name("vgx")
@@ -129,9 +129,9 @@ try:
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         z.writestr("dir/big.bin", b"\0" * (3 * 1024 * 1024))
     n, err = H._safe_extract_zip(buf.getvalue(), os.path.join(tmp, "x"), max_bytes=1024 * 1024)
-    check(n == 0 and "archive rejetée" in (err or ""), "archive gonflée refusée avant écriture")
+    check(n == 0 and "archive rejected" in (err or ""), "archive gonflée refusée avant écriture")
 
-    print("\n== C1 récupération : namespace encore présent -> refus serveur ==")
+    print("\n== C1 récupération: namespace encore présent -> refus serveur ==")
     d = os.path.join(tmp, "_contexts", "ctx-test", "gone", "2026-09-24_00-00-00_000000")
     os.makedirs(d)
     pv = {"apiVersion": "v1", "kind": "PersistentVolume", "metadata": {"name": "pvc-g"},
@@ -148,22 +148,22 @@ try:
             "items": [{"pvc": "data", "new_ref": ""}], "dry": True}
     H.resource_state = lambda kind, name, ns=None: ("present", "")
     r = H.action_clone_app(dict(base))
-    check(not r["ok"] and "existe encore" in r["error"], "namespace présent : refus (garde same_uuid non levée)")
+    check(not r["ok"] and "still exists" in r["error"], "namespace présent: refus (garde same_uuid non levée)")
     H.resource_state = lambda kind, name, ns=None: ("error", "kubectl KO")
     r = H.action_clone_app(dict(base))
-    check(not r["ok"] and "par prudence" in r["error"], "existence invérifiable : refus par prudence")
+    check(not r["ok"] and "as a precaution" in r["error"], "existence invérifiable: refus par prudence")
 
-    print("\n== C5 assistant Restaurer : refus AVANT destruction si réf = nom du VG / même UUID en clone ==")
+    print("\n== C5 assistant Restaurer: refus AVANT destruction si réf = nom du VG / même UUID en clone ==")
     H._load_txn = lambda ns: None
     H._context_guard = lambda payload: None
     H.action_prepare_restore = lambda payload: {"ok": True, "results": [
         {"ok": True, "pvc": "data", "looks_like_vg_name": True, "same_uuid": False}]}
     r = H._execute_restore_locked({"namespace": "app", "mode": "clone", "dry": False, "items": [{"pvc": "data", "new_ref": VG}]})
-    check(not r["ok"] and "NOM du Volume Group" in (r["error"] or ""), "nom de VG collé -> refus, rien détruit")
+    check(not r["ok"] and "Volume Group NAME" in (r["error"] or ""), "nom de VG collé -> refus, rien détruit")
     H.action_prepare_restore = lambda payload: {"ok": True, "results": [
         {"ok": True, "pvc": "data", "looks_like_vg_name": False, "same_uuid": True}]}
     r = H._execute_restore_locked({"namespace": "app", "mode": "clone", "dry": False, "items": [{"pvc": "data", "new_ref": VG}]})
-    check(not r["ok"] and "identique au VG SOURCE" in (r["error"] or ""), "même UUID en clone -> refus")
+    check(not r["ok"] and "identical to the SOURCE VG" in (r["error"] or ""), "même UUID en clone -> refus")
 finally:
     for k, v in S.items():
         setattr(H, k, v)
@@ -173,5 +173,5 @@ finally:
     H.CONFIG.clear(); H.CONFIG.update(saved)
     shutil.rmtree(tmp, ignore_errors=True)
 
-print("\nRÉSULTAT : %d OK, %d FAIL" % (passed, failed))
+print("\nRÉSULTAT: %d OK, %d FAIL" % (passed, failed))
 raise SystemExit(1 if failed else 0)

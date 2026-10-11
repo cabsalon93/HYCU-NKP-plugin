@@ -24,7 +24,7 @@ saved_rest = H._rest
 
 
 def boom(args):
-    raise AssertionError("lecture LIVE interdite en mode DR : kubectl %s" % args)
+    raise AssertionError("lecture LIVE interdite en mode DR: kubectl %s" % args)
 
 
 VG_OLD = "11111111-2222-3333-4444-555555555555"
@@ -79,7 +79,7 @@ try:
 
     print("== Inventaire /api/dr/backups ==")
     inv = H.action_dr_backups()
-    check(inv["ok"] and not inv["allowed"], "inventaire disponible ; dérogation désactivée par défaut")
+    check(inv["ok"] and not inv["allowed"], "inventaire disponible; dérogation disabled default")
     b = [x for x in inv["backups"] if x["namespace"] == "boutique"]
     check(len(b) == 1 and b[0]["imported"] and b[0]["context"] == "prod-perdu"
           and b[0]["volumes"] == ["data"], "sauvegarde importée inventoriée (contexte, volumes)")
@@ -92,15 +92,15 @@ try:
                "items": [{"pvc": "data", "new_ref": VG_NEW}], "dry": True, "dr_restore": True,
                "dr_storageclass": "dr-class", "clone_refs": True}
     r = H.action_clone_app(dict(payload))
-    check(not r["ok"] and "Autoriser la restauration DR" in r["error"],
-          "dr_restore demandé mais réglage désactivé : refus explicite")
+    check(not r["ok"] and "Allow DR restore" in r["error"],
+          "dr_restore demandé mais réglage disabled: refus explicite")
     H.CONFIG["allow_dr_restore"] = True
     r2 = H.action_clone_app({**{k: v for k, v in payload.items() if k != "dr_restore"},
                              "target_namespace": "boutique2"})
-    check(not r2["ok"] and "contexte" in (r2["error"] or ""),
-          "réglage activé mais SANS demande explicite : garde inter-contexte toujours appliquée")
+    check(not r2["ok"] and "context" in (r2["error"] or ""),
+          "réglage enabled mais SANS demande explicite: garde inter-contexte toujours appliquée")
 
-    print("\n== Clone DR « depuis la sauvegarde seule » (simulation) ==")
+    print("\n== Clone DR “depuis la sauvegarde seule” (simulation) ==")
     applied = []
     real_apply = H._apply_manifest
     def capture_apply(m, basename, dry, label):
@@ -111,40 +111,40 @@ try:
         r = H.action_clone_app(dict(payload))
     finally:
         H._apply_manifest = real_apply
-    check(r["ok"], "clone DR simulé : %s" % (r.get("error") or "ok"))
+    check(r["ok"], "clone DR simulé: %s" % (r.get("error") or "ok"))
     labels = [l.get("label") or "" for l in r["log"]]
     txt = json.dumps(r["log"], ensure_ascii=False)
-    check(any("Namespace cible" in l for l in labels), "namespace cible recréé")
-    check(any("PV cloné" in l for l in labels) and any("PVC cloné" in l for l in labels), "PV + PVC recréés")
-    check(any("Deployment/web" in l or "Application clonée Deployment/web" in l for l in labels),
+    check(any("Target namespace" in l for l in labels), "namespace cible recréé")
+    check(any("Cloned PV " in l for l in labels) and any("Cloned PVC " in l for l in labels), "PV + PVC recréés")
+    check(any("Deployment/web" in l or "Cloned application Deployment/web" in l for l in labels),
           "workload recréé depuis resources.json (cluster source jamais lu)")
     kinds_applied = {(m.get("kind"), (m.get("metadata") or {}).get("name")) for m in applied}
     check(("ConfigMap", "cm-app") in kinds_applied and ("Service", "web") in kinds_applied,
           "dépendances (ConfigMap, Service) recréées depuis la sauvegarde")
     check(("Secret", "sec-app") not in kinds_applied, "Secret MASQUÉ jamais appliqué")
     warns = " ".join(r.get("warnings") or [])
-    check("sec-app" in warns and "MODE DR" in warns, "Secret masqué signalé + avertissement MODE DR")
+    check("sec-app" in warns and "DR MODE" in warns, "Secret masqué signalé + avertissement MODE DR")
     scs = {(m.get("kind"), (m.get("spec") or {}).get("storageClassName"))
            for m in applied if m.get("kind") in ("PersistentVolume", "PersistentVolumeClaim")}
     check(scs == {("PersistentVolume", "dr-class"), ("PersistentVolumeClaim", "dr-class")},
           "StorageClass remappée sur les PV/PVC recréés")
     vh = [((m.get("spec") or {}).get("csi") or {}).get("volumeHandle")
           for m in applied if m.get("kind") == "PersistentVolume"]
-    check(vh == ["NutanixVolumes-" + VG_NEW], "volumeHandle dérivé du VG restauré sur le site cible")
+    check(vh == ["NutanixVolumes-" + VG_NEW], "derived volumeHandle du VG restauré sur le site cible")
     recs = [json.loads(l) for l in open(os.path.join(tmp, "audit.log"))]
     ca = [x for x in recs if x["event"] == "clone_app"]
     check(ca and ca[-1].get("dr") is True and ca[-1].get("storageclass") == "dr-class",
-          "audit : clone_app marqué dr=true + storageclass")
+          "audit: clone_app marqué dr=true + storageclass")
 
     print("\n== Sécurités du mode DR ==")
     r = H.action_clone_app({**payload, "dr_storageclass": "Bad_Class!"})
     check(not r["ok"] and "StorageClass" in r["error"], "nom de StorageClass invalide refusé")
     r = H.action_clone_app({**payload, "backup_path": None})
-    check(not r["ok"] and "sauvegarde source" in r["error"], "DR sans sauvegarde source : refus")
+    check(not r["ok"] and "source backup" in r["error"], "DR sans sauvegarde source: refus")
     r = H.action_clone_app({**payload, "items": [{"pvc": "data", "new_ref": VG_OLD}]})
-    check(not r["ok"] and "SOURCE" in r["error"], "réf identique au VG source : toujours refusée en DR")
+    check(not r["ok"] and "SOURCE" in r["error"], "réf identique au VG source: toujours refusée en DR")
 
-    print("\n== Application SUPPRIMÉE du cluster : récupération SANS dérogation DR ==")
+    print("\n== Application SUPPRIMÉE du cluster: récupération SANS dérogation DR ==")
     H.CONFIG["allow_dr_restore"] = False
     # Sauvegarde du contexte ACTIF (dr-site) : le namespace « atelier » a été détruit.
     adir = os.path.join(tmp, "_contexts", "dr-site", "atelier", "2026-09-24_09-00-00_000000")
@@ -168,7 +168,7 @@ try:
     inv = H.action_dr_backups()
     here = {x["namespace"]: x["restorable_here"] for x in inv["backups"]}
     check(here.get("atelier") is True and here.get("boutique") is False,
-          "restorable_here : vrai pour la sauvegarde d'ici, faux pour l'étrangère")
+          "restorable_here: vrai pour la sauvegarde d'ici, faux pour l'étrangère")
 
     saved_ns_fn, saved_wl_fn = H.action_namespaces, H._list_namespace_workloads
     H.action_namespaces = lambda: {"ok": True, "namespaces": ["autre-ns"]}
@@ -180,9 +180,9 @@ try:
         H._list_namespace_workloads = saved_wl_fn
     check("atelier" in apps and apps["atelier"]["missing"] and apps["atelier"]["protected"]
           and apps["atelier"]["backups"] >= 1,
-          "namespace détruit : toujours listé (missing=true, sauvegardes comptées)")
+          "namespace détruit: toujours listé (missing=true, sauvegardes comptées)")
     check("autre-ns" in apps and not apps["autre-ns"]["missing"],
-          "namespace vivant : missing=false")
+          "namespace vivant: missing=false")
 
     rec = {"namespace": "atelier", "target_namespace": "atelier", "backup_path": adir,
            "items": [{"pvc": "data", "new_ref": VG_NEW}], "dry": True,
@@ -196,7 +196,7 @@ try:
         r = H.action_clone_app(dict(rec))
     finally:
         H._apply_manifest = real_apply
-    check(r["ok"], "récupération simulée sans allow_dr_restore : %s" % (r.get("error") or "ok"))
+    check(r["ok"], "récupération simulée sans allow_dr_restore: %s" % (r.get("error") or "ok"))
     kinds2 = {(m.get("kind"), (m.get("metadata") or {}).get("name")) for m in applied2}
     check(("PersistentVolume", "pvc-orig-clone") in kinds2 or any(k == "PersistentVolume" for k, _ in kinds2),
           "PV recréé depuis la sauvegarde")
@@ -204,21 +204,21 @@ try:
           "workload + dépendances recréés depuis resources.json (cluster jamais lu)")
     check(("Secret", "sec-app") not in kinds2, "Secret MASQUÉ jamais appliqué en récupération")
     warns = " ".join(r.get("warnings") or [])
-    check("n'existe plus sur le cluster" in warns and "MODE DR" not in warns,
-          "avertissement « depuis la sauvegarde seule » (pas de bannière DR)")
+    check("no longer exists on the cluster" in warns and "DR MODE" not in warns,
+          "avertissement “depuis la sauvegarde seule” (pas de bannière DR)")
     recs = [json.loads(l) for l in open(os.path.join(tmp, "audit.log"))]
     ca = [x for x in recs if x["event"] == "clone_app"][-1]
     check(ca.get("from_backup") is True and ca.get("dr") is False,
-          "audit : from_backup=true, dr=false (récupération, pas dérogation)")
+          "audit: from_backup=true, dr=false (récupération, pas dérogation)")
     r = H.action_clone_app({**rec, "backup_path": bdir, "namespace": "boutique",
                             "target_namespace": "boutique"})
-    check(not r["ok"] and "contexte" in (r["error"] or ""),
-          "récupération d'une sauvegarde d'un AUTRE contexte : refus sans dérogation DR")
+    check(not r["ok"] and "context" in (r["error"] or ""),
+          "récupération d'une sauvegarde d'un AUTRE contexte: refus sans dérogation DR")
 
-    print("\n== Saisie minimale : réutilisation auto du VG d'origine (new_ref vide) ==")
+    print("\n== Saisie minimale: réutilisation auto du VG d'origine (new_ref vide) ==")
     inv2 = [x for x in H.action_dr_backups()["backups"] if x["namespace"] == "atelier"][0]
     check(inv2.get("vol_refs", {}).get("data") == VG_OLD,
-          "inventaire : UUID d'origine du VG exposé (pré-remplissage sans lecture live)")
+          "inventaire: UUID d'origine du VG exposé (pré-remplissage sans lecture live)")
     applied3 = []
     def capture3(m, basename, dry, label):
         applied3.append(json.loads(json.dumps(m)))
@@ -229,7 +229,7 @@ try:
         r = H.action_clone_app({**rec, "items": [{"pvc": "data", "new_ref": ""}]})
     finally:
         H._apply_manifest = real_apply
-    check(r["ok"], "récupération sans aucun UUID saisi : %s" % (r.get("error") or "ok"))
+    check(r["ok"], "récupération sans aucun UUID saisi: %s" % (r.get("error") or "ok"))
     vh3 = [((m.get("spec") or {}).get("csi") or {}).get("volumeHandle")
            for m in applied3 if m.get("kind") == "PersistentVolume"]
     check(vh3 == ["NutanixVolumes-" + VG_OLD],
@@ -237,7 +237,7 @@ try:
     kinds3 = {(m.get("kind"), (m.get("metadata") or {}).get("name")) for m in applied3}
     check(("Deployment", "web") in kinds3, "workload recréé (réutilisation du VG d'origine)")
 
-    print("\n== VG d'origine SUPPRIMÉ : restauration IN-PLACE auto via HYCU (reuse, 1 clic) ==")
+    print("\n== VG d'origine SUPPRIMÉ: restauration IN-PLACE auto via HYCU (reuse, 1 clic) ==")
     s_iqn = H.action_nutanix_iqn
     s_rest = H.action_hycu_provision_restore
     s_clone = H.action_hycu_provision_clone
@@ -266,7 +266,7 @@ try:
         r = H.action_clone_app({**rec, "items": [{"pvc": "data", "new_ref": ""}]})
     finally:
         H._apply_manifest = real_apply
-    check(r["ok"], "récupération avec VG supprimé (mode restore) : %s" % (r.get("error") or "ok"))
+    check(r["ok"], "récupération avec VG supprimé (mode restore): %s" % (r.get("error") or "ok"))
     check(len(rest_calls) == 1 and not clone_calls
           and rest_calls[0]["volumes"][0]["source_vg_uuid"] == VG_OLD
           and rest_calls[0]["volumes"][0]["vg_name"] == "pvc-orig",
@@ -294,9 +294,9 @@ try:
             H.SESSION_CREDS["hycu"] = None
             H.SESSION_CREDS["prismcentral"] = None
     check(r["ok"] and len(clone_calls) == 1 and not rest_calls,
-          "mode « clone » : bascule sur la création d'un nouveau VG")
+          "mode “clone”: bascule sur la création d'un nouveau VG")
 
-    print("\n== Sauvegarde SANS resources.json : dégradé (volumes seulement), pas de blocage ==")
+    print("\n== Sauvegarde SANS resources.json: dégradé (volumes seulement), pas de blocage ==")
     ndir = os.path.join(tmp, "_contexts", "dr-site", "sansres", "2026-09-24_10-00-00_000000")
     os.makedirs(ndir)
     pv3 = json.loads(json.dumps(pv2)); pv3["spec"]["claimRef"]["namespace"] = "sansres"
@@ -314,7 +314,7 @@ try:
     invn = {x["namespace"]: x for x in H.action_dr_backups()["backups"]}
     check(invn.get("sansres", {}).get("has_resources") is False
           and invn.get("atelier", {}).get("has_resources") is True,
-          "inventaire : has_resources distingue les sauvegardes avec/sans instantané")
+          "inventaire: has_resources distingue les sauvegardes avec/sans instantané")
     applied4 = []
     def capture4(m, basename, dry, label):
         applied4.append(json.loads(json.dumps(m)))
@@ -326,12 +326,12 @@ try:
                                 "dry": True, "from_backup_only": True, "clone_refs": True})
     finally:
         H._apply_manifest = real_apply
-    check(r["ok"], "récupération SANS resources.json : réussie (pas de blocage) : %s" % (r.get("error") or "ok"))
+    check(r["ok"], "récupération SANS resources.json: réussie (pas de blocage): %s" % (r.get("error") or "ok"))
     kinds4 = {m.get("kind") for m in applied4}
     check("PersistentVolume" in kinds4 and "PersistentVolumeClaim" in kinds4 and "Deployment" not in kinds4,
           "volumes recréés, aucun workload (dégradé)")
-    check(any("instantané de ressources" in w for w in (r.get("warnings") or [])),
-          "avertissement clair : volumes seulement")
+    check(any("resource snapshot" in w for w in (r.get("warnings") or [])),
+          "avertissement clair: volumes seulement")
 finally:
     H.kubectl_json = saved_kj
     H.resource_state = saved_rs
@@ -340,5 +340,5 @@ finally:
     H.CONFIG.clear(); H.CONFIG.update(saved)
     shutil.rmtree(tmp, ignore_errors=True)
 
-print("\nRÉSULTAT : %d OK, %d FAIL" % (passed, failed))
+print("\nRÉSULTAT: %d OK, %d FAIL" % (passed, failed))
 raise SystemExit(1 if failed else 0)

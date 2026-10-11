@@ -94,24 +94,16 @@ def test_no_rotation_while_operation_running(H):
         ev.set()
 
 
-def test_default_language_is_english(H):
+def test_page_is_english_only(H):
     c = _run(H, "GET", "/", {"Accept": "text/html", "User-Agent": "Mozilla/5.0"})
-    assert 'const PAGE_LANG="en"' in c["body"]
     assert '<html lang="en">' in c["body"]
-    H.CONFIG["default_lang"] = "fr"
-    c = _run(H, "GET", "/", {"Accept": "text/html", "User-Agent": "Mozilla/5.0"})
-    assert 'const PAGE_LANG="fr"' in c["body"]
-    c = _run(H, "GET", "/", {"Accept": "text/html", "User-Agent": "Mozilla/5.0", "Cookie": "hycu_lang=en"})
-    assert 'const PAGE_LANG="en"' in c["body"]
+    assert "hycu_lang" not in c["body"] and "langBtn" not in c["body"]
+    assert not hasattr(H, "I18N_EN") and not hasattr(H, "HTML_EN")
 
 
-def test_json_translation_skips_commands(H):
-    c = _run(H, "GET", "/api/context", {"Cookie": "hycu_lang=en"})
-    assert c["code"] == 200
-    out = H._tr_json_en({"error": "Non connecté à HYCU.", "cmd": "kubectl get ns exemple.com",
-                         "stdout": "rien à supprimer"})
-    assert out["cmd"] == "kubectl get ns exemple.com"          # jamais traduit (données)
-    assert out["error"] != "Non connecté à HYCU."
+def test_json_is_sent_as_is(H):
+    c = _run(H, "GET", "/api/context", {"Cookie": "hycu_lang=fr"})
+    assert c["code"] == 200 and "Tableau" not in c["body"]
 
 
 def test_op_cancel(H):

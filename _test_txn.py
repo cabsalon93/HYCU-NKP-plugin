@@ -25,10 +25,10 @@ try:
     H._clear_txn(ns)
     check(H._load_txn(ns) is None, "_clear_txn supprime le marqueur")
     H._clear_txn("inconnu")  # ne doit pas lever
-    check(True, "_clear_txn sur ns inexistant : sans erreur")
+    check(True, "_clear_txn sur ns inexistant: sans erreur")
 finally:
     shutil.rmtree(H.CONFIG["backup_root"], ignore_errors=True)
     H.CONFIG["backup_root"] = old_root
 
-print("\nRÉSULTAT : %d OK, %d FAIL" % (passed, failed))
+print("\nRÉSULTAT: %d OK, %d FAIL" % (passed, failed))
 raise SystemExit(1 if failed else 0)

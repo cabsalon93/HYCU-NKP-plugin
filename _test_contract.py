@@ -61,7 +61,7 @@ try:
                 return json.load(open(os.path.join(dp, "index.json")))
         return None
 
-    print("== HYCU + Prism connectés : contrat complet ==")
+    print("== HYCU + Prism connectés: contrat complet ==")
     with H.CRED_LOCK:
         H.SESSION_CREDS["hycu"] = {"access": "a", "secret": "b"}
         H.SESSION_CREDS["prismcentral"] = {"access": "a", "secret": "b"}
@@ -77,17 +77,17 @@ try:
     check(r["ok"], "sauvegarde OK")
     idx = read_index()
     c = (idx["volumes"][0] or {}).get("restore_contract") or {}
-    check(c.get("vg_uuid") == VG, "contrat : UUID du VG source")
+    check(c.get("vg_uuid") == VG, "contrat: VG UUID source")
     check(c.get("hycu_uuid") == "hy-" + VG and c.get("vg_name") == "pvc-orig",
-          "contrat : identité HYCU (source_uuid + nom du VG)")
+          "contrat: identité HYCU (source_uuid + nom du VG)")
     check(c.get("hycu_latest_backup", {}).get("uuid") == "rp-latest",
-          "contrat : dernier point de restauration HYCU (le plus récent)")
-    check(c.get("disk_extids") == ["disk-aaa", "disk-bbb"], "contrat : disques (extId via Prism)")
-    check(c.get("pe_uuid", "").startswith("pe-"), "contrat : Prism Element (multi-PE)")
+          "contrat: dernier point de restauration HYCU (most recent)")
+    check(c.get("disk_extids") == ["disk-aaa", "disk-bbb"], "contrat: disques (extId via Prism)")
+    check(c.get("pe_uuid", "").startswith("pe-"), "contrat: Prism Element (multi-PE)")
     check(idx.get("systems", {}).get("hycu") and idx["systems"].get("nutanix", {}).get("kind") == "prismcentral",
-          "contrat : systèmes (endpoints HYCU/Prism) enregistrés")
+          "contrat: systèmes (endpoints HYCU/Prism) enregistrés")
 
-    print("\n== Rien de connecté : backup OK, pas de contrat, aucune erreur ==")
+    print("\n== Rien de connecté: backup OK, pas de contrat, aucune erreur ==")
     shutil.rmtree(tmp, ignore_errors=True); os.makedirs(tmp)
     with H.CRED_LOCK:
         H.SESSION_CREDS["hycu"] = None
@@ -98,7 +98,7 @@ try:
     check("restore_contract" not in (idx["volumes"][0] or {}), "aucun contrat collecté (best-effort)")
     check("systems" not in idx, "aucun bloc systems")
 
-    print("\n== HYCU renvoie une erreur : backup TOUJOURS OK (best-effort) ==")
+    print("\n== HYCU renvoie une erreur: backup TOUJOURS OK (best-effort) ==")
     shutil.rmtree(tmp, ignore_errors=True); os.makedirs(tmp)
     with H.CRED_LOCK:
         H.SESSION_CREDS["hycu"] = {"access": "a", "secret": "b"}
@@ -108,11 +108,11 @@ try:
     H._hycu_list_vgs = boom_list
     r = H.action_backup("boutique")
     idx = read_index()
-    check(r["ok"], "sauvegarde OK malgré l'échec HYCU")
+    check(r["ok"], "sauvegarde OK malgré l'failed HYCU")
     # vg_uuid vient de l'analyse locale (pas d'appel) ; l'identité HYCU manque.
     c = (idx["volumes"][0] or {}).get("restore_contract") or {}
     check(c.get("vg_uuid") == VG and "hycu_uuid" not in c,
-          "contrat dégradé : UUID local présent, identité HYCU absente, sans crash")
+          "contrat dégradé: UUID local présent, identité HYCU absente, sans crash")
 finally:
     with H.CRED_LOCK:
         H.SESSION_CREDS["hycu"] = None
@@ -126,5 +126,5 @@ finally:
     H.CONFIG.clear(); H.CONFIG.update(saved)
     shutil.rmtree(tmp, ignore_errors=True)
 
-print("\nRÉSULTAT : %d OK, %d FAIL" % (passed, failed))
+print("\nRÉSULTAT: %d OK, %d FAIL" % (passed, failed))
 raise SystemExit(1 if failed else 0)

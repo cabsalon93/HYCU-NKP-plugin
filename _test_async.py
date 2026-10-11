@@ -22,14 +22,14 @@ print("\n== 1. _run_async renvoie un op_id immédiatement ==")
 start = H._run_async(slow_action, {"x": 1})
 check(start["ok"] is True and start.get("op_id"), "op_id renvoyé sans bloquer")
 
-print("\n== 2. suivi : progression puis résultat ==")
+print("\n== 2. suivi: progression puis résultat ==")
 final = None
 for _ in range(200):
     st = H.action_op_status(start["op_id"])
     if st["done"]:
         final = st; break
     time.sleep(0.01)
-check(final is not None, "opération terminée (done=True)")
+check(final is not None, "opération finishede (done=True)")
 check(final["result"]["ok"] is True, "résultat ok")
 check(len(final["result"]["log"]) == 2, "les 2 étapes sont dans le log")
 
@@ -47,5 +47,5 @@ for _ in range(200):
     time.sleep(0.01)
 check(shared_seen["n"] == 1, "l'action a écrit dans la liste partagée")
 
-print("\nRÉSULTAT : %d OK, %d FAIL" % (passed, failed))
+print("\nRÉSULTAT: %d OK, %d FAIL" % (passed, failed))
 raise SystemExit(1 if failed else 0)

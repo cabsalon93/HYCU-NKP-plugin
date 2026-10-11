@@ -28,7 +28,7 @@ SRC_PV = {"kind": "PersistentVolume", "metadata": {"name": "pvc-" + PVCU},
 SRC_PVC = {"kind": "PersistentVolumeClaim", "metadata": {"name": "mariadb-pvc", "namespace": "wordpress"},
            "spec": {"volumeName": "pvc-" + PVCU, "accessModes": ["ReadWriteOnce"]}}
 
-print("\n== V2 : reprise injecte txn.backup_dir comme backup_path ==")
+print("\n== V2: reprise injecte txn.backup_dir comme backup_path ==")
 captured = {}
 H.action_context = lambda: {"context_ok": True, "require_confirm": False, "context": "c"}
 H._load_txn = lambda ns: {"backup_dir": "/safe/backup-init", "mode": "clone", "started": "t"}
@@ -44,9 +44,9 @@ check(captured.get("backup_path") == "/safe/backup-init",
 H._load_txn = lambda ns: None
 captured.clear()
 H._execute_restore_locked({"namespace": "wordpress", "mode": "clone", "dry": False, "items": []})
-check(captured.get("backup_path") is None, "restore frais (pas de txn) : backup_path None -> lecture live")
+check(captured.get("backup_path") is None, "restore frais (pas de txn): backup_path None -> lecture live")
 
-print("\n== V4 : redirection REST ne fuit pas Authorization cross-host ==")
+print("\n== V4: redirection REST ne fuit pas Authorization cross-host ==")
 req = H.urllib.request.Request("https://hycu.example.com/rest/v1.0/vms", method="GET")
 req.add_header("Authorization", "Bearer secret-token")
 h = H._NoCredLeakRedirect()
@@ -56,9 +56,9 @@ nr2 = h.redirect_request(req, None, 302, "Found", {}, "https://hycu.example.com/
 check(nr2 is not None and nr2.headers.get("Authorization") == "Bearer secret-token",
       "Authorization conservé sur redirection same-host")
 r_scheme = H._http_json("GET", "file:///etc/passwd", None, False)
-check(r_scheme.get("ok") is False and "Schéma" in (r_scheme.get("error") or ""), "schéma file:// refusé sans I/O")
+check(r_scheme.get("ok") is False and "scheme refused" in (r_scheme.get("error") or ""), "schéma file:// refusé sans I/O")
 
-print("\n== V7 : clone d'app refuse la réf SOURCE / le nom du VG ==")
+print("\n== V7: clone d'app refuse la réf SOURCE / le nom du VG ==")
 H.CONFIG["namespace_filter"] = []
 H._load_old_pv = lambda ns, pvc, bp, root=None, no_live=False: (H.json.loads(H.json.dumps(SRC_PV)), "pvc-" + PVCU)
 H._load_backup_pvc = lambda bp, pvc, root=None: H.json.loads(H.json.dumps(SRC_PVC))
@@ -69,10 +69,10 @@ check(res_same.get("ok") is False and "SOURCE" in (res_same.get("error") or ""),
       "réf = VG source -> refus (same_uuid)")
 # réf = UUID du NOM du VG (pvc-<uuid>) -> looks_like_vg_name
 res_name = H.action_clone_app({**base_clone, "items": [{"pvc": "mariadb-pvc", "new_ref": PVCU}]})
-check(res_name.get("ok") is False and "NOM" in (res_name.get("error") or ""),
+check(res_name.get("ok") is False and "NAME" in (res_name.get("error") or ""),
       "réf = nom du VG -> refus (looks_like_vg_name)")
 
-print("\n== Clone d'app : namespace CIBLE hors filtre autorisé ; SOURCE toujours filtrée ==")
+print("\n== Clone d'app: namespace CIBLE hors filtre autorisé; SOURCE toujours filtrée ==")
 H.CONFIG["namespace_filter"] = ["wordpress"]
 NEW_VG = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 _kj_v8 = H.kubectl_json
@@ -80,21 +80,21 @@ H.kubectl_json = lambda args: ({"items": []}, None)   # pas de workloads/service
 # cible hors filtre -> ne doit PLUS être refusée pour cause de filtre (création permise)
 res_tgt = H.action_clone_app({"namespace": "wordpress", "target_namespace": "ns-hors-filtre",
                               "suffix": "", "dry": True, "items": [{"pvc": "mariadb-pvc", "new_ref": NEW_VG}]})
-check("non autoris" not in (res_tgt.get("error") or "").lower(),
+check("not allowed" not in (res_tgt.get("error") or "").lower(),
       "namespace cible hors filtre -> plus de refus 'non autorisé'")
 # source hors filtre -> toujours refusée (le filtre borne bien les sources)
 res_src = H.action_clone_app({"namespace": "interdit-src", "target_namespace": "x",
                               "suffix": "", "dry": True, "items": [{"pvc": "mariadb-pvc", "new_ref": NEW_VG}]})
-check(res_src.get("ok") is False and "autoris" in (res_src.get("error") or "").lower(),
+check(res_src.get("ok") is False and "not allowed" in (res_src.get("error") or "").lower(),
       "namespace SOURCE hors filtre -> toujours refusé")
 H.kubectl_json = _kj_v8
 
-print("\n== V9 : extId des disques triés (ordre canonique) ==")
+print("\n== V9: extId des disques triés (ordre canonique) ==")
 H._rest_raw = lambda system, method, path, body=None, timeout=30: {
     "ok": True, "json": {"data": [{"extId": "zzz"}, {"extId": "aaa"}, {"extId": "mmm"}]}}
 check(H._clone_vg_disk_uuids("vg") == "aaa,mmm,zzz", "extId triés indépendamment de l'ordre renvoyé")
 
-print("\n== HYCU : parsing de l'ID de job tolérant aux chaînes (bug protect 500) ==")
+print("\n== HYCU: parsing de l'ID de job tolérant aux chaînes (bug protect 500) ==")
 # /schedules/backupVolumeGroup renvoie des UUID de tâches en CHAÎNES : ne doit plus
 # planter avec 'str' object has no attribute 'get'.
 check(H._hycu_job_id({"entities": ["task-uuid-123"]}) == "task-uuid-123",
@@ -111,7 +111,7 @@ _ns_orig, _bk_orig = H.action_namespaces, H.action_backup
 H.action_namespaces = lambda: {"ok": True, "namespaces": ["wordpress", "vide", "shop"], "error": None}
 def _fake_bk(ns, dest=None, **kw):
     if ns == "vide":
-        return {"ok": False, "error": "Aucun PVC trouvé dans le namespace 'vide'."}
+        return {"ok": False, "error": "No PVC found in namespace 'vide'."}
     return {"ok": True, "dir": "/b/" + ns, "count": 2 if ns == "wordpress" else 3}
 H.action_backup = _fake_bk
 H.CONFIG["namespace_filter"] = ["wordpress", "vide", "shop"]
@@ -122,7 +122,7 @@ check(any(x["ns"] == "vide" and x.get("skipped") for x in _rall["results"]),
 check(_rall["filtered"] is True, "indique qu'un filtre est actif")
 H.action_namespaces, H.action_backup = _ns_orig, _bk_orig
 
-print("\n== Serveur HTTP : coupure client ignorée proprement (WinError 10053) ==")
+print("\n== Serveur HTTP: coupure client ignorée proprement (WinError 10053) ==")
 class _OkWfile:
     def __init__(self): self.data = b""
     def write(self, b): self.data += b
@@ -148,10 +148,10 @@ try:
 except Exception as e:
     check(False, "_send a propagé %r" % e)
 
-print("\n== Sauvegarde : dossier de destination choisi par l'utilisateur ==")
+print("\n== Sauvegarde: dossier de destination choisi par l'utilisateur ==")
 import tempfile, os as _os, shutil as _sh
 _root_def, _e0 = H._resolve_backup_dest("")
-check(_e0 is None and _root_def == H.CONFIG["backup_root"], "destination vide -> backup_root par défaut")
+check(_e0 is None and _root_def == H.CONFIG["backup_root"], "destination vide -> backup_root default")
 _tmp = tempfile.mkdtemp()
 _custom = _os.path.join(_tmp, "mes-sauvegardes")
 _root, _e1 = H._resolve_backup_dest(_custom)
@@ -173,7 +173,7 @@ _ra = H.action_backup_all(_custom)
 check(_ra.get("ok") and _ra.get("root") == _root, "action_backup_all honore la destination commune")
 _sh.rmtree(_tmp, ignore_errors=True)
 
-print("\n== Restauration depuis un dossier personnalisé (lecture) ==")
+print("\n== Restauration depuis un dossier personnalisé (read) ==")
 H._load_old_pv = _ORIG["_load_old_pv"]          # restaurer les vraies fonctions (stubées plus haut)
 H._load_backup_pvc = _ORIG["_load_backup_pvc"]
 _tmp2 = tempfile.mkdtemp()
@@ -182,7 +182,7 @@ _os.makedirs(_inside, exist_ok=True)
 check(H._safe_backup_path(_inside, _tmp2) == _os.path.realpath(_inside),
       "chemin sous le dossier perso DÉSIGNÉ -> autorisé")
 check(H._safe_backup_path(_inside, None) is None,
-      "même chemin SANS dossier perso -> refusé (sécurité par défaut conservée)")
+      "même chemin SANS dossier perso -> refusé (sécurité default conservée)")
 check(H._safe_backup_path("/etc", _tmp2) is None, "chemin hors zone -> refusé même avec dossier perso")
 with open(_os.path.join(_inside, "index.json"), "w", encoding="utf-8") as f:
     f.write('{"namespace":"wordpress","volumes":[{"pvc":"mariadb-pvc","pv":"pvc-x","pv_file":"pv_pvc-x.json"}]}')
@@ -195,7 +195,7 @@ check(_pv is not None and _pv.get("metadata", {}).get("name") == "pvc-x" and _pv
       "_load_old_pv charge le PV depuis le dossier perso désigné")
 _sh.rmtree(_tmp2, ignore_errors=True)
 
-print("\n== Conteneur : surcharges par variables d'environnement (mode-agnostique) ==")
+print("\n== Conteneur: surcharges par variables d'environnement (mode-agnostique) ==")
 import os as _os2
 _envsave = {k: _os2.environ.get(k) for k in ("HYCU_HOST", "HYCU_PORT", "HYCU_OPEN_BROWSER", "HYCU_BACKUP_ROOT")}
 _cfgsave = dict(H.CONFIG)
@@ -222,5 +222,5 @@ for k, v in _ORIG.items():
     setattr(H, k, v)
 H.CONFIG["namespace_filter"] = _ORIG_FILTER
 
-print("\nRÉSULTAT : %d OK, %d FAIL" % (passed, failed))
+print("\nRÉSULTAT: %d OK, %d FAIL" % (passed, failed))
 raise SystemExit(1 if failed else 0)

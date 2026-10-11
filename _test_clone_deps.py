@@ -26,7 +26,7 @@ check(r["secrets"] == {"regcred", "tls-secret", "wordpress-db-secret"}, "secrets
 check(r["configmaps"] == {"wp-config", "wp-env"}, "configmaps détectés (volume+env)")
 check(r["serviceaccount"] == "wp-sa", "serviceAccount détecté")
 
-print("\n== 2. _prepare_cloned_object : Service ==")
+print("\n== 2. _prepare_cloned_object: Service ==")
 svc = {"kind": "Service", "metadata": {"name": "mariadb", "namespace": "wordpress",
         "uid": "x", "resourceVersion": "9"},
        "spec": {"clusterIP": "10.0.0.5", "clusterIPs": ["10.0.0.5"], "type": "ClusterIP",
@@ -41,7 +41,7 @@ check("status" not in o, "status retiré")
 check(o["metadata"]["labels"][H.CLONE_LABEL] == H.CLONE_LABEL_VAL, "label de clone posé")
 check(o["spec"]["selector"] == {"app": "mariadb"}, "sélecteur conservé")
 
-print("\n== 3. _prepare_cloned_object : Secret ==")
+print("\n== 3. _prepare_cloned_object: Secret ==")
 sec = {"kind": "Secret", "metadata": {"name": "s", "namespace": "wordpress", "uid": "u"},
        "type": "Opaque", "data": {"k": "dg=="}}
 o2 = H._prepare_cloned_object(sec, "restore")
@@ -68,7 +68,7 @@ names = sorted(s["metadata"]["name"] for s in svcs)
 check(names == ["mariadb", "wordpress"], "seuls les Services ciblant les pods clonés (mariadb, wordpress)")
 check(all(s["metadata"]["namespace"] == "restore" for s in svcs), "Services re-namespacés vers cible")
 
-print("\n== 5. _fetch_for_clone : ignore les tokens de SA ==")
+print("\n== 5. _fetch_for_clone: ignore les tokens de SA ==")
 H.kubectl_json = lambda args: ({"kind": "Secret", "metadata": {"name": "tok", "namespace": "wordpress"},
                                 "type": "kubernetes.io/service-account.token"}, None)
 check(H._fetch_for_clone("secret", "tok", "wordpress", "restore") is None, "token de SA non cloné")
@@ -77,5 +77,5 @@ H.kubectl_json = lambda args: ({"kind": "Secret", "metadata": {"name": "ok", "na
 got = H._fetch_for_clone("secret", "ok", "wordpress", "restore")
 check(got is not None and got["metadata"]["namespace"] == "restore", "secret normal cloné + re-namespacé")
 
-print("\nRÉSULTAT : %d OK, %d FAIL" % (passed, failed))
+print("\nRÉSULTAT: %d OK, %d FAIL" % (passed, failed))
 raise SystemExit(1 if failed else 0)

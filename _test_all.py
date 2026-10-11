@@ -58,7 +58,7 @@ def main():
     n_ok = sum(results) + (1 if comp else 0)
     n_tot = len(SUITES) + 1
     print("\n========================================")
-    print("RÉSULTAT GLOBAL : %d / %d vert" % (n_ok, n_tot))
+    print("RÉSULTAT GLOBAL: %d / %d vert" % (n_ok, n_tot))
     return 0 if (comp and all(results)) else 1
 
 

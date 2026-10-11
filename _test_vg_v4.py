@@ -40,5 +40,5 @@ r2 = H.action_nutanix_vg_v4("x")
 check(r2["ok"] is False and "Prism Central" in r2["error"], "exige Prism Central connecté")
 check(H.action_nutanix_vg_v4("")["ok"] is False, "uuid vide rejeté")
 
-print("\nRÉSULTAT : %d OK, %d FAIL" % (passed, failed))
+print("\nRÉSULTAT: %d OK, %d FAIL" % (passed, failed))
 raise SystemExit(1 if failed else 0)

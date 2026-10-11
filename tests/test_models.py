@@ -103,16 +103,12 @@ def test_retention_protects_transaction_backup(H):
     assert not os.path.isdir(dirs[1])
 
 
-def test_build_is_up_to_date_and_i18n_clean():
+def test_build_is_up_to_date():
     r = subprocess.run([sys.executable, os.path.join(ROOT, "build.py"), "--check"], capture_output=True,
                        text=True, encoding="utf-8", errors="replace", cwd=ROOT)
     assert r.returncode == 0, r.stdout + r.stderr
-    r = subprocess.run([sys.executable, os.path.join(ROOT, "build.py"), "--lint"], capture_output=True,
-                       text=True, encoding="utf-8", errors="replace", cwd=ROOT)
-    assert r.returncode == 0, r.stdout + r.stderr
 
 
-def test_english_page_prerendered(H):
-    assert 'const PAGE_LANG="en"' in H.HTML_EN
-    assert 'const PAGE_LANG="fr"' in H.HTML
-    assert "Tableau de bord" not in H.HTML_EN.split("<script>")[0] or "Dashboard" in H.HTML_EN
+def test_page_is_english(H):
+    assert '<html lang="en">' in H.HTML and "Dashboard" in H.HTML
+    assert ">Tableau de bord<" not in H.HTML and ">Sauvegarder<" not in H.HTML

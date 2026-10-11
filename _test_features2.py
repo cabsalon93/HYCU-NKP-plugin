@@ -44,20 +44,20 @@ try:
     removed = H._prune_backups(tmp, "app", 999)
     left = H.list_backups("app")
     check(len(left) == len(keep) and removed == 60 - len(keep),
-          "GFS : %d conservées, %d supprimées" % (len(left), removed))
+          "GFS: %d conservées, %d supprimées" % (len(left), removed))
     days = {b["index"]["created"][:10] for b in left}
     check(len([d for d in days]) >= 7, "au moins 7 jours distincts couverts")
     per_day = {}
     for b in left:
         per_day.setdefault(b["index"]["created"][:10], []).append(b["index"]["created"])
     check(all(max(v) == sorted(v)[-1] and len(v) == 1 for v in per_day.values()),
-          "une seule sauvegarde par jour : la plus récente")
+          "une seule sauvegarde par jour: la plus récente")
     check(left[0]["path"] == backups[0]["path"], "la plus récente est toujours conservée")
     # mode count intact
     H.CONFIG.update({"auto_backup_retention": "count", "auto_backup_keep": 15})
     mkd = [mk("cnt", base - datetime.timedelta(hours=i)) for i in range(5)]
     H._prune_backups(tmp, "cnt", 3)
-    check(len(H.list_backups("cnt")) == 3, "mode « count » inchangé (garde N)")
+    check(len(H.list_backups("cnt")) == 3, "mode “count” inchangé (garde N)")
 
     print("\n== Sélecteur d'étiquettes ==")
     CALLS = []
@@ -105,17 +105,16 @@ try:
             "health": {"prod": {"ok": False, "error": "timeout", "at": now}},
             "s3": {"configured": True, "auto_upload": True, "encrypt": True}}
     html = H.report_html(fake)
-    check("wordpress" in html and "Team A" in html and "Rapport de protection" in html, "HTML : contenu")
-    check("<script>" not in html and "bo&lt;script&gt;" in html, "HTML : namespace hostile échappé")
-    check("1/2" in html and "GFS 7 j / 4 sem / 12 mois" in html, "HTML : indicateurs + rétention GFS")
-    check("activé (chiffré)" in html and "timeout" in html, "HTML : S3 chiffré + santé des clusters")
-    en = H._tr_en(html)
-    check("Kubernetes application protection report" in en and "Généré" not in en
-          and "enabled (encrypted)" in en, "rapport traduit en anglais")
+    check("wordpress" in html and "Team A" in html and "application protection report" in html, "HTML: contenu")
+    check("<script>" not in html and "bo&lt;script&gt;" in html, "HTML: namespace hostile échappé")
+    check("1/2" in html and "GFS 7 d / 4 w / 12 m" in html, "HTML: indicateurs + rétention GFS")
+    check("enabled (encrypted)" in html and "timeout" in html, "HTML: S3 chiffré + santé des clusters")
+    check("Kubernetes application protection report" in html and "Generated on" in html
+          and "Généré" not in html, "rapport directement en anglais")
     csv = H.report_csv(fake)
     lines = csv.strip().splitlines()
-    check(len(lines) == 3 and lines[1].startswith("prod;Team A;wordpress;wordpress;;oui;oui;12;"),
-          "CSV : une ligne par application (namespace, application, type)")
+    check(len(lines) == 3 and lines[1].startswith("prod;Team A;wordpress;wordpress;;yes;yes;12;"),
+          "CSV: une ligne par application (namespace, application, type)")
 
     print("\n== Chiffrement des exports (HV2B) ==")
     blob = H.encrypt_bytes(b"donnees-zip" * 100, "phrase!")
@@ -134,8 +133,8 @@ try:
     bdir = os.path.join(tmp, "wp", "2026-09-24_09-00-00_000000")
     os.makedirs(bdir); open(os.path.join(bdir, "index.json"), "w").write("{}")
     ok, err = H.s3_upload_backup(bdir, "wp", "2026-09-24_09-00-00_000000")
-    check(not ok and "phrase de chiffrement absente" in err,
-          "chiffrement activé sans phrase : refus explicite (pas d'envoi en clair)")
+    check(not ok and "encryption passphrase missing" in err,
+          "chiffrement enabled sans phrase: refus explicite (pas d'envoi en clair)")
     H.CONFIG["s3_encrypt"] = False
     with H.CRED_LOCK:
         H.SESSION_CREDS["s3"] = None
@@ -168,31 +167,31 @@ try:
     r = H.action_objects_list(payload)
     kinds = {(x["kind"], x["redacted"]) for x in r["items"]}
     check(r["ok"] and ("Deployment", False) in kinds and ("Secret", True) in kinds,
-          "liste : objets de l'instantané, Secret masqué signalé")
+          "liste: objets de l'instantané, Secret masqué signalé")
     check(not H.action_objects_list({"namespace": "boutique",
                                      "backup_path": os.path.join(tmp, "wp", "2026-09-24_09-00-00_000000")})["ok"],
-          "sauvegarde sans resources.json : erreur claire")
+          "sauvegarde sans resources.json: erreur claire")
     idx = {x["kind"]: x["i"] for x in r["items"]}
     d = H.action_objects_diff({**payload, "indexes": [idx["Deployment"], idx["Ingress"], idx["Secret"]]})
     st = {x["kind"]: x for x in d["results"]}
     check(st["Deployment"]["status"] == "differs" and '"replicas": 2' in st["Deployment"]["diff"]
-          and '"replicas": 5' in st["Deployment"]["diff"], "diff : réplicas 5 (live) -> 2 (sauvegarde)")
+          and '"replicas": 5' in st["Deployment"]["diff"], "diff: réplicas 5 (live) -> 2 (sauvegarde)")
     check("uid" not in st["Deployment"]["diff"] and "status" not in st["Deployment"]["diff"],
-          "diff : le live est nettoyé comme la sauvegarde (pas de bruit uid/status)")
-    check(st["Ingress"]["status"] == "absent", "objet absent du live : sera recréé (kind.groupe résolu)")
-    check(st["Secret"]["status"] == "redacted", "Secret masqué : signalé non restaurable")
+          "diff: le live est nettoyé comme la sauvegarde (pas de bruit uid/status)")
+    check(st["Ingress"]["status"] == "absent", "objet absent du live: sera recréé (kind.groupe résolu)")
+    check(st["Secret"]["status"] == "redacted", "Secret masqué: signalé non restaurable")
     applied = []
     H._apply_manifest = lambda m, b, dry, label: (applied.append((m["kind"], dry)) or
         {"ok": True, "dry": dry, "cmd": "kubectl apply -f -", "stdout": "", "stderr": "", "rc": 0, "label": label})
     H._context_guard = lambda p: None
     r = H.action_objects_restore({**payload, "indexes": [idx["Deployment"], idx["Secret"], idx["Ingress"]],
                                   "dry": False})
-    check(r["ok"] and r["applied"] == 2 and r["skipped"] == 1, "apply réel : 2 appliqués, Secret masqué ignoré")
+    check(r["ok"] and r["applied"] == 2 and r["skipped"] == 1, "apply réel: 2 appliqués, Secret masqué ignoré")
     check(("Secret", False) not in [a for a in applied], "le Secret masqué n'est JAMAIS appliqué")
-    check(not H.action_objects_restore({**payload, "indexes": []})["ok"], "aucune sélection : refus")
+    check(not H.action_objects_restore({**payload, "indexes": []})["ok"], "aucune sélection: refus")
     recs = [json.loads(l) for l in open(os.path.join(tmp, "audit.log"))]
     check(any(x["event"] == "restore_objects" and x["count"] == 2 and x["skipped"] == 1 for x in recs),
-          "audit : restore_objects tracé")
+          "audit: restore_objects tracé")
     print("\n== Garde-fous du stockage ==")
     import collections
     DU = collections.namedtuple("du", "total used free")
@@ -200,7 +199,7 @@ try:
     H.shutil.disk_usage = lambda p: DU(100 * 1024**3, 99 * 1024**3, 100 * 1024**2)   # 100 Mo libres
     H.CONFIG["storage_min_free_mb"] = 500
     r = H.action_backup("app")
-    check(not r["ok"] and "REFUS" in r["error"], "plancher : sauvegarde refusée sous 500 Mo libres")
+    check(not r["ok"] and "REFUS" in r["error"], "plancher: sauvegarde refusée sous 500 Mo libres")
     recs = [json.loads(l) for l in open(os.path.join(tmp, "audit.log"))]
     check(any(x["event"] == "backup_refused_storage" for x in recs), "refus audité")
     H.shutil.disk_usage = old_du
@@ -226,7 +225,7 @@ try:
     H.CONFIG["storage_quota_gb"] = round((3.2 * 1024 * 1024) / 1024**3, 6)   # ~3 Mo
     removed, freed = H.enforce_storage_quota(tmp)
     left = [d for d in qdirs if os.path.isdir(d)]
-    check(removed >= 2 and freed > 0, "quota : %d sauvegardes purgées (%d Ko libérés)" % (removed, freed // 1024))
+    check(removed >= 2 and freed > 0, "quota: %d sauvegardes purgées (%d Ko libérés)" % (removed, freed // 1024))
     check(os.path.isdir(qdirs[0]), "sauvegarde d'une transaction en cours JAMAIS purgée")
     for ns in qns:
         latest = sorted([d for d in qdirs if os.sep + ns + os.sep in d])[-1]
@@ -239,7 +238,7 @@ try:
     st = H.action_storage()
     r0 = st["roots"][0]
     check(st["ok"] and r0["exists"] and r0["backups_count"] >= 4 and r0["disk_total"] > 0,
-          "/api/storage : espace disque + versions comptées")
+          "/api/storage: espace disque + versions comptées")
 
     print("\n== Hiérarchie par contexte (prod/dev, mêmes namespaces) ==")
     import time as _t
@@ -248,7 +247,7 @@ try:
     set_ctx("prod-ctx")
     d_prod = H.backup_dir("wordpress")
     check(os.sep + os.path.join("_contexts", "prod-ctx", "wordpress") + os.sep in d_prod + os.sep,
-          "contexte prod : <root>/_contexts/prod-ctx/wordpress/…")
+          "contexte prod: <root>/_contexts/prod-ctx/wordpress/…")
     with open(os.path.join(d_prod, "index.json"), "w") as f:
         json.dump({"namespace": "wordpress", "context": "prod-ctx", "cluster_id": "local",
                    "created": datetime.datetime.now().isoformat()}, f)
@@ -258,7 +257,7 @@ try:
         json.dump({"namespace": "wordpress", "context": "dev-ctx", "cluster_id": "local",
                    "created": datetime.datetime.now().isoformat()}, f)
     check("_contexts%sdev-ctx" % os.sep in d_dev and d_dev != d_prod,
-          "contexte dev : dossier distinct — aucun mélange")
+          "contexte dev: dossier distinct — aucun mélange")
     # ancienne sauvegarde (disposition historique <root>/<ns>) prise sur prod
     old = os.path.join(tmp, "wordpress", "2020-01-01_00-00-00_000000")
     os.makedirs(old)
@@ -268,14 +267,14 @@ try:
     set_ctx("prod-ctx")
     lp = H.list_backups("wordpress")
     check([b["path"] for b in lp] == [d_prod, old],
-          "prod : sa sauvegarde + l'ancienne disposition (même contexte), sans celle de dev")
+          "prod: sa sauvegarde + l'ancienne disposition (même contexte), sans celle de dev")
     set_ctx("dev-ctx")
     ld = H.list_backups("wordpress")
-    check([b["path"] for b in ld] == [d_dev], "dev : uniquement la sienne (l'ancienne est filtrée)")
+    check([b["path"] for b in ld] == [d_dev], "dev: uniquement la sienne (l'ancienne est filtrée)")
     check(H._backup_cluster_error(d_prod) and "prod-ctx" in H._backup_cluster_error(d_prod),
-          "garde : restaurer une sauvegarde prod sur le contexte dev est refusé")
+          "garde: restaurer une sauvegarde prod sur le contexte dev est refusé")
     set_ctx("prod-ctx")
-    check(H._backup_cluster_error(d_prod) is None, "même contexte : restauration acceptée")
+    check(H._backup_cluster_error(d_prod) is None, "même contexte: restauration acceptée")
     check(H._txn_path("wordpress").startswith(os.path.join(tmp, "_contexts", "prod-ctx")),
           "transaction/état des réplicas rangés par contexte")
     H._LOCAL_CTX.update({"name": None, "at": 0.0})
@@ -289,7 +288,7 @@ try:
     H.CONFIG["audit_retention_days"] = 31
     n = H._audit_compact()
     lines = open(os.path.join(tmp, "audit.log")).read().splitlines()
-    check(n == 1 and len(lines) == 2 and "illisible" in lines[0], "purge > 31 j ; lignes non datées conservées")
+    check(n == 1 and len(lines) == 2 and "illisible" in lines[0], "purge > 31 j; lignes non datées conservées")
     H.CONFIG["audit_retention_days"] = 0
     check(H._audit_compact() == 0, "0 = conservation illimitée (aucune purge)")
 finally:
@@ -298,5 +297,5 @@ finally:
     H.CONFIG.clear(); H.CONFIG.update(saved)
     shutil.rmtree(tmp, ignore_errors=True)
 
-print("\nRÉSULTAT : %d OK, %d FAIL" % (passed, failed))
+print("\nRÉSULTAT: %d OK, %d FAIL" % (passed, failed))
 raise SystemExit(1 if failed else 0)

@@ -71,7 +71,7 @@ def test_full_restore_success(H):
     assert st["pvs"]["pv-new-1"]["spec"]["persistentVolumeReclaimPolicy"] == "Delete"
     assert st["deployments"]["app"]["web"]["spec"]["replicas"] == 2, "application redémarrée"
     assert H._load_txn("app") is None, "transaction effacée"
-    assert any(l.startswith("Préflight") for l in labels(res))
+    assert any(l.startswith("Preflight") for l in labels(res))
     assert res["preflight"] and all(c["ok"] is not False for c in res["preflight"])
 
 
@@ -102,7 +102,7 @@ def test_failure_then_resume_skips_done_volume(H, monkeypatch):
     monkeypatch.delenv("FAKE_FAIL_AT")
     res2 = H._execute_restore_locked(dict(PAYLOAD))
     assert res2["ok"] and not res2["aborted"], labels(res2)
-    assert any("déjà restauré" in l for l in labels(res2))
+    assert any("already restored" in l for l in labels(res2))
     st = read_state(H)
     assert set(st["pvs"]) == {"pv-new-1", "pv-new-2"}
     assert st["deployments"]["app"]["web"]["spec"]["replicas"] == 2, "réplicas repris de la transaction"
@@ -116,7 +116,7 @@ def test_resume_with_other_volumes_is_refused(H, monkeypatch):
     monkeypatch.delenv("FAKE_FAIL_AT")
     other = dict(PAYLOAD, items=[{"pvc": "data-1", "new_ref": VG_NEW2, "new_name": "pv-other"}])
     res = H._execute_restore_locked(other)
-    assert not res["ok"] and "interrompue" in (res.get("error") or "")
+    assert not res["ok"] and "interrupted" in (res.get("error") or "")
 
 
 def test_restart_failure_keeps_transaction(H, monkeypatch):
@@ -133,7 +133,7 @@ def test_preflight_blocks_on_denied_rbac_before_stop(H, monkeypatch):
     seed(H)
     monkeypatch.setenv("FAKE_FAIL_AT", "auth:persistentvolumes")
     res = H._execute_restore_locked(dict(PAYLOAD))
-    assert res["aborted"] and "Préflight" in (res.get("error") or "")
+    assert res["aborted"] and "preflight" in (res.get("error") or "")
     st = read_state(H)
     assert st["deployments"]["app"]["web"]["spec"]["replicas"] == 2, "application non arrêtée"
     assert set(st["pvs"]) == {"pv-1", "pv-2"}
@@ -145,7 +145,7 @@ def test_preflight_blocks_operator_owned_workload(H):
     st["deployments"]["app"]["web"]["metadata"]["ownerReferences"] = [{"kind": "Cluster", "name": "pg", "controller": True}]
     write_state(H, st)
     res = H._execute_restore_locked(dict(PAYLOAD))
-    assert res["aborted"] and "opérateur" in (res.get("error") or "")
+    assert res["aborted"] and "operator" in (res.get("error") or "")
 
 
 def test_pvc_finalizer_not_forced_when_pod_active(H):
@@ -158,7 +158,7 @@ def test_pvc_finalizer_not_forced_when_pod_active(H):
                               "status": {"phase": "Running"}})
     write_state(H, st)
     res = H._execute_restore_locked(dict(PAYLOAD))
-    assert res["aborted"] and "non gérés" in (res.get("error") or "")
+    assert res["aborted"] and "Unmanaged" in (res.get("error") or "")
 
 
 def test_terminal_pods_are_ignored(H):
@@ -191,7 +191,7 @@ def test_backup_refused_during_operation_and_kinds(H):
     H.ACTION_LOCK.acquire()
     try:
         r2 = H.action_backup("app")
-        assert not r2["ok"] and "en cours" in r2["error"]
+        assert not r2["ok"] and "running" in r2["error"]
         r3 = H.action_backup("app", internal=True)
         assert r3["ok"]
     finally:
@@ -203,7 +203,7 @@ def test_backup_partial_when_pv_unreadable(H, monkeypatch):
     monkeypatch.setenv("FAKE_FAIL_AT", "get:pv:pv-2")
     r = H.action_backup("app")
     # Sauvegarde PARTIELLE = échec explicite (ok False), dossier conservé, aucune purge.
-    assert not r["ok"] and r["partial"] and "PARTIELLE" in r["error"] and "data-2" in r["error"]
+    assert not r["ok"] and r["partial"] and "PARTIAL" in r["error"] and "data-2" in r["error"]
     idx = json.load(open(os.path.join(r["dir"], "index.json"), encoding="utf-8"))
     assert idx["partial"] and idx["pv_errors"] and not idx["complete"]
 
@@ -232,7 +232,7 @@ def test_restart_failed_resume_keeps_transaction(H, monkeypatch):
     res2 = H._execute_restore_locked(dict(PAYLOAD))
     assert res2["aborted"] and not res2["ok"]
     txn = H._load_txn("app")
-    assert txn and txn["status"] == "restart_failed", "la transaction doit survivre à un nouvel échec du redémarrage"
+    assert txn and txn["status"] == "restart_failed", "la transaction doit survivre à un nouvel failed du redémarrage"
     assert txn["workloads"] == [{"kind": "deployment", "name": "web", "replicas": 2}]
     assert set(read_state(H)["pvs"]) == {"pv-new-1", "pv-new-2"}
     # Le redémarrage finit par réussir -> transaction effacée, réplicas repris de la transaction.

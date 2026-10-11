@@ -22,21 +22,21 @@ dep = {"kind": "Deployment", "status": {"replicas": 3},
                         "kubectl.kubernetes.io/last-applied-configuration": "{...}"}},
        "spec": {"replicas": 3}}
 c = H._clean_resource(json.loads(json.dumps(dep)))
-check("status" not in c, "Deployment : status retiré")
+check("status" not in c, "Deployment: status retiré")
 check("uid" not in c["metadata"] and "managedFields" not in c["metadata"], "métadonnées runtime retirées")
 check("annotations" not in c["metadata"], "annotation last-applied retirée")
 
 sec = {"kind": "Secret", "type": "Opaque", "metadata": {"name": "db"},
        "data": {"password": "cwd=", "user": "cm9vdA=="}, "stringData": {"x": "y"}}
 c = H._clean_resource(json.loads(json.dumps(sec)))
-check(c["data"] == {"password": "__REDACTED__", "user": "__REDACTED__"}, "Secret : données MASQUÉES par défaut")
-check("stringData" not in c, "Secret : stringData retiré")
-check(c["metadata"]["annotations"]["hycu.backup/secret-data"] == "redacted", "Secret : marqueur 'redacted'")
+check(c["data"] == {"password": "__REDACTED__", "user": "__REDACTED__"}, "Secret: données MASQUÉES default")
+check("stringData" not in c, "Secret: stringData retiré")
+check(c["metadata"]["annotations"]["hycu.backup/secret-data"] == "redacted", "Secret: marqueur 'redacted'")
 c2 = H._clean_resource(json.loads(json.dumps(sec)), include_secret_data=True)
-check(c2["data"]["password"] == "cwd=", "Secret : données conservées si include_secret_data=True")
+check(c2["data"]["password"] == "cwd=", "Secret: données conservées si include_secret_data=True")
 
 sa = {"kind": "ServiceAccount", "metadata": {"name": "sa"}, "secrets": [{"name": "sa-token-xxx"}]}
-check("secrets" not in H._clean_resource(json.loads(json.dumps(sa))), "ServiceAccount : tokens auto retirés")
+check("secrets" not in H._clean_resource(json.loads(json.dumps(sa))), "ServiceAccount: tokens auto retirés")
 
 # ---- _backup_namespace_resources : robustesse + resources.json ----
 tmp = tempfile.mkdtemp()
@@ -63,7 +63,7 @@ try:
     H.CONFIG["backup_secrets"] = "redacted"
     n, skipped, _items, _mode = H._backup_namespace_resources("wordpress", tmp)
     check(n == 2, "2 objets exportés (Deployment + Secret)")
-    check(skipped == ["ingress"], "type en erreur IGNORÉ (pas d'échec)")
+    check(skipped == ["ingress"], "type en erreur IGNORÉ (pas d'failed)")
     saved = json.load(open(os.path.join(tmp, "resources.json"), encoding="utf-8"))
     check(saved["namespace"] == "wordpress" and len(saved["items"]) == 2, "resources.json écrit")
     sec_item = [x for x in saved["items"] if x["kind"] == "Secret"][0]
@@ -85,5 +85,5 @@ check('hycu_connected{system="hycu"}' in m, "hycu_connected par système")
 check(m.count("# HELP hycu_connected") == 1, "un seul bloc HELP pour hycu_connected multi-lignes")
 check("__REDACTED__" not in m and "password" not in m, "aucune donnée sensible dans /metrics")
 
-print("\nRÉSULTAT : %d OK, %d FAIL" % (passed, failed))
+print("\nRÉSULTAT: %d OK, %d FAIL" % (passed, failed))
 raise SystemExit(1 if failed else 0)

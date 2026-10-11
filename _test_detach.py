@@ -26,7 +26,7 @@ H._rest = fake_rest
 H.SESSION_CREDS["nutanix"] = {"mode": "basic"}
 H._nutanix_source = lambda: "nutanix"
 
-print("\n== 1. action_nutanix_detach_vg : détache la VM ==")
+print("\n== 1. action_nutanix_detach_vg: détache la VM ==")
 res = H.action_nutanix_detach_vg(VG)
 check(res["ok"] is True, "ok")
 check(res["detached"] == [VM], "VM détachée")
@@ -43,5 +43,5 @@ check(H.action_nutanix_detach_vg("")["ok"] is False, "uuid vide rejeté")
 H._nutanix_source = lambda: None
 check(H.action_nutanix_detach_vg(VG)["ok"] is False, "refus si pas de Prism Element")
 
-print("\nRÉSULTAT : %d OK, %d FAIL" % (passed, failed))
+print("\nRÉSULTAT: %d OK, %d FAIL" % (passed, failed))
 raise SystemExit(1 if failed else 0)

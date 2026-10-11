@@ -29,7 +29,7 @@ try:
     H.CONFIG.update({"backup_root": tmp})
     H.CONFIG_PATH = os.path.join(tmp, "hycu_config.json")
 
-    print("== Simulation (dry) : plan seulement, aucun clone HYCU ==")
+    print("== Simulation (dry): plan seulement, aucun clone HYCU ==")
     def boom_restore(p):
         raise AssertionError("action_hycu_restore ne doit PAS être appelé en simulation")
     H.action_hycu_restore = boom_restore
@@ -38,9 +38,9 @@ try:
     r = H.action_hycu_provision_clone({"volumes": [{"pvc": "data", "source_vg_uuid": SRC}], "dry": True})
     check(r["ok"] and r["dry"], "plan simulé OK")
     check(r["items"][0]["new_ref"] is None and r["items"][0].get("planned_name", "").startswith("hycurestore-") and r["items"][0]["planned_name"].endswith("-data"),
-          "plan : aucun UUID encore, nom de VG cible imposé")
+          "plan: aucun UUID encore, nom de VG cible imposé")
 
-    print("\n== Simulation informative : identité HYCU résolue (VG supprimé), point affiché ==")
+    print("\n== Simulation informative: identité HYCU résolue (VG supprimé), point affiché ==")
     # Cas réel : sauvegarde ancienne -> on n'a que l'UUID Source (Nutanix) ; HYCU garde le
     # VG « Protected deleted » avec HYCU UUID != Source UUID.
     NSRC = "a6a2d63d-52fd-41b2-518f-a119566b744a"   # Source UUID (externalId Nutanix)
@@ -54,7 +54,7 @@ try:
                                                     "vg_name": "pvc-afae3cb2"}], "dry": True})
     check(r["ok"] and r["dry"], "simulation OK sur un VG supprimé (identité résolue)")
     check(r["items"][0].get("hycu_source") == NHY and r["items"][0].get("restore_point_id") == "rp-1",
-          "plan : identité HYCU résolue depuis l'UUID Source + point de restauration trouvé")
+          "plan: identité HYCU résolue depuis l'UUID Source + point de restauration trouvé")
     with H.CRED_LOCK:
         H.SESSION_CREDS["hycu"] = None
     H._hycu_list_vgs = s_list
@@ -62,7 +62,7 @@ try:
     H.action_hycu_restore_points = lambda src: {"ok": True, "points": [
         {"id": "rp-latest", "time": "2026-09-25 01:00", "restorable": True}]}
 
-    print("\n== Réel : clone HYCU + attente job + découverte de l'UUID ==")
+    print("\n== Réel: clone HYCU + attente job + découverte de l'UUID ==")
     with H.CRED_LOCK:
         H.SESSION_CREDS["hycu"] = {"access": "a", "secret": "b"}
         H.SESSION_CREDS["prismcentral"] = {"access": "a", "secret": "b"}
@@ -80,11 +80,11 @@ try:
     r = H.action_hycu_provision_clone({"volumes": [{"pvc": "data", "source_vg_uuid": SRC}], "dry": False})
     check(r["ok"] and not r["dry"], "provisionnement réel OK")
     check(r["items"][0]["pvc"] == "data" and r["items"][0]["new_ref"] == NEW,
-          "UUID du VG cloné découvert automatiquement (aucune saisie)")
+          "VG UUID cloné découvert automatiquement (aucune saisie)")
     check(CALLS and CALLS[0]["restore_point_id"] == "rp-latest",
-          "point de restauration le plus récent choisi par défaut")
+          "point de restauration le plus récent choisi default")
 
-    print("\n== VG supprimé du cluster : identité HYCU résolue depuis l'UUID Nutanix ==")
+    print("\n== VG supprimé du cluster: identité HYCU résolue depuis l'UUID Nutanix ==")
     HYU = "cccccccc-dddd-eeee-ffff-000000000000"     # uuid HYCU (≠ externalId Nutanix SRC)
     CALLS.clear()
     H._hycu_list_vgs = lambda: ([{"uuid": HYU, "name": "pvc-orig", "externalId": SRC, "hasBackups": True}], None)
@@ -107,7 +107,7 @@ try:
           "VG source (Nutanix) résolu vers l'identité HYCU -> points trouvés -> clone -> UUID")
     check(CALLS and CALLS[0]["source_uuid"] == HYU, "le clone HYCU utilise l'uuid HYCU résolu")
 
-    print("\n== Restauration IN-PLACE : VG recréé à son UUID d'origine (aucune découverte) ==")
+    print("\n== Restauration IN-PLACE: VG recréé à son UUID d'origine (aucune découverte) ==")
     prev_restore = H.action_hycu_restore
     rest_calls = []
     def fake_restore_call(p):
@@ -131,11 +131,11 @@ try:
     rest_calls.clear()
     r = H.action_hycu_provision_restore({"volumes": [{"pvc": "mariadb-pvc", "source_vg_uuid": NSRC,
                                                       "vg_name": "pvc-afae3cb2"}], "dry": True})
-    check(r["ok"] and r["dry"] and not rest_calls, "simulation in-place : plan seulement, aucune restauration")
+    check(r["ok"] and r["dry"] and not rest_calls, "simulation in-place: plan seulement, aucune restauration")
     # NB : on garde HYCU connecté (les sections suivantes en ont besoin).
     H.action_hycu_restore = prev_restore     # rendre le mock attendu par la suite
 
-    print("\n== Découverte : ambiguïté jamais tranchée au hasard ==")
+    print("\n== Découverte: ambiguïté jamais tranchée au hasard ==")
     H.action_hycu_restore_points = lambda src: {"ok": True, "points": [
         {"id": "rp-latest", "time": "2026-09-25 01:00", "restorable": True}]}
     H._hycu_list_vgs = s_list
@@ -145,17 +145,17 @@ try:
     u, e = H._discover_vg_uuid_by_name("dup")
     check(u is None and "ambigu" in (e or "").lower(), "deux VG du même nom -> refus (ambiguïté)")
 
-    print("\n== Job HYCU en échec : remontée claire, pas d'items ==")
+    print("\n== Job HYCU failed: remontée claire, pas d'items ==")
     H.action_nutanix_vgs = fake_vgs
     H.action_hycu_job = lambda jid: {"ok": True, "status": "FAILED"}
     r = H.action_hycu_provision_clone({"volumes": [{"pvc": "data", "source_vg_uuid": SRC}], "dry": False})
-    check(not r["ok"] and "échec" in (r["error"] or "").lower(), "échec du job HYCU signalé")
+    check(not r["ok"] and "failed" in (r["error"] or "").lower(), "failed du job HYCU signalé")
 
-    print("\n== Repli : HYCU non connecté en réel -> message clair ==")
+    print("\n== Repli: HYCU non connecté en réel -> message clair ==")
     with H.CRED_LOCK:
         H.SESSION_CREDS["hycu"] = None
     r = H.action_hycu_provision_clone({"volumes": [{"pvc": "data", "source_vg_uuid": SRC}], "dry": False})
-    check(not r["ok"] and "HYCU" in (r["error"] or ""), "sans HYCU : refus explicite (saisie manuelle possible)")
+    check(not r["ok"] and "HYCU" in (r["error"] or ""), "sans HYCU: refus explicite (saisie manuelle possible)")
 finally:
     with H.CRED_LOCK:
         H.SESSION_CREDS["hycu"] = None
@@ -168,5 +168,5 @@ finally:
     H.CONFIG.clear(); H.CONFIG.update(saved)
     shutil.rmtree(tmp, ignore_errors=True)
 
-print("\nRÉSULTAT : %d OK, %d FAIL" % (passed, failed))
+print("\nRÉSULTAT: %d OK, %d FAIL" % (passed, failed))
 raise SystemExit(1 if failed else 0)

@@ -24,7 +24,7 @@ for k in H.SESSION_CREDS:
 
 # 1) Premier chargement (aucun cookie) : nouvelle session, cookie posé.
 sc = H.check_ui_session(None)
-check(sc is not None and "hycu_sess=" in sc, "premier chargement : Set-Cookie posé")
+check(sc is not None and "hycu_sess=" in sc, "premier chargement: Set-Cookie posé")
 check("HttpOnly" in sc and "SameSite=Strict" in sc, "cookie HttpOnly + SameSite=Strict")
 check("Expires" not in sc and "Max-Age" not in sc, "cookie de session (meurt avec le navigateur)")
 tok = re.search(r"hycu_sess=([A-Za-z0-9_-]+)", sc).group(1)
@@ -32,23 +32,23 @@ tok = re.search(r"hycu_sess=([A-Za-z0-9_-]+)", sc).group(1)
 # 2) Connexion simulée puis rechargement F5 (même cookie) : rien ne change.
 H.SESSION_CREDS["hycu"] = {"mode": "basic", "user": "u", "password": "p"}
 sc2 = H.check_ui_session("hycu_lang=fr; hycu_sess=" + tok)
-check(sc2 is None, "même session (F5) : pas de nouveau cookie")
-check(_connected() == ["hycu"], "même session (F5) : identifiants conservés")
+check(sc2 is None, "même session (F5): pas de nouveau cookie")
+check(_connected() == ["hycu"], "même session (F5): identifiants conservés")
 
 # 3) Navigateur relancé (pas de cookie) : identifiants effacés, nouveau cookie.
 sc3 = H.check_ui_session("hycu_lang=fr")
-check(sc3 is not None and tok not in sc3, "navigateur relancé : nouvelle session, id différent")
-check(_connected() == [], "navigateur relancé : identifiants effacés")
+check(sc3 is not None and tok not in sc3, "navigateur relancé: nouvelle session, id différent")
+check(_connected() == [], "navigateur relancé: identifiants effacés")
 
 # 4) Ancien cookie devenu invalide : re-verrouillage aussi.
 H.SESSION_CREDS["nutanix"] = {"mode": "basic", "user": "u", "password": "p"}
 sc4 = H.check_ui_session("hycu_sess=" + tok)
-check(sc4 is not None, "cookie périmé : nouvelle session")
-check(_connected() == [], "cookie périmé : identifiants effacés")
+check(sc4 is not None, "cookie périmé: nouvelle session")
+check(_connected() == [], "cookie périmé: identifiants effacés")
 
 # 5) Cookie forgé / malformé : traité comme absent, sans erreur.
 sc5 = H.check_ui_session("hycu_sess=;;;garbage")
-check(sc5 is not None, "cookie malformé : nouvelle session sans exception")
+check(sc5 is not None, "cookie malformé: nouvelle session sans exception")
 
-print("\nRÉSULTAT : %d OK, %d FAIL" % (passed, failed))
+print("\nRÉSULTAT: %d OK, %d FAIL" % (passed, failed))
 raise SystemExit(1 if failed else 0)

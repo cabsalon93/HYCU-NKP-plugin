@@ -33,5 +33,5 @@ print("\n== 3. Ni sauvegarde ni live -> None (sinistre) ==")
 H.kubectl_json = lambda args: (None, "not found")
 check(H._load_old_pvc(ns, pvc, None) is None, "None si PVC introuvable partout")
 
-print("\nRÉSULTAT : %d OK, %d FAIL" % (passed, failed))
+print("\nRÉSULTAT: %d OK, %d FAIL" % (passed, failed))
 raise SystemExit(1 if failed else 0)

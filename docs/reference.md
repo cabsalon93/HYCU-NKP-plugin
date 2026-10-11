@@ -2,7 +2,6 @@
 
 > Full reference (long). To get started, read the **[README](../README.md)**.
 
-> 🇫🇷 Version française : **[reference.fr.md](reference.fr.md)**
 
 Guided web interface to **back up and restore** Kubernetes applications whose
 volumes (PVC = Nutanix Volume Groups) are protected by **HYCU**.
@@ -105,14 +104,14 @@ Backups and the audit log are written to `./hycu-backups/`, the configuration to
 
 > **Workstation without Python**: the same container image runs with **Docker** —
 > `docker compose -f deploy/docker-compose.yml up` then <http://127.0.0.1:8765>.
-> Guides: [docs/docker.md](docker.md) · [docs/docker-demarrage.md](docker-demarrage.md).
+> Guides: [docs/docker.md](docker.md) · [docs/docker-quickstart.md](docker-quickstart.md).
 
 ### Option B — Kubernetes application (deployed in the cluster)
 
 The **same image** (`ghcr.io/cabsalon93/hycu-nkp-plugin:latest`, public) packages
 the script **and** `kubectl`: nothing to install on workstations, the tool runs
 continuously inside the cluster. Deployment in **5 steps** — detailed
-step-by-step guide: **[docs/kubernetes-demarrage.md](kubernetes-demarrage.md)**.
+step-by-step guide: **[docs/kubernetes.md](kubernetes.md)**.
 
 **Step 1 — Namespace + RBAC identity.** Creates the `hycu-operator`
 ServiceAccount and its rights ([deploy/k8s/rbac.yaml](../deploy/k8s/rbac.yaml)):
@@ -251,17 +250,6 @@ program again; `hycu_config.json`, the vault and the backups stay in place.
 
 After any update: reload the UI without cache (Ctrl+Shift+R) and check the version at the
 bottom of the sidebar; `/healthz` must answer `200`.
-
-### Language / Langue
-
-The UI is **bilingual French / English**: the **EN** / **FR** button in the
-header switches the language (page **and** server messages). The choice is
-remembered per browser (`hycu_lang` cookie); French is the default.
-
-*L'interface est bilingue français / anglais : le bouton **EN** / **FR** dans
-l'en-tête bascule la langue (page **et** messages du serveur). Le choix est
-mémorisé par navigateur (cookie `hycu_lang`) ; le français est la langue par
-défaut.*
 
 ## 4. Using the tool — HYCU Enterprise Cloud interface
 
@@ -478,7 +466,7 @@ refreshes every ~3 s until the state is stable (all PVCs Bound, pods Running;
   `backup_root`, `logo_path`, `host` and `port` can only be set by the file or `HYCU_*`
   variables, not by the API.
 - **Development**: the UI lives in `ui/` and is assembled into the single file by
-  `python build.py` (`--check` in CI, `--lint` for the i18n dictionary); tests run with
+  `python build.py` (`--check` in CI); tests run with
   `python -m pytest -q tests` on a fake `kubectl`, never on a real cluster.
 - **Restore safety**: preflight (RBAC `auth can-i`, StorageClass, cloned VG disks, operator-owned
   workloads, unmanaged pods) before stopping the application; Retain forced on source, current
@@ -571,7 +559,6 @@ Copy `hycu_config.example.json` → `hycu_config.json`. Also editable via the
 | `hycu_ca_bundle` / `nutanix_ca_bundle` / `prismcentral_ca_bundle` | `""` | Path of a CA bundle (PEM) used when `*_verify_tls` is true: internal PKI or exported self-signed certificate, without disabling verification. |
 | `hycu_job_timeout` | `1800` | Maximum wait (s) for a HYCU job (clone, restore, backup). |
 | `allowed_hosts` | `[]` | Host names (DNS) under which the UI may be served **in addition to** the loopback (Ingress, reverse proxy); `HYCU_ALLOWED_HOSTS` in a container. Empty = loopback only. Protect with upstream authentication. |
-| `default_lang` | `"en"` | Interface language when the browser has not chosen yet (FR/EN button): `en` or `fr`. |
 | `simulation_mode_available` | `false` | `true` = offer the "Simulation mode" switch in the banner (checked by default); `false` = live mode directly, banner hidden. |
 | `kube_context` / `kubeconfig_path` | `""` | Context and kubeconfig file of the **local** cluster (empty = kubectl default resolution). |
 | `backup_root` | `./hycu-backups` | Folder for backups, the audit log and restore transactions (`HYCU_BACKUP_ROOT` in a container). |

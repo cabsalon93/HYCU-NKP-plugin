@@ -10,7 +10,7 @@ import hycu_k8s_nutanix as H
 # Isolation : aucun kubectl réel (sur un poste avec un kubeconfig, l'appel à un cluster
 # injoignable bloquerait la suite). Les lectures passent par kubectl_json (doublé ci-dessous).
 H.run = lambda cmd, dry=False, label=None, timeout=None, input_text=None: {
-    "ok": False, "dry": False, "cmd": "", "stdout": "", "stderr": "kubectl désactivé (test)", "rc": 1,
+    "ok": False, "dry": False, "cmd": "", "stdout": "", "stderr": "kubectl désenabled (test)", "rc": 1,
     "label": label or "kubectl"}
 
 passed = failed = 0
@@ -44,13 +44,13 @@ try:
     r = H.action_applications()
     apps = {a["name"]: a for a in r["apps"]}
     check(r["ok"] and len(apps) == 3, "3 namespaces listés")
-    check(apps["wordpress"]["protected"] and apps["wordpress"]["compliant"], "sauvegarde récente : protégé + conforme")
+    check(apps["wordpress"]["protected"] and apps["wordpress"]["compliant"], "sauvegarde récente: protégé + conforme")
     check(apps["wordpress"]["backups"] == 2 and apps["wordpress"]["volumes"] == 2,
           "compte des versions + volumes de la plus récente")
-    check(apps["vieux"]["protected"] and not apps["vieux"]["compliant"], "sauvegarde de 5 j : protégé mais NON conforme (24 h)")
-    check(not apps["neuf"]["protected"] and apps["neuf"]["last_backup"] is None, "jamais sauvegardé : non protégé")
+    check(apps["vieux"]["protected"] and not apps["vieux"]["compliant"], "sauvegarde de 5 j: protégé mais NON conforme (24 h)")
+    check(not apps["neuf"]["protected"] and apps["neuf"]["last_backup"] is None, "jamais sauvegardé: non protégé")
     H.CONFIG.update({"auto_backup_enabled": True, "auto_backup_interval_hours": 168})
-    check(H.action_applications()["apps"][1]["compliant"], "politique 7 j : la sauvegarde de 5 j redevient conforme")
+    check(H.action_applications()["apps"][1]["compliant"], "politique 7 j: la sauvegarde de 5 j redevient conforme")
     H.CONFIG["auto_backup_enabled"] = False
 
     # Dossier de la sauvegarde auto distinct : ses sauvegardes comptent aussi.
@@ -80,10 +80,10 @@ try:
     check(j["ok"] and len(j["jobs"]) == 5, "5 tâches (connexion et ligne corrompue ignorées)")
     check(j["jobs"][0]["event"] == "auto_backup", "plus récente d'abord")
     st = {x["event"]: x["status"] for x in j["jobs"]}
-    check(st["backup"] == "success", "sauvegarde : succès")
-    check(st["restore_end"] == "simulation", "restauration dry-run : simulation")
-    check(st["clone_app"] == "failed", "clone en échec : échec")
-    check(st["orchestrate_inplace"] == "failed", "séquence interrompue (aborted) : échec")
+    check(st["backup"] == "success", "sauvegarde: succès")
+    check(st["restore_end"] == "simulation", "restauration dry-run: simulation")
+    check(st["clone_app"] == "failed", "clone failed: failed")
+    check(st["orchestrate_inplace"] == "failed", "séquence interrompue (aborted): failed")
     check(j["counts"] == {"success": 2, "failed": 2, "simulation": 1}, "compteurs")
     check(len(j["days"]) == 7 and j["days"][-1]["date"] == today and j["days"][-1]["failed"] == 2,
           "activité sur 7 jours (aujourd'hui en dernier)")
@@ -91,11 +91,11 @@ try:
           "namespace cible du clone conservé")
 
     os.remove(os.path.join(tmp, "audit.log"))
-    check(H.action_jobs()["jobs"] == [], "pas de journal : liste vide, sans erreur")
+    check(H.action_jobs()["jobs"] == [], "pas de journal: liste vide, sans erreur")
 finally:
     H.action_namespaces = old_ns
     H.CONFIG.update(saved)
     shutil.rmtree(tmp, ignore_errors=True)
 
-print("\nRÉSULTAT : %d OK, %d FAIL" % (passed, failed))
+print("\nRÉSULTAT: %d OK, %d FAIL" % (passed, failed))
 raise SystemExit(1 if failed else 0)

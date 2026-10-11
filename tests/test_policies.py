@@ -70,7 +70,7 @@ def test_selector_error_never_purges(H, monkeypatch):
     fake_selectors(H, monkeypatch, {}, fail=True)
     pmap, err = H._policy_map(["app"])
     assert err and pmap["app"] is None
-    assert H._retention_for("app") == (0, "count"), "appartenance invérifiable : aucune purge"
+    assert H._retention_for("app") == (0, "count"), "appartenance invérifiable: aucune purge"
 
 
 # ------------------------------------------------------------------ périmètre des passages
@@ -87,12 +87,12 @@ def test_backup_all_scopes(H, monkeypatch):
     monkeypatch.setattr(H, "action_backup", fake_backup)
     H.CONFIG["backup_parallel"] = 1
     H.action_backup_all(None, kind="auto", internal=True, policy_scope=None)
-    assert sorted(c[0] for c in calls) == ["app", "misc"], "défaut : namespaces SANS politique nommée"
+    assert sorted(c[0] for c in calls) == ["app", "misc"], "défaut: namespaces SANS politique nommée"
     assert all(c[1] is None for c in calls)
     calls.clear()
     p = H._named_policies()[0]
     H.action_backup_all(None, kind="auto", internal=True, policy_scope=p)
-    assert calls == [("shop", 7, "count")], "politique : ses namespaces, avec sa rétention"
+    assert calls == [("shop", 7, "count")], "politique: ses namespaces, avec sa rétention"
     calls.clear()
     H.action_backup_all(None)                                            # sauvegarde manuelle « tout »
     assert sorted(c[0] for c in calls) == ["app", "misc", "shop"]
@@ -119,7 +119,7 @@ def test_manual_backup_uses_policy_retention(H):
 def test_policy_due_and_run_state(H, monkeypatch):
     set_policies(H, [pol("argent", namespaces=["app"], interval_hours=2, keep=5)])
     p = H._named_policies()[0]
-    assert H._policy_due(p, 1000.0), "jamais exécutée : due tout de suite"
+    assert H._policy_due(p, 1000.0), "jamais exécutée: due tout de suite"
     monkeypatch.setattr(H, "action_backup_all", lambda dest, kind="manual", internal=False, policy_scope=None:
                         {"ok": True, "results": [{"ns": "app", "ok": True, "count": 1, "pruned": 0}],
                          "root": "/x", "backed_up": 1, "volumes": 1})
@@ -151,7 +151,7 @@ def test_policy_hycu_assign_only_unassigned_trusted(H, monkeypatch):
     ok, msg = H._policy_hycu_assign(p, ["app"])
     assert ok and calls == [("/policies/pol-uuid/assign",
                              {"volumeGroupUuidList": ["vg-free"], "includeDependencies": False})]
-    assert "1 volume(s) rattaché(s)" in msg and "1 volume(s) déjà dans une autre politique" in msg
+    assert "1 volume(s) attached" in msg and "1 volume(s) already in another HYCU policy" in msg
 
 
 def test_compliance_window_follows_policy(H):

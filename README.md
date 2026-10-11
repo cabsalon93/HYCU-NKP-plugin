@@ -1,6 +1,6 @@
 # HYCU · Kubernetes on Nutanix
 
-> 🇫🇷 Version française : **[README.fr.md](README.fr.md)** · Full reference: [docs/reference.md](docs/reference.md)
+> Full reference: [docs/reference.md](docs/reference.md)
 
 A single web page to **back up, protect and restore** Kubernetes applications whose
 volumes (PVCs) are Nutanix Volume Groups protected by **HYCU**. One Python file (standard
@@ -55,7 +55,7 @@ kubectl -n hycu port-forward svc/hycu 8765:8765        # then http://127.0.0.1:8
 ```
 
 On first launch a wizard creates the configuration. One replica only (global state +
-`hycu-data` PVC). Detailed walkthrough: [docs/kubernetes-demarrage.md](docs/kubernetes-demarrage.md) (French).
+`hycu-data` PVC). Detailed walkthrough: [docs/kubernetes.md](docs/kubernetes.md).
 
 ### With Docker (on a workstation)
 
@@ -114,7 +114,6 @@ Everything is set from the UI (⚙ **Settings**, ⚙ **Sources**) or in `hycu_co
 | `allow_dr_restore` | `false` | Allow restoring onto another cluster (DR mode). |
 | `require_context_confirm` | `true` | Retype the cluster name before any live action. |
 | `simulation_mode_available` | `false` | Offer the “simulation mode” (dry-run) switch. |
-| `default_lang` | `"en"` | Default UI language (`en` / `fr`). |
 | `hycu_url`, `prismcentral_url`, `nutanix_url` | `""` | System addresses (`*_verify_tls`, `*_ca_bundle` for TLS). |
 | `s3_url`, `s3_bucket`, `s3_auto_upload`, `s3_encrypt` | `""`, `""`, `false`, `false` | Backup export to an S3 bucket (Nutanix Objects, MinIO, AWS). |
 | `kubectl_path`, `kube_context` | `"kubectl"`, `""` | kubectl binary and context of the local cluster. |
@@ -140,6 +139,6 @@ unlock of the credentials vault at startup).
 
 - [docs/reference.md](docs/reference.md) — full reference (all settings, restore paths,
   HYCU/Nutanix endpoints, troubleshooting).
-- [docs/kubernetes-demarrage.md](docs/kubernetes-demarrage.md) · [docs/docker.md](docs/docker.md) — detailed deployment (French).
-- [docs/audit-2026-10-09.md](docs/audit-2026-10-09.md) — audit and hardening work (French).
-- Development: `python build.py --check --lint` (UI sources in `ui/`), `python -m pytest tests`.
+- [docs/kubernetes.md](docs/kubernetes.md) · [docs/docker.md](docs/docker.md) — detailed deployment.
+- [docs/audit-2026-10-09.md](docs/audit-2026-10-09.md) — audit and hardening work (historical notes, in French).
+- Development: `python build.py --check` (UI sources in `ui/`), `python -m pytest tests`.

@@ -47,7 +47,7 @@ check(pv_applied and pv_applied[0]["spec"]["csi"]["volumeAttributes"]["hyperviso
       "hypervisorAttachedDiskUUIDs = nouveau disque")
 check(pv_applied and pv_applied[0]["spec"]["csi"]["volumeHandle"] == "NutanixVolumes-" + VG, "même volumeHandle (même VG)")
 check(pv_applied and pv_applied[0]["spec"].get("persistentVolumeReclaimPolicy") == "Retain",
-      "PV recréé forcé en Retain (V10 : ne pas réarmer la destruction du VG)")
+      "PV recréé forcé en Retain (V10: ne pas réarmer la destruction du VG)")
 
 print("\n== 2. Disque INCHANGÉ -> no-op ==")
 H._clone_vg_disk_uuids = lambda u: OLD
@@ -63,11 +63,11 @@ ok3, _ = H._refresh_pv_disk("wordpress", "mariadb-pvc", dry=False, log=log3)
 check(ok3 is True and not applied, "non bloquant, aucune recréation sans PC")
 check(any(l.get("ok") is False for l in log3), "avertissement journalisé")
 
-print("\n== 4. dry-run : aperçu, aucune opération destructive ==")
+print("\n== 4. dry-run: aperçu, aucune opération destructive ==")
 H.SESSION_CREDS["prismcentral"] = {"mode": "basic"}
 applied.clear(); log4 = []
 ok4, _ = H._refresh_pv_disk("wordpress", "mariadb-pvc", dry=True, log=log4)
-check(ok4 is True and not applied, "dry : aucun apply destructif")
+check(ok4 is True and not applied, "dry: aucun apply destructif")
 
 print("\n== 5. État du PV INCERTAIN (erreur kubectl) -> AVORTE sans rien supprimer (V1) ==")
 H._clone_vg_disk_uuids = lambda u: NEW
@@ -82,9 +82,9 @@ H.resource_state = lambda kind, name, ns=None: ("present", "")
 check(ok5 is False, "retourne un échec si l'état du PV est indéterminé")
 check(not deleted, "AUCUNE suppression PVC/PV (le VG ne peut pas être détruit par erreur)")
 check(not applied, "aucune recréation de PV")
-check("état du PV" in (detail5 or "") or "vérification" in (detail5 or ""), "détail d'échec explicite")
+check("state of PV" in (detail5 or "") or "checking" in (detail5 or ""), "explicit failure detail")
 
-print("\n== 6. Cible iSCSI renommée par le restore (targetName « hycu-… ») -> PV recréé avec le bon IQN ==")
+print("\n== 6. Cible iSCSI renommée par le restore (targetName “hycu-…”) -> PV recréé avec le bon IQN ==")
 PV["spec"]["csi"]["volumeAttributes"]["iqn"] = "iqn.2010-06.com.nutanix:ntnx-k8s-" + VG + "-tgt0"
 H.SESSION_CREDS["prismcentral"] = {"mode": "basic"}
 H._clone_vg_disk_uuids = lambda u: OLD                     # disque inchangé
@@ -94,11 +94,11 @@ ok6, _ = H._refresh_pv_disk("wordpress", "mariadb-pvc", dry=False, log=log6)
 pv6 = [m for m in applied if m.get("kind") == "PersistentVolume"]
 check(ok6 is True and len(pv6) == 1 and pv6[0]["spec"]["csi"]["volumeAttributes"]["iqn"] == "iqn.2010-06.com.nutanix:hycu-clone-vg-" + VG + "-tgt0"
       and pv6[0]["spec"]["csi"]["volumeAttributes"]["hypervisorAttachedDiskUUIDs"] == OLD,
-      "disque inchangé mais cible renommée : PV recréé avec l'IQN réel, disque conservé")
+      "disque inchangé mais cible renommée: PV recréé avec l'IQN réel, disque conservé")
 H._vg_target_name = lambda u: "ntnx-k8s-" + VG
 applied.clear(); log7 = []
 ok7, _ = H._refresh_pv_disk("wordpress", "mariadb-pvc", dry=False, log=log7)
-check(ok7 is True and not applied, "cible conforme et disque inchangé : no-op")
+check(ok7 is True and not applied, "cible conforme et disque inchangé: no-op")
 
-print("\nRÉSULTAT : %d OK, %d FAIL" % (passed, failed))
+print("\nRÉSULTAT: %d OK, %d FAIL" % (passed, failed))
 raise SystemExit(1 if failed else 0)

@@ -42,7 +42,7 @@ payload = {"namespace": "wordpress", "dry": True, "mode": "clone",
 res = H._execute_restore_locked(payload)
 
 labels = [l.get("label", "") for l in res["log"]]
-print("Étapes (dry-run) :")
+print("Étapes (dry-run):")
 for l in labels:
     print("   -", l)
 
@@ -54,8 +54,8 @@ def check(c, m):
 
 joined = " || ".join(labels)
 retain_idx = next((i for i, l in enumerate(labels) if "Retain" in l), -1)
-delpvc_idx = next((i for i, l in enumerate(labels) if "Suppression PVC" in l), -1)
-delpv_idx = next((i for i, l in enumerate(labels) if "Suppression PV " in l), -1)
+delpvc_idx = next((i for i, l in enumerate(labels) if "Deleting PVC" in l), -1)
+delpv_idx = next((i for i, l in enumerate(labels) if "Deleting PV " in l), -1)
 disk_idx = next((i for i, l in enumerate(labels) if "hypervisorAttachedDiskUUIDs" in l), -1)
 
 print()
@@ -68,5 +68,5 @@ check(res["dry"] is True and res["ok"] is True, "dry-run ok")
 # reprotect non rempli en dry (sécurité)
 check(res.get("reprotect") == [], "rappel re-protection vide en dry")
 
-print("\nRÉSULTAT : %d OK, %d FAIL" % (passed, failed))
+print("\nRÉSULTAT: %d OK, %d FAIL" % (passed, failed))
 raise SystemExit(1 if failed else 0)

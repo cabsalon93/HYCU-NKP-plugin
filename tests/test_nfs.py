@@ -43,7 +43,7 @@ def test_match_share_rules(H):
     sh, kind, sub = H._match_share({"server": "nutanix-afs", "path": "/pvc-k8s/app1"}, [SHARE])
     assert kind == "exact" and sub == "/app1", "PV sur un sous-dossier du partage"
     sh, kind, _ = H._match_share({"server": "10.0.0.5", "path": "/pvc-k8s"}, [SHARE])
-    assert kind == "name", "même chemin, serveur non reconnu : suggestion à confirmer"
+    assert kind == "name", "même chemin, serveur non reconnu: suggestion à confirmer"
     other = dict(SHARE, uuid="sh-2", fileServerName="autre-nas")
     _sh, kind, _ = H._match_share({"server": "10.0.0.5", "path": "/pvc-k8s"}, [SHARE, other])
     assert kind == "ambiguous"
@@ -101,7 +101,7 @@ def test_backup_records_nfs_volume(H):
 def test_volume_group_flows_refuse_nfs_clearly(H):
     seed_nas(H)
     res = H._prepare_one("app", {"pvc": "data", "new_ref": "11111111-1111-4111-8111-111111111111"}, "clone", None)
-    assert not res["ok"] and res.get("nfs") and "volume NAS" in res["error"]
+    assert not res["ok"] and res.get("nfs") and "NAS volume" in res["error"]
 
 
 def test_copy_refused_but_recovery_reuses_export(H, monkeypatch):
@@ -111,7 +111,7 @@ def test_copy_refused_but_recovery_reuses_export(H, monkeypatch):
     # Copie d'une application VIVANTE : refusée (partagerait les données de production).
     r = H.action_clone_app({"namespace": "app", "target_namespace": "copie", "dry": True,
                             "backup_path": b["dir"], "items": [{"pvc": "data", "new_ref": ""}]})
-    assert not r["ok"] and "volume NAS" in r["error"]
+    assert not r["ok"] and "NAS volume" in r["error"]
     # Récupération d'une application SUPPRIMÉE : PV recréé vers le même export, sans UUID.
     st = read_state(H)
     st["namespaces"] = []
@@ -120,7 +120,7 @@ def test_copy_refused_but_recovery_reuses_export(H, monkeypatch):
     r2 = H.action_clone_app({"namespace": "app", "target_namespace": "app", "dry": True, "from_backup_only": True,
                              "backup_path": b["dir"], "items": [{"pvc": "data", "new_ref": ""}]})
     assert r2.get("ok") or r2.get("dry"), r2
-    assert any("même export" in w for w in (r2.get("warnings") or [])), r2.get("warnings")
+    assert any("same export" in w for w in (r2.get("warnings") or [])), r2.get("warnings")
 
 
 def test_named_policy_assigns_hycu_policy_to_unassigned_share(H, monkeypatch):
@@ -140,7 +140,7 @@ def test_named_policy_assigns_hycu_policy_to_unassigned_share(H, monkeypatch):
     ok, msg = H._policy_hycu_assign(p, ["app"])
     assert ok and calls == [("/policies/pol/assign", {"volumeGroupUuidList": [], "includeDependencies": False,
                                                       "shareUuidList": ["sh-1"]})]
-    assert "1 volume(s) rattaché(s)" in msg and "1 volume(s) déjà dans une autre politique" in msg
+    assert "1 volume(s) attached" in msg and "1 volume(s) already in another HYCU policy" in msg
 
 
 def _fake_hycu(H, monkeypatch, calls):
@@ -174,9 +174,9 @@ def test_copy_restores_share_into_namespace_folder(H, monkeypatch):
                "items": [{"pvc": "data", "new_ref": ""}]}
     r = H.action_clone_app(dict(payload, dry=True))
     assert r.get("ok") or r.get("dry"), r
-    assert any("copie NAS" in w and "bk" not in w for w in r["warnings"]), r["warnings"]
-    assert any("verra le dossier" in w for w in r["warnings"])
-    assert not any("restoreShareItems" in c[1] for c in calls), "simulation : aucune restauration lancée"
+    assert any("NAS copy" in w and "bk-" not in w for w in r["warnings"]), r["warnings"]
+    assert any("will see the folder" in w for w in r["warnings"])
+    assert not any("restoreShareItems" in c[1] for c in calls), "simulation: aucune restauration lancée"
     assert any("browseShareClose" in c[1] and "s1" in c[1] for c in calls), "session de parcours refermée"
     # Réel : restauration HYCU de la sauvegarde la plus récente dans « copie », puis PV vers ce dossier.
     monkeypatch.setattr(H, "_context_guard", lambda p: None)
@@ -198,8 +198,8 @@ def test_copy_of_subfolder_volume_and_failures(H, monkeypatch):
     plan, err = H._nfs_copy_plan({"server": "nutanix-afs", "path": "/pvc-k8s/app1"}, "data")
     assert not err and plan["sub"] == "/app1" and plan["root_path"] == "/pvc-k8s"
     body, pv_path, sel, _ = H._nfs_copy_target(plan, "copie")
-    assert pv_path == "/pvc-k8s/copie/app1", "HYCU garde l'arborescence : copie/app1"
-    assert sel == ["/nas-demo", "/copie"], "sous-dossier : rien n'est écarté"
+    assert pv_path == "/pvc-k8s/copie/app1", "HYCU garde l'arborescence: copie/app1"
+    assert sel == ["/nas-demo", "/copie"], "sous-dossier: rien n'est écarté"
     H.SESSION_CREDS.pop("hycu", None)
     _p, err = H._nfs_copy_plan({"server": "nutanix-afs", "path": "/pvc-k8s"}, "data")
-    assert "Connectez HYCU" in err
+    assert "Connect HYCU" in err

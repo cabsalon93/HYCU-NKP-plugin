@@ -65,23 +65,23 @@ try:
              {"kind": "ReplicaSet", "metadata": {"name": "rs", "ownerReferences": [{"kind": "Deployment"}]}}]
     pvcs = ["wp-data", "data-wp-mariadb-0", "data-wp-mariadb-1", "data-wp-mariadb-2", "orphan"]
     apps = {a["name"]: a for a in H._apps_from_workloads("shop", items, pvcs)}
-    check(set(apps) == {"wp", "redis", "nolabel", H.APP_UNASSIGNED}, "4 applications : wp, redis, nolabel + volumes orphelins")
+    check(set(apps) == {"wp", "redis", "nolabel", H.APP_UNASSIGNED}, "4 applications: wp, redis, nolabel + volumes orphelins")
     check(apps["wp"]["type"] == "stateful" and apps["wp"]["pvcs"] == ["wp-data", "data-wp-mariadb-0", "data-wp-mariadb-1", "data-wp-mariadb-2"],
-          "wp = stateful : PVC monté + volumeClaimTemplates (tous les PVC existants du STS)")
+          "wp = stateful: PVC monté + volumeClaimTemplates (tous les PVC existants du STS)")
     check([w["kind"] for w in apps["wp"]["workloads"]] == ["Deployment", "StatefulSet"], "wp regroupe Deployment + StatefulSet (même instance)")
     check(apps["redis"]["type"] == "stateless" and {w["name"] for w in apps["redis"]["workloads"]} == {"redis", "cleanup"},
-          "redis = stateless (Deployment + CronJob par étiquette app) ; Job dérivé ignoré")
+          "redis = stateless (Deployment + CronJob par étiquette app); Job dérivé ignoré")
     check(apps["nolabel"]["type"] == "stateless" and apps["nolabel"]["workloads"][0]["name"] == "nolabel",
-          "workload sans étiquette : application à lui seul")
+          "workload sans étiquette: application à lui seul")
     check(apps[H.APP_UNASSIGNED]["unassigned"] and apps[H.APP_UNASSIGNED]["pvcs"] == ["orphan"],
-          "PVC qu'aucun workload ne monte -> pseudo-application « volumes sans workload »")
+          "PVC qu'aucun workload ne monte -> pseudo-application “volumes without workload”")
     only_sts = H._apps_from_workloads("db", [wl("StatefulSet", "pg", vct=("data",), replicas=3)])
-    check(only_sts[0]["pvcs"] == ["data-pg-0", "data-pg-1", "data-pg-2"], "sans liste de PVC : un PVC par réplica")
+    check(only_sts[0]["pvcs"] == ["data-pg-0", "data-pg-1", "data-pg-2"], "sans liste de PVC: un PVC par réplica")
     empty = H._apps_from_workloads("void", [], [])
-    check(len(empty) == 1 and empty[0]["type"] == "empty" and empty[0]["whole_ns"], "namespace vide : une ligne « vide »")
+    check(len(empty) == 1 and empty[0]["type"] == "empty" and empty[0]["whole_ns"], "namespace vide: une ligne “vide”")
     onlypvc = H._apps_from_workloads("raw", [], ["d1"])
     check(onlypvc[0]["type"] == "stateful" and onlypvc[0]["whole_ns"] and onlypvc[0]["pvcs"] == ["d1"],
-          "PVC sans aucun workload : application = namespace (stateful)")
+          "PVC sans aucun workload: application = namespace (stateful)")
 
     print("\n== Objets d'une application dans l'instantané ==")
     svc_wp = {"kind": "Service", "metadata": {"name": "wp-svc"}, "spec": {"selector": inst}}
@@ -95,12 +95,12 @@ try:
     names = {(snap[i]["kind"], snap[i]["metadata"]["name"]) for i in sel}
     check(names == {("Deployment", "wp-wordpress"), ("StatefulSet", "wp-mariadb"), ("Service", "wp-svc"),
                     ("ConfigMap", "wp-cm"), ("Secret", "wp-sec"), ("Ingress", "wp-ing")},
-          "wp : workloads + Service ciblant ses pods + ConfigMap/Secret référencés + objet étiqueté ; rien de redis ni du partagé")
+          "wp: workloads + Service ciblant ses pods + ConfigMap/Secret référencés + objet étiqueté; rien de redis ni du partagé")
     sel2 = {snap[i]["metadata"]["name"] for i in H._app_object_indexes(snap, "redis")}
-    check(sel2 == {"redis", "cleanup", "redis-svc"}, "redis : Deployment + CronJob + son Service")
-    check(H._app_object_indexes(snap, "") == set(range(len(snap))), "sans application : tous les objets")
+    check(sel2 == {"redis", "cleanup", "redis-svc"}, "redis: Deployment + CronJob + son Service")
+    check(H._app_object_indexes(snap, "") == set(range(len(snap))), "sans application: tous les objets")
 
-    print("\n== Page Applications : une ligne par application, protection du namespace ==")
+    print("\n== Page Applications: une ligne par application, protection of the namespace ==")
     def mk_backup(ns, when, volumes, apps_idx=None, resources=None):
         d = os.path.join(H._cluster_root(tmp), ns, when)
         os.makedirs(d)
@@ -125,20 +125,20 @@ try:
     rows = {(a["namespace"], a["name"]): a for a in r["apps"]}
     check(r["ok"] and set(rows) == {("shop", "wp"), ("shop", "redis"), ("shop", "nolabel"), ("shop", H.APP_UNASSIGNED),
                                     ("void", "void"), ("gone", "legacy"), ("gone", "sidecar")},
-          "lignes : 4 applications de shop, namespace vide, 2 applications du namespace SUPPRIMÉ (depuis son index)")
+          "lignes: 4 applications de shop, namespace vide, 2 applications of the namespace SUPPRIMÉ (depuis son index)")
     wp = rows[("shop", "wp")]
     check(wp["type"] == "stateful" and wp["protected"] and wp["backups"] == 1 and wp["volumes"] == 4
           and wp["unbacked_pvcs"] == ["data-wp-mariadb-2"],
-          "wp : protégé par la sauvegarde du namespace, volume créé depuis signalé (unbacked_pvcs)")
+          "wp: protégé par la sauvegarde of the namespace, volume créé depuis signalé (unbacked_pvcs)")
     check(rows[("shop", "redis")]["type"] == "stateless" and rows[("shop", "redis")]["protected"]
-          and rows[("shop", "redis")]["unbacked_pvcs"] == [], "redis : stateless, protégé, rien à signaler")
+          and rows[("shop", "redis")]["unbacked_pvcs"] == [], "redis: stateless, protégé, rien à signaler")
     check(rows[("gone", "legacy")]["missing"] and rows[("gone", "sidecar")]["missing"]
-          and rows[("gone", "sidecar")]["type"] == "stateless", "namespace supprimé : applications lues dans sa sauvegarde")
-    check(rows[("void", "void")]["type"] == "empty" and not rows[("void", "void")]["protected"], "namespace vide : ligne « vide », non protégé")
+          and rows[("gone", "sidecar")]["type"] == "stateless", "namespace supprimé: applications lues dans sa sauvegarde")
+    check(rows[("void", "void")]["type"] == "empty" and not rows[("void", "void")]["protected"], "namespace vide: ligne “vide”, non protégé")
     H._list_namespace_workloads = lambda names, full=False: ({}, {}, "forbidden")
     r2 = H.action_applications()
     check({a["name"] for a in r2["apps"] if a["namespace"] == "shop"} == {"shop"} and r2["workloads_error"] == "forbidden",
-          "sans droits sur les workloads : repli une ligne par namespace + erreur exposée")
+          "sans droits sur les workloads: repli une ligne par namespace + erreur exposée")
 
     print("\n== Sauvegarde d'un namespace STATELESS (aucun PVC) ==")
     calls = []
@@ -152,20 +152,20 @@ try:
     H.kubectl_json = kj_stateless
     H.action_context = (lambda _o=H.action_context: {"context": "ctx-test", "kubectl_ok": True})
     b = H.action_backup("front")
-    check(b["ok"] and b["count"] == 0 and b["resources_count"] == 1, "namespace sans PVC mais avec workload : sauvegardé (0 volume)")
+    check(b["ok"] and b["count"] == 0 and b["resources_count"] == 1, "namespace sans PVC mais avec workload: sauvegardé (0 volume)")
     with open(os.path.join(b["dir"], "index.json")) as f:
         idx = json.load(f)
     check(idx["volumes"] == [] and idx["apps"] == [{"name": "api", "workloads": [{"kind": "Deployment", "name": "api", "replicas": 1}], "type": "stateless"}],
-          "index : volumes vides + applications stateless mémorisées")
+          "index: volumes vides + applications stateless mémorisées")
     inv = [x for x in H.action_dr_backups()["backups"] if x["namespace"] == "front"]
-    check(inv and inv[0]["stateless"] and inv[0]["apps"] == ["api"], "inventaire DR : sauvegarde marquée stateless")
+    check(inv and inv[0]["stateless"] and inv[0]["apps"] == ["api"], "inventaire DR: sauvegarde marquée stateless")
     H.kubectl_json = lambda args: ({"items": []}, None)
     b2 = H.action_backup("nothing")
     check(not b2["ok"] and b2.get("skipped") and not os.path.isdir(os.path.join(H._cluster_root(tmp), "nothing")),
-          "namespace sans PVC ni workload : ignoré, aucun dossier laissé")
+          "namespace sans PVC ni workload: ignoré, aucun dossier laissé")
     H.CONFIG["config_backup_full"] = False
     b3 = H.action_backup("nothing")
-    check(not b3["ok"] and b3.get("skipped") and "Aucun PVC" in b3["error"], "instantané désactivé : ancien comportement (Aucun PVC)")
+    check(not b3["ok"] and b3.get("skipped") and "No PVC" in b3["error"], "instantané désactivé: ancien comportement (No PVC)")
     H.CONFIG["config_backup_full"] = True
 
     print("\n== Liste des objets filtrée par application ==")
@@ -177,7 +177,7 @@ try:
     check([x["in_app"] for x in r["items"]][:6] == [True] * 6 and not any(x["in_app"] for x in r["items"][6:]),
           "objets de l'application triés en tête")
     r = H.action_objects_list({"namespace": "shop", "backup_path": d})
-    check(r["ok"] and r["app"] is None and "in_app" not in r["items"][0], "sans application : liste inchangée")
+    check(r["ok"] and r["app"] is None and "in_app" not in r["items"][0], "sans application: liste inchangée")
 
     print("\n== Récupération STATELESS d'un namespace supprimé (simulation) ==")
     front = [x for x in H.action_dr_backups()["backups"] if x["namespace"] == "front"][0]
@@ -193,14 +193,14 @@ try:
                                 "items": [], "dry": True, "from_backup_only": True, "clone_refs": True})
     finally:
         H._apply_manifest = real_apply
-    check(r["ok"], "récupération sans volume acceptée : %s" % (r.get("error") or "ok"))
+    check(r["ok"], "récupération sans volume acceptée: %s" % (r.get("error") or "ok"))
     check(("Namespace", "front") in applied and ("Deployment", "api") in applied
           and not any(k == "PersistentVolume" for k, _ in applied),
           "namespace + workload recréés, aucun PV/PVC")
-    check(any("stateless" in w for w in r.get("warnings", [])), "avertissement « application stateless »")
+    check(any("stateless" in w for w in r.get("warnings", [])), "avertissement “application stateless”")
     rr = H.action_clone_app({"namespace": "shop", "target_namespace": "shop-copy", "backup_path": d,
                              "items": [], "dry": True})
-    check(not rr["ok"] and "Aucun volume" in rr["error"], "clone ordinaire sans volume : toujours refusé")
+    check(not rr["ok"] and "No volume" in rr["error"], "clone ordinaire sans volume: toujours refusé")
 
     print("\n== Une application = TOUS ses workloads (stateless compris) — récupération et clone ==")
     # sauvegarde shop2 : wp-wordpress (monte wp-data), wp-mariadb (STS volumeClaimTemplates -> data-wp-mariadb-0),
@@ -244,12 +244,12 @@ try:
     r, ap = run_rec()
     kinds = {(k, n) for k, n in ap}
     check(r["ok"] and {("Deployment", "wp-wordpress"), ("StatefulSet", "wp-mariadb"), ("Deployment", "wp-front"), ("Deployment", "redis")} <= kinds,
-          "récupération du namespace : workloads stateful (dont STS volumeClaimTemplates) ET stateless recréés : %s" % (r.get("error") or "ok"))
-    check(any("sans volume du namespace" in w for w in r.get("warnings", [])), "avertissement listant les workloads sans volume ajoutés")
+          "récupération of the namespace: workloads stateful (dont STS volumeClaimTemplates) ET stateless recréés: %s" % (r.get("error") or "ok"))
+    check(any("without volumes of the namespace" in w for w in r.get("warnings", [])), "avertissement listant les workloads sans volume ajoutés")
     r2, ap2 = run_rec(app="wp")
     kinds2 = {(k, n) for k, n in ap2}
     check(r2["ok"] and {("Deployment", "wp-wordpress"), ("StatefulSet", "wp-mariadb"), ("Deployment", "wp-front")} <= kinds2
-          and ("Deployment", "redis") not in kinds2, "application ciblée : ses workloads stateless suivent, ceux des autres applications non")
+          and ("Deployment", "redis") not in kinds2, "application ciblée: ses workloads stateless suivent, ceux des autres applications non")
     H._vg_exists = s_vg
     # clone LIVE d'une application stateful : les workloads sans volume de l'application suivent aussi
     H._list_namespace_workloads = lambda names, full=False: ({"shop": items + [front_wp]}, {"shop": pvcs}, None)
@@ -271,7 +271,7 @@ try:
     kinds3 = {(k, n) for k, n in applied}
     check(r3["ok"] and ("Deployment", "wp-wordpress-copy") in kinds3 and ("Deployment", "wp-front-copy") in kinds3
           and not any(n and n.startswith("redis") for _k, n in applied),
-          "clone live de l'application wp : frontend stateless copié avec la base, redis non : %s" % (r3.get("error") or "ok"))
+          "clone live de l'application wp: frontend stateless copié avec la base, redis non: %s" % (r3.get("error") or "ok"))
 
     print("\n== Clone d'une application STATELESS depuis le cluster (simulation) ==")
     H._list_namespace_workloads = lambda names, full=False: ({"shop": items}, {"shop": pvcs}, None)
@@ -289,17 +289,17 @@ try:
         H._apply_manifest = real_apply
     check(r["ok"] and ("Deployment", "redis-copy") in same_applied and ("CronJob", "cleanup-copy") in same_applied
           and not any(k in ("PersistentVolume", "PersistentVolumeClaim") for k, _ in same_applied),
-          "même namespace : workloads de l'application copiés avec suffixe, aucun PV/PVC")
+          "même namespace: workloads de l'application copiés avec suffixe, aucun PV/PVC")
     check(r["preview"]["workloads"] == ["Deployment/redis-copy", "CronJob/cleanup-copy"] and not r["preview"]["pvcs"],
-          "aperçu : workloads clonés, aucun volume")
+          "aperçu: workloads clonés, aucun volume")
     check(r2["ok"] and ("Namespace", "shop-copy") in other_applied and ("Deployment", "redis") in other_applied,
-          "autre namespace : namespace cible + workloads recréés")
-    check(not r3["ok"] and "monte le(s) volume(s)" in r3["error"], "application stateful demandée sans volume : refus explicite")
-    check(not r4["ok"] and "introuvable" in r4["error"], "application inconnue : refus")
+          "autre namespace: namespace cible + workloads recréés")
+    check(not r3["ok"] and "mounts volume(s)" in r3["error"], "application stateful demandée sans volume: refus explicite")
+    check(not r4["ok"] and "not found" in r4["error"], "application inconnue: refus")
 finally:
     H.action_namespaces, H._list_namespace_workloads, H.kubectl_json, H.resource_state = s_ns, s_wl, s_kj, s_rs
     H.CONFIG.clear(); H.CONFIG.update(saved)
     shutil.rmtree(tmp, ignore_errors=True)
 
-print("\nRÉSULTAT : %d OK, %d FAIL" % (passed, failed))
+print("\nRÉSULTAT: %d OK, %d FAIL" % (passed, failed))
 raise SystemExit(1 if failed else 0)

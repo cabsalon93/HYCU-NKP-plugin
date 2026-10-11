@@ -22,12 +22,12 @@ H.AUTO_BACKUP.update({"last_run": 0.0, "last_ok": None, "last_summary": "", "run
 try:
     # Désactivée -> jamais due.
     H.CONFIG["auto_backup_enabled"] = False
-    check(not H._auto_backup_due(1e9), "désactivée : jamais due")
+    check(not H._auto_backup_due(1e9), "disabled: jamais due")
 
     # Activée, jamais exécutée -> due immédiatement.
     H.CONFIG["auto_backup_enabled"] = True
     H.CONFIG["auto_backup_interval_hours"] = 24
-    check(H._auto_backup_due(1000.0), "activée sans historique : due immédiatement")
+    check(H._auto_backup_due(1000.0), "enabled sans historique: due immédiatement")
 
     # Exécution avec runner factice (succès) : état enregistré + persisté.
     calls = []
@@ -36,7 +36,7 @@ try:
         return {"ok": True, "backed_up": 3, "volumes": 7}
     H.CONFIG["auto_backup_dest"] = ""
     ok = H._auto_backup_run(now=1000.0, runner=fake_runner)
-    check(ok and calls == [None], "runner appelé (dest par défaut)")
+    check(ok and calls == [None], "runner appelé (dest default)")
     check(H.AUTO_BACKUP["last_run"] == 1000.0 and H.AUTO_BACKUP["last_ok"] is True,
           "dernier passage enregistré")
     check("3 namespace(s)" in H.AUTO_BACKUP["last_summary"], "résumé lisible")
@@ -49,9 +49,9 @@ try:
 
     # Intervalle invalide -> retombe sur 24 h ; plancher 15 min.
     H.CONFIG["auto_backup_interval_hours"] = "n'importe quoi"
-    check(H._auto_backup_interval_s() == 24 * 3600.0, "intervalle invalide : 24 h par défaut")
+    check(H._auto_backup_interval_s() == 24 * 3600.0, "intervalle invalide: 24 h default")
     H.CONFIG["auto_backup_interval_hours"] = 0
-    check(H._auto_backup_interval_s() == 24 * 3600.0, "0 = non renseigné : 24 h par défaut")
+    check(H._auto_backup_interval_s() == 24 * 3600.0, "0 = non renseigné: 24 h default")
     H.CONFIG["auto_backup_interval_hours"] = 0.01
     check(H._auto_backup_interval_s() == 900.0, "plancher 15 min")
 
@@ -59,14 +59,14 @@ try:
     H.CONFIG["auto_backup_interval_hours"] = 24
     ok = H._auto_backup_run(now=2000.0, runner=lambda d: {"ok": False, "error": "kubectl indisponible"})
     check(not ok and H.AUTO_BACKUP["last_ok"] is False and "kubectl" in H.AUTO_BACKUP["last_summary"],
-          "échec consigné")
-    check(H.AUTO_BACKUP["last_run"] == 2000.0, "échec : prochaine tentative à l'intervalle suivant")
+          "failed consigné")
+    check(H.AUTO_BACKUP["last_run"] == 2000.0, "failed: prochaine tentative à l'intervalle suivant")
 
     # Statut pour l'UI.
     s = H.action_auto_backup_status()
     check(s["ok"] and s["enabled"] and s["last_run"] == 2000.0 and s["next_due"] == 2000.0 + 24 * 3600,
           "statut UI complet (échéance calculée)")
-    check(s["keep"] == 15, "rétention par défaut : 15 versions")
+    check(s["keep"] == 15, "rétention default: 15 versions")
 
     # Rétention : 20 fausses sauvegardes -> ne garde que les 15 plus récentes.
     ns_dir = os.path.join(tmp, "wordpress")
@@ -79,7 +79,7 @@ try:
     os.makedirs(os.path.join(ns_dir, "notes-perso"))
     removed = H._prune_backups(tmp, "wordpress", 15)
     kept = [d for d in os.listdir(ns_dir) if os.path.isfile(os.path.join(ns_dir, d, "index.json"))]
-    check(removed == 5 and len(kept) == 15, "rétention : 5 supprimées, 15 conservées")
+    check(removed == 5 and len(kept) == 15, "rétention: 5 supprimées, 15 conservées")
     check(min(kept) == "2026-07-06_00-00-00_000000", "les PLUS ANCIENNES sont supprimées")
     check(os.path.isdir(os.path.join(ns_dir, "notes-perso")), "dossier étranger (sans index.json) intact")
     check(H._prune_backups(tmp, "wordpress", 15) == 0, "rétention idempotente")
@@ -91,8 +91,8 @@ try:
     H.CONFIG["auto_backup_keep"] = 10
     H._auto_backup_run(now=3000.0, runner=runner_with_results)
     left = [d for d in os.listdir(ns_dir) if os.path.isfile(os.path.join(ns_dir, d, "index.json"))]
-    check(len(left) == 10, "exécution auto : rétention appliquée (10 gardées)")
-    check("5 ancienne(s) version(s) supprimée(s)" in H.AUTO_BACKUP["last_summary"],
+    check(len(left) == 10, "exécution auto: rétention appliquée (10 gardées)")
+    check("5 old version(s) deleted" in H.AUTO_BACKUP["last_summary"],
           "résumé mentionne les versions supprimées")
 
     # Redémarrage simulé : l'état est rechargé depuis le disque (dernier passage = 3000).
@@ -105,5 +105,5 @@ finally:
         H.CONFIG[k] = v
     shutil.rmtree(tmp, ignore_errors=True)
 
-print("\nRÉSULTAT : %d OK, %d FAIL" % (passed, failed))
+print("\nRÉSULTAT: %d OK, %d FAIL" % (passed, failed))
 raise SystemExit(1 if failed else 0)

@@ -56,7 +56,7 @@ check("storage.kubernetes.io/csiProvisionerIdentity" in va, "csiProvisionerIdent
 check("hypervisorAttachedDiskUUIDs" in built["stripped"], "stripped[] le mentionne")
 check(SRC_DISK_UUID not in json.dumps(built["manifest"]), "aucun UUID de disque SOURCE résiduel")
 check(OLD_VG_UUID not in json.dumps(built["manifest"]), "aucun UUID de VG SOURCE résiduel")
-check(built["manifest"]["metadata"]["name"] == "pvc-clone-0000", "nom du PV cloné appliqué")
+check(built["manifest"]["metadata"]["name"] == "pvc-clone-0000", "PV name cloné appliqué")
 check(built["same_uuid"] is False, "same_uuid False")
 check(built["looks_like_vg_name"] is False, "looks_like_vg_name False")
 check(built["new_volume_handle"] == "NutanixVolumes-" + NEW_VG_UUID, "new_volume_handle correct")
@@ -68,11 +68,11 @@ built2, err2 = H.build_new_pv(REAL_PV, "NutanixVolumes-" + NEW_VG_UUID, "pvc-c2"
 check(err2 is None and built2["manifest"]["spec"]["csi"]["volumeHandle"] == "NutanixVolumes-" + NEW_VG_UUID,
       "volumeHandle collé accepté")
 
-print("\n== 3. Garde : UUID = NOM du VG (pvc-<uuid>) au lieu de l'UUID du VG ==")
+print("\n== 3. Garde: UUID = NOM du VG (pvc-<uuid>) instead of l'VG UUID ==")
 built3, err3 = H.build_new_pv(REAL_PV, PVC_UUID, "x", "clone")
 check(err3 is None and built3["looks_like_vg_name"] is True, "looks_like_vg_name détecté")
 
-print("\n== 4. same_uuid : on resaisit l'UUID source ==")
+print("\n== 4. same_uuid: on resaisit l'UUID source ==")
 built4, err4 = H.build_new_pv(REAL_PV, OLD_VG_UUID, "y", "clone")
 check(err4 is None and built4["same_uuid"] is True, "same_uuid détecté")
 
@@ -82,13 +82,13 @@ check(r["ok"] is False and "UUID" in r["error"], "rejet d'une réf sans UUID")
 r2 = H._prepare_one("wordpress", {"pvc": "mariadb-pvc", "new_ref": ""}, "clone", None)
 check(r2["ok"] is False, "rejet d'une réf vide")
 
-print("\n== 6. inplace : pas de purge, nom conservé ==")
+print("\n== 6. inplace: pas de purge, nom conservé ==")
 built6, err6 = H.build_new_pv(REAL_PV, NEW_VG_UUID, "", "inplace")
 check(err6 is None, "pas d'erreur")
 check(built6["manifest"]["metadata"]["name"] == "pvc-44c5d5d7-5c80-4894-9adc-1c02f0368b10", "nom conservé (inplace)")
 check(built6["stripped"] == [], "aucune purge en inplace")
 
-print("\n== 7. Legacy iSCSI : PV AVEC IQN + new_ref = IQN complet ==")
+print("\n== 7. Legacy iSCSI: PV AVEC IQN + new_ref = IQN complet ==")
 legacy = json.loads(json.dumps(REAL_PV))
 old_iqn = "iqn.2010-06.com.nutanix:hycu-" + OLD_VG_UUID + "-12345-tgt0"
 new_iqn = "iqn.2010-06.com.nutanix:hycu-" + NEW_VG_UUID + "-67890-tgt0"
@@ -106,7 +106,7 @@ custom["spec"]["csi"]["volumeHandle"] = "AcmeCSI-" + OLD_VG_UUID
 built8, _ = H.build_new_pv(custom, NEW_VG_UUID, "z", "clone")
 check(built8["manifest"]["spec"]["csi"]["volumeHandle"] == "AcmeCSI-" + NEW_VG_UUID, "préfixe 'AcmeCSI-' conservé")
 
-print("\n== 9. Legacy iSCSI SANS spec.csi.volumeHandle : réf = UUID nu du nouveau VG (V3) ==")
+print("\n== 9. Legacy iSCSI SANS spec.csi.volumeHandle: réf = UUID nu du nouveau VG (V3) ==")
 # Un vrai PV iSCSI hérité n'a PAS de csi.volumeHandle ; l'identité du VG vit dans l'IQN.
 # analyse_pv doit prendre l'UUID DANS l'IQN (pas l'UUID « pvc-<uuid> » du nom de PV),
 # sinon la réécriture laisse le nouveau PV pointer vers le VG SOURCE.
@@ -123,14 +123,14 @@ legacy_iscsi = {
 }
 info9 = H.analyse_pv(legacy_iscsi)
 check(H.split_volume_handle(info9["old_volume_handle"] or "")[1] == OLD_VG_UUID,
-      "analyse_pv extrait l'UUID du VG depuis l'IQN (pas l'UUID du nom de PV)")
+      "analyse_pv extrait l'VG UUID depuis l'IQN (pas l'UUID du nom de PV)")
 built9, err9 = H.build_new_pv(legacy_iscsi, NEW_VG_UUID, "pvc-legacy-0000", "clone")
 check(err9 is None, "pas d'erreur")
 blob9 = json.dumps(built9["manifest"])
-check(OLD_VG_UUID not in blob9, "UUID du VG SOURCE absent du PV reconstruit (plus de pointage vers le VG source)")
+check(OLD_VG_UUID not in blob9, "VG UUID SOURCE absent du PV reconstruit (plus de pointage vers le VG source)")
 check(("ntnx-k8s-" + NEW_VG_UUID) in blob9, "IQN réécrit avec l'UUID du NOUVEAU VG")
 check(built9["same_uuid"] is False and built9["looks_like_vg_name"] is False, "gardes anti-confusion OK")
 
 print("\n----------------------------------------")
-print("RÉSULTAT : %d OK, %d FAIL" % (passed, failed))
+print("RÉSULTAT: %d OK, %d FAIL" % (passed, failed))
 raise SystemExit(1 if failed else 0)
