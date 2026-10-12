@@ -880,7 +880,7 @@ async function buildHyPanel(){
   }
   const rows=await Promise.all(chks.map(async pvc=>{
     const m=(rsHyMatch.matches||[]).find(x=>x.pvc===pvc);
-    if(m && m.volume_kind==="nfs") return {pvc, matched:false, nfs:m.nfs||"NFS", nfsRoot:(m.share_subpath||"/")==="/"};
+    if(m && m.volume_kind==="nfs") return {pvc, matched:false, nfs:m.nfs||"NFS"};
     if(!m || !m.matched) return {pvc, matched:false};
     const rp=await get("/api/hycu/restorepoints?source="+encodeURIComponent(m.hycu_vg_uuid));
     return {pvc, matched:true, vg:m.hycu_vg_uuid, vgName:m.hycu_vg_name||"", kind:m.match_kind,
@@ -893,18 +893,9 @@ async function buildHyPanel(){
     if(!slot) return;
     const card=slot.closest(".vol-cfg");
     if(r.nfs){
-      if(!isCloneApp()){
-        slot.innerHTML='<div class="warnbox" style="margin-top:6px">'+esc("NAS volume ("+r.nfs+"): its data is restored in HYCU (NAS share). Untick it for this flow.")+'</div>';
-        return;
-      }
-      slot.innerHTML = r.nfsRoot
-        ? `<label class="fld">Data layout on the share</label>
-           <select class="nasMode" data-pvc="${esc(r.pvc)}">
-             <option value="ns_folder">One folder per namespace at the share root — the app writes into the folder named after its namespace</option>
-             <option value="app_folders">The application keeps its own folders — restored under a folder named after the target namespace</option>
-           </select>
-           <div class="hint" style="margin-top:4px">${esc("NAS volume ("+r.nfs+"): HYCU restores the latest share backup; the copy's data lands in a folder named after the target namespace.")}</div>`
-        : '<div class="hint" style="margin-top:6px">'+esc("NAS volume ("+r.nfs+"): HYCU restores the latest share backup into a folder named after the target namespace, keeping the tree the application saw.")+'</div>';
+      slot.innerHTML = isCloneApp()
+        ? '<div class="hint" style="margin-top:6px">'+esc("NAS volume ("+r.nfs+"): HYCU restores the latest share backup into a folder named after the target namespace, and the new PV points to that folder.")+'</div>'
+       : '<div class="warnbox" style="margin-top:6px">'+esc("NAS volume ("+r.nfs+"): its data is restored in HYCU (NAS share). Untick it for this flow.")+'</div>';
       return;
     }
     if(!r.matched){
@@ -1130,8 +1121,7 @@ function collectItems(){
     const pvc=c.dataset.pvc;
     const ref=(document.querySelector(`.rsRef[data-pvc="${CSS.escape(pvc)}"]`)||{}).value||"";
     const nameEl=document.querySelector(`.rsName[data-pvc="${CSS.escape(pvc)}"]`);
-    const modeEl=document.querySelector(`.nasMode[data-pvc="${CSS.escape(pvc)}"]`);
-    items.push({pvc, new_ref:ref, new_name:nameEl?nameEl.value:"", nfs:!!c.dataset.nfs, nas_mode:modeEl?modeEl.value:""});
+    items.push({pvc, new_ref:ref, new_name:nameEl?nameEl.value:"", nfs:!!c.dataset.nfs});
   });
   return items;
 }
