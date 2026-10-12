@@ -202,7 +202,7 @@ def test_copy_of_subfolder_volume_and_failures(H, monkeypatch):
     assert any("/browseShare?" in c[1] and "path=app1&" in c[1] for c in calls), "chemin relatif au partage"
     body, pv_path, sel, _skipped, flatten = H._nfs_copy_target(plan, "copie")
     assert pv_path == "/pvc-k8s/copie", "the copy's PV always points to <share>/<target folder>"
-    assert sel == ["/app1"] and flatten == "app1", "the mounted folder is restored, then moved up one level"
+    assert sel == ["/app1"] and flatten == ("/pvc-k8s/copie", "app1"), "the mounted folder is restored, then moved up one level"
     H.SESSION_CREDS.pop("hycu", None)
     _p, err = H._nfs_copy_plan({"server": "nutanix-afs", "path": "/pvc-k8s"}, "data")
     assert "Connect HYCU" in err
@@ -242,10 +242,15 @@ def test_copy_takes_only_the_source_namespace_folder(H, monkeypatch):
     plan, err = H._nfs_copy_plan({"server": "nutanix-afs", "path": "/pvc-k8s"}, "data")
     assert not err
     plan["entries"] = [{"fullItemName": "/namespace3"}, {"fullItemName": "/nas-demo"}, {"fullItemName": "/other"}]
+    # Default: one folder per namespace -> content flattened at the root of the target folder,
+    # the copy mounts the share root like the original.
     body, pv_path, sel, left, flatten = H._nfs_copy_target(plan, "nas-demo-copy", "nas-demo")
-    assert sel == ["/nas-demo"] and body["selectedItems"] == ["/nas-demo"] and flatten is None
-    assert pv_path == "/pvc-k8s/nas-demo-copy", "the app keeps writing to /data/nas-demo inside the copy"
-    assert left == ["namespace3", "other"] and plan["ns_folder"] == "nas-demo"
+    assert sel == ["/nas-demo"] and body["selectedItems"] == ["/nas-demo"] and body["restoreTargetPath"] == "nas-demo-copy"
+    assert pv_path == "/pvc-k8s" and flatten == ("/pvc-k8s/nas-demo-copy", "nas-demo")
+    assert left == ["namespace3", "other"] and plan["ns_folder"] == "nas-demo" and plan["ns_mode"] == "ns_folder"
+    # Application with its own fixed folders: the namespace folder is kept, PV on the target folder.
+    body, pv_path, sel, left, flatten = H._nfs_copy_target(plan, "nas-demo-copy", "nas-demo", "app_folders")
+    assert sel == ["/nas-demo"] and pv_path == "/pvc-k8s/nas-demo-copy" and flatten is None and plan["ns_mode"] == "app_folders"
     # No folder named after the namespace: previous behaviour (whole root minus copies).
     plan.pop("ns_folder")
     _b, _p, sel2, _l, _f = H._nfs_copy_target(plan, "x-copy", "unknown-ns")
@@ -332,3 +337,22 @@ def test_copy_falls_back_to_nested_path_when_nas_denies_the_move(H, monkeypatch)
     assert r.get("ok"), r.get("error") or r
     assert read_state(H)["pvs"]["nas-pv-copie"]["spec"]["nfs"]["path"] == "/pvc-k8s/copie/app"
     assert any("root squash" in w for w in r["warnings"])
+
+
+def test_namespace_folder_mode_end_to_end(H, monkeypatch):
+    """Root-mounted share, one folder per namespace: /app restored into copie, flattened, PV on the share root."""
+    seed_nas(H)
+    calls = []
+    _fake_hycu(H, monkeypatch, calls)
+    monkeypatch.setattr(H, "_share_browse", lambda bk, path: ([{"fullItemName": "/app"}, {"fullItemName": "/other"}], None))
+    monkeypatch.setattr(H, "_context_guard", lambda p: None)
+    flat = []
+    monkeypatch.setattr(H, "_nas_flatten", lambda ns, server, path, sub, log, **kw: flat.append((ns, path, sub)) or ("ok", ""))
+    r = H.action_clone_app({"namespace": "app", "target_namespace": "copie", "dry": False,
+                            "backup_path": None, "items": [{"pvc": "data", "new_ref": "", "nas_mode": "ns_folder"}]})
+    assert r.get("ok"), r.get("error") or r
+    body = [c for c in calls if "restoreShareItems" in c[1]][0][2]
+    assert body["selectedItems"] == ["/app"] and body["restoreTargetPath"] == "copie"
+    assert flat == [("copie", "/pvc-k8s/copie", "app")]
+    assert read_state(H)["pvs"]["nas-pv-copie"]["spec"]["nfs"]["path"] == "/pvc-k8s"
+    assert any("must write into" in w and "copie/" in w for w in r["warnings"]), r["warnings"]
