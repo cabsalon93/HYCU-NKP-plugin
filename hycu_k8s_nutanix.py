@@ -613,7 +613,7 @@ def save_config(updates, source="internal"):
 
 # Version horodatée de la build (format AAAAMMJJ-HHMM). À incrémenter à chaque
 # changement notable du programme ; affichée dans l'en-tête de l'interface.
-VERSION = "20261012-0400"
+VERSION = "20261012-0430"
 
 # Jeton anti-CSRF généré au démarrage, injecté dans la page et exigé sur les POST.
 CSRF_TOKEN = secrets.token_urlsafe(32)
@@ -9852,6 +9852,11 @@ def action_clone_app(payload, log=None):
                                         "(deleted?) — connect HYCU to restore it "
                                         "automatically, or untick “reuse the original volumes” "
                                         "and use “Create the volumes automatically via HYCU”. Nothing was created.") % p["new_pvc_name"])}
+        # Arrêt coopératif (POST /api/op_cancel) : avant toute création Kubernetes.
+        if not dry and _op_cancel_requested():
+            return {"ok": False, "aborted": True, "log": log, "warnings": warnings, "preview": preview,
+                    "error": "Stopped by the operator before creating any Kubernetes object%s."
+                             % (" (the Volume Groups already cloned by HYCU are kept)" if deferred_provision else "")}
         if not same_ns:
             log.append(_apply_manifest({"apiVersion": "v1", "kind": "Namespace",
                                         "metadata": {"name": target_ns}},
@@ -9935,6 +9940,12 @@ def action_clone_app(payload, log=None):
                     continue
             log.append(_apply_manifest(o, "clonedep_%s_%s" % (k, nm), dry,
                                        "Cloned dependency %s %s/%s" % (o.get("kind"), target_ns, nm)))
+        # Arrêt coopératif : après les phases HYCU, avant PV/PVC/workloads (relançable).
+        if not dry and _op_cancel_requested():
+            return {"ok": False, "aborted": True, "log": log, "warnings": warnings, "preview": preview,
+                    "error": "Stopped by the operator: namespace “%s” exists%s, no PV/PVC/workload created — run "
+                             "the copy again to finish it, or delete that namespace."
+                             % (target_ns, " and the NAS data is restored" if any(p.get("nfs_restore") for p in prepared) else "")}
         created = []                     # (kind, name, ns) dans l'ordre de création -> rollback inverse
         failed_step = None
         for p in prepared:  # hypervisorAttachedDiskUUIDs déjà renseigné dans la pré-passe ci-dessus

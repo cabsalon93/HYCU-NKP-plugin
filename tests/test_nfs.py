@@ -459,3 +459,16 @@ def test_copy_takes_a_full_backup_when_the_catalog_lags_behind_the_live_folder(H
     assert any("does not match the live folder" in (l.get("label") or "") for l in r["log"])
     rs = [c for c in calls if "restoreShareItems" in c[1]]
     assert len(rs) == 1 and "/bk-full/" in rs[0][1], "restored from the full backup, not the stale one"
+
+
+def test_copy_honours_a_cancel_request_before_creating_objects(H, monkeypatch):
+    seed_nas(H)
+    calls = []
+    _fake_hycu(H, monkeypatch, calls)
+    monkeypatch.setattr(H, "_context_guard", lambda p: None)
+    monkeypatch.setattr(H, "_op_cancel_requested", lambda: True)
+    r = H.action_clone_app({"namespace": "app", "target_namespace": "copie", "dry": False, "backup_path": None,
+                            "items": [{"pvc": "data", "new_ref": ""}]})
+    assert not r.get("ok") and r.get("aborted") and "Stopped by the operator" in r["error"], r
+    assert "copie" not in read_state(H)["namespaces"], "nothing created"
+    assert not any("restoreShareItems" in c[1] for c in calls), "no HYCU restore started after the cancel"
