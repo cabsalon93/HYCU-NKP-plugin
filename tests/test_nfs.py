@@ -325,6 +325,7 @@ def test_copy_falls_back_to_nested_path_when_nas_denies_the_move(H, monkeypatch)
     write_state(H, st)
     calls = []
     _fake_hycu(H, monkeypatch, calls)
+    monkeypatch.setattr(H, "_share_backup_has", lambda bk, sub: True)   # the fake backup holds the folder
     monkeypatch.setattr(H, "_context_guard", lambda p: None)
     monkeypatch.setattr(H, "_nas_flatten", lambda ns, server, path, sub, log, **kw: ("denied", "Permission denied"))
     r = H.action_clone_app({"namespace": "app", "target_namespace": "copie", "dry": False,
@@ -347,6 +348,7 @@ def test_copy_of_csi_nfs_volume_creates_a_native_nfs_pv(H, monkeypatch):
     write_state(H, st)
     calls = []
     _fake_hycu(H, monkeypatch, calls)
+    monkeypatch.setattr(H, "_share_backup_has", lambda bk, sub: True)   # the fake backup holds the folder
     monkeypatch.setattr(H, "_context_guard", lambda p: None)
     monkeypatch.setattr(H, "_nas_flatten", lambda ns, server, path, sub, log, **kw: ("ok", ""))
     r = H.action_clone_app({"namespace": "app", "target_namespace": "copie", "dry": False,
@@ -357,3 +359,52 @@ def test_copy_of_csi_nfs_volume_creates_a_native_nfs_pv(H, monkeypatch):
     body = [c for c in calls if "restoreShareItems" in c[1]][0][2]
     assert body["selectedItems"] == ["/app"] and body["restoreTargetPath"] == "copie"
     assert any("CSI NFS driver" in w for w in r["warnings"])
+
+
+def test_copy_backs_up_the_share_when_latest_backup_lacks_the_folder(H, monkeypatch):
+    """Source folder created after the latest share backup: real run backs up the share first."""
+    st = read_state(H)
+    pv = json.loads(json.dumps(NAS_PV))
+    pv["spec"]["nfs"]["path"] = "/pvc-k8s/copie"
+    st["pvs"] = {"nas-pv": pv}
+    st["pvcs"] = {"app": {"data": NAS_PVC}}
+    write_state(H, st)
+    H.SESSION_CREDS["hycu"] = {"user": "x"}
+    monkeypatch.setattr(H, "_hycu_list_shares", lambda: ([SHARE], None))
+    monkeypatch.setattr(H.time, "sleep", lambda s: None)
+    state = {"backed_up": False}
+    calls = []
+
+    def rest(system, method, path, body=None, **kw):
+        calls.append((method, path, body))
+        if path.startswith("/shares/sh-1/backups"):
+            ents = [{"uuid": "bk-old", "endTime": 1000}]
+            if state["backed_up"]:
+                ents.append({"uuid": "bk-new", "endTime": 2000000000000})
+            return {"ok": True, "json": {"entities": ents}}
+        if "/browseShare?" in path:
+            folders = ["/nas-demo"] + (["/copie"] if ("bk-new" in path and state["backed_up"]) else [])
+            if "path=copie" in path:
+                return {"ok": True, "json": {"entities": [{"fullItemName": "/copie/journal.txt"}] if "bk-new" in path else []}}
+            return {"ok": True, "json": {"entities": [{"fullItemName": f} for f in folders]}}
+        if path == "/schedules/backupShare":
+            state["backed_up"] = True
+            return {"ok": True, "json": {"entities": ["job-b"]}}
+        if "restoreShareItems" in path:
+            return {"ok": True, "json": {"entities": [{"uuid": "job-1"}]}}
+        if path.startswith("/jobs/"):
+            return {"ok": True, "json": {"entities": [{"status": "OK"}]}}
+        return {"ok": True, "json": {}}
+    monkeypatch.setattr(H, "_rest", rest)
+    monkeypatch.setattr(H, "_context_guard", lambda p: None)
+    monkeypatch.setattr(H, "_nas_flatten", lambda ns, server, path, sub, log, **kw: ("ok", ""))
+    payload = {"namespace": "app", "target_namespace": "copie2", "backup_path": None, "items": [{"pvc": "data", "new_ref": ""}]}
+    d = H.action_clone_app(dict(payload, dry=True))
+    assert (d.get("ok") or d.get("dry")) and any("does not contain" in w for w in d["warnings"]), d.get("error") or d["warnings"]
+    assert not any(c[1] == "/schedules/backupShare" for c in calls), "simulation never starts a backup"
+    r = H.action_clone_app(dict(payload, dry=False))
+    assert r.get("ok"), r.get("error") or r
+    assert any(c[1] == "/schedules/backupShare" for c in calls), "real run backed up the share first"
+    rs = [c for c in calls if "restoreShareItems" in c[1]]
+    assert len(rs) == 1 and "/bk-new/" in rs[0][1], "restore taken from the fresh backup"
+    assert any("Fresh share backup" in (l.get("label") or "") for l in r["log"])

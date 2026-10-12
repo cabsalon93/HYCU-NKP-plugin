@@ -613,7 +613,7 @@ def save_config(updates, source="internal"):
 
 # Version horodatée de la build (format AAAAMMJJ-HHMM). À incrémenter à chaque
 # changement notable du programme ; affichée dans l'en-tête de l'interface.
-VERSION = "20261012-0300"
+VERSION = "20261012-0330"
 
 # Jeton anti-CSRF généré au démarrage, injecté dans la page et exigé sur les POST.
 CSRF_TOKEN = secrets.token_urlsafe(32)
@@ -7954,11 +7954,32 @@ def _share_backups(share_uuid):
         if not isinstance(b, dict) or not b.get("uuid"):
             continue
         st = " ".join(str(b.get(k) or "") for k in ("status", "primaryTargetStatus")).upper()
-        if "FAIL" in st or "ERROR" in st or "ABORT" in st:
+        if "FAIL" in st or "ERROR" in st or "ABORT" in st or "RUNNING" in st or "PROGRESS" in st:
+            continue
+        if not b.get("endTime") and "endTime" in b:      # sauvegarde encore en cours
             continue
         out.append(b)
     out.sort(key=_hycu_ts, reverse=True)
     return out, None
+
+
+def _share_backup_has(backup_uuid, sub):
+    """Vrai si la sauvegarde de partage contient le dossier « sub » (listage de son parent)."""
+    parent = "/".join(sub.strip("/").split("/")[:-1])
+    entries, _err = _share_browse(backup_uuid, parent)
+    names = {str(e.get("fullItemName") or e.get("displayName") or "").strip("/").split("/")[-1]
+             for e in (entries or [])}
+    return sub.strip("/").split("/")[-1] in names
+
+
+def _share_backup_now(share_uuid, log, label="share"):
+    """Lance une sauvegarde HYCU du partage et attend sa fin. Renvoie (ok, erreur)."""
+    r = _rest("hycu", "POST", "/schedules/backupShare", body={"uuidList": [share_uuid], "forceFull": False})
+    if not r["ok"]:
+        return False, r.get("error") or "backup request refused"
+    log.append(logentry("HYCU backup of %s started (the latest backup predates the folder to copy)" % label,
+                        stdout=json.dumps(r.get("json"), ensure_ascii=False)[:300]))
+    return _wait_hycu_job(_hycu_job_id(r.get("json") or {}), log, label="HYCU backup of %s" % label), None
 
 
 def _hycu_ts(b):
@@ -8067,9 +8088,14 @@ def _nfs_copy_plan(nfs, pvc_name):
     if sub != "/":
         root_path = root_path[:-len(sub)] or "/"
     entries, err = _share_browse(bk["uuid"], sub)
+    # Sous-dossier monté par le PV : la sauvegarde la plus récente doit le CONTENIR, sinon
+    # HYCU restaurerait autre chose (dossier créé après la dernière sauvegarde du partage :
+    # cas d'une copie faite juste après la création de l'application ou d'une autre copie).
+    needs_backup = sub != "/" and not _share_backup_has(bk["uuid"], sub)
     return {"share_uuid": sh["uuid"], "share_name": sh.get("shareName") or "", "backup_uuid": bk["uuid"],
             "backup_time": _hycu_ts_label(bk), "sub": sub, "root_path": root_path,
-            "server": nfs["server"], "entries": entries or [], "browse_error": err}, None
+            "server": nfs["server"], "entries": entries or [], "browse_error": err,
+            "needs_backup": needs_backup}, None
 
 
 def _nfs_copy_target(plan, folder, src_ns=None):
@@ -9693,6 +9719,10 @@ def action_clone_app(payload, log=None):
             warnings.append("“%s”: the share backup could not be listed%s; the whole share root is restored "
                             "(earlier copy folders included)." % (p["pvc"], (" (%s)" % cp["browse_error"])
                                                                   if cp.get("browse_error") else ""))
+        if cp.get("needs_backup"):
+            warnings.append("“%s”: the latest backup of share “%s” (%s) does not contain “%s” yet — the copy first "
+                            "backs up the share in HYCU (a few minutes), then restores from that fresh backup."
+                            % (p["pvc"], cp["share_name"], cp["backup_time"], cp["sub"].strip("/")))
         if flatten:
             warnings.append("“%s”: HYCU recreates “%s” under “%s”; a short Job then moves its content up so the "
                             "copy keeps the original tree (it needs root on the share — nodes exempt from root "
@@ -9809,6 +9839,17 @@ def action_clone_app(payload, log=None):
                 if not p.get("nfs_restore"):
                     continue
                 cp = p["nfs_copy"]
+                if cp.get("needs_backup"):
+                    okb, berr = _share_backup_now(cp["share_uuid"], log, label="share “%s”" % cp["share_name"])
+                    fresh, lerr = _share_backups(cp["share_uuid"]) if okb else (None, berr)
+                    fresh = [b for b in (fresh or []) if _share_backup_has(b["uuid"], cp["sub"])]
+                    if not okb or not fresh:
+                        return {"ok": False, "log": log, "warnings": warnings, "preview": preview,
+                                "error": "“%s”: no HYCU backup of share “%s” contains “%s” (%s) — nothing was "
+                                         "created. Check the share backup in HYCU, then run the copy again."
+                                         % (p["pvc"], cp["share_name"], cp["sub"].strip("/"), berr or lerr or "backup started but folder still missing")}
+                    cp["backup_uuid"], cp["backup_time"] = fresh[0]["uuid"], _hycu_ts_label(fresh[0])
+                    log.append(logentry("Fresh share backup selected: %s" % cp["backup_time"]))
                 rr = _rest("hycu", "POST", "/shares/backup/%s/restoreShareItems"
                            % urllib.parse.quote(str(cp["backup_uuid"])), p["nfs_restore"])
                 if not rr["ok"]:
