@@ -613,7 +613,7 @@ def save_config(updates, source="internal"):
 
 # Version horodatée de la build (format AAAAMMJJ-HHMM). À incrémenter à chaque
 # changement notable du programme ; affichée dans l'en-tête de l'interface.
-VERSION = "20261012-0500"
+VERSION = "20261012-0530"
 
 # Jeton anti-CSRF généré au démarrage, injecté dans la page et exigé sur les POST.
 CSRF_TOKEN = secrets.token_urlsafe(32)
@@ -10547,7 +10547,8 @@ HTML = r"""<!DOCTYPE html>
   table.ht td{padding:11px 12px;color:var(--text);border-bottom:1px solid #F0F2F6;vertical-align:middle}
   table.ht tr:last-child td{border-bottom:none}
   #appsTable td{padding-top:6px;padding-bottom:6px}       /* liste dense : plus de lignes à l'écran */
-  #mPurge table.ht, #tkOut table.ht{min-width:0}          /* tableaux étroits (fenêtre / carte) */
+  #mPurge table.ht, #tkOut table.ht, #mSources table.ht, #mBulk table.ht{min-width:0}   /* tables inside windows: no horizontal scroll */
+  #srcBody code{white-space:normal;word-break:break-all}
   table.ht tbody tr:hover td{background:#FAF8FF}
   table.ht tbody tr.sel td{background:var(--purple-t)}
   table.ht tbody tr.clk{cursor:pointer}
@@ -11404,7 +11405,7 @@ HTML = r"""<!DOCTYPE html>
   </div>
 </div>
 <div id="mSources" class="hmodal-bg" style="display:none">
-  <div class="hmodal" style="max-width:860px">
+  <div class="hmodal" style="max-width:960px">
     <div class="hm-head"><h2 id="mSourcesTitle">Sources</h2><div class="hm-ico"><button type="button" data-close="mSources" title="Close">✕</button></div></div>
     <div class="hm-body">
       <p class="hint" style="margin:0 0 12px">Register here the systems used by the tool — HYCU, Nutanix and your Kubernetes clusters. Credentials and kubeconfigs stay in memory for the session (or in the encrypted vault if you choose so).</p>

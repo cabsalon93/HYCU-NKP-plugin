@@ -164,7 +164,8 @@
   table.ht td{padding:11px 12px;color:var(--text);border-bottom:1px solid #F0F2F6;vertical-align:middle}
   table.ht tr:last-child td{border-bottom:none}
   #appsTable td{padding-top:6px;padding-bottom:6px}       /* liste dense : plus de lignes à l'écran */
-  #mPurge table.ht, #tkOut table.ht{min-width:0}          /* tableaux étroits (fenêtre / carte) */
+  #mPurge table.ht, #tkOut table.ht, #mSources table.ht, #mBulk table.ht{min-width:0}   /* tables inside windows: no horizontal scroll */
+  #srcBody code{white-space:normal;word-break:break-all}
   table.ht tbody tr:hover td{background:#FAF8FF}
   table.ht tbody tr.sel td{background:var(--purple-t)}
   table.ht tbody tr.clk{cursor:pointer}
