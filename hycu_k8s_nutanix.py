@@ -613,7 +613,7 @@ def save_config(updates, source="internal"):
 
 # Version horodatée de la build (format AAAAMMJJ-HHMM). À incrémenter à chaque
 # changement notable du programme ; affichée dans l'en-tête de l'interface.
-VERSION = "20261012-0230"
+VERSION = "20261012-0300"
 
 # Jeton anti-CSRF généré au démarrage, injecté dans la page et exigé sur les POST.
 CSRF_TOKEN = secrets.token_urlsafe(32)
@@ -9369,10 +9369,6 @@ def action_clone_app(payload, log=None):
                 # COPIE : jamais le même export (données de production partagées en écriture).
                 # HYCU restaure la dernière sauvegarde du partage dans un NOUVEAU dossier au nom
                 # du namespace cible, et le nouveau PV vise ce dossier.
-                if not isinstance((old_pv.get("spec") or {}).get("nfs"), dict):
-                    return {"ok": False, "log": [], "error":
-                            "“%s”: copy is supported for native NFS PVs (spec.nfs); "
-                            "this volume uses a CSI NFS driver — restore its data in HYCU." % pvc_name}
                 copy_plan, cperr = _nfs_copy_plan(nfs, pvc_name)
                 if cperr:
                     return {"ok": False, "log": [], "error": cperr}
@@ -9390,6 +9386,16 @@ def action_clone_app(payload, log=None):
             pv = clean_pv(json.loads(json.dumps(old_pv)))
             pv.setdefault("metadata", {})["name"] = clone_pv_name
             pv["metadata"].setdefault("labels", {})[CLONE_LABEL] = CLONE_LABEL_VAL
+            if copy_plan and not isinstance((pv.get("spec") or {}).get("nfs"), dict):
+                # Source provisionnée par un driver CSI NFS : la copie est un PV NFS natif
+                # (statique) vers le dossier que HYCU crée — aucune dépendance au driver.
+                spec = pv.setdefault("spec", {})
+                spec.pop("csi", None)
+                spec.pop("volumeAttributesClassName", None)
+                spec.pop("nodeAffinity", None)
+                spec["nfs"] = {"server": nfs["server"], "path": nfs["path"]}
+                warnings.append("“%s”: the source is provisioned by a CSI NFS driver; the copy uses a static "
+                                "native NFS PV on the same server." % pvc_name)
             new_pvc_name, pvc_manifest = _clone_pvc_manifest(src_pvc, target_ns, same_ns, suffix, clone_pv_name)
             cr = (pv.get("spec") or {}).get("claimRef")
             if isinstance(cr, dict):

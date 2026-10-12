@@ -332,3 +332,28 @@ def test_copy_falls_back_to_nested_path_when_nas_denies_the_move(H, monkeypatch)
     assert r.get("ok"), r.get("error") or r
     assert read_state(H)["pvs"]["nas-pv-copie"]["spec"]["nfs"]["path"] == "/pvc-k8s/copie/app"
     assert any("root squash" in w for w in r["warnings"])
+
+
+def test_copy_of_csi_nfs_volume_creates_a_native_nfs_pv(H, monkeypatch):
+    """Source provisioned by nfs.csi.k8s.io: the copy is a static spec.nfs PV on the HYCU-created folder."""
+    st = read_state(H)
+    pv = json.loads(json.dumps(NAS_PV))
+    pv["spec"].pop("nfs")
+    pv["spec"]["storageClassName"] = "nfs-csi"
+    pv["spec"]["csi"] = {"driver": "nfs.csi.k8s.io", "volumeHandle": "nutanix-afs.amsdemo.ct#pvc-k8s#app#",
+                         "volumeAttributes": {"server": "nutanix-afs.amsdemo.ct", "share": "/pvc-k8s", "subdir": "app"}}
+    st["pvs"] = {"nas-pv": pv}
+    st["pvcs"] = {"app": {"data": NAS_PVC}}
+    write_state(H, st)
+    calls = []
+    _fake_hycu(H, monkeypatch, calls)
+    monkeypatch.setattr(H, "_context_guard", lambda p: None)
+    monkeypatch.setattr(H, "_nas_flatten", lambda ns, server, path, sub, log, **kw: ("ok", ""))
+    r = H.action_clone_app({"namespace": "app", "target_namespace": "copie", "dry": False,
+                            "backup_path": None, "items": [{"pvc": "data", "new_ref": ""}]})
+    assert r.get("ok"), r.get("error") or r
+    newpv = read_state(H)["pvs"]["nas-pv-copie"]["spec"]
+    assert "csi" not in newpv and newpv["nfs"] == {"server": "nutanix-afs.amsdemo.ct", "path": "/pvc-k8s/copie"}
+    body = [c for c in calls if "restoreShareItems" in c[1]][0][2]
+    assert body["selectedItems"] == ["/app"] and body["restoreTargetPath"] == "copie"
+    assert any("CSI NFS driver" in w for w in r["warnings"])

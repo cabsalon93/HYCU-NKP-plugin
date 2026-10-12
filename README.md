@@ -21,7 +21,9 @@ library only), also shipped as a container image.
   tree the application saw (a short Job in the target namespace moves HYCU's nested folder up;
   it needs the cluster nodes exempt from root squash on that share). Recommended layout: one
   sub-folder per namespace, mounted by its PV (`<export>/<namespace>`), so namespaces stay
-  isolated and copies land next to the original.
+  isolated and copies land next to the original. Nothing is created by hand: HYCU creates the
+  copy's folder, and a new application creates its own with a one-shot Job in its manifest (or
+  through the CSI NFS driver's dynamic provisioning, also accepted as a copy source).
 - **Restores**: to **new volumes** (HYCU clone), **in place** (HYCU in-place restore), a
   **deleted application**, **in bulk**, or onto **another cluster** (DR). The tool runs
   stop the application → recreate PV/PVC → restart → verify, with a preflight, volume
