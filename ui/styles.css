@@ -137,7 +137,7 @@
   .conn-dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:var(--grey);margin-right:6px;vertical-align:0}
   .conn-dot.on{background:var(--green)}
   .topbar .conn-dot{background:rgba(255,255,255,.45)}
-  .topbar .conn-dot.on{background:#fff}
+  .topbar .conn-dot.on{background:#2BD48F;box-shadow:0 0 0 1px rgba(255,255,255,.35)}
   .switch{position:relative;display:inline-block;width:38px;height:20px;flex:none}
   .switch input{opacity:0;width:0;height:0}
   .slider{position:absolute;inset:0;background:var(--red);border-radius:20px;cursor:pointer;transition:.2s}
