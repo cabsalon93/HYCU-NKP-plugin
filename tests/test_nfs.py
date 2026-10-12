@@ -303,6 +303,7 @@ def test_copy_of_a_copy_keeps_the_tree_flat(H, monkeypatch):
     write_state(H, st)
     calls = []
     _fake_hycu(H, monkeypatch, calls)
+    monkeypatch.setattr(H, "_nas_ls", lambda ns, server, path, log, **kw: ({"nas-demo", "copie"}, None))   # live folder = backup listing
     monkeypatch.setattr(H, "_context_guard", lambda p: None)
     flat = []
     monkeypatch.setattr(H, "_nas_flatten", lambda ns, server, path, sub, log, **kw: flat.append((ns, path, sub)) or ("ok", ""))
@@ -325,6 +326,7 @@ def test_copy_falls_back_to_nested_path_when_nas_denies_the_move(H, monkeypatch)
     write_state(H, st)
     calls = []
     _fake_hycu(H, monkeypatch, calls)
+    monkeypatch.setattr(H, "_nas_ls", lambda ns, server, path, log, **kw: ({"nas-demo", "copie"}, None))   # live folder = backup listing
     monkeypatch.setattr(H, "_share_backup_has", lambda bk, sub: True)   # the fake backup holds the folder
     monkeypatch.setattr(H, "_context_guard", lambda p: None)
     monkeypatch.setattr(H, "_nas_flatten", lambda ns, server, path, sub, log, **kw: ("denied", "Permission denied"))
@@ -348,6 +350,7 @@ def test_copy_of_csi_nfs_volume_creates_a_native_nfs_pv(H, monkeypatch):
     write_state(H, st)
     calls = []
     _fake_hycu(H, monkeypatch, calls)
+    monkeypatch.setattr(H, "_nas_ls", lambda ns, server, path, log, **kw: ({"nas-demo", "copie"}, None))   # live folder = backup listing
     monkeypatch.setattr(H, "_share_backup_has", lambda bk, sub: True)   # the fake backup holds the folder
     monkeypatch.setattr(H, "_context_guard", lambda p: None)
     monkeypatch.setattr(H, "_nas_flatten", lambda ns, server, path, sub, log, **kw: ("ok", ""))
@@ -408,3 +411,51 @@ def test_copy_backs_up_the_share_when_latest_backup_lacks_the_folder(H, monkeypa
     rs = [c for c in calls if "restoreShareItems" in c[1]]
     assert len(rs) == 1 and "/bk-new/" in rs[0][1], "restore taken from the fresh backup"
     assert any("Fresh share backup" in (l.get("label") or "") for l in r["log"])
+
+
+def test_copy_takes_a_full_backup_when_the_catalog_lags_behind_the_live_folder(H, monkeypatch):
+    """Seen live: a share backup taken right after the flatten still lists the nested folder.
+    The tool compares the backup listing with the live folder and takes a full backup first."""
+    st = read_state(H)
+    pv = json.loads(json.dumps(NAS_PV))
+    pv["spec"]["nfs"]["path"] = "/pvc-k8s/copie"
+    st["pvs"] = {"nas-pv": pv}
+    st["pvcs"] = {"app": {"data": NAS_PVC}}
+    write_state(H, st)
+    H.SESSION_CREDS["hycu"] = {"user": "x"}
+    monkeypatch.setattr(H, "_hycu_list_shares", lambda: ([SHARE], None))
+    monkeypatch.setattr(H.time, "sleep", lambda s: None)
+    monkeypatch.setattr(H, "_nas_ls", lambda ns, server, path, log, **kw: ({"journal.txt"}, None))
+    monkeypatch.setattr(H, "_nas_flatten", lambda ns, server, path, sub, log, **kw: ("ok", ""))
+    monkeypatch.setattr(H, "_context_guard", lambda p: None)
+    state = {"full": False}
+    calls = []
+
+    def rest(system, method, path, body=None, **kw):
+        calls.append((method, path, body))
+        if path.startswith("/shares/sh-1/backups"):
+            ents = [{"uuid": "bk-stale", "endTime": 1000}]
+            if state["full"]:
+                ents.append({"uuid": "bk-full", "endTime": 2000000000000})
+            return {"ok": True, "json": {"entities": ents}}
+        if "/browseShare?" in path:
+            if "path=&" in path:
+                return {"ok": True, "json": {"entities": [{"fullItemName": "/nas-demo"}, {"fullItemName": "/copie"}]}}
+            inner = [{"fullItemName": "copie/nas-demo"}] if "bk-stale" in path else [{"fullItemName": "copie/journal.txt"}]
+            return {"ok": True, "json": {"entities": inner}}
+        if path == "/schedules/backupShare":
+            state["full"] = True
+            assert body["forceFull"] is True, "a FULL backup is requested"
+            return {"ok": True, "json": {"entities": ["job-b"]}}
+        if "restoreShareItems" in path:
+            return {"ok": True, "json": {"entities": [{"uuid": "job-1"}]}}
+        if path.startswith("/jobs/"):
+            return {"ok": True, "json": {"entities": [{"status": "OK"}]}}
+        return {"ok": True, "json": {}}
+    monkeypatch.setattr(H, "_rest", rest)
+    r = H.action_clone_app({"namespace": "app", "target_namespace": "copie2", "backup_path": None, "dry": False,
+                            "items": [{"pvc": "data", "new_ref": ""}]})
+    assert r.get("ok"), r.get("error") or r
+    assert any("does not match the live folder" in (l.get("label") or "") for l in r["log"])
+    rs = [c for c in calls if "restoreShareItems" in c[1]]
+    assert len(rs) == 1 and "/bk-full/" in rs[0][1], "restored from the full backup, not the stale one"

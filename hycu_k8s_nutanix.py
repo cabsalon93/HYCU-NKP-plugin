@@ -613,7 +613,7 @@ def save_config(updates, source="internal"):
 
 # Version horodatée de la build (format AAAAMMJJ-HHMM). À incrémenter à chaque
 # changement notable du programme ; affichée dans l'en-tête de l'interface.
-VERSION = "20261012-0330"
+VERSION = "20261012-0400"
 
 # Jeton anti-CSRF généré au démarrage, injecté dans la page et exigé sur les POST.
 CSRF_TOKEN = secrets.token_urlsafe(32)
@@ -7974,10 +7974,10 @@ def _share_backup_has(backup_uuid, sub):
 
 def _share_backup_now(share_uuid, log, label="share"):
     """Lance une sauvegarde HYCU du partage et attend sa fin. Renvoie (ok, erreur)."""
-    r = _rest("hycu", "POST", "/schedules/backupShare", body={"uuidList": [share_uuid], "forceFull": False})
+    r = _rest("hycu", "POST", "/schedules/backupShare", body={"uuidList": [share_uuid], "forceFull": True})
     if not r["ok"]:
         return False, r.get("error") or "backup request refused"
-    log.append(logentry("HYCU backup of %s started (the latest backup predates the folder to copy)" % label,
+    log.append(logentry("HYCU full backup of %s started (the latest backup does not reflect the folder to copy)" % label,
                         stdout=json.dumps(r.get("json"), ensure_ascii=False)[:300]))
     return _wait_hycu_job(_hycu_job_id(r.get("json") or {}), log, label="HYCU backup of %s" % label), None
 
@@ -8168,25 +8168,23 @@ ls -la
 """
 
 
-def _nas_flatten(ns, server, folder_path, sub, log, timeout=180):
-    """Post-traitement d'une copie NAS : Job Kubernetes (namespace cible) qui monte
-    <serveur>:<folder_path> et remonte « <sub>/* » d'un niveau, pour que la copie garde
-    l'arborescence de l'original. Renvoie ("ok" | "denied" | "error", détail).
-    « denied » = rien n'a été déplacé (root squash : le Job tourne en anonyme et ne peut pas
-    écrire dans le dossier créé par HYCU) -> l'appelant garde le chemin imbriqué."""
-    name = re.sub(r"[^a-z0-9-]+", "-", ("hycu-nas-flatten-%s-%d" % (sub.split("/")[-1], int(time.time()))).lower())[:63].strip("-")
+def _nas_job(ns, server, mount_path, args, label, log, timeout=180, tag="job"):
+    """Job Kubernetes éphémère (root, image nas_job_image) qui monte <serveur>:<mount_path>
+    sur /w et exécute `args` (liste passée à /bin/sh -c "$script" ...). Renvoie
+    (statut "ok"|"failed"|"timeout"|"error", code de sortie, sortie)."""
+    name = re.sub(r"[^a-z0-9-]+", "-", ("hycu-nas-%s-%d" % (tag, int(time.time() * 1000) % 10**9)).lower())[:63].strip("-")
     job = {"apiVersion": "batch/v1", "kind": "Job",
            "metadata": {"name": name, "namespace": ns, "labels": {CLONE_LABEL: CLONE_LABEL_VAL}},
            "spec": {"backoffLimit": 0, "ttlSecondsAfterFinished": 600, "template": {"spec": {
                "restartPolicy": "Never", "securityContext": {"runAsUser": 0},
-               "containers": [{"name": "flatten", "image": CONFIG.get("nas_job_image") or "busybox:1.36",
-                               "command": ["/bin/sh", "-c", _NAS_FLATTEN_SCRIPT, "flatten", sub],
+               "containers": [{"name": "nas", "image": CONFIG.get("nas_job_image") or "busybox:1.36",
+                               "command": ["/bin/sh", "-c"] + list(args),
                                "volumeMounts": [{"name": "w", "mountPath": "/w"}]}],
-               "volumes": [{"name": "w", "nfs": {"server": server, "path": folder_path}}]}}}}
-    r = _apply_manifest(job, "nas_flatten_%s" % name, False, "NAS copy: flatten “%s/%s” (Job %s)" % (folder_path, sub, name))
+               "volumes": [{"name": "w", "nfs": {"server": server, "path": mount_path}}]}}}}
+    r = _apply_manifest(job, "nas_%s" % name, False, "%s (Job %s)" % (label, name))
     log.append(r)
     if not r["ok"]:
-        return "error", r.get("stderr") or "Job not created"
+        return "error", None, r.get("stderr") or "Job not created"
     status, deadline = None, time.time() + timeout
     while time.time() < deadline:
         data, _e = kubectl_json(["get", "job", name, "-n", ns])
@@ -8199,7 +8197,7 @@ def _nas_flatten(ns, server, folder_path, sub, log, timeout=180):
             status = "failed"
             break
         time.sleep(3)
-    lg = kubectl(["logs", "job/%s" % name, "-n", ns], dry=False, label="Flatten Job output")
+    lg = kubectl(["logs", "job/%s" % name, "-n", ns], dry=False, label="Job %s output" % name)
     out = (lg.get("stdout") or "").strip()
     rc = None
     pods, _e = kubectl_json(["get", "pods", "-n", ns, "-l", "job-name=%s" % name])
@@ -8209,16 +8207,45 @@ def _nas_flatten(ns, server, folder_path, sub, log, timeout=180):
             if term.get("exitCode") is not None:
                 rc = int(term["exitCode"])
     kubectl(["delete", "job", name, "-n", ns, "--wait=false", "--ignore-not-found"], dry=False, label="Delete Job %s" % name)
+    return (status or "timeout"), rc, out
+
+
+def _nas_flatten(ns, server, folder_path, sub, log, timeout=180):
+    """Post-traitement d'une copie NAS : Job (namespace cible) qui monte <serveur>:<folder_path>
+    et remonte « <sub>/* » d'un niveau, pour que la copie garde l'arborescence de l'original.
+    Renvoie ("ok" | "denied" | "error", détail). « denied » = rien n'a été déplacé (root
+    squash : le Job tourne en anonyme) -> l'appelant garde le chemin imbriqué."""
+    status, rc, out = _nas_job(ns, server, folder_path, [_NAS_FLATTEN_SCRIPT, "flatten", sub],
+                               "NAS copy: flatten “%s/%s”" % (folder_path, sub), log, timeout, tag="flatten-" + sub.split("/")[-1])
     if status == "ok":
         log.append(logentry("NAS copy flattened: “%s/%s” moved to “%s”" % (folder_path, sub, folder_path), stdout=out))
         return "ok", out
-    if status is None:
-        return "error", "Job %s did not finish within %ss%s" % (name, timeout, (": " + out) if out else "")
+    if status == "timeout":
+        return "error", "flatten Job did not finish within %ss%s" % (timeout, (": " + out) if out else "")
     if rc == 3:
         log.append(logentry("NAS copy: flatten refused by the NAS (permission denied) — nested path kept",
                             ok=False, rc=3, stderr=out))
         return "denied", out
-    return "error", "Job %s failed (exit %s): %s" % (name, rc, out or "no output")
+    return "error", "flatten Job failed (exit %s): %s" % (rc, out or "no output")
+
+
+def _nas_ls(ns, server, folder_path, log, timeout=120):
+    """Noms (1er niveau, fichiers cachés exclus) du dossier <serveur>:<folder_path>, lus par un
+    Job en lecture seule. Renvoie (ensemble de noms, erreur)."""
+    status, rc, out = _nas_job(ns, server, folder_path, ["cd /w && ls -1 | sort"],
+                               "NAS copy: list the live folder “%s”" % folder_path, log, timeout, tag="ls")
+    if status != "ok":
+        return None, "listing Job %s (exit %s): %s" % (status, rc, out[:200])
+    return {l.strip() for l in out.splitlines() if l.strip()}, None
+
+
+def _backup_names(backup_uuid, sub):
+    """Noms de 1er niveau du dossier « sub » dans une sauvegarde de partage (fichiers cachés exclus)."""
+    entries, err = _share_browse(backup_uuid, sub)
+    if entries is None:
+        return None, err
+    return {str(e.get("fullItemName") or e.get("displayName") or "").strip("/").split("/")[-1]
+            for e in entries if not str(e.get("displayName") or e.get("fullItemName") or "").strip("/").split("/")[-1].startswith(".")}, None
 
 
 def action_hycu_match(ns, vg_items=None):
@@ -9839,10 +9866,29 @@ def action_clone_app(payload, log=None):
                 if not p.get("nfs_restore"):
                     continue
                 cp = p["nfs_copy"]
+                if cp["sub"] != "/" and not cp.get("needs_backup"):
+                    # Le catalogue HYCU d'une sauvegarde prise juste après un renommage (Job de
+                    # mise à plat d'une copie précédente) peut encore montrer l'ancienne
+                    # arborescence : on compare au dossier VIVANT avant de restaurer.
+                    src_path = cp["root_path"].rstrip("/") + cp["sub"]
+                    live, lerr = _nas_ls(ns, cp["server"], src_path, log)
+                    inbk, berr = _backup_names(cp["backup_uuid"], cp["sub"])
+                    if live is None or inbk is None:
+                        return {"ok": False, "log": log, "warnings": warnings, "preview": preview,
+                                "error": "“%s”: cannot compare the share backup with the live folder (%s) — nothing was created."
+                                         % (p["pvc"], lerr or berr)}
+                    if live != inbk:
+                        log.append(logentry("Share backup of %s does not match the live folder “%s” (backup: %s; live: %s) — "
+                                            "taking a full backup first" % (cp["backup_time"], src_path,
+                                                                             ", ".join(sorted(inbk)) or "empty", ", ".join(sorted(live)) or "empty"),
+                                            ok=True, rc=None))
+                        cp["needs_backup"] = True
+                        cp["live_names"] = live
                 if cp.get("needs_backup"):
                     okb, berr = _share_backup_now(cp["share_uuid"], log, label="share “%s”" % cp["share_name"])
                     fresh, lerr = _share_backups(cp["share_uuid"]) if okb else (None, berr)
-                    fresh = [b for b in (fresh or []) if _share_backup_has(b["uuid"], cp["sub"])]
+                    fresh = [b for b in (fresh or []) if _share_backup_has(b["uuid"], cp["sub"])
+                             and (cp.get("live_names") is None or _backup_names(b["uuid"], cp["sub"])[0] == cp["live_names"])]
                     if not okb or not fresh:
                         return {"ok": False, "log": log, "warnings": warnings, "preview": preview,
                                 "error": "“%s”: no HYCU backup of share “%s” contains “%s” (%s) — nothing was "
