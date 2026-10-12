@@ -17,7 +17,9 @@ library only), also shipped as a container image.
 - **Protects** volumes in HYCU: PVC ↔ Volume Group matching, HYCU policy.
   **NAS (NFS)** volumes — Nutanix Files or generic NAS — are matched to their **HYCU share**
   (policy + immediate backup) and recreated as-is on recovery. An application **copy** has HYCU
-  restore the share's latest backup into a folder named after the target namespace.
+  restore the share's latest backup into a folder named after the target namespace, keeping the
+  tree the application saw (a short Job in the target namespace moves HYCU's nested folder up;
+  it needs the cluster nodes exempt from root squash on that share).
 - **Restores**: to **new volumes** (HYCU clone), **in place** (HYCU in-place restore), a
   **deleted application**, **in bulk**, or onto **another cluster** (DR). The tool runs
   stop the application → recreate PV/PVC → restart → verify, with a preflight, volume

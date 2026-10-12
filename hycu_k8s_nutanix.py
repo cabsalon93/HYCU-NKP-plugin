@@ -163,6 +163,7 @@ DEFAULT_CONFIG = {
     # VG vide), ABANDONNER avant de recréer le PV plutôt que livrer un PV qui ne
     # s'attachera pas. True = sécurité (recommandé).
     "clone_require_disk_uuids": True,
+    "nas_job_image": "busybox:1.36",   # image du Job qui remet à plat une copie NAS (post-restauration)
     # Sauvegarde de sécurité des manifestes PV/PVC du namespace AVANT toute restauration
     # réelle (le seul filet en cas d'échec d'apply). True = sauvegarder d'abord, abandonner
     # si la sauvegarde échoue.
@@ -345,6 +346,7 @@ CONFIG_SCHEMA = {
     "clone_strip_runtime_attrs": (bool, None),
     "clone_fix_disk_uuids": (bool, None),
     "clone_require_disk_uuids": (bool, None),
+    "nas_job_image": (str, None),
     "backup_before_restore": (bool, None),
     "config_backup_full": (bool, None),
     "config_backup_kinds": (list, _is_str_list),
@@ -611,7 +613,7 @@ def save_config(updates, source="internal"):
 
 # Version horodatée de la build (format AAAAMMJJ-HHMM). À incrémenter à chaque
 # changement notable du programme ; affichée dans l'en-tête de l'interface.
-VERSION = "20261012-0100"
+VERSION = "20261012-0130"
 
 # Jeton anti-CSRF généré au démarrage, injecté dans la page et exigé sur les POST.
 CSRF_TOKEN = secrets.token_urlsafe(32)
@@ -8071,14 +8073,26 @@ def _nfs_copy_plan(nfs, pvc_name):
 
 
 def _nfs_copy_target(plan, folder, src_ns=None):
-    """Dossier cible (relatif au partage) -> corps de la restauration HYCU, chemin d'export
-    du nouveau PV, éléments retenus et écartés. HYCU conserve l'arborescence d'origine
-    sous le dossier cible (« /nas-demo » restauré dans « copie » donne « copie/nas-demo ») :
-    le PV de la copie vise donc <racine>/<dossier><sous-chemin d'origine>, et l'application
-    copiée retrouve exactement sa structure, sans déplacer de fichiers.
+    """Dossier cible (relatif au partage) -> (corps de la restauration HYCU, chemin d'export
+    du nouveau PV, éléments retenus, éléments écartés, sous-dossier à remettre à plat).
+    Invariant : les données de la copie vivent dans <racine>/<dossier>, avec EXACTEMENT
+    l'arborescence que l'application voyait sous son point de montage ; le PV de la copie
+    vise toujours <racine>/<dossier>. Comme HYCU recrée le chemin d'origine sous le dossier
+    cible (« /app1 » restauré dans « copie » donne « copie/app1 »), un PV monté sur un
+    sous-dossier « app1 » exige une remise à plat après coup (Job _nas_flatten : « copie/app1/* »
+    -> « copie/ ») — sinon chaque copie de copie ajouterait un niveau.
     Partage monté à la racine : un partage sert souvent plusieurs namespaces (un dossier par
-    namespace) — seul le dossier au nom du namespace SOURCE est copié s'il existe."""
-    if plan["sub"] == "/" and src_ns:
+    namespace) — seul le dossier au nom du namespace SOURCE est copié s'il existe ; ce dossier
+    fait partie des chemins de l'application, il est donc conservé tel quel."""
+    pv_path = plan["root_path"].rstrip("/") + "/" + folder
+    if plan["sub"] != "/":
+        sub = plan["sub"].strip("/")
+        body = {"shareUuid": plan["share_uuid"], "targetShareUuid": plan["share_uuid"],
+                "restoreItemType": "FILESYSTEM", "selectedItems": ["/" + sub], "restoreSource": "AUTO",
+                "restoreOverwriteMode": "OVERWRITE", "restoreACLs": False, "sharedLocation": False,
+                "restoreTargetPath": folder}
+        return body, pv_path, ["/" + sub], [], sub
+    if src_ns:
         mine = [str(e.get("fullItemName") or e.get("displayName") or "") for e in plan["entries"]
                 if str(e.get("fullItemName") or e.get("displayName") or "").strip("/").split("/")[-1] == src_ns]
         if mine:
@@ -8089,19 +8103,16 @@ def _nfs_copy_target(plan, folder, src_ns=None):
                     "restoreItemType": "FILESYSTEM", "selectedItems": mine[:1], "restoreSource": "AUTO",
                     "restoreOverwriteMode": "OVERWRITE", "restoreACLs": False, "sharedLocation": False,
                     "restoreTargetPath": folder}
-            return body, plan["root_path"].rstrip("/") + "/" + folder, mine[:1], others
-    excluded = set()
-    if plan["sub"] == "/":
-        excluded = _nfs_copy_excluded(plan["root_path"], plan["server"]) | {folder.split("/")[0]}
+            return body, pv_path, mine[:1], others, None
+    excluded = _nfs_copy_excluded(plan["root_path"], plan["server"]) | {folder.split("/")[0]}
     sel, skipped = [], []
     if not plan["entries"]:
-        # Parcours vide ou indisponible : on restaure le dossier monté par le PV en entier
-        # (« / » pour la racine du partage) ; HYCU garde l'arborescence sous le dossier cible.
-        sel = [plan["sub"]]
+        # Parcours vide ou indisponible : on restaure la racine du partage en entier.
+        sel = ["/"]
     for e in plan["entries"]:
         full = str(e.get("fullItemName") or e.get("displayName") or "")
-        top = full.strip("/").split("/")[-1] if plan["sub"] == "/" else None
-        if top and top in excluded:
+        top = full.strip("/").split("/")[-1]
+        if top in excluded:
             skipped.append(top)
             continue
         sel.append(full)
@@ -8109,8 +8120,79 @@ def _nfs_copy_target(plan, folder, src_ns=None):
             "restoreItemType": "FILESYSTEM", "selectedItems": sel, "restoreSource": "AUTO",
             "restoreOverwriteMode": "OVERWRITE", "restoreACLs": False, "sharedLocation": False,
             "restoreTargetPath": folder}
-    pv_path = plan["root_path"].rstrip("/") + "/" + folder + ("" if plan["sub"] == "/" else plan["sub"])
-    return body, pv_path, sel, skipped
+    return body, pv_path, sel, skipped, None
+
+
+_NAS_FLATTEN_SCRIPT = r"""cd /w || exit 5
+S="$1"
+[ -d "$S" ] || { echo "folder $S not found under the target folder"; ls -la; exit 4; }
+moved=0
+for e in "$S"/* "$S"/.[!.]* "$S"/..?*; do
+  [ -e "$e" ] || continue
+  if ! mv -n "$e" . 2>/tmp/err; then
+    cat /tmp/err
+    if [ "$moved" = 0 ] && grep -qi "denied" /tmp/err; then exit 3; fi
+    exit 5
+  fi
+  moved=$((moved+1))
+done
+rmdir -p "$S" 2>/dev/null
+echo "moved $moved entry(ies) of $S to the folder root"
+ls -la
+"""
+
+
+def _nas_flatten(ns, server, folder_path, sub, log, timeout=180):
+    """Post-traitement d'une copie NAS : Job Kubernetes (namespace cible) qui monte
+    <serveur>:<folder_path> et remonte « <sub>/* » d'un niveau, pour que la copie garde
+    l'arborescence de l'original. Renvoie ("ok" | "denied" | "error", détail).
+    « denied » = rien n'a été déplacé (root squash : le Job tourne en anonyme et ne peut pas
+    écrire dans le dossier créé par HYCU) -> l'appelant garde le chemin imbriqué."""
+    name = re.sub(r"[^a-z0-9-]+", "-", ("hycu-nas-flatten-%s-%d" % (sub.split("/")[-1], int(time.time()))).lower())[:63].strip("-")
+    job = {"apiVersion": "batch/v1", "kind": "Job",
+           "metadata": {"name": name, "namespace": ns, "labels": {CLONE_LABEL: CLONE_LABEL_VAL}},
+           "spec": {"backoffLimit": 0, "ttlSecondsAfterFinished": 600, "template": {"spec": {
+               "restartPolicy": "Never", "securityContext": {"runAsUser": 0},
+               "containers": [{"name": "flatten", "image": CONFIG.get("nas_job_image") or "busybox:1.36",
+                               "command": ["/bin/sh", "-c", _NAS_FLATTEN_SCRIPT, "flatten", sub],
+                               "volumeMounts": [{"name": "w", "mountPath": "/w"}]}],
+               "volumes": [{"name": "w", "nfs": {"server": server, "path": folder_path}}]}}}}
+    r = _apply_manifest(job, "nas_flatten_%s" % name, False, "NAS copy: flatten “%s/%s” (Job %s)" % (folder_path, sub, name))
+    log.append(r)
+    if not r["ok"]:
+        return "error", r.get("stderr") or "Job not created"
+    status, deadline = None, time.time() + timeout
+    while time.time() < deadline:
+        data, _e = kubectl_json(["get", "job", name, "-n", ns])
+        st = (data or {}).get("status") or {}
+        if st.get("succeeded"):
+            status = "ok"
+            break
+        if st.get("failed") or any((c.get("type") == "Failed" and c.get("status") == "True")
+                                   for c in st.get("conditions") or []):
+            status = "failed"
+            break
+        time.sleep(3)
+    lg = kubectl(["logs", "job/%s" % name, "-n", ns], dry=False, label="Flatten Job output")
+    out = (lg.get("stdout") or "").strip()
+    rc = None
+    pods, _e = kubectl_json(["get", "pods", "-n", ns, "-l", "job-name=%s" % name])
+    for pod in (pods or {}).get("items", []) or []:
+        for cs in ((pod.get("status") or {}).get("containerStatuses") or []):
+            term = (cs.get("state") or {}).get("terminated") or {}
+            if term.get("exitCode") is not None:
+                rc = int(term["exitCode"])
+    kubectl(["delete", "job", name, "-n", ns, "--wait=false", "--ignore-not-found"], dry=False, label="Delete Job %s" % name)
+    if status == "ok":
+        log.append(logentry("NAS copy flattened: “%s/%s” moved to “%s”" % (folder_path, sub, folder_path), stdout=out))
+        return "ok", out
+    if status is None:
+        return "error", "Job %s did not finish within %ss%s" % (name, timeout, (": " + out) if out else "")
+    if rc == 3:
+        log.append(logentry("NAS copy: flatten refused by the NAS (permission denied) — nested path kept",
+                            ok=False, rc=3, stderr=out))
+        return "denied", out
+    return "error", "Job %s failed (exit %s): %s" % (name, rc, out or "no output")
 
 
 def action_hycu_match(ns, vg_items=None):
@@ -9577,12 +9659,14 @@ def action_clone_app(payload, log=None):
         base = (target_ns + suffix) if same_ns else target_ns
         siblings = [q for q in nas_copies if q["nfs_copy"]["share_uuid"] == cp["share_uuid"]]
         folder = base if len(siblings) == 1 else "%s/%s" % (base, p["pvc"])
-        body, pv_path, sel, skipped = _nfs_copy_target(cp, folder, ns)
+        body, pv_path, sel, skipped, flatten = _nfs_copy_target(cp, folder, ns)
         if not sel:
             return {"ok": False, "log": log, "error": "“%s”: the backup of share “%s” (%s) "
                                                       "contains no file to copy for this volume." % (p["pvc"], cp["share_name"], cp["backup_time"])}
         p["pv"]["spec"]["nfs"]["path"] = pv_path
         p["nfs_restore"] = body
+        p["nfs_flatten"] = flatten
+        p["nfs_folder"] = folder
         warnings.append("“%s”: NAS copy — HYCU restores the backup of %s of "
                         "share “%s” into the folder “%s”; the new PV points to %s:%s." % (p["pvc"], cp["backup_time"],
                                                                       cp["share_name"], folder, cp["server"], pv_path))
@@ -9599,10 +9683,17 @@ def action_clone_app(payload, log=None):
             warnings.append("“%s”: no folder named “%s” at the share root — the whole share is copied (%s)."
                             % (p["pvc"], ns, ", ".join(str(e.get("fullItemName") or e.get("displayName") or "")
                                                         .strip("/") for e in cp["entries"][:6])))
-        if not cp["entries"]:
-            warnings.append("“%s”: the share backup could not be listed%s; the whole folder “%s” is restored "
+        if not cp["entries"] and cp["sub"] == "/":
+            warnings.append("“%s”: the share backup could not be listed%s; the whole share root is restored "
                             "(earlier copy folders included)." % (p["pvc"], (" (%s)" % cp["browse_error"])
-                                                                  if cp.get("browse_error") else "", cp["sub"]))
+                                                                  if cp.get("browse_error") else ""))
+        if flatten:
+            warnings.append("“%s”: HYCU recreates “%s” under “%s”; a short Job then moves its content up so the "
+                            "copy keeps the original tree (it needs root on the share — nodes exempt from root "
+                            "squash; otherwise the PV points to “%s/%s”)." % (p["pvc"], flatten, folder, folder, flatten))
+            log.append(logentry("Flatten Job (namespace “%s”, image %s): %s/%s -> %s/"
+                                % (target_ns, CONFIG.get("nas_job_image") or "busybox:1.36", folder, flatten, folder),
+                                dry=dry, rc=None))
         log.append(logentry("HYCU restore of share “%s” to “%s” (%d item(s))"
                             % (cp["share_name"], folder, len(sel)), dry=dry, rc=None,
                             stdout=json.dumps(body, ensure_ascii=False)))
@@ -9682,23 +9773,6 @@ def action_clone_app(payload, log=None):
                                 csi["volumeHandle"] = new_vh
                     log.append(logentry("PV of %s re-pointed to the VG cloned by HYCU" % dp["pvc"],
                                         stdout="%s -> %s" % (dp["orig"], disc)))
-        # Copies NAS (réel) : restauration HYCU dans le nouveau dossier, attendue avant le PV.
-        if not dry:
-            for p in prepared:
-                if not p.get("nfs_restore"):
-                    continue
-                cp = p["nfs_copy"]
-                rr = _rest("hycu", "POST", "/shares/backup/%s/restoreShareItems"
-                           % urllib.parse.quote(str(cp["backup_uuid"])), p["nfs_restore"])
-                if not rr["ok"]:
-                    return {"ok": False, "log": log, "warnings": warnings, "preview": preview,
-                            "error": "“%s”: HYCU share restore refused: %s — nothing was created."
-                                     % (p["pvc"], rr.get("error"))}
-                if not _wait_hycu_job(_hycu_job_id(rr.get("json") or {}), log,
-                                      label="NAS copy of %s (HYCU)" % p["pvc"]):
-                    return {"ok": False, "log": log, "warnings": warnings, "preview": preview,
-                            "error": "“%s”: the HYCU share restore did not "
-                                     "complete — no Kubernetes object created." % p["pvc"]}
         # Pré-résoudre le disque de CHAQUE VG cloné (renseigne hypervisorAttachedDiskUUIDs)
         # AVANT toute création : si introuvable en réel, on abandonne sans rien créer.
         for p in prepared:
@@ -9723,6 +9797,37 @@ def action_clone_app(payload, log=None):
             # onglets Vérifier/Restaurer refuseront ce namespace juste après le clone.
             if not dry and log[-1].get("ok"):
                 _allow_namespace(target_ns, log)
+        # Copies NAS (réel) : restauration HYCU dans le nouveau dossier, attendue avant le PV.
+        if not dry:
+            for p in prepared:
+                if not p.get("nfs_restore"):
+                    continue
+                cp = p["nfs_copy"]
+                rr = _rest("hycu", "POST", "/shares/backup/%s/restoreShareItems"
+                           % urllib.parse.quote(str(cp["backup_uuid"])), p["nfs_restore"])
+                if not rr["ok"]:
+                    return {"ok": False, "log": log, "warnings": warnings, "preview": preview,
+                            "error": "“%s”: HYCU share restore refused: %s — nothing was created."
+                                     % (p["pvc"], rr.get("error"))}
+                if not _wait_hycu_job(_hycu_job_id(rr.get("json") or {}), log,
+                                      label="NAS copy of %s (HYCU)" % p["pvc"]):
+                    return {"ok": False, "log": log, "warnings": warnings, "preview": preview,
+                            "error": "“%s”: the HYCU share restore did not "
+                                     "complete — no PV/PVC/workload created." % p["pvc"]}
+                if p.get("nfs_flatten"):
+                    cp_path = p["pv"]["spec"]["nfs"]["path"]
+                    st, detail = _nas_flatten(target_ns, cp["server"], cp_path, p["nfs_flatten"], log)
+                    if st == "denied":
+                        p["pv"]["spec"]["nfs"]["path"] = cp_path.rstrip("/") + "/" + p["nfs_flatten"]
+                        warnings.append("“%s”: the NAS refused the move (root squash): the PV points to %s:%s "
+                                        "instead — the data is complete, only nested one level. Exempt the cluster "
+                                        "nodes from root squash on this share to get flat copies."
+                                        % (p["pvc"], cp["server"], p["pv"]["spec"]["nfs"]["path"]))
+                    elif st != "ok":
+                        return {"ok": False, "log": log, "warnings": warnings, "preview": preview,
+                                "error": "“%s”: the data was restored by HYCU into “%s” but the flatten Job failed "
+                                         "(%s) — no PV/PVC/workload created; fix the cause and run the copy again "
+                                         "(HYCU overwrites the folder)." % (p["pvc"], p["nfs_folder"], detail)}
         # Dépendances (Secrets/ConfigMaps/SA/Services) AVANT les workloads. On NE
         # remplace PAS une dépendance déjà présente dans la cible (ne rien écraser).
         for o in dep_manifests:

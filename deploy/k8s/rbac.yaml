@@ -53,8 +53,14 @@ rules:
     verbs: ["get", "list", "create", "patch"]    # restauration d'objets : kubectl apply sur l'existant
   # --- Sauvegarde de configuration ÉTENDUE : lecture seule des kinds exportés ---
   - apiGroups: ["batch"]
-    resources: ["jobs", "cronjobs"]
+    resources: ["cronjobs"]
     verbs: ["get", "list"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch", "create", "delete"]   # NAS copy: short flatten Job in the target namespace
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]                               # output of that Job
   - apiGroups: ["networking.k8s.io"]
     resources: ["ingresses", "networkpolicies"]
     verbs: ["get", "list"]

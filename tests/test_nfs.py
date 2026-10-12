@@ -200,9 +200,9 @@ def test_copy_of_subfolder_volume_and_failures(H, monkeypatch):
     plan, err = H._nfs_copy_plan({"server": "nutanix-afs", "path": "/pvc-k8s/app1"}, "data")
     assert not err and plan["sub"] == "/app1" and plan["root_path"] == "/pvc-k8s"
     assert any("/browseShare?" in c[1] and "path=app1&" in c[1] for c in calls), "chemin relatif au partage"
-    body, pv_path, sel, _ = H._nfs_copy_target(plan, "copie")
-    assert pv_path == "/pvc-k8s/copie/app1", "HYCU garde l'arborescence: copie/app1"
-    assert sel == ["/nas-demo", "/copie"], "sous-dossier: rien n'est écarté"
+    body, pv_path, sel, _skipped, flatten = H._nfs_copy_target(plan, "copie")
+    assert pv_path == "/pvc-k8s/copie", "the copy's PV always points to <share>/<target folder>"
+    assert sel == ["/app1"] and flatten == "app1", "the mounted folder is restored, then moved up one level"
     H.SESSION_CREDS.pop("hycu", None)
     _p, err = H._nfs_copy_plan({"server": "nutanix-afs", "path": "/pvc-k8s"}, "data")
     assert "Connect HYCU" in err
@@ -242,11 +242,93 @@ def test_copy_takes_only_the_source_namespace_folder(H, monkeypatch):
     plan, err = H._nfs_copy_plan({"server": "nutanix-afs", "path": "/pvc-k8s"}, "data")
     assert not err
     plan["entries"] = [{"fullItemName": "/namespace3"}, {"fullItemName": "/nas-demo"}, {"fullItemName": "/other"}]
-    body, pv_path, sel, left = H._nfs_copy_target(plan, "nas-demo-copy", "nas-demo")
-    assert sel == ["/nas-demo"] and body["selectedItems"] == ["/nas-demo"]
+    body, pv_path, sel, left, flatten = H._nfs_copy_target(plan, "nas-demo-copy", "nas-demo")
+    assert sel == ["/nas-demo"] and body["selectedItems"] == ["/nas-demo"] and flatten is None
     assert pv_path == "/pvc-k8s/nas-demo-copy", "the app keeps writing to /data/nas-demo inside the copy"
     assert left == ["namespace3", "other"] and plan["ns_folder"] == "nas-demo"
     # No folder named after the namespace: previous behaviour (whole root minus copies).
     plan.pop("ns_folder")
-    _b, _p, sel2, _l = H._nfs_copy_target(plan, "x-copy", "unknown-ns")
+    _b, _p, sel2, _l, _f = H._nfs_copy_target(plan, "x-copy", "unknown-ns")
     assert sorted(sel2) == ["/namespace3", "/nas-demo", "/other"]
+
+
+def test_flatten_job_outcomes(H, monkeypatch):
+    """Post-restore Job: success, permission denied (root squash) and failure are told apart."""
+    H.CONFIG["nas_job_image"] = "busybox:1.36"
+    monkeypatch.setattr(H.time, "sleep", lambda s: None)
+    applied, deleted = [], []
+
+    def fake_apply(manifest, basename, dry, label):
+        applied.append(manifest)
+        return {"ok": True, "dry": False, "rc": 0, "stdout": "job created", "stderr": "", "label": label, "cmd": ""}
+
+    def run_case(succeeded, exit_code, logs):
+        applied.clear()
+        monkeypatch.setattr(H, "_apply_manifest", fake_apply)
+        monkeypatch.setattr(H, "kubectl_json", lambda args: (
+            {"status": {"succeeded": 1}} if succeeded else {"status": {"failed": 1}}, None) if args[1] == "job"
+            else ({"items": [{"status": {"containerStatuses": [{"state": {"terminated": {"exitCode": exit_code}}}]}}]}, None))
+        monkeypatch.setattr(H, "kubectl", lambda args, **kw: (deleted.append(args) or {"ok": True, "stdout": "", "stderr": ""})
+                            if args[0] == "delete" else {"ok": True, "stdout": logs, "stderr": ""})
+        log = []
+        return H._nas_flatten("copie", "nas1", "/pvc-k8s/copie", "app1", log, timeout=5), log
+
+    (st, out), log = run_case(True, 0, "moved 2 entry(ies)")
+    assert st == "ok" and "moved" in out
+    job = applied[0]
+    assert job["kind"] == "Job" and job["metadata"]["namespace"] == "copie"
+    spec = job["spec"]["template"]["spec"]
+    assert spec["volumes"][0]["nfs"] == {"server": "nas1", "path": "/pvc-k8s/copie"}
+    assert spec["containers"][0]["command"][-1] == "app1" and spec["securityContext"]["runAsUser"] == 0
+    assert any(a[0] == "delete" and a[1] == "job" for a in deleted), "the Job is removed afterwards"
+    (st, _o), log = run_case(False, 3, "mv: can't rename: Permission denied")
+    assert st == "denied" and any(e.get("rc") == 3 for e in log)
+    (st, detail), _l = run_case(False, 5, "mv: no space")
+    assert st == "error" and "exit 5" in detail
+
+
+def test_copy_of_a_copy_keeps_the_tree_flat(H, monkeypatch):
+    """Copy of a copy: HYCU gives <T2>/<T1>/..., the Job moves it up; the PV points to <T2>."""
+    st = read_state(H)
+    pv = json.loads(json.dumps(NAS_PV))
+    pv["metadata"]["name"] = "nas-pv-copy"
+    pv["spec"]["nfs"]["path"] = "/pvc-k8s/copie"
+    pv["spec"]["claimRef"]["namespace"] = "copie"
+    pvc = json.loads(json.dumps(NAS_PVC))
+    pvc["metadata"]["namespace"] = "copie"
+    pvc["spec"]["volumeName"] = "nas-pv-copy"
+    st["pvs"] = {"nas-pv-copy": pv}
+    st["pvcs"] = {"copie": {"data": pvc}}
+    st["namespaces"] = ["copie"]
+    write_state(H, st)
+    calls = []
+    _fake_hycu(H, monkeypatch, calls)
+    monkeypatch.setattr(H, "_context_guard", lambda p: None)
+    flat = []
+    monkeypatch.setattr(H, "_nas_flatten", lambda ns, server, path, sub, log, **kw: flat.append((ns, path, sub)) or ("ok", ""))
+    r = H.action_clone_app({"namespace": "copie", "target_namespace": "copie2", "dry": False,
+                            "backup_path": None, "items": [{"pvc": "data", "new_ref": ""}]})
+    assert r.get("ok"), r.get("error") or r
+    body = [c for c in calls if "restoreShareItems" in c[1]][0][2]
+    assert body["selectedItems"] == ["/copie"] and body["restoreTargetPath"] == "copie2"
+    assert flat == [("copie2", "/pvc-k8s/copie2", "copie")]
+    newpv = read_state(H)["pvs"]["nas-pv-copy-copie2"]
+    assert newpv["spec"]["nfs"]["path"] == "/pvc-k8s/copie2", newpv["spec"]["nfs"]
+
+
+def test_copy_falls_back_to_nested_path_when_nas_denies_the_move(H, monkeypatch):
+    st = read_state(H)
+    pv = json.loads(json.dumps(NAS_PV))
+    pv["spec"]["nfs"]["path"] = "/pvc-k8s/app"
+    st["pvs"] = {"nas-pv": pv}
+    st["pvcs"] = {"app": {"data": NAS_PVC}}
+    write_state(H, st)
+    calls = []
+    _fake_hycu(H, monkeypatch, calls)
+    monkeypatch.setattr(H, "_context_guard", lambda p: None)
+    monkeypatch.setattr(H, "_nas_flatten", lambda ns, server, path, sub, log, **kw: ("denied", "Permission denied"))
+    r = H.action_clone_app({"namespace": "app", "target_namespace": "copie", "dry": False,
+                            "backup_path": None, "items": [{"pvc": "data", "new_ref": ""}]})
+    assert r.get("ok"), r.get("error") or r
+    assert read_state(H)["pvs"]["nas-pv-copie"]["spec"]["nfs"]["path"] == "/pvc-k8s/copie/app"
+    assert any("root squash" in w for w in r["warnings"])

@@ -549,6 +549,7 @@ Copy `hycu_config.example.json` → `hycu_config.json`. Also editable via the
 | `s3_verify_tls` | `false` | Verify the S3 endpoint TLS certificate. |
 | `s3_auto_upload` | `false` | `true` = every successful backup is also sent as a `.zip` to the bucket. |
 | `s3_encrypt` | `false` | `true` = exports are **encrypted** before upload (passphrase entered in ⚙ Sources); decryption: `python3 hycu_k8s_nutanix.py --decrypt <file>.zip.enc`. |
+| `nas_job_image` | `"busybox:1.36"` | Image of the short Job that flattens a NAS copy after the HYCU restore (set it to an internal registry when nodes are offline). |
 | `allow_dr_restore` | `false` | **Disaster-recovery mode**: allows cross-cluster/cross-context restore — only on an explicit “DR restore” request (sources read from the backup alone, warning, dedicated audit). Enable it for the duration of a drill or a disaster. |
 | `host` / `port` | `127.0.0.1` / `8765` | Listen address. **Do not expose** `host` outside the local loopback. |
 | `open_browser` | `true` | Open the browser at startup. |
