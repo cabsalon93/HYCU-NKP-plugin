@@ -738,7 +738,7 @@ async function applyBackupSelection(){
     state.backup_path=null;   // aucune sauvegarde -> repli live (vide si namespace détruit)
     const _dl=$("#rsBackupDl"); if(_dl) _dl.style.display="none";
     const live=await get("/api/pvcs?ns="+encodeURIComponent(ns));
-    pvcs=live.pvcs||[];
+    pvcs=(live.pvcs||[]).map(p=>Object.assign({}, p, {nfs: p.nfs ? (p.nfs.server+":"+p.nfs.path) : ""}));
   }
   renderRsPvcs(pvcs, src);
 }
@@ -804,6 +804,17 @@ function rebuildVolCfgs(){
         <textarea class="rsRef" data-pvc="${esc(pvc)}" placeholder="5b4d284b-7109-4e82-4c71-7d0e36ecb5ab  (VG UUID, or NutanixVolumes-&lt;uuid&gt;, or legacy IQN)"></textarea>${ntRow}
       </details></div>`;
   }).join("");
+  // NAS volumes: no Volume Group reference to enter, whatever the HYCU connection state.
+  document.querySelectorAll("#rsVolCfgs .vol-cfg").forEach(div=>{
+    const chk=document.querySelector(`.rsChk[data-pvc="${CSS.escape(div.dataset.pvc)}"]`);
+    if(!chk || !chk.dataset.nfs) return;
+    const adv=div.querySelector("details.rsAdv"); if(adv) adv.remove();
+    const lbl=div.querySelector(".refStat"); if(lbl) lbl.remove();
+    const nfs=(chk.closest("li")||{}).querySelector ? ((chk.closest("li").querySelector(".meta")||{}).textContent||"").replace(/\s*·.*$/,"").replace(/^NFS\s*/,"") : "";
+    div.querySelector(".hySlot").innerHTML = isCloneApp()
+      ? '<div class="hint" style="margin-top:6px">'+esc("NAS volume ("+nfs+"): HYCU restores the latest share backup into a folder named after the target namespace, keeping the tree the application saw.")+'</div>'
+      : '<div class="warnbox" style="margin-top:6px">'+esc("NAS volume ("+nfs+"): its data is restored in HYCU (NAS share). Untick it for this flow.")+'</div>';
+  });
   document.querySelectorAll(".ntRefBtn").forEach(b=>b.onclick=()=>ntFindRef(b.dataset.pvc));
   // Bouton global d'orchestration sur place (mode inplace + HYCU)
   $("#rsInplaceRunWrap").style.display = inplaceOrch? "block":"none";

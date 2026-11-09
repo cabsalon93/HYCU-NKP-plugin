@@ -570,6 +570,10 @@ def _write_json_atomic(path, obj, mode=0o600):
             pass
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(obj, f, indent=2, ensure_ascii=False)
+            # Durable AVANT le replace : le marqueur de reprise / le catalogue doivent
+            # survivre à une coupure de courant juste après l'échange de noms.
+            f.flush()
+            os.fsync(f.fileno())
         # Windows : un antivirus peut tenir brièvement le fichier tout juste écrit
         # (PermissionError transitoire sur os.replace) -> quelques tentatives.
         for attempt in range(5):
@@ -580,6 +584,17 @@ def _write_json_atomic(path, obj, mode=0o600):
                 if attempt == 4:
                     raise
                 time.sleep(0.05 * (attempt + 1))
+        # POSIX : le renommage n'est durable qu'une fois le DOSSIER synchronisé
+        # (best-effort ; Windows ne permet pas d'ouvrir un dossier pour fsync).
+        if os.name != "nt":
+            try:
+                dfd = os.open(d, os.O_RDONLY)
+                try:
+                    os.fsync(dfd)
+                finally:
+                    os.close(dfd)
+            except OSError:
+                pass
     except Exception:
         try:
             os.remove(tmp)
@@ -797,6 +812,18 @@ def action_lock(skip=False, wait=0.0):
     finally:
         if not skip:
             ACTION_LOCK.release()
+
+
+def _first_failure(log):
+    """Première étape RÉELLE en échec d'un journal d'orchestration (« label — détail »),
+    pour renseigner `error` quand le verdict est négatif. Les lignes de simulation et
+    le récapitulatif « SEQUENCE ABORTED » sont ignorés. Chaîne vide si aucune."""
+    for x in log or []:
+        if x.get("ok") or x.get("dry") or x.get("label") == "SEQUENCE ABORTED":
+            continue
+        detail = (x.get("stderr") or x.get("error") or "").strip()
+        return "%s%s" % (x.get("label") or "step", (" — " + detail[:300]) if detail else "")
+    return ""
 
 
 # ------------------------------------------------------------------------------
@@ -2606,6 +2633,18 @@ def action_pvcs(ns):
             "storage": spec.get("resources", {}).get("requests", {}).get("storage"),
             "storageClass": spec.get("storageClassName"),
         })
+    # Volumes NAS (NFS) : l'export est lu sur le PV, pour que l'assistant les reconnaisse
+    # sans sauvegarde préalable ni HYCU connecté. UN seul `get pv` pour tout le namespace
+    # (comme action_verify), pas un sous-processus par PVC. Best-effort : sans lecture
+    # des PV, les volumes restent simplement non annotés.
+    if any(p.get("pv") for p in pvcs):
+        pv_all, _e = kubectl_json(["get", "pv"])
+        by_name = {((pv.get("metadata") or {}).get("name")): pv
+                   for pv in ((pv_all or {}).get("items") or [])}
+        for p in pvcs:
+            info = _pv_nfs_info(by_name.get(p["pv"])) if p.get("pv") else None
+            if info:
+                p["nfs"] = info
     return {"ok": True, "pvcs": pvcs, "error": None}
 
 
@@ -4537,16 +4576,26 @@ def _volume_attachments_for_pv(pv_name):
     return out, None
 
 
-def _wait_volume_attachments_gone(pv_name, timeout, log):
+def _wait_volume_attachments_gone(pv_name, timeout, log, strict=False):
     """Attend que plus aucun VolumeAttachment ne référence le PV (le VG est détaché de
     la VM worker). Renvoie True si libre, False sinon. Si l'API est inaccessible
-    (RBAC), on l'indique et on considère l'information indisponible (True) : on ne
-    bloque pas, mais on ne forcera JAMAIS le finalizer de l'attacher (cf. _delete_and_unblock)."""
+    (RBAC), l'information est indisponible : par défaut on l'indique et on continue
+    (True) — le volume cible est un AUTRE VG (clone), le risque n'est qu'un attachement
+    orphelin. `strict=True` (le PV re-pointe le MÊME VG : restauration sur place) :
+    un détachement non confirmé est un ÉCHEC (False) — ré-attacher un VG encore attaché
+    à une autre VM le corromprait. On ne force JAMAIS le finalizer de l'attacher
+    (cf. _delete_and_unblock)."""
     deadline = time.time() + timeout
     last = []
     while time.time() < deadline:
         last, err = _volume_attachments_for_pv(pv_name)
         if err:
+            if strict:
+                log.append(logentry("VolumeAttachments cannot be checked (%s)" % err.strip()[:160], ok=False, rc=-1,
+                                    cmd="(waiting) kubectl get volumeattachments",
+                                    stderr="Same Volume Group re-attached (in-place restore): the detach MUST be "
+                                           "confirmed before going on. Grant “get volumeattachments” and try again."))
+                return False
             log.append(logentry("VolumeAttachments cannot be checked (%s)" % err.strip()[:160],
                                 stdout="Missing “get volumeattachments” right: the VG detach is not confirmed."))
             return True
@@ -5202,6 +5251,17 @@ def _kubectl_client_minor():
         return None
 
 
+def _restore_same_vg(r):
+    """Vrai si le nouveau PV re-pointe le MÊME Volume Group que l'ancien (restauration
+    sur place / réutilisation des volumes d'origine). Ré-attacher ce VG alors qu'il est
+    encore attaché à une autre VM le corromprait : le détachement doit être CONFIRMÉ.
+    Inconnu (reprise sans analyse) = non : on ne peut pas l'affirmer."""
+    if r.get("same_uuid"):
+        return True
+    old = r.get("old_volume_handle")
+    return bool(old) and r.get("new_volume_handle") == old
+
+
 def _restore_preflight(ns, prepared, mode, dry, current, log):
     """Contrôles AVANT tout arrêt de l'application. Renvoie (checks, bloquant) :
     `checks` = liste [{name, ok, detail}] renvoyée à l'interface (liste ✓/✕),
@@ -5234,9 +5294,16 @@ def _restore_preflight(ns, prepared, mode, dry, current, log):
         add("RBAC rights", None, "undetermined: " + ", ".join(unknown), block=False)
     else:
         add("RBAC rights", True, "delete/create/patch pv+pvc, scale, list pods")
+    # Consultatif pour un clone (le nouveau VG est distinct) ; BLOQUANT dès qu'un volume
+    # re-pointe le MÊME VG : sans confirmation du détachement, on refuse AVANT d'arrêter
+    # l'application plutôt que d'abandonner au milieu de la séquence.
     va = _kubectl_can_i("get", "volumeattachments")
-    add("Reading VolumeAttachments", va if va is not None else None,
-        "" if va else "without this right, the VG detach cannot be confirmed", block=False)
+    same_vg_vols = [r["pvc"] for r in prepared if _restore_same_vg(r)]
+    va_detail = "" if va else "without this right, the VG detach cannot be confirmed"
+    if va is False and same_vg_vols:
+        va_detail += (" — blocking: %s re-point the SAME Volume Group (in-place); re-attaching it "
+                      "while still attached elsewhere would corrupt it" % ", ".join(same_vg_vols))
+    add("Reading VolumeAttachments", va if va is not None else None, va_detail, block=bool(same_vg_vols))
 
     # 2) Version du client kubectl (wait --for=jsonpath exige 1.23+).
     minor = _kubectl_client_minor()
@@ -5528,7 +5595,6 @@ def _execute_restore_locked(payload, log=None):
         # sur place) : avec reclaimPolicy=Delete, supprimer l'ancien PV détruirait le VG
         # sur lequel on s'apprête à redémarrer l'application. La config ne peut pas
         # désactiver cette protection (le passage en Retain est de toute façon systématique).
-        same_vg = bool(r.get("old_volume_handle")) and r.get("new_volume_handle") == r.get("old_volume_handle")
 
         # Réécrire hypervisorAttachedDiskUUIDs avec le disque du VG cloné (clone) AVANT
         # l'apply : sans lui, le CSI tente l'attach iSCSI et l'attachement échoue.
@@ -5586,8 +5652,12 @@ def _execute_restore_locked(payload, log=None):
             # Y compris quand l'ancien PV porte le MÊME nom que le nouveau (restauration sur
             # place) : un `apply` par-dessus un PV Released garderait le claimRef.uid périmé
             # et le PVC recréé ne se lierait jamais. Il est en Retain : suppression sans risque.
+            # Même VG (sur place) : un détachement NON confirmé est bloquant — ré-attacher un
+            # VG encore attaché à une autre VM le corromprait. Clone : le nouveau VG est
+            # distinct, l'information manquante n'est qu'un avertissement.
+            same_vg = _restore_same_vg(r)
             for p in [x for x in dict.fromkeys([pv_old, cur_pv]) if x]:
-                if not _wait_volume_attachments_gone(p, CONFIG["wait_timeout"], log):
+                if not _wait_volume_attachments_gone(p, CONFIG["wait_timeout"], log, strict=same_vg):
                     aborted = True
                     abort_detail = "detach of volume %s (VolumeAttachment still present)" % p
                     break
@@ -5687,7 +5757,11 @@ def _execute_restore_locked(payload, log=None):
                              dry=False, label="PV %s: original reclaim policy (%s) restored" % (r["new_pv_name"], pol))
                 log.append(pr)
 
-    ok_all = (not aborted) and not mism and all(r["ok"] or r.get("dry") for r in log)
+    # Verdict fondé sur les SIGNAUX réels de la séquence (abandon, mauvais volumeHandle),
+    # jamais sur un repli de tout le journal : le préflight y écrit des contrôles
+    # CONSULTATIFS à ok=False (ex. droit « get volumeattachments » absent) qui ne
+    # doivent pas faire passer une restauration réussie pour un échec sans message.
+    ok_all = (not aborted) and not mism
     # Transaction : effacée si la restauration s'est terminée sans interruption (réel).
     # Interrompue AVANT toute suppression (inventaire, arrêt, attente des pods) : le
     # marqueur est aussi effacé — rien n'est à reprendre, et le laisser bloquerait la
@@ -5705,6 +5779,10 @@ def _execute_restore_locked(payload, log=None):
     if restart_failed:
         err = ("Volumes restored but restart incomplete — run the restore again (resume) or by hand: "
                + "; ".join(restart_failed))
+    elif aborted:
+        err = "Sequence aborted at step: %s. Nothing else was changed." % (abort_detail or "unknown")
+    elif mism:
+        err = "Unexpected volumeHandle after the restore: " + "; ".join(mism)
     return {"ok": ok_all, "error": err, "dry": dry, "aborted": aborted, "log": log,
             "preflight": checks, "reprotect": reprotect}
 
@@ -6025,7 +6103,11 @@ def _sigv4_auth(method, host, path, query, headers, payload_hash, region, servic
     # « % » deviendrait « %25 » et la signature ne correspondrait plus à l'URL envoyée).
     # La chaîne de requête canonique est TRIÉE par nom de paramètre (exigence SigV4) :
     # sans tri, « continuation-token » ajouté en fin casse la page 2 d'un listing.
-    canonical_query = "&".join(sorted(query.split("&"))) if query else ""
+    # Tri par NOM de paramètre (puis valeur), pas par chaîne « k=v » entière : un tri de
+    # chaînes placerait « a-b=1 » avant « a=1 » (« - » < « = ») alors que SigV4 attend
+    # « a » avant « a-b ». Indifférent pour les paramètres actuels, mais pas latent.
+    canonical_query = ("&".join(sorted(query.split("&"), key=lambda kv: tuple(kv.split("=", 1))))
+                       if query else "")
     canonical = "\n".join([
         method,
         path or "/",
@@ -6080,7 +6162,8 @@ def _s3_request(method, key="", body=b"", query="", want_body=False):
     if query:
         url += "?" + query
     region = (CONFIG.get("s3_region") or "us-east-1").strip() or "us-east-1"
-    amzdate = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    # now(timezone.utc) : utcnow() est déprécié depuis Python 3.12 ; même sortie (pas de %z).
+    amzdate = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     payload_hash = hashlib.sha256(body or b"").hexdigest()
     hdrs = {"host": host, "x-amz-date": amzdate, "x-amz-content-sha256": payload_hash}
     auth = _sigv4_auth(method, host, path, query, hdrs, payload_hash, region, "s3",
@@ -8621,6 +8704,17 @@ def action_orchestrate_inplace(payload, log=None):
             if CONFIG.get("inplace_refresh_pv_disk", True) and not SESSION_CREDS.get("prismcentral"):
                 log.append(logentry("Preflight ? Prism Central not connected: the PV disk "
                                     "cannot be refreshed after the restore (FailedMount possible)", ok=True))
+            # La restauration sur place ré-attache le MÊME Volume Group après que HYCU
+            # l'a réécrit : le détachement devra être CONFIRMÉ (VolumeAttachments). Sans le
+            # droit de lecture, on refuse ICI, avant d'arrêter l'application.
+            va = _kubectl_can_i("get", "volumeattachments")
+            if va is False:
+                return _err("Preflight: “get volumeattachments” denied — the in-place restore re-attaches "
+                            "the SAME Volume Group after HYCU rewrites it, so the detach must be confirmed. "
+                            "Grant the right and try again. Application not stopped.", log=log)
+            log.append(logentry("Preflight %s Reading VolumeAttachments" % ("✓" if va else "?"),
+                                cmd="kubectl auth can-i get volumeattachments",
+                                stdout="" if va else "undetermined: the detach check will fail if unreadable"))
             owned = [w for w in current if w.get("owner")]
             if owned:
                 return _err("Preflight: operator-managed workload(s) (%s) — the "
@@ -8640,7 +8734,8 @@ def action_orchestrate_inplace(payload, log=None):
                 for it in items:
                     pvc_live, _ = kubectl_json(["get", "pvc", it["pvc"], "-n", ns, "--ignore-not-found"])
                     pvn = ((pvc_live or {}).get("spec") or {}).get("volumeName")
-                    if pvn and not _wait_volume_attachments_gone(pvn, CONFIG["wait_timeout"], log):
+                    # strict : même VG réécrit par HYCU -> détachement non confirmé = échec.
+                    if pvn and not _wait_volume_attachments_gone(pvn, CONFIG["wait_timeout"], log, strict=True):
                         aborted = True
                         break
 
@@ -8690,10 +8785,13 @@ def action_orchestrate_inplace(payload, log=None):
             log.append({"ok": True, "dry": False, "label": "Final verification", "rc": 0, "stderr": "",
                         "cmd": "kubectl get pvc/pods", "stdout": json.dumps(v, indent=2)})
 
-        ok_all = (not aborted) and all(x["ok"] or x.get("dry") for x in log)
+        # Verdict = la séquence est allée au bout (voir _execute_restore_locked : ne pas
+        # replier tout le journal, qui peut contenir des lignes consultatives à ok=False).
+        ok_all = not aborted
+        err = None if ok_all else ("Sequence aborted: %s" % (_first_failure(log) or "a step failed — see the log"))
         audit("orchestrate_inplace", namespace=ns, dry=dry, ok=ok_all, aborted=aborted,
               volumes=[it["pvc"] for it in items])
-        return {"ok": ok_all, "error": None, "dry": dry, "aborted": aborted, "log": log}
+        return {"ok": ok_all, "error": err, "dry": dry, "aborted": aborted, "log": log}
     finally:
         if acquired:
             ACTION_LOCK.release()
@@ -9022,12 +9120,11 @@ def _bulk_load():
 
 
 def _bulk_save(j):
+    """Journal de la restauration en masse = marqueur de REPRISE : même écriture durable
+    (fsync avant os.replace, tentatives Windows) que la transaction de restauration."""
     p = _bulk_path()
     try:
-        os.makedirs(os.path.dirname(p), exist_ok=True)
-        with open(p + ".tmp", "w", encoding="utf-8") as f:
-            json.dump(j, f)
-        os.replace(p + ".tmp", p)
+        _write_json_atomic(p, j, mode=0o600)
     except OSError as e:
         print("Bulk restore journal not written: %s" % e)
 
@@ -9172,6 +9269,17 @@ def _bulk_worker(j, confirm_context, cid):
             audit("bulk_restore", dry=bool(j.get("dry", True)), ok=(c["failed"] == 0 and not j.get("stopped")),
                   namespaces=c["total"], done=c["done"], failed=c["failed"], stopped=bool(j.get("stopped")),
                   as_of=j.get("as_of"))
+    except Exception as e:
+        # Erreur HORS de la boucle par namespace (journal, comptage, audit…) : ne jamais
+        # mourir en silence — le journal porte l'erreur et l'audit en garde la trace.
+        print("Bulk restore worker error: %s" % e)
+        j["error"] = "Internal error: %s" % e
+        j["ended"] = datetime.datetime.now().isoformat(timespec="seconds")
+        try:
+            _bulk_save(j)
+        except Exception:
+            pass
+        audit("bulk_restore_error", dry=bool(j.get("dry", True)), error=str(e)[:300])
     finally:
         BULK["running"] = False
         BULK["stop"] = False
@@ -9951,12 +10059,17 @@ def action_clone_app(payload, log=None):
                 if not _wait_pvc_bound(p["new_pvc_name"], target_ns, log):
                     warnings.append("Cloned PVC “%s” is not Bound: check the "
                                     "cloned VG and the hypervisorAttachedDiskUUIDs." % p["new_pvc_name"])
-        ok_all = all(x["ok"] or x.get("dry") for x in log)
+        # Verdict = aucune création n'a échoué (failed_step) ; un PVC cloné non lié reste
+        # un avertissement. Ne pas replier tout le journal (lignes consultatives possibles).
+        ok_all = failed_step is None
         audit("clone_app", namespace=ns, target_namespace=target_ns, dry=dry, ok=ok_all,
               items=[it["pvc"] for it in items],
               **({"dr": dr, "from_backup": True, "backup": os.path.basename(backup_path or ""),
                   "storageclass": dr_sc or None} if from_backup else {}))
-        return {"ok": ok_all, "error": None, "dry": dry, "log": log, "warnings": warnings,
+        return {"ok": ok_all,
+                "error": None if ok_all else ("Failure on %s — the objects created by this clone "
+                                              "were cleaned up (nothing is left half-created)." % failed_step),
+                "dry": dry, "log": log, "warnings": warnings,
                 "preview": preview,
                 "manifests_preview": json.dumps(cloned_workloads, indent=2) if dry else None}
     finally:
@@ -12356,7 +12469,7 @@ async function applyBackupSelection(){
     state.backup_path=null;   // aucune sauvegarde -> repli live (vide si namespace détruit)
     const _dl=$("#rsBackupDl"); if(_dl) _dl.style.display="none";
     const live=await get("/api/pvcs?ns="+encodeURIComponent(ns));
-    pvcs=live.pvcs||[];
+    pvcs=(live.pvcs||[]).map(p=>Object.assign({}, p, {nfs: p.nfs ? (p.nfs.server+":"+p.nfs.path) : ""}));
   }
   renderRsPvcs(pvcs, src);
 }
@@ -12422,6 +12535,17 @@ function rebuildVolCfgs(){
         <textarea class="rsRef" data-pvc="${esc(pvc)}" placeholder="5b4d284b-7109-4e82-4c71-7d0e36ecb5ab  (VG UUID, or NutanixVolumes-&lt;uuid&gt;, or legacy IQN)"></textarea>${ntRow}
       </details></div>`;
   }).join("");
+  // NAS volumes: no Volume Group reference to enter, whatever the HYCU connection state.
+  document.querySelectorAll("#rsVolCfgs .vol-cfg").forEach(div=>{
+    const chk=document.querySelector(`.rsChk[data-pvc="${CSS.escape(div.dataset.pvc)}"]`);
+    if(!chk || !chk.dataset.nfs) return;
+    const adv=div.querySelector("details.rsAdv"); if(adv) adv.remove();
+    const lbl=div.querySelector(".refStat"); if(lbl) lbl.remove();
+    const nfs=(chk.closest("li")||{}).querySelector ? ((chk.closest("li").querySelector(".meta")||{}).textContent||"").replace(/\s*·.*$/,"").replace(/^NFS\s*/,"") : "";
+    div.querySelector(".hySlot").innerHTML = isCloneApp()
+      ? '<div class="hint" style="margin-top:6px">'+esc("NAS volume ("+nfs+"): HYCU restores the latest share backup into a folder named after the target namespace, keeping the tree the application saw.")+'</div>'
+      : '<div class="warnbox" style="margin-top:6px">'+esc("NAS volume ("+nfs+"): its data is restored in HYCU (NAS share). Untick it for this flow.")+'</div>';
+  });
   document.querySelectorAll(".ntRefBtn").forEach(b=>b.onclick=()=>ntFindRef(b.dataset.pvc));
   // Bouton global d'orchestration sur place (mode inplace + HYCU)
   $("#rsInplaceRunWrap").style.display = inplaceOrch? "block":"none";
