@@ -472,3 +472,56 @@ def test_copy_honours_a_cancel_request_before_creating_objects(H, monkeypatch):
     assert not r.get("ok") and r.get("aborted") and "Stopped by the operator" in r["error"], r
     assert "copie" not in read_state(H)["namespaces"], "nothing created"
     assert not any("restoreShareItems" in c[1] for c in calls), "no HYCU restore started after the cancel"
+
+
+def test_live_pvcs_carry_nfs_export_with_a_single_pv_listing(H, tmp_path):
+    """Repli LIVE de l'assistant (aucune sauvegarde sélectionnée, HYCU non connecté) :
+    action_pvcs annote les volumes NAS avec leur export {server, path}, laisse les
+    volumes bloc sans clé `nfs`, et lit les PV en UN seul `get pv` (liste), jamais un
+    `get pv <nom>` par PVC."""
+    blk_pv = {"apiVersion": "v1", "kind": "PersistentVolume", "metadata": {"name": "blk-pv"},
+              "spec": {"accessModes": ["ReadWriteOnce"], "capacity": {"storage": "8Gi"},
+                       "claimRef": {"kind": "PersistentVolumeClaim", "name": "blk", "namespace": "app"},
+                       "csi": {"driver": "csi.nutanix.com",
+                               "volumeHandle": "NutanixVolumes-11111111-1111-4111-8111-111111111111",
+                               "volumeAttributes": {"iqn": "iqn.2010-06.com.nutanix:x"}},
+                       "persistentVolumeReclaimPolicy": "Delete", "storageClassName": "nutanix-volume"},
+              "status": {"phase": "Bound"}}
+    blk_pvc = {"apiVersion": "v1", "kind": "PersistentVolumeClaim",
+               "metadata": {"name": "blk", "namespace": "app"},
+               "spec": {"accessModes": ["ReadWriteOnce"], "storageClassName": "nutanix-volume",
+                        "volumeName": "blk-pv", "resources": {"requests": {"storage": "8Gi"}}},
+               "status": {"phase": "Bound"}}
+    st = read_state(H)
+    st["pvs"] = {"nas-pv": NAS_PV, "blk-pv": blk_pv}
+    st["pvcs"] = {"app": {"data": NAS_PVC, "blk": blk_pvc}}
+    write_state(H, st)
+
+    res = H.action_pvcs("app")
+    assert res["ok"], res
+    by = {p["name"]: p for p in res["pvcs"]}
+    assert by["data"]["nfs"] == {"server": "nutanix-afs.amsdemo.ct", "path": "/pvc-k8s"}
+    assert "nfs" not in by["blk"]
+
+    # Journal du faux kubectl : un seul `get pv` (liste), aucun `get pv <nom>`.
+    with_value = {"--kubeconfig", "--context", "-n", "--namespace", "-p", "--type", "-f", "-o",
+                  "--timeout", "--replicas", "--for"}
+
+    def positionals(args):
+        out, i = [], 0
+        while i < len(args):
+            a = args[i]
+            if a in with_value:
+                i += 2
+                continue
+            if a.startswith("-"):
+                i += 1
+                continue
+            out.append(a)
+            i += 1
+        return out
+
+    with open(tmp_path / "kubectl.log", encoding="utf-8") as f:
+        calls = [positionals(json.loads(line)) for line in f if line.strip()]
+    assert sum(1 for c in calls if c == ["get", "pv"]) == 1, calls
+    assert not [c for c in calls if c[:2] == ["get", "pv"] and len(c) > 2], calls
