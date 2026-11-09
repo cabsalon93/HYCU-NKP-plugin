@@ -6103,7 +6103,11 @@ def _sigv4_auth(method, host, path, query, headers, payload_hash, region, servic
     # « % » deviendrait « %25 » et la signature ne correspondrait plus à l'URL envoyée).
     # La chaîne de requête canonique est TRIÉE par nom de paramètre (exigence SigV4) :
     # sans tri, « continuation-token » ajouté en fin casse la page 2 d'un listing.
-    canonical_query = "&".join(sorted(query.split("&"))) if query else ""
+    # Tri par NOM de paramètre (puis valeur), pas par chaîne « k=v » entière : un tri de
+    # chaînes placerait « a-b=1 » avant « a=1 » (« - » < « = ») alors que SigV4 attend
+    # « a » avant « a-b ». Indifférent pour les paramètres actuels, mais pas latent.
+    canonical_query = ("&".join(sorted(query.split("&"), key=lambda kv: tuple(kv.split("=", 1))))
+                       if query else "")
     canonical = "\n".join([
         method,
         path or "/",
@@ -6158,7 +6162,8 @@ def _s3_request(method, key="", body=b"", query="", want_body=False):
     if query:
         url += "?" + query
     region = (CONFIG.get("s3_region") or "us-east-1").strip() or "us-east-1"
-    amzdate = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    # now(timezone.utc) : utcnow() est déprécié depuis Python 3.12 ; même sortie (pas de %z).
+    amzdate = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     payload_hash = hashlib.sha256(body or b"").hexdigest()
     hdrs = {"host": host, "x-amz-date": amzdate, "x-amz-content-sha256": payload_hash}
     auth = _sigv4_auth(method, host, path, query, hdrs, payload_hash, region, "s3",
@@ -9115,12 +9120,11 @@ def _bulk_load():
 
 
 def _bulk_save(j):
+    """Journal de la restauration en masse = marqueur de REPRISE : même écriture durable
+    (fsync avant os.replace, tentatives Windows) que la transaction de restauration."""
     p = _bulk_path()
     try:
-        os.makedirs(os.path.dirname(p), exist_ok=True)
-        with open(p + ".tmp", "w", encoding="utf-8") as f:
-            json.dump(j, f)
-        os.replace(p + ".tmp", p)
+        _write_json_atomic(p, j, mode=0o600)
     except OSError as e:
         print("Bulk restore journal not written: %s" % e)
 
@@ -9265,6 +9269,17 @@ def _bulk_worker(j, confirm_context, cid):
             audit("bulk_restore", dry=bool(j.get("dry", True)), ok=(c["failed"] == 0 and not j.get("stopped")),
                   namespaces=c["total"], done=c["done"], failed=c["failed"], stopped=bool(j.get("stopped")),
                   as_of=j.get("as_of"))
+    except Exception as e:
+        # Erreur HORS de la boucle par namespace (journal, comptage, audit…) : ne jamais
+        # mourir en silence — le journal porte l'erreur et l'audit en garde la trace.
+        print("Bulk restore worker error: %s" % e)
+        j["error"] = "Internal error: %s" % e
+        j["ended"] = datetime.datetime.now().isoformat(timespec="seconds")
+        try:
+            _bulk_save(j)
+        except Exception:
+            pass
+        audit("bulk_restore_error", dry=bool(j.get("dry", True)), error=str(e)[:300])
     finally:
         BULK["running"] = False
         BULK["stop"] = False
