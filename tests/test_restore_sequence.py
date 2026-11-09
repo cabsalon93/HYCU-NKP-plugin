@@ -241,3 +241,20 @@ def test_restart_failed_resume_keeps_transaction(H, monkeypatch):
     assert res3["ok"], labels(res3)
     assert read_state(H)["deployments"]["app"]["web"]["spec"]["replicas"] == 2
     assert H._load_txn("app") is None
+
+
+def test_advisory_preflight_failure_does_not_flip_verdict(H, monkeypatch):
+    """Régression : un contrôle préflight CONSULTATIF en échec — ici le droit
+    « get volumeattachments » refusé (RBAC least-privilege courant) — écrit une ligne
+    ok=False dans le journal mais ne bloque pas. La restauration RÉUSSIE ne doit pas
+    pour autant être renvoyée ok=False sans message (ancien verdict = repli du journal)."""
+    seed(H)
+    monkeypatch.setenv("FAKE_FAIL_AT", "auth:volumeattachments")
+    res = H._execute_restore_locked(dict(PAYLOAD))
+    assert any(c["name"] == "Reading VolumeAttachments" and c["ok"] is False
+               for c in res["preflight"]), "le contrôle consultatif doit bien être en échec"
+    assert res["ok"] and not res["aborted"] and res["error"] is None, labels(res)
+    st = read_state(H)
+    assert set(st["pvs"]) == {"pv-new-1", "pv-new-2"}
+    assert st["deployments"]["app"]["web"]["spec"]["replicas"] == 2, "application redémarrée"
+    assert H._load_txn("app") is None, "transaction effacée"

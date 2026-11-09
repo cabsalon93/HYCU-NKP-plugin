@@ -799,6 +799,18 @@ def action_lock(skip=False, wait=0.0):
             ACTION_LOCK.release()
 
 
+def _first_failure(log):
+    """Première étape RÉELLE en échec d'un journal d'orchestration (« label — détail »),
+    pour renseigner `error` quand le verdict est négatif. Les lignes de simulation et
+    le récapitulatif « SEQUENCE ABORTED » sont ignorés. Chaîne vide si aucune."""
+    for x in log or []:
+        if x.get("ok") or x.get("dry") or x.get("label") == "SEQUENCE ABORTED":
+            continue
+        detail = (x.get("stderr") or x.get("error") or "").strip()
+        return "%s%s" % (x.get("label") or "step", (" — " + detail[:300]) if detail else "")
+    return ""
+
+
 # ------------------------------------------------------------------------------
 # Opérations longues asynchrones (progression live) — exécutées en thread, suivies
 # par /api/op_status. Le `log` partagé grossit pendant l'exécution ; le client poll.
@@ -5528,7 +5540,6 @@ def _execute_restore_locked(payload, log=None):
         # sur place) : avec reclaimPolicy=Delete, supprimer l'ancien PV détruirait le VG
         # sur lequel on s'apprête à redémarrer l'application. La config ne peut pas
         # désactiver cette protection (le passage en Retain est de toute façon systématique).
-        same_vg = bool(r.get("old_volume_handle")) and r.get("new_volume_handle") == r.get("old_volume_handle")
 
         # Réécrire hypervisorAttachedDiskUUIDs avec le disque du VG cloné (clone) AVANT
         # l'apply : sans lui, le CSI tente l'attach iSCSI et l'attachement échoue.
@@ -5687,7 +5698,11 @@ def _execute_restore_locked(payload, log=None):
                              dry=False, label="PV %s: original reclaim policy (%s) restored" % (r["new_pv_name"], pol))
                 log.append(pr)
 
-    ok_all = (not aborted) and not mism and all(r["ok"] or r.get("dry") for r in log)
+    # Verdict fondé sur les SIGNAUX réels de la séquence (abandon, mauvais volumeHandle),
+    # jamais sur un repli de tout le journal : le préflight y écrit des contrôles
+    # CONSULTATIFS à ok=False (ex. droit « get volumeattachments » absent) qui ne
+    # doivent pas faire passer une restauration réussie pour un échec sans message.
+    ok_all = (not aborted) and not mism
     # Transaction : effacée si la restauration s'est terminée sans interruption (réel).
     # Interrompue AVANT toute suppression (inventaire, arrêt, attente des pods) : le
     # marqueur est aussi effacé — rien n'est à reprendre, et le laisser bloquerait la
@@ -5705,6 +5720,10 @@ def _execute_restore_locked(payload, log=None):
     if restart_failed:
         err = ("Volumes restored but restart incomplete — run the restore again (resume) or by hand: "
                + "; ".join(restart_failed))
+    elif aborted:
+        err = "Sequence aborted at step: %s. Nothing else was changed." % (abort_detail or "unknown")
+    elif mism:
+        err = "Unexpected volumeHandle after the restore: " + "; ".join(mism)
     return {"ok": ok_all, "error": err, "dry": dry, "aborted": aborted, "log": log,
             "preflight": checks, "reprotect": reprotect}
 
@@ -8690,10 +8709,13 @@ def action_orchestrate_inplace(payload, log=None):
             log.append({"ok": True, "dry": False, "label": "Final verification", "rc": 0, "stderr": "",
                         "cmd": "kubectl get pvc/pods", "stdout": json.dumps(v, indent=2)})
 
-        ok_all = (not aborted) and all(x["ok"] or x.get("dry") for x in log)
+        # Verdict = la séquence est allée au bout (voir _execute_restore_locked : ne pas
+        # replier tout le journal, qui peut contenir des lignes consultatives à ok=False).
+        ok_all = not aborted
+        err = None if ok_all else ("Sequence aborted: %s" % (_first_failure(log) or "a step failed — see the log"))
         audit("orchestrate_inplace", namespace=ns, dry=dry, ok=ok_all, aborted=aborted,
               volumes=[it["pvc"] for it in items])
-        return {"ok": ok_all, "error": None, "dry": dry, "aborted": aborted, "log": log}
+        return {"ok": ok_all, "error": err, "dry": dry, "aborted": aborted, "log": log}
     finally:
         if acquired:
             ACTION_LOCK.release()
@@ -9951,12 +9973,17 @@ def action_clone_app(payload, log=None):
                 if not _wait_pvc_bound(p["new_pvc_name"], target_ns, log):
                     warnings.append("Cloned PVC “%s” is not Bound: check the "
                                     "cloned VG and the hypervisorAttachedDiskUUIDs." % p["new_pvc_name"])
-        ok_all = all(x["ok"] or x.get("dry") for x in log)
+        # Verdict = aucune création n'a échoué (failed_step) ; un PVC cloné non lié reste
+        # un avertissement. Ne pas replier tout le journal (lignes consultatives possibles).
+        ok_all = failed_step is None
         audit("clone_app", namespace=ns, target_namespace=target_ns, dry=dry, ok=ok_all,
               items=[it["pvc"] for it in items],
               **({"dr": dr, "from_backup": True, "backup": os.path.basename(backup_path or ""),
                   "storageclass": dr_sc or None} if from_backup else {}))
-        return {"ok": ok_all, "error": None, "dry": dry, "log": log, "warnings": warnings,
+        return {"ok": ok_all,
+                "error": None if ok_all else ("Failure on %s — the objects created by this clone "
+                                              "were cleaned up (nothing is left half-created)." % failed_step),
+                "dry": dry, "log": log, "warnings": warnings,
                 "preview": preview,
                 "manifests_preview": json.dumps(cloned_workloads, indent=2) if dry else None}
     finally:
