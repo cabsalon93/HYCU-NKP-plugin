@@ -570,6 +570,10 @@ def _write_json_atomic(path, obj, mode=0o600):
             pass
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(obj, f, indent=2, ensure_ascii=False)
+            # Durable AVANT le replace : le marqueur de reprise / le catalogue doivent
+            # survivre à une coupure de courant juste après l'échange de noms.
+            f.flush()
+            os.fsync(f.fileno())
         # Windows : un antivirus peut tenir brièvement le fichier tout juste écrit
         # (PermissionError transitoire sur os.replace) -> quelques tentatives.
         for attempt in range(5):
@@ -580,6 +584,17 @@ def _write_json_atomic(path, obj, mode=0o600):
                 if attempt == 4:
                     raise
                 time.sleep(0.05 * (attempt + 1))
+        # POSIX : le renommage n'est durable qu'une fois le DOSSIER synchronisé
+        # (best-effort ; Windows ne permet pas d'ouvrir un dossier pour fsync).
+        if os.name != "nt":
+            try:
+                dfd = os.open(d, os.O_RDONLY)
+                try:
+                    os.fsync(dfd)
+                finally:
+                    os.close(dfd)
+            except OSError:
+                pass
     except Exception:
         try:
             os.remove(tmp)
@@ -4561,16 +4576,26 @@ def _volume_attachments_for_pv(pv_name):
     return out, None
 
 
-def _wait_volume_attachments_gone(pv_name, timeout, log):
+def _wait_volume_attachments_gone(pv_name, timeout, log, strict=False):
     """Attend que plus aucun VolumeAttachment ne référence le PV (le VG est détaché de
     la VM worker). Renvoie True si libre, False sinon. Si l'API est inaccessible
-    (RBAC), on l'indique et on considère l'information indisponible (True) : on ne
-    bloque pas, mais on ne forcera JAMAIS le finalizer de l'attacher (cf. _delete_and_unblock)."""
+    (RBAC), l'information est indisponible : par défaut on l'indique et on continue
+    (True) — le volume cible est un AUTRE VG (clone), le risque n'est qu'un attachement
+    orphelin. `strict=True` (le PV re-pointe le MÊME VG : restauration sur place) :
+    un détachement non confirmé est un ÉCHEC (False) — ré-attacher un VG encore attaché
+    à une autre VM le corromprait. On ne force JAMAIS le finalizer de l'attacher
+    (cf. _delete_and_unblock)."""
     deadline = time.time() + timeout
     last = []
     while time.time() < deadline:
         last, err = _volume_attachments_for_pv(pv_name)
         if err:
+            if strict:
+                log.append(logentry("VolumeAttachments cannot be checked (%s)" % err.strip()[:160], ok=False, rc=-1,
+                                    cmd="(waiting) kubectl get volumeattachments",
+                                    stderr="Same Volume Group re-attached (in-place restore): the detach MUST be "
+                                           "confirmed before going on. Grant “get volumeattachments” and try again."))
+                return False
             log.append(logentry("VolumeAttachments cannot be checked (%s)" % err.strip()[:160],
                                 stdout="Missing “get volumeattachments” right: the VG detach is not confirmed."))
             return True
@@ -5226,6 +5251,17 @@ def _kubectl_client_minor():
         return None
 
 
+def _restore_same_vg(r):
+    """Vrai si le nouveau PV re-pointe le MÊME Volume Group que l'ancien (restauration
+    sur place / réutilisation des volumes d'origine). Ré-attacher ce VG alors qu'il est
+    encore attaché à une autre VM le corromprait : le détachement doit être CONFIRMÉ.
+    Inconnu (reprise sans analyse) = non : on ne peut pas l'affirmer."""
+    if r.get("same_uuid"):
+        return True
+    old = r.get("old_volume_handle")
+    return bool(old) and r.get("new_volume_handle") == old
+
+
 def _restore_preflight(ns, prepared, mode, dry, current, log):
     """Contrôles AVANT tout arrêt de l'application. Renvoie (checks, bloquant) :
     `checks` = liste [{name, ok, detail}] renvoyée à l'interface (liste ✓/✕),
@@ -5258,9 +5294,16 @@ def _restore_preflight(ns, prepared, mode, dry, current, log):
         add("RBAC rights", None, "undetermined: " + ", ".join(unknown), block=False)
     else:
         add("RBAC rights", True, "delete/create/patch pv+pvc, scale, list pods")
+    # Consultatif pour un clone (le nouveau VG est distinct) ; BLOQUANT dès qu'un volume
+    # re-pointe le MÊME VG : sans confirmation du détachement, on refuse AVANT d'arrêter
+    # l'application plutôt que d'abandonner au milieu de la séquence.
     va = _kubectl_can_i("get", "volumeattachments")
-    add("Reading VolumeAttachments", va if va is not None else None,
-        "" if va else "without this right, the VG detach cannot be confirmed", block=False)
+    same_vg_vols = [r["pvc"] for r in prepared if _restore_same_vg(r)]
+    va_detail = "" if va else "without this right, the VG detach cannot be confirmed"
+    if va is False and same_vg_vols:
+        va_detail += (" — blocking: %s re-point the SAME Volume Group (in-place); re-attaching it "
+                      "while still attached elsewhere would corrupt it" % ", ".join(same_vg_vols))
+    add("Reading VolumeAttachments", va if va is not None else None, va_detail, block=bool(same_vg_vols))
 
     # 2) Version du client kubectl (wait --for=jsonpath exige 1.23+).
     minor = _kubectl_client_minor()
@@ -5609,8 +5652,12 @@ def _execute_restore_locked(payload, log=None):
             # Y compris quand l'ancien PV porte le MÊME nom que le nouveau (restauration sur
             # place) : un `apply` par-dessus un PV Released garderait le claimRef.uid périmé
             # et le PVC recréé ne se lierait jamais. Il est en Retain : suppression sans risque.
+            # Même VG (sur place) : un détachement NON confirmé est bloquant — ré-attacher un
+            # VG encore attaché à une autre VM le corromprait. Clone : le nouveau VG est
+            # distinct, l'information manquante n'est qu'un avertissement.
+            same_vg = _restore_same_vg(r)
             for p in [x for x in dict.fromkeys([pv_old, cur_pv]) if x]:
-                if not _wait_volume_attachments_gone(p, CONFIG["wait_timeout"], log):
+                if not _wait_volume_attachments_gone(p, CONFIG["wait_timeout"], log, strict=same_vg):
                     aborted = True
                     abort_detail = "detach of volume %s (VolumeAttachment still present)" % p
                     break
@@ -8652,6 +8699,17 @@ def action_orchestrate_inplace(payload, log=None):
             if CONFIG.get("inplace_refresh_pv_disk", True) and not SESSION_CREDS.get("prismcentral"):
                 log.append(logentry("Preflight ? Prism Central not connected: the PV disk "
                                     "cannot be refreshed after the restore (FailedMount possible)", ok=True))
+            # La restauration sur place ré-attache le MÊME Volume Group après que HYCU
+            # l'a réécrit : le détachement devra être CONFIRMÉ (VolumeAttachments). Sans le
+            # droit de lecture, on refuse ICI, avant d'arrêter l'application.
+            va = _kubectl_can_i("get", "volumeattachments")
+            if va is False:
+                return _err("Preflight: “get volumeattachments” denied — the in-place restore re-attaches "
+                            "the SAME Volume Group after HYCU rewrites it, so the detach must be confirmed. "
+                            "Grant the right and try again. Application not stopped.", log=log)
+            log.append(logentry("Preflight %s Reading VolumeAttachments" % ("✓" if va else "?"),
+                                cmd="kubectl auth can-i get volumeattachments",
+                                stdout="" if va else "undetermined: the detach check will fail if unreadable"))
             owned = [w for w in current if w.get("owner")]
             if owned:
                 return _err("Preflight: operator-managed workload(s) (%s) — the "
@@ -8671,7 +8729,8 @@ def action_orchestrate_inplace(payload, log=None):
                 for it in items:
                     pvc_live, _ = kubectl_json(["get", "pvc", it["pvc"], "-n", ns, "--ignore-not-found"])
                     pvn = ((pvc_live or {}).get("spec") or {}).get("volumeName")
-                    if pvn and not _wait_volume_attachments_gone(pvn, CONFIG["wait_timeout"], log):
+                    # strict : même VG réécrit par HYCU -> détachement non confirmé = échec.
+                    if pvn and not _wait_volume_attachments_gone(pvn, CONFIG["wait_timeout"], log, strict=True):
                         aborted = True
                         break
 

@@ -258,3 +258,65 @@ def test_advisory_preflight_failure_does_not_flip_verdict(H, monkeypatch):
     assert set(st["pvs"]) == {"pv-new-1", "pv-new-2"}
     assert st["deployments"]["app"]["web"]["spec"]["replicas"] == 2, "application redémarrée"
     assert H._load_txn("app") is None, "transaction effacée"
+
+
+PAYLOAD_INPLACE = {"namespace": "app", "dry": False, "mode": "inplace",
+                   "items": [{"pvc": "data-1", "new_ref": VG_OLD1}]}
+
+
+def test_same_vg_restore_blocked_at_preflight_when_detach_unverifiable(H, monkeypatch):
+    """Point 2 : le PV re-pointe le MÊME Volume Group (sur place) et le droit « get
+    volumeattachments » est refusé -> le préflight BLOQUE avant d'arrêter l'application :
+    rien n'est supprimé, aucune transaction, réplicas intacts."""
+    seed(H)
+    monkeypatch.setenv("FAKE_FAIL_AT", "auth:volumeattachments")
+    res = H._execute_restore_locked(dict(PAYLOAD_INPLACE))
+    assert not res["ok"] and res["aborted"], labels(res)
+    assert "Blocking preflight" in (res["error"] or "") and "Nothing was changed" in res["error"]
+    assert any(c["name"] == "Reading VolumeAttachments" and c["ok"] is False and "SAME Volume Group" in c["detail"]
+               for c in res["preflight"]), res["preflight"]
+    st = read_state(H)
+    assert set(st["pvs"]) == {"pv-1", "pv-2"}, "aucun PV supprimé"
+    assert st["pvcs"]["app"]["data-1"]["spec"]["volumeName"] == "pv-1"
+    assert st["deployments"]["app"]["web"]["spec"]["replicas"] == 2, "application jamais arrêtée"
+    assert H._load_txn("app") is None, "aucune transaction écrite"
+
+
+def test_same_vg_restore_proceeds_when_detach_readable(H):
+    """Contrôle positif du point 2 : même restauration sur place, droit présent -> la
+    séquence va au bout (le blocage est bien CONDITIONNEL au droit manquant)."""
+    seed(H)
+    res = H._execute_restore_locked(dict(PAYLOAD_INPLACE))
+    assert res["ok"] and not res["aborted"], labels(res)
+    assert any(c["name"] == "Reading VolumeAttachments" and c["ok"] is True for c in res["preflight"])
+    st = read_state(H)
+    assert st["pvs"]["pv-1"]["spec"]["csi"]["volumeHandle"] == "NutanixVolumes-" + VG_OLD1
+    assert st["deployments"]["app"]["web"]["spec"]["replicas"] == 2, "application redémarrée"
+
+
+def test_wait_attachments_strict_fails_when_unreadable(H, monkeypatch):
+    """Seconde ligne de défense : lecture des VolumeAttachments impossible -> non strict
+    = on continue (True, clone) ; strict = échec (False, même VG), avec une ligne ok=False."""
+    monkeypatch.setattr(H, "_volume_attachments_for_pv", lambda pv: ([], "forbidden: volumeattachments"))
+    log = []
+    assert H._wait_volume_attachments_gone("pv-1", 1, log) is True
+    assert all(e["ok"] for e in log)
+    log = []
+    assert H._wait_volume_attachments_gone("pv-1", 1, log, strict=True) is False
+    assert any((not e["ok"]) and "MUST be" in (e.get("stderr") or "") for e in log), log
+
+
+def test_inplace_orchestrator_refuses_before_stopping_when_detach_unverifiable(H, monkeypatch):
+    """Point 2, orchestrateur sur place (HYCU réécrit le MÊME VG) : droit « get
+    volumeattachments » refusé -> refus au préflight, AVANT l'arrêt de l'application."""
+    seed(H)
+    H.SESSION_CREDS["hycu"] = {"mode": "basic"}
+    monkeypatch.setattr(H, "_reject_stale_vgs", lambda *a, **k: None)
+    monkeypatch.setattr(H, "_rest", lambda *a, **k: {"ok": True, "json": {}})
+    monkeypatch.setenv("FAKE_FAIL_AT", "auth:volumeattachments")
+    res = H.action_orchestrate_inplace({"namespace": "app", "dry": False,
+                                        "items": [{"pvc": "data-1", "source_vg_uuid": VG_OLD1,
+                                                   "restore_point_id": "rp-1"}]})
+    assert not res["ok"], res
+    assert "get volumeattachments" in res["error"] and "not stopped" in res["error"], res["error"]
+    assert read_state(H)["deployments"]["app"]["web"]["spec"]["replicas"] == 2, "application jamais arrêtée"
